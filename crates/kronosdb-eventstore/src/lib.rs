@@ -2,6 +2,7 @@ pub mod error;
 pub mod event;
 pub mod criteria;
 pub mod append;
+pub mod api;
 
 pub mod segment;
 pub mod index;

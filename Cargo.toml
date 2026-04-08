@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/kronosdb-eventstore",
-    "crates/kronosdb-messaging",
+    "crates/kronosdb-messaging", "crates/kronosdb-server",
 ]
 
 [workspace.package]
