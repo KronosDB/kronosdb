@@ -31,8 +31,9 @@ const DEFAULT_BLOOM_CACHE_SIZE: usize = 200;
 /// The main event store. Combines the segment writer, tag index, and
 /// concurrency control into a single API.
 ///
-/// Write operations go through the single writer (&mut self).
-/// Read operations can proceed concurrently.
+/// All operations take `&self`. The writer is behind a Mutex for interior
+/// mutability, allowing reads to proceed concurrently with each other
+/// (they don't need the writer lock). Only appends lock the writer.
 ///
 /// Tags are stored on events in segments (source of truth).
 /// The tag index is a derived in-memory structure rebuilt from segments on recovery.
@@ -42,8 +43,9 @@ pub struct EventStoreEngine {
     /// Directory where segment files are stored.
     dir: PathBuf,
 
-    /// The segment writer. Only accessed by the write path.
-    writer: SegmentWriter,
+    /// The segment writer. Behind Mutex for interior mutability —
+    /// only the append path locks this.
+    writer: parking_lot::Mutex<SegmentWriter>,
 
     /// The tag index for the active segment. Protected by RwLock for concurrent read access.
     tag_index: Arc<RwLock<TagIndex>>,
@@ -56,9 +58,6 @@ pub struct EventStoreEngine {
 
     /// LRU cache for sealed segment indices and bloom filters.
     cache: Arc<IndexCache>,
-
-    /// Maximum segment size.
-    max_segment_size: u64,
 }
 
 impl EventStoreEngine {
@@ -75,19 +74,15 @@ impl EventStoreEngine {
 
         Ok(Self {
             dir: dir.to_path_buf(),
-            writer,
+            writer: parking_lot::Mutex::new(writer),
             tag_index: Arc::new(RwLock::new(TagIndex::new())),
             committed_position: Arc::new(AtomicU64::new(0)),
             commit_tx,
             cache: Arc::new(IndexCache::new(DEFAULT_INDEX_CACHE_SIZE, DEFAULT_BLOOM_CACHE_SIZE)),
-            max_segment_size,
         })
     }
 
     /// Opens an existing event store, recovering from the last valid state.
-    ///
-    /// Sealed segments with valid `.idx` files don't need replay.
-    /// The active segment (no `.idx`) is replayed to rebuild its in-memory tag index.
     pub fn open(dir: &Path) -> Result<Self, Error> {
         Self::open_with_options(dir, DEFAULT_SEGMENT_SIZE)
     }
@@ -107,12 +102,11 @@ impl EventStoreEngine {
 
         Ok(Self {
             dir: dir.to_path_buf(),
-            writer,
+            writer: parking_lot::Mutex::new(writer),
             tag_index: Arc::new(RwLock::new(tag_index)),
             committed_position: Arc::new(AtomicU64::new(committed)),
             commit_tx,
             cache: Arc::new(IndexCache::new(DEFAULT_INDEX_CACHE_SIZE, DEFAULT_BLOOM_CACHE_SIZE)),
-            max_segment_size,
         })
     }
 
@@ -122,7 +116,11 @@ impl EventStoreEngine {
     /// 2. Writes events to the active segment (tags included on disk)
     /// 3. Updates the in-memory tag index
     /// 4. Advances the committed position
-    pub fn append(&mut self, request: AppendRequest) -> Result<AppendResponse, Error> {
+    pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        // Lock the writer for the entire append operation.
+        // DCB condition check + write + index update must be atomic.
+        let mut writer = self.writer.lock();
+
         // Step 1: Check DCB condition.
         {
             let index = self.tag_index.read();
@@ -136,7 +134,7 @@ impl EventStoreEngine {
         }
 
         if request.events.is_empty() {
-            let head = self.writer.head();
+            let head = writer.head();
             return Ok(AppendResponse {
                 first_position: head,
                 count: 0,
@@ -145,7 +143,7 @@ impl EventStoreEngine {
         }
 
         // Step 2: Write events to segment (tags are persisted with the event).
-        let (first_position, count) = self.writer.append(&request.events)?;
+        let (first_position, count) = writer.append(&request.events)?;
 
         // Step 3: Update in-memory tag index.
         {
@@ -236,7 +234,7 @@ impl EventStoreEngine {
 
     /// Returns the current head position (next position to be assigned).
     pub fn head(&self) -> Position {
-        self.writer.head()
+        self.writer.lock().head()
     }
 
     /// Returns the tail position (first event in the store).
@@ -324,7 +322,7 @@ impl EventStoreEngine {
 }
 
 impl EventStore for EventStoreEngine {
-    fn append(&mut self, request: AppendRequest) -> Result<AppendResponse, Error> {
+    fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
         self.append(request)
     }
 
@@ -409,7 +407,7 @@ mod tests {
     #[test]
     fn create_and_append() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStoreEngine::create(dir.path()).unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
 
         let request = AppendRequest {
             condition: None,
@@ -429,7 +427,7 @@ mod tests {
     #[test]
     fn dcb_condition_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStoreEngine::create(dir.path()).unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -457,7 +455,7 @@ mod tests {
     #[test]
     fn dcb_condition_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStoreEngine::create(dir.path()).unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -491,7 +489,7 @@ mod tests {
     #[test]
     fn source_query() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStoreEngine::create(dir.path()).unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -520,7 +518,7 @@ mod tests {
     #[test]
     fn get_tags_from_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStoreEngine::create(dir.path()).unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -543,7 +541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let mut store = EventStoreEngine::create(dir.path()).unwrap();
+            let store = EventStoreEngine::create(dir.path()).unwrap();
             store
                 .append(AppendRequest {
                     condition: None,

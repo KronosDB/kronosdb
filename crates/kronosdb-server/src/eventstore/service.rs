@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -17,17 +16,18 @@ use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer as 
 /// gRPC service implementation for the event store.
 ///
 /// Programs against the `EventStore` trait, not the concrete engine.
-/// The inner store is behind Arc<Mutex<>> for shared access.
+/// All operations on EventStore take `&self` (interior mutability),
+/// so no Mutex wrapper is needed. Reads proceed concurrently.
 /// All engine calls are dispatched to `spawn_blocking` to avoid
 /// blocking the tokio async worker threads with synchronous file I/O.
 pub struct EventStoreService {
-    store: Arc<Mutex<Box<dyn EventStore>>>,
+    store: Arc<dyn EventStore>,
 }
 
 impl EventStoreService {
     pub fn new(store: Box<dyn EventStore>) -> Self {
         Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::from(store),
         }
     }
 
@@ -65,7 +65,6 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
         let store = Arc::clone(&self.store);
         let response = tokio::task::spawn_blocking(move || {
-            let mut store = store.lock();
             store.append(request)
         })
         .await
@@ -90,7 +89,6 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let store = Arc::clone(&self.store);
         let condition_clone = condition.clone();
         let (events, committed) = tokio::task::spawn_blocking(move || {
-            let store = store.lock();
             let events = store.source(from_position, &condition_clone)?;
             let head = store.head();
             let committed = if head.0 > 0 { head.0 - 1 } else { 0 };
@@ -132,10 +130,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let from_position = Position(req.from_sequence as u64);
         let condition = from_proto_criteria(req.criteria);
 
-        let mut event_stream = {
-            let store = self.store.lock();
-            store.subscribe(from_position, condition.clone())
-        };
+        let mut event_stream = self.store.subscribe(from_position, condition.clone());
 
         let store = Arc::clone(&self.store);
         let (tx, rx) = mpsc::channel(128);
@@ -147,8 +142,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                 let condition = condition.clone();
                 let cursor = event_stream.cursor;
                 tokio::task::spawn_blocking(move || {
-                    let s = store.lock();
-                    s.source(cursor, &condition)
+                    store.source(cursor, &condition)
                 })
                 .await
             };
@@ -186,8 +180,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     let condition = condition.clone();
                     let cursor = event_stream.cursor;
                     tokio::task::spawn_blocking(move || {
-                        let s = store.lock();
-                        s.source(cursor, &condition)
+                        store.source(cursor, &condition)
                     })
                     .await
                 };
@@ -227,7 +220,6 @@ impl pb::event_store_server::EventStore for EventStoreService {
     ) -> Result<Response<pb::GetHeadResponse>, Status> {
         let store = Arc::clone(&self.store);
         let head = tokio::task::spawn_blocking(move || {
-            let store = store.lock();
             store.head()
         })
         .await
@@ -244,7 +236,6 @@ impl pb::event_store_server::EventStore for EventStoreService {
     ) -> Result<Response<pb::GetTailResponse>, Status> {
         let store = Arc::clone(&self.store);
         let tail = tokio::task::spawn_blocking(move || {
-            let store = store.lock();
             store.tail()
         })
         .await
@@ -264,7 +255,6 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
         let store = Arc::clone(&self.store);
         let tags = tokio::task::spawn_blocking(move || {
-            let store = store.lock();
             store.get_tags(position)
         })
         .await

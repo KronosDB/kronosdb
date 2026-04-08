@@ -149,21 +149,15 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             pending_map.insert(message_id.clone(), pending_cmd.response_tx);
         }
 
-        // Find the handler's stream and deliver the command.
-        // The dispatch selected the handler, but PendingCommand doesn't carry
-        // the target handler ID. We need to find which handler lost a permit.
-        // For now, we look up by the handler that was selected.
-        // TODO: PendingCommand should expose the target client_id.
+        // Find the selected handler's stream and deliver the command.
+        let target_id = &pending_cmd.target_handler.0;
         let handler_tx = {
             let streams = self.handler_streams.lock();
-            // Try all streams — the command bus already selected the right handler
-            // via permit acquisition. We deliver to the first available stream.
-            // In a production system, PendingCommand would carry the target client_id.
-            streams.values().next().cloned()
+            streams.get(target_id).cloned()
         };
 
         let handler_tx = handler_tx
-            .ok_or_else(|| Status::unavailable("no handler stream available"))?;
+            .ok_or_else(|| Status::unavailable(format!("handler '{}' stream not found", target_id)))?;
 
         let inbound_cmd = to_proto_command_inbound(&pending_cmd.command);
         handler_tx

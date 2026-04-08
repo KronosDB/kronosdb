@@ -13,7 +13,7 @@ use crate::stream::EventStream;
 /// The gRPC service layer programs against this trait, not the concrete `EventStore` type.
 pub trait EventStore: Send + Sync {
     /// Appends events to the store, optionally with a DCB consistency condition.
-    fn append(&mut self, request: AppendRequest) -> Result<AppendResponse, Error>;
+    fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error>;
 
     /// Reads events matching a sourcing condition from `from_position` up to the current head.
     fn source(

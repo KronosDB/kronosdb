@@ -77,6 +77,8 @@ impl std::fmt::Display for CommandError {
 pub struct PendingCommand {
     pub command: Command,
     pub response_tx: oneshot::Sender<CommandResult>,
+    /// The client_id of the handler this command was routed to.
+    pub target_handler: ClientId,
 }
 
 /// The command bus. Routes commands to registered handlers.
@@ -184,12 +186,15 @@ impl CommandBus {
             });
         }
 
+        let target_handler = selected.handler.client_id.clone();
+
         // Create the response channel.
         let (response_tx, response_rx) = oneshot::channel();
 
         let pending = PendingCommand {
             command,
             response_tx,
+            target_handler,
         };
 
         Ok((pending, response_rx))
