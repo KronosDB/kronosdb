@@ -1,0 +1,216 @@
+use tokio::sync::oneshot;
+
+use crate::api::{CommandDispatcher, MessagingPlatform, QueryDispatcher, SubscriptionQueryDispatcher};
+use crate::command::{Command, CommandBus, CommandError, CommandResult, PendingCommand};
+use crate::query::{PendingQuery, Query, QueryBus, QueryError};
+use crate::subscription::{SubscriptionError, SubscriptionQuery, SubscriptionRegistry, SubscriptionUpdate};
+use crate::types::{ClientId, ComponentName};
+
+/// The messaging platform engine.
+///
+/// Combines the command bus, query bus, and subscription registry
+/// into a single concrete implementation of `MessagingPlatform`.
+pub struct MessagingEngine {
+    command_bus: CommandBus,
+    query_bus: QueryBus,
+    subscriptions: SubscriptionRegistry,
+}
+
+impl MessagingEngine {
+    pub fn new() -> Self {
+        Self {
+            command_bus: CommandBus::new(),
+            query_bus: QueryBus::new(),
+            subscriptions: SubscriptionRegistry::new(),
+        }
+    }
+}
+
+impl CommandDispatcher for MessagingEngine {
+    fn subscribe_command(
+        &self,
+        command_name: String,
+        client_id: ClientId,
+        component_name: ComponentName,
+        load_factor: i32,
+    ) {
+        self.command_bus.subscribe(command_name, client_id, component_name, load_factor);
+    }
+
+    fn unsubscribe_command(&self, command_name: &str, client_id: &ClientId) {
+        self.command_bus.unsubscribe(command_name, client_id);
+    }
+
+    fn remove_command_client(&self, client_id: &ClientId) {
+        self.command_bus.remove_client(client_id);
+    }
+
+    fn grant_command_permits(&self, client_id: &ClientId, permits: i64) {
+        self.command_bus.grant_permits(client_id, permits);
+    }
+
+    fn dispatch_command(
+        &self,
+        command: Command,
+    ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        self.command_bus.dispatch(command)
+    }
+}
+
+impl QueryDispatcher for MessagingEngine {
+    fn subscribe_query(
+        &self,
+        query_name: String,
+        client_id: ClientId,
+        component_name: ComponentName,
+    ) {
+        self.query_bus.subscribe(query_name, client_id, component_name);
+    }
+
+    fn unsubscribe_query(&self, query_name: &str, client_id: &ClientId) {
+        self.query_bus.unsubscribe(query_name, client_id);
+    }
+
+    fn remove_query_client(&self, client_id: &ClientId) {
+        self.query_bus.remove_client(client_id);
+    }
+
+    fn grant_query_permits(&self, client_id: &ClientId, permits: i64) {
+        self.query_bus.grant_permits(client_id, permits);
+    }
+
+    fn dispatch_query(&self, query: Query) -> Result<PendingQuery, QueryError> {
+        self.query_bus.dispatch(query)
+    }
+}
+
+impl SubscriptionQueryDispatcher for MessagingEngine {
+    fn subscribe(
+        &self,
+        query: SubscriptionQuery,
+    ) -> Result<PendingQuery, SubscriptionError> {
+        let (pending, _rx) = self.subscriptions.open(query)?;
+        // TODO: The rx (update receiver) needs to be returned to the gRPC layer
+        // so it can stream updates to the subscriber. For now we return just the
+        // pending query. The gRPC service will call subscriptions.open() directly
+        // to get both the pending query and the update receiver.
+        Ok(pending)
+    }
+
+    fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate) {
+        self.subscriptions.send_update(subscription_id, update);
+    }
+
+    fn complete_subscription(&self, subscription_id: &str) {
+        self.subscriptions.complete(subscription_id);
+    }
+
+    fn cancel_subscription(&self, subscription_id: &str) {
+        self.subscriptions.cancel(subscription_id);
+    }
+}
+
+impl MessagingPlatform for MessagingEngine {
+    fn remove_client(&self, client_id: &ClientId) {
+        self.command_bus.remove_client(client_id);
+        self.query_bus.remove_client(client_id);
+        self.subscriptions.remove_client(client_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Payload;
+
+    fn client(id: &str) -> ClientId {
+        ClientId(id.to_string())
+    }
+
+    fn component(name: &str) -> ComponentName {
+        ComponentName(name.to_string())
+    }
+
+    #[test]
+    fn messaging_engine_dispatches_commands() {
+        let engine = MessagingEngine::new();
+
+        engine.subscribe_command(
+            "CreateOrder".into(),
+            client("handler-1"),
+            component("order-service"),
+            100,
+        );
+        engine.grant_command_permits(&client("handler-1"), 10);
+
+        let cmd = Command {
+            message_id: "cmd-1".into(),
+            name: "CreateOrder".into(),
+            timestamp: 0,
+            payload: Payload { payload_type: "CreateOrder".into(), revision: "1".into(), data: vec![] },
+            metadata: vec![],
+            routing_key: None,
+            client_id: client("dispatcher"),
+            component_name: component("test"),
+        };
+
+        let result = engine.dispatch_command(cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn messaging_engine_dispatches_queries() {
+        let engine = MessagingEngine::new();
+
+        engine.subscribe_query("GetOrders".into(), client("handler-1"), component("order-service"));
+        engine.grant_query_permits(&client("handler-1"), 10);
+
+        let query = Query {
+            message_id: "q-1".into(),
+            name: "GetOrders".into(),
+            timestamp: 0,
+            payload: Payload { payload_type: "GetOrders".into(), revision: "1".into(), data: vec![] },
+            metadata: vec![],
+            client_id: client("dispatcher"),
+            component_name: component("test"),
+            expected_results: -1,
+        };
+
+        let result = engine.dispatch_query(query);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn remove_client_cleans_up_everything() {
+        let engine = MessagingEngine::new();
+
+        engine.subscribe_command("CreateOrder".into(), client("node-1"), component("order-service"), 100);
+        engine.subscribe_query("GetOrders".into(), client("node-1"), component("order-service"));
+
+        engine.remove_client(&client("node-1"));
+
+        let cmd = Command {
+            message_id: "cmd-1".into(),
+            name: "CreateOrder".into(),
+            timestamp: 0,
+            payload: Payload { payload_type: "CreateOrder".into(), revision: "1".into(), data: vec![] },
+            metadata: vec![],
+            routing_key: None,
+            client_id: client("dispatcher"),
+            component_name: component("test"),
+        };
+        assert!(matches!(engine.dispatch_command(cmd), Err(CommandError::NoHandlerAvailable { .. })));
+
+        let query = Query {
+            message_id: "q-1".into(),
+            name: "GetOrders".into(),
+            timestamp: 0,
+            payload: Payload { payload_type: "GetOrders".into(), revision: "1".into(), data: vec![] },
+            metadata: vec![],
+            client_id: client("dispatcher"),
+            component_name: component("test"),
+            expected_results: 1,
+        };
+        assert!(matches!(engine.dispatch_query(query), Err(QueryError::NoHandlerAvailable { .. })));
+    }
+}
