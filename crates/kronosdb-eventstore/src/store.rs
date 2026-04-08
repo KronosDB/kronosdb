@@ -5,6 +5,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+use crate::api::EventStore;
 use crate::error::Error;
 use crate::append::{AppendRequest, AppendResponse};
 use crate::cache::IndexCache;
@@ -37,7 +38,7 @@ const DEFAULT_BLOOM_CACHE_SIZE: usize = 200;
 /// The tag index is a derived in-memory structure rebuilt from segments on recovery.
 /// Tag mutations (retagging, redaction) are handled by the transformation system,
 /// not by direct mutation on the store.
-pub struct EventStore {
+pub struct EventStoreEngine {
     /// Directory where segment files are stored.
     dir: PathBuf,
 
@@ -60,7 +61,7 @@ pub struct EventStore {
     max_segment_size: u64,
 }
 
-impl EventStore {
+impl EventStoreEngine {
     /// Creates a new event store in the given directory.
     pub fn create(dir: &Path) -> Result<Self, Error> {
         Self::create_with_options(dir, DEFAULT_SEGMENT_SIZE)
@@ -322,6 +323,36 @@ impl EventStore {
     }
 }
 
+impl EventStore for EventStoreEngine {
+    fn append(&mut self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        self.append(request)
+    }
+
+    fn source(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+    ) -> Result<Vec<SequencedEvent>, Error> {
+        self.source(from_position, condition)
+    }
+
+    fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
+        self.subscribe(from_position, condition)
+    }
+
+    fn head(&self) -> Position {
+        self.head()
+    }
+
+    fn tail(&self) -> Position {
+        self.tail()
+    }
+
+    fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error> {
+        self.get_tags(position)
+    }
+}
+
 /// Rebuilds the tag index for the active (unsealed) segment.
 ///
 /// Sealed segments have `.idx` companion files on disk and don't need replay.
@@ -378,7 +409,7 @@ mod tests {
     #[test]
     fn create_and_append() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStore::create(dir.path()).unwrap();
+        let mut store = EventStoreEngine::create(dir.path()).unwrap();
 
         let request = AppendRequest {
             condition: None,
@@ -398,7 +429,7 @@ mod tests {
     #[test]
     fn dcb_condition_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStore::create(dir.path()).unwrap();
+        let mut store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -426,7 +457,7 @@ mod tests {
     #[test]
     fn dcb_condition_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStore::create(dir.path()).unwrap();
+        let mut store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -460,7 +491,7 @@ mod tests {
     #[test]
     fn source_query() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStore::create(dir.path()).unwrap();
+        let mut store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -489,7 +520,7 @@ mod tests {
     #[test]
     fn get_tags_from_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = EventStore::create(dir.path()).unwrap();
+        let mut store = EventStoreEngine::create(dir.path()).unwrap();
 
         store
             .append(AppendRequest {
@@ -512,7 +543,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let mut store = EventStore::create(dir.path()).unwrap();
+            let mut store = EventStoreEngine::create(dir.path()).unwrap();
             store
                 .append(AppendRequest {
                     condition: None,
@@ -528,7 +559,7 @@ mod tests {
         }
 
         {
-            let store = EventStore::open(dir.path()).unwrap();
+            let store = EventStoreEngine::open(dir.path()).unwrap();
             assert_eq!(store.head(), Position(3));
 
             let cond = SourcingCondition {
@@ -559,7 +590,7 @@ mod tests {
     #[test]
     fn head_and_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let store = EventStore::create(dir.path()).unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
 
         assert_eq!(store.head(), Position(1));
         assert_eq!(store.tail(), Position(0));

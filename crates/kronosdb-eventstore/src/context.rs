@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
 
 use crate::error::Error;
-use crate::store::EventStore;
+use crate::store::EventStoreEngine;
 
 /// Manages multiple isolated event store contexts.
 ///
@@ -17,7 +17,7 @@ pub struct ContextManager {
     data_dir: PathBuf,
 
     /// Active contexts, keyed by name.
-    contexts: RwLock<HashMap<String, EventStore>>,
+    contexts: RwLock<HashMap<String, EventStoreEngine>>,
 
     /// Default segment size for new contexts.
     default_segment_size: u64,
@@ -53,17 +53,17 @@ impl ContextManager {
         }
 
         let context_dir = self.data_dir.join(name);
-        let store = EventStore::create_with_options(&context_dir, self.default_segment_size)?;
+        let store = EventStoreEngine::create_with_options(&context_dir, self.default_segment_size)?;
         contexts.insert(name.to_string(), store);
 
         Ok(())
     }
 
     /// Gets a reference to a context's event store for read operations.
-    /// The callback receives a reference to the EventStore.
+    /// The callback receives a reference to the EventStoreEngine.
     pub fn with_context<F, R>(&self, name: &str, f: F) -> Result<R, Error>
     where
-        F: FnOnce(&EventStore) -> Result<R, Error>,
+        F: FnOnce(&EventStoreEngine) -> Result<R, Error>,
     {
         let contexts = self.contexts.read();
         let store = contexts.get(name).ok_or_else(|| Error::ContextNotFound {
@@ -73,10 +73,10 @@ impl ContextManager {
     }
 
     /// Gets a mutable reference to a context's event store for write operations.
-    /// The callback receives a mutable reference to the EventStore.
+    /// The callback receives a mutable reference to the EventStoreEngine.
     pub fn with_context_mut<F, R>(&self, name: &str, f: F) -> Result<R, Error>
     where
-        F: FnOnce(&mut EventStore) -> Result<R, Error>,
+        F: FnOnce(&mut EventStoreEngine) -> Result<R, Error>,
     {
         let mut contexts = self.contexts.write();
         let store = contexts
@@ -134,7 +134,7 @@ impl ContextManager {
 
             if has_segments {
                 let store =
-                    EventStore::open_with_options(&path, self.default_segment_size)?;
+                    EventStoreEngine::open_with_options(&path, self.default_segment_size)?;
                 contexts.insert(name, store);
             }
         }
