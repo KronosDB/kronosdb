@@ -186,9 +186,15 @@ impl SegmentWriter {
     }
 
     /// Rotates to a new segment file.
+    /// Builds the per-segment `.idx` and `.bloom` files for the sealed segment.
     fn rotate_segment(&mut self) -> Result<(), Error> {
-        // Sync and close the current segment (File is closed on drop, but sync first).
+        // Sync the current segment before sealing.
         fdatasync(&self.active_file)?;
+
+        // Build per-segment index for the sealed segment.
+        let sealed_path = segment_path(&self.dir, self.active_base_position);
+        let index = super::segment_index::SegmentIndex::build_from_segment(&sealed_path)?;
+        index.write_to_disk(&sealed_path)?;
 
         // New segment starts at the current next_position.
         let new_base = self.next_position.0;
@@ -363,7 +369,7 @@ fn list_segments(dir: &Path) -> Result<Vec<u64>, io::Error> {
 mod tests {
     use super::*;
     use crate::segment::DEFAULT_SEGMENT_SIZE;
-    use crate::tag::Tag;
+    use crate::event::Tag;
 
     fn make_event(name: &str, payload: &[u8]) -> AppendEvent {
         AppendEvent {

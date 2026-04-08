@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::event::{Position, StoredEvent};
-use crate::tag::Tag;
+use crate::event::Tag;
 
 /// Serializes a stored event (with tags) into the binary on-disk format.
 ///

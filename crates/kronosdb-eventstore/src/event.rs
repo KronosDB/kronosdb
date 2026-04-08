@@ -1,5 +1,3 @@
-use crate::tag::Tag;
-
 /// Global position in the event log. Monotonically increasing, gapless.
 /// Position 0 means "no events" / "beginning of log".
 /// First event has position 1.
@@ -11,6 +9,35 @@ impl Position {
 
     pub fn next(self) -> Position {
         Position(self.0 + 1)
+    }
+}
+
+/// A tag is a key-value pair that describes an event.
+/// Tags are the primary mechanism for querying and for DCB consistency checks.
+/// Stored on events in segment files as source of truth.
+///
+/// Both key and value are raw bytes, allowing domain-specific encoding.
+/// Common usage: key="orderId", value=b"abc-123"
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Tag {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl Tag {
+    pub fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Convenience constructor for string key-value tags.
+    pub fn from_str(key: &str, value: &str) -> Self {
+        Self {
+            key: key.as_bytes().to_vec(),
+            value: value.as_bytes().to_vec(),
+        }
     }
 }
 

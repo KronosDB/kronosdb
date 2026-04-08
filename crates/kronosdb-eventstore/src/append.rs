@@ -1,50 +1,29 @@
-use crate::event::Position;
-use crate::tag::Tag;
-
-/// A criterion matches an event if:
-/// - ALL tags in `tags` are present on the event (AND logic)
-/// - AND the event name is in `names` (if `names` is non-empty)
-///
-/// If `names` is empty, only the tags are checked.
-#[derive(Debug, Clone)]
-pub struct Criterion {
-    /// Event type names. If non-empty, the event must match one of these.
-    pub names: Vec<String>,
-    /// Tags that must ALL be present on the event.
-    pub tags: Vec<Tag>,
-}
-
-/// A query is a list of criteria. An event matches if ANY criterion matches (OR logic).
-///
-/// This gives you: (tags1 AND name1) OR (tags2 AND name2) OR ...
-#[derive(Debug, Clone)]
-pub struct Query {
-    pub criteria: Vec<Criterion>,
-}
+use crate::criteria::SourcingCondition;
+use crate::event::{AppendEvent, Position};
 
 /// The DCB consistency condition for an append.
 ///
-/// "Reject this append if any event matching the query exists
+/// "Reject this append if any event matching the criteria exists
 ///  at a position greater than `consistency_marker`."
 ///
 /// The `consistency_marker` is typically the position returned by a
 /// previous Source call — it represents the point up to which the
 /// client has already observed events.
 #[derive(Debug, Clone)]
-pub struct ConsistencyCondition {
+pub struct AppendCondition {
     /// Position after which to check for conflicting events.
     /// Events at positions > consistency_marker are checked.
     pub consistency_marker: Position,
-    /// The query defining which events would conflict.
-    pub query: Query,
+    /// The criteria defining which events would conflict.
+    pub criteria: SourcingCondition,
 }
 
 /// Request to append events, optionally with a DCB condition.
 pub struct AppendRequest {
     /// If present, the append is rejected if the condition is violated.
-    pub condition: Option<ConsistencyCondition>,
+    pub condition: Option<AppendCondition>,
     /// Events to append. All-or-nothing: either all are appended or none.
-    pub events: Vec<crate::event::AppendEvent>,
+    pub events: Vec<AppendEvent>,
 }
 
 /// Result of a successful append.

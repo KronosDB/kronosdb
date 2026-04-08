@@ -150,7 +150,7 @@ mod tests {
     use crate::segment::writer::SegmentWriter;
     use crate::segment::DEFAULT_SEGMENT_SIZE;
     use crate::event::AppendEvent;
-    use crate::tag::Tag;
+    use crate::event::Tag;
 
     fn make_event(name: &str, payload: &[u8]) -> AppendEvent {
         AppendEvent {
