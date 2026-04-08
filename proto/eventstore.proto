@@ -1,0 +1,153 @@
+syntax = "proto3";
+package kronosdb.eventstore;
+option java_multiple_files = true;
+
+/* The Event Store service. */
+service EventStore {
+
+  /* Appends new events to the store. */
+  rpc Append (stream AppendRequest) returns (AppendResponse);
+
+  /* Provides a finite stream of events matching the given criteria. */
+  rpc Source (SourceRequest) returns (stream SourceResponse);
+
+  /* Provides an infinite stream of events matching the given criteria.
+     Stays open and pushes new events as they are appended. */
+  rpc Stream (StreamRequest) returns (stream StreamResponse);
+
+  /* Gets the current head of the event store (next position to be assigned). */
+  rpc GetHead (GetHeadRequest) returns (GetHeadResponse);
+
+  /* Gets the current tail of the event store (first event position). */
+  rpc GetTail (GetTailRequest) returns (GetTailResponse);
+
+  /* Gets tags for an event by its sequence position. */
+  rpc GetTags (GetTagsRequest) returns (GetTagsResponse);
+
+  /* Tag mutations (AddTags/RemoveTags) and other transformations are admin
+     operations handled via a separate HTTP admin API, not this gRPC service. */
+}
+
+/* An event as provided by the client. */
+message Event {
+  /* Client-provided unique identifier. */
+  string identifier = 1;
+  /* Timestamp in milliseconds since epoch. Client-provided. */
+  int64 timestamp = 2;
+  /* The event type name (e.g., "OrderPlaced"). */
+  string name = 3;
+  /* The schema version of the event payload. */
+  string version = 4;
+  /* The opaque event payload. */
+  bytes payload = 5;
+  /* Arbitrary key-value metadata. */
+  map<string, string> metadata = 6;
+}
+
+/* A tag describing an event. Key-value pair using domain concepts. */
+message Tag {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+/* An event with its tags, used for appending. */
+message TaggedEvent {
+  Event event = 1;
+  repeated Tag tags = 2;
+}
+
+/* An event with its assigned sequence position, returned on reads. */
+message SequencedEvent {
+  int64 sequence = 1;
+  Event event = 2;
+}
+
+/* Request to append events. Sent as a stream to allow batching. */
+message AppendRequest {
+  /* Optional consistency condition. If omitted, events are appended unconditionally. */
+  ConsistencyCondition condition = 1;
+  /* Events to append. All-or-nothing transaction. */
+  repeated TaggedEvent events = 2;
+}
+
+/* Response to a successful append. */
+message AppendResponse {
+  /* Sequence of the first event appended. */
+  int64 first_sequence = 1;
+  /* Number of events appended. */
+  int32 count = 2;
+  /* Consistency marker for subsequent appends. */
+  int64 consistency_marker = 3;
+}
+
+/* The consistency condition for conditional appends.
+   "Reject if any event matching the criteria exists after the consistency marker." */
+message ConsistencyCondition {
+  /* Position after which to check for conflicts. Events with sequence > this are checked. */
+  int64 consistency_marker = 1;
+  /* Criteria defining which events would conflict. */
+  repeated Criterion criteria = 2;
+}
+
+/* A single criterion. Matches an event if ALL tags are present AND the event name
+   is in the names list (if names is non-empty). */
+message Criterion {
+  /* Event type names. If non-empty, the event name must match one of these. */
+  repeated string names = 1;
+  /* Tags that must ALL be present on the event. */
+  repeated Tag tags = 2;
+}
+
+/* Request to source (finite read) events matching criteria. */
+message SourceRequest {
+  /* Inclusive starting sequence position. */
+  int64 from_sequence = 1;
+  /* Criteria to filter events. If empty, all events are returned. */
+  repeated Criterion criteria = 2;
+}
+
+/* Response containing either a matching event or the final consistency marker. */
+message SourceResponse {
+  oneof result {
+    /* A matching event with its sequence. */
+    SequencedEvent event = 1;
+    /* The consistency marker at the end of the stream.
+       Use this for subsequent appends related to the same criteria. */
+    int64 consistency_marker = 2;
+  }
+}
+
+/* Request for an infinite event stream matching criteria. */
+message StreamRequest {
+  /* Inclusive starting sequence position. */
+  int64 from_sequence = 1;
+  /* Criteria to filter events. If empty, all events are streamed. */
+  repeated Criterion criteria = 2;
+}
+
+/* A matching event from the infinite stream. */
+message StreamResponse {
+  SequencedEvent event = 1;
+}
+
+message GetHeadRequest {}
+
+message GetHeadResponse {
+  /* The sequence of the next event to be appended. 0 for an empty store. */
+  int64 sequence = 1;
+}
+
+message GetTailRequest {}
+
+message GetTailResponse {
+  /* The sequence of the first event in the store. 0 for an empty or non-truncated store. */
+  int64 sequence = 1;
+}
+
+message GetTagsRequest {
+  int64 sequence = 1;
+}
+
+message GetTagsResponse {
+  repeated Tag tags = 1;
+}

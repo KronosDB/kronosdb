@@ -1,0 +1,169 @@
+syntax = "proto3";
+package kronosdb.query;
+import "common.proto";
+option java_multiple_files = true;
+
+/* Service for dispatching and handling queries.
+   Queries can be routed to one handler (point-to-point) or all handlers
+   of that type (scatter-gather). */
+service QueryService {
+
+  /* Opens a bidirectional stream for a query handler.
+     The client registers which query types it handles and receives
+     queries to process. Responses are sent back on the same stream. */
+  rpc OpenStream (stream QueryHandlerOutbound) returns (stream QueryHandlerInbound);
+
+  /* Dispatches a query and returns results as a stream.
+     Multiple results may be returned in scatter-gather mode. */
+  rpc Query (QueryRequest) returns (stream QueryResponse);
+
+  /* Opens a subscription query — get an initial result plus live updates
+     as the answer changes over time. */
+  rpc Subscription (stream SubscriptionQueryRequest) returns (stream SubscriptionQueryResponse);
+}
+
+/* Messages sent FROM the query handler TO the server. */
+message QueryHandlerOutbound {
+  oneof request {
+    /* Register as a handler for a query type. */
+    QuerySubscription subscribe = 1;
+    /* Unregister as a handler for a query type. */
+    QuerySubscription unsubscribe = 2;
+    /* Grant the server permits to send more queries. */
+    kronosdb.FlowControl flow_control = 3;
+    /* Return a result for a received query. */
+    QueryResponse query_response = 4;
+    /* Signal that all results for a query have been sent. */
+    QueryComplete query_complete = 5;
+    /* Return a response for a subscription query. */
+    SubscriptionQueryResponse subscription_query_response = 6;
+    /* Acknowledge a previously received instruction. */
+    kronosdb.InstructionAck ack = 7;
+  }
+  /* If set, the server will acknowledge this instruction. */
+  string instruction_id = 8;
+}
+
+/* Messages sent FROM the server TO the query handler. */
+message QueryHandlerInbound {
+  oneof request {
+    /* Acknowledgement of a handler instruction. */
+    kronosdb.InstructionAck ack = 1;
+    /* A query to process. */
+    QueryRequest query = 2;
+    /* A subscription query to process. */
+    SubscriptionQueryRequest subscription_query_request = 3;
+    /* Client is no longer interested in updates for this query. */
+    QueryReference query_cancel = 5;
+    /* Client wants more updates for this query. */
+    QueryFlowControl query_flow_control = 6;
+  }
+  /* If set, the handler should acknowledge this instruction. */
+  string instruction_id = 4;
+}
+
+/* Reference to a query by its request ID. */
+message QueryReference {
+  string request_id = 1;
+}
+
+/* Indicates all results for a query have been sent. */
+message QueryComplete {
+  string message_id = 1;
+  string request_id = 2;
+}
+
+/* Request more results for a query. */
+message QueryFlowControl {
+  QueryReference query_reference = 1;
+  int64 permits = 2;
+}
+
+/* An incoming query to be handled. */
+message QueryRequest {
+  string message_identifier = 1;
+  /* The query name, used for routing. */
+  string query = 2;
+  int64 timestamp = 3;
+  kronosdb.SerializedObject payload = 4;
+  map<string, kronosdb.MetadataValue> metadata = 5;
+  repeated kronosdb.ProcessingInstruction processing_instructions = 6;
+  string client_id = 7;
+  string component_name = 8;
+}
+
+/* A query result. */
+message QueryResponse {
+  string message_identifier = 1;
+  string error_code = 2;
+  kronosdb.ErrorMessage error_message = 3;
+  kronosdb.SerializedObject payload = 4;
+  map<string, kronosdb.MetadataValue> metadata = 5;
+  repeated kronosdb.ProcessingInstruction processing_instructions = 6;
+  /* The query this is a response to. */
+  string request_identifier = 7;
+}
+
+/* A handler's registration for a query type. */
+message QuerySubscription {
+  string message_id = 1;
+  /* The query name this handler can process. */
+  string query = 2;
+  /* The result type name this handler produces. */
+  string result_name = 3;
+  string component_name = 4;
+  string client_id = 5;
+}
+
+/* Opens a subscription query. */
+message SubscriptionQuery {
+  string subscription_identifier = 1;
+  int64 number_of_permits = 2;
+  QueryRequest query_request = 3;
+}
+
+/* An update for a subscription query. */
+message QueryUpdate {
+  string message_identifier = 1;
+  kronosdb.SerializedObject payload = 2;
+  map<string, kronosdb.MetadataValue> metadata = 3;
+  string client_id = 4;
+  string component_name = 5;
+  string error_code = 6;
+  kronosdb.ErrorMessage error_message = 7;
+}
+
+/* Subscription query completed normally. */
+message QueryUpdateComplete {
+  string client_id = 1;
+  string component_name = 2;
+}
+
+/* Subscription query completed with an error. */
+message QueryUpdateCompleteExceptionally {
+  string client_id = 1;
+  string component_name = 2;
+  string error_code = 3;
+  kronosdb.ErrorMessage error_message = 4;
+}
+
+/* Interactions for a subscription query. */
+message SubscriptionQueryRequest {
+  oneof request {
+    SubscriptionQuery subscribe = 1;
+    SubscriptionQuery unsubscribe = 2;
+    SubscriptionQuery flow_control = 3;
+  }
+}
+
+/* Responses for a subscription query. */
+message SubscriptionQueryResponse {
+  string message_identifier = 1;
+  string subscription_identifier = 2;
+  oneof response {
+    QueryResponse initial_result = 3;
+    QueryUpdate update = 4;
+    QueryUpdateComplete complete = 5;
+    QueryUpdateCompleteExceptionally complete_exceptionally = 6;
+  }
+}

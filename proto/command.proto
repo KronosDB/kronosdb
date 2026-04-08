@@ -1,0 +1,100 @@
+syntax = "proto3";
+package kronosdb.command;
+import "common.proto";
+option java_multiple_files = true;
+
+/* Service for dispatching and handling commands.
+   Commands are routed to exactly one handler, load-balanced across instances. */
+service CommandService {
+
+  /* Opens a bidirectional stream for a command handler.
+     The client registers which command types it handles and receives
+     commands to process. Responses are sent back on the same stream. */
+  rpc OpenStream (stream CommandHandlerOutbound) returns (stream CommandHandlerInbound);
+
+  /* Dispatches a command to a registered handler and returns the result. */
+  rpc Dispatch (Command) returns (CommandResponse);
+}
+
+/* Messages sent FROM the command handler TO the server. */
+message CommandHandlerOutbound {
+  oneof request {
+    /* Register as a handler for a command type. */
+    CommandSubscription subscribe = 1;
+    /* Unregister as a handler for a command type. */
+    CommandSubscription unsubscribe = 2;
+    /* Grant the server permits to send more commands. */
+    kronosdb.FlowControl flow_control = 3;
+    /* Return the result of processing a command. */
+    CommandResponse command_response = 4;
+    /* Acknowledge a previously received instruction. */
+    kronosdb.InstructionAck ack = 5;
+  }
+  /* If set, the server will acknowledge this instruction. */
+  string instruction_id = 6;
+}
+
+/* Messages sent FROM the server TO the command handler. */
+message CommandHandlerInbound {
+  oneof request {
+    /* Acknowledgement of a handler instruction. */
+    kronosdb.InstructionAck ack = 1;
+    /* A command to process. */
+    Command command = 2;
+  }
+  /* If set, the handler should acknowledge this instruction. */
+  string instruction_id = 3;
+}
+
+/* A command to be routed to a handler. */
+message Command {
+  /* Unique identifier for this command message. */
+  string message_identifier = 1;
+  /* The command name, used for routing to the correct handler. */
+  string name = 2;
+  /* Timestamp of command creation. */
+  int64 timestamp = 3;
+  /* The command payload. */
+  kronosdb.SerializedObject payload = 4;
+  /* Metadata providing context. */
+  map<string, kronosdb.MetadataValue> metadata = 5;
+  /* Routing and processing instructions. */
+  repeated kronosdb.ProcessingInstruction processing_instructions = 6;
+  /* The client instance that dispatched this command. */
+  string client_id = 7;
+  /* The component name that dispatched this command. */
+  string component_name = 8;
+}
+
+/* Result of command handler execution. */
+message CommandResponse {
+  /* Unique identifier for this response. */
+  string message_identifier = 1;
+  /* Error code, if the command failed. */
+  string error_code = 2;
+  /* Error details, if the command failed. */
+  kronosdb.ErrorMessage error_message = 3;
+  /* The result payload, if any. */
+  kronosdb.SerializedObject payload = 4;
+  /* Response metadata. */
+  map<string, kronosdb.MetadataValue> metadata = 5;
+  /* Processing instructions for the response. */
+  repeated kronosdb.ProcessingInstruction processing_instructions = 6;
+  /* The identifier of the command this is a response to. */
+  string request_identifier = 7;
+}
+
+/* A handler's registration for a command type. */
+message CommandSubscription {
+  /* Unique identifier for this subscription message. */
+  string message_id = 1;
+  /* The command name this handler can process. */
+  string command = 2;
+  /* The component name of the handler. */
+  string component_name = 3;
+  /* The unique client instance identifier. */
+  string client_id = 4;
+  /* Relative load capacity. Higher = more commands routed here.
+     0 is treated as 100 (default). */
+  int32 load_factor = 5;
+}
