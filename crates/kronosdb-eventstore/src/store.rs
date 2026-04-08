@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 
 use crate::error::Error;
 use crate::append::{AppendRequest, AppendResponse};
+use crate::cache::IndexCache;
 use crate::criteria::SourcingCondition;
 use crate::event::{Position, SequencedEvent, Tag};
 use crate::stream::{CommitNotification, EventStream};
@@ -19,6 +20,12 @@ use crate::segment::{self, DEFAULT_SEGMENT_SIZE};
 
 /// Default capacity for the commit notification channel.
 const COMMIT_CHANNEL_CAPACITY: usize = 256;
+
+/// Default number of segment indices to cache.
+const DEFAULT_INDEX_CACHE_SIZE: usize = 50;
+
+/// Default number of bloom filters to cache.
+const DEFAULT_BLOOM_CACHE_SIZE: usize = 200;
 
 /// The main event store. Combines the segment writer, tag index, and
 /// concurrency control into a single API.
@@ -46,6 +53,9 @@ pub struct EventStore {
     /// Broadcast channel for notifying stream subscribers of new commits.
     commit_tx: broadcast::Sender<CommitNotification>,
 
+    /// LRU cache for sealed segment indices and bloom filters.
+    cache: Arc<IndexCache>,
+
     /// Maximum segment size.
     max_segment_size: u64,
 }
@@ -68,6 +78,7 @@ impl EventStore {
             tag_index: Arc::new(RwLock::new(TagIndex::new())),
             committed_position: Arc::new(AtomicU64::new(0)),
             commit_tx,
+            cache: Arc::new(IndexCache::new(DEFAULT_INDEX_CACHE_SIZE, DEFAULT_BLOOM_CACHE_SIZE)),
             max_segment_size,
         })
     }
@@ -99,6 +110,7 @@ impl EventStore {
             tag_index: Arc::new(RwLock::new(tag_index)),
             committed_position: Arc::new(AtomicU64::new(committed)),
             commit_tx,
+            cache: Arc::new(IndexCache::new(DEFAULT_INDEX_CACHE_SIZE, DEFAULT_BLOOM_CACHE_SIZE)),
             max_segment_size,
         })
     }
@@ -273,9 +285,11 @@ impl EventStore {
 
             // Determine matching positions for this segment.
             let matching_positions = if SegmentIndex::has_companion_files(&seg_path) {
-                // Sealed segment — load per-segment index from disk.
-                // TODO: LRU cache for loaded indices.
-                let seg_index = SegmentIndex::read_idx(&seg_path.with_extension("idx"))?;
+                // Sealed segment — check bloom filter first, then load index via cache.
+                if let Some(false) = self.cache.bloom_check(&seg_path, base, condition) {
+                    continue; // Bloom filter says definitely no match — skip segment.
+                }
+                let seg_index = self.cache.get_index(&seg_path, base)?;
                 seg_index.matching(condition)
             } else {
                 // Active segment — use in-memory index.

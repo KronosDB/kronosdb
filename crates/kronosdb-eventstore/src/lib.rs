@@ -5,6 +5,7 @@ pub mod append;
 
 pub mod segment;
 pub mod index;
+pub mod cache;
 pub mod store;
 pub mod stream;
 pub mod context;

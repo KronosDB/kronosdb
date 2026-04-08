@@ -49,6 +49,7 @@ impl SegmentWriter {
         let path = segment_path(dir, base_position);
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, base_position)?;
+        preallocate(&file, max_segment_size);
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -95,8 +96,10 @@ impl SegmentWriter {
         // Scan forward to find the last valid record, recovering from torn writes.
         let (write_offset, next_position) = recover_segment(&mut file)?;
 
-        // Truncate any torn write garbage at the end.
+        // Truncate any torn write garbage / pre-allocated space at the end,
+        // then re-preallocate for future writes.
         file.set_len(write_offset)?;
+        preallocate(&file, max_segment_size);
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -191,6 +194,10 @@ impl SegmentWriter {
         // Sync the current segment before sealing.
         fdatasync(&self.active_file)?;
 
+        // Truncate the sealed segment to its actual data size.
+        // It was pre-allocated to max_segment_size, so we trim the unused space.
+        self.active_file.set_len(self.write_offset)?;
+
         // Build per-segment index for the sealed segment.
         let sealed_path = segment_path(&self.dir, self.active_base_position);
         let index = super::segment_index::SegmentIndex::build_from_segment(&sealed_path)?;
@@ -201,6 +208,7 @@ impl SegmentWriter {
         let path = segment_path(&self.dir, new_base);
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, new_base)?;
+        preallocate(&file, self.max_segment_size);
 
         self.active_file = file;
         self.active_base_position = new_base;
@@ -319,6 +327,30 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
     };
 
     Ok((offset, next_position))
+}
+
+/// Pre-allocates disk space for a file.
+///
+/// On Linux, uses fallocate to reserve contiguous blocks without writing zeros.
+/// On other platforms, falls back to setting the file length (which may write zeros).
+///
+/// Pre-allocation has two benefits:
+/// 1. Contiguous blocks on disk → better sequential read/write performance
+/// 2. File size doesn't change on each append → fdatasync skips metadata update
+///
+/// Errors are silently ignored — pre-allocation is an optimization, not a requirement.
+fn preallocate(file: &File, size: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::fallocate(file.as_raw_fd(), 0, 0, size as i64);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file.set_len(size);
+    }
 }
 
 /// Flushes data to disk.
