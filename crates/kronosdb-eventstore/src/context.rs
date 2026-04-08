@@ -59,8 +59,8 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Gets a reference to a context's event store for read operations.
-    /// The callback receives a reference to the EventStoreEngine.
+    /// Gets a reference to a context's event store.
+    /// All operations (including append) take `&self`, so no mutable access needed.
     pub fn with_context<F, R>(&self, name: &str, f: F) -> Result<R, Error>
     where
         F: FnOnce(&EventStoreEngine) -> Result<R, Error>,
@@ -69,21 +69,6 @@ impl ContextManager {
         let store = contexts.get(name).ok_or_else(|| Error::ContextNotFound {
             name: name.to_string(),
         })?;
-        f(store)
-    }
-
-    /// Gets a mutable reference to a context's event store for write operations.
-    /// The callback receives a mutable reference to the EventStoreEngine.
-    pub fn with_context_mut<F, R>(&self, name: &str, f: F) -> Result<R, Error>
-    where
-        F: FnOnce(&mut EventStoreEngine) -> Result<R, Error>,
-    {
-        let mut contexts = self.contexts.write();
-        let store = contexts
-            .get_mut(name)
-            .ok_or_else(|| Error::ContextNotFound {
-                name: name.to_string(),
-            })?;
         f(store)
     }
 
@@ -204,7 +189,7 @@ mod tests {
 
         // Append to the context.
         manager
-            .with_context_mut("orders", |store| {
+            .with_context("orders", |store| {
                 store.append(AppendRequest {
                     condition: None,
                     events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
@@ -232,7 +217,7 @@ mod tests {
 
         // Append to orders.
         manager
-            .with_context_mut("orders", |store| {
+            .with_context("orders", |store| {
                 store.append(AppendRequest {
                     condition: None,
                     events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
@@ -304,7 +289,7 @@ mod tests {
             manager.create_context("payments").unwrap();
 
             manager
-                .with_context_mut("orders", |store| {
+                .with_context("orders", |store| {
                     store.append(AppendRequest {
                         condition: None,
                         events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
