@@ -432,6 +432,10 @@ dependencies = [
 [[package]]
 name = "kronosdb-messaging"
 version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tokio",
+]
 
 [[package]]
 name = "kronosdb-server"
