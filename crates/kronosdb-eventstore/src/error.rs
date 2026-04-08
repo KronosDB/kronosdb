@@ -17,6 +17,22 @@ pub enum Error {
     Corrupted {
         message: String,
     },
+
+    /// The requested context was not found.
+    ContextNotFound {
+        name: String,
+    },
+
+    /// A context with this name already exists.
+    ContextAlreadyExists {
+        name: String,
+    },
+
+    /// The context name is invalid.
+    InvalidContextName {
+        name: String,
+        reason: String,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -37,6 +53,13 @@ impl std::fmt::Display for Error {
             }
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::Corrupted { message } => write!(f, "data corrupted: {message}"),
+            Error::ContextNotFound { name } => write!(f, "context not found: {name}"),
+            Error::ContextAlreadyExists { name } => {
+                write!(f, "context already exists: {name}")
+            }
+            Error::InvalidContextName { name, reason } => {
+                write!(f, "invalid context name '{name}': {reason}")
+            }
         }
     }
 }

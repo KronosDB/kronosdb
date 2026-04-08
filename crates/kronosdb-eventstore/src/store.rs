@@ -3,16 +3,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use tokio::sync::broadcast;
 
 use crate::error::Error;
-use crate::event::{Position, SequencedEvent};
-use crate::query::{AppendRequest, AppendResponse, Query};
-use crate::tag::Tag;
+use crate::append::{AppendRequest, AppendResponse};
+use crate::criteria::SourcingCondition;
+use crate::event::{Position, SequencedEvent, Tag};
+use crate::stream::{CommitNotification, EventStream};
 
 use crate::index::tag_index::TagIndex;
 use crate::segment::reader::SegmentReader;
+use crate::segment::segment_index::SegmentIndex;
 use crate::segment::writer::SegmentWriter;
 use crate::segment::{self, DEFAULT_SEGMENT_SIZE};
+
+/// Default capacity for the commit notification channel.
+const COMMIT_CHANNEL_CAPACITY: usize = 256;
 
 /// The main event store. Combines the segment writer, tag index, and
 /// concurrency control into a single API.
@@ -37,6 +43,9 @@ pub struct EventStore {
     /// The committed position — the position of the last event visible to readers.
     committed_position: Arc<AtomicU64>,
 
+    /// Broadcast channel for notifying stream subscribers of new commits.
+    commit_tx: broadcast::Sender<CommitNotification>,
+
     /// Maximum segment size.
     max_segment_size: u64,
 }
@@ -51,12 +60,14 @@ impl EventStore {
     pub fn create_with_options(dir: &Path, max_segment_size: u64) -> Result<Self, Error> {
         std::fs::create_dir_all(dir)?;
         let writer = SegmentWriter::new(dir, Position(1), max_segment_size)?;
+        let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
             tag_index: Arc::new(RwLock::new(TagIndex::new())),
             committed_position: Arc::new(AtomicU64::new(0)),
+            commit_tx,
             max_segment_size,
         })
     }
@@ -80,12 +91,14 @@ impl EventStore {
         rebuild_active_segment_index(dir, &mut tag_index)?;
 
         let committed = if head.0 > 0 { head.0 - 1 } else { 0 };
+        let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
             tag_index: Arc::new(RwLock::new(tag_index)),
             committed_position: Arc::new(AtomicU64::new(committed)),
+            commit_tx,
             max_segment_size,
         })
     }
@@ -136,6 +149,12 @@ impl EventStore {
         self.committed_position
             .store(last_position.0, Ordering::Release);
 
+        // Step 5: Notify stream subscribers.
+        // Ignore send errors — they just mean no active subscribers.
+        let _ = self.commit_tx.send(CommitNotification {
+            committed_position: last_position.0,
+        });
+
         Ok(AppendResponse {
             first_position,
             count,
@@ -182,6 +201,26 @@ impl EventStore {
         })
     }
 
+    /// Creates a live event stream subscription.
+    ///
+    /// The stream will first replay all matching historical events from
+    /// `from_position` (like Source), then switch to live mode and push
+    /// new matching events as they are appended.
+    ///
+    /// The caller is responsible for driving the stream by:
+    /// 1. Calling `source()` to get historical events up to the current head
+    /// 2. Waiting on `stream.receiver` for commit notifications
+    /// 3. Calling `source()` again from the cursor to get new events
+    /// 4. Repeating until cancelled
+    pub fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
+        EventStream::new(
+            condition,
+            from_position,
+            self.commit_tx.subscribe(),
+            Arc::clone(&self.committed_position),
+        )
+    }
+
     /// Returns the current head position (next position to be assigned).
     pub fn head(&self) -> Position {
         self.writer.head()
@@ -199,23 +238,15 @@ impl EventStore {
 
     /// Reads events matching a query from `from_position` up to the current head.
     /// This is the "Source" operation — a finite read.
+    ///
+    /// For sealed segments: loads per-segment `.idx` files (with bloom filter skip).
+    /// For the active segment: uses the in-memory tag index.
     pub fn source(
         &self,
         from_position: Position,
-        query: &Query,
+        condition: &SourcingCondition,
     ) -> Result<Vec<SequencedEvent>, Error> {
         let committed = self.committed_position.load(Ordering::Acquire);
-
-        // Get the bitmap of matching positions from the tag index.
-        let matching_positions = {
-            let index = self.tag_index.read();
-            index.query_bitmap(query, from_position)
-        };
-
-        let matching_positions = match matching_positions {
-            Some(bm) => bm,
-            None => return Ok(vec![]),
-        };
 
         let segment_bases = segment::list_segment_files(&self.dir)?;
         if segment_bases.is_empty() {
@@ -224,36 +255,40 @@ impl EventStore {
 
         let mut events = Vec::new();
 
-        // TODO: When per-segment `.idx` and `.bloom` files are implemented,
-        // check bloom filters here and load sealed segment indices on demand.
-        // For now, we rely on the active segment's in-memory index only.
-
         for (i, &base) in segment_bases.iter().enumerate() {
-            let seg_start = base;
-            let seg_end = if i + 1 < segment_bases.len() {
+            let seg_path = segment::segment_path(&self.dir, base);
+            let is_last = i + 1 == segment_bases.len();
+            let seg_end = if !is_last {
                 segment_bases[i + 1] - 1
             } else {
                 committed
             };
 
-            if seg_start > committed {
+            if base > committed {
                 break;
             }
-            let range_min = std::cmp::max(seg_start, from_position.0);
-            if range_min > seg_end {
-                continue;
-            }
-            let count_before = if range_min > 0 {
-                matching_positions.rank(range_min - 1)
-            } else {
-                0
-            };
-            let count_up_to = matching_positions.rank(seg_end);
-            if count_up_to - count_before == 0 {
+            if seg_end < from_position.0 {
                 continue;
             }
 
-            let seg_path = segment::segment_path(&self.dir, base);
+            // Determine matching positions for this segment.
+            let matching_positions = if SegmentIndex::has_companion_files(&seg_path) {
+                // Sealed segment — load per-segment index from disk.
+                // TODO: LRU cache for loaded indices.
+                let seg_index = SegmentIndex::read_idx(&seg_path.with_extension("idx"))?;
+                seg_index.matching(condition)
+            } else {
+                // Active segment — use in-memory index.
+                let index = self.tag_index.read();
+                index.matching_bitmap(condition, from_position)
+            };
+
+            let matching_positions = match matching_positions {
+                Some(bm) => bm,
+                None => continue, // No matches in this segment.
+            };
+
+            // Forward-scan the segment, collecting matching events.
             let reader = SegmentReader::open(&seg_path)?;
 
             for result in reader.iter(Some(Position(committed + 1))) {
@@ -274,16 +309,24 @@ impl EventStore {
 }
 
 /// Rebuilds the tag index for the active (unsealed) segment.
-/// The active segment is the last segment that has no `.idx` companion file.
+///
+/// Sealed segments have `.idx` companion files on disk and don't need replay.
+/// Only the active segment (the last one without `.idx`) is replayed.
+/// If a sealed segment is missing its `.idx`, it's rebuilt from the segment data.
 fn rebuild_active_segment_index(dir: &Path, index: &mut TagIndex) -> Result<(), Error> {
     let segments = segment::list_segment_files(dir)?;
 
-    // Find the active segment — the last one without an `.idx` file.
-    // For now, replay ALL segments since we don't have per-segment indices yet.
-    // TODO: Once `.idx` files are implemented, only replay the active segment.
     for base_pos in segments {
-        let path = segment::segment_path(dir, base_pos);
-        let reader = SegmentReader::open(&path)?;
+        let seg_path = segment::segment_path(dir, base_pos);
+
+        if SegmentIndex::has_companion_files(&seg_path) {
+            // Sealed segment with valid index files — skip replay.
+            continue;
+        }
+
+        // No companion files — either active segment or sealed segment
+        // with missing index. Rebuild the index from segment data.
+        let reader = SegmentReader::open(&seg_path)?;
 
         for result in reader.iter(None) {
             let event = result?;
@@ -298,8 +341,9 @@ fn rebuild_active_segment_index(dir: &Path, index: &mut TagIndex) -> Result<(), 
 mod tests {
     use super::*;
     use crate::event::AppendEvent;
-    use crate::query::{ConsistencyCondition, Criterion};
-    use crate::tag::Tag;
+    use crate::append::AppendCondition;
+    use crate::criteria::{Criterion, SourcingCondition};
+    use crate::event::Tag;
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag::from_str(key, value)
@@ -350,9 +394,9 @@ mod tests {
             .unwrap();
 
         let result = store.append(AppendRequest {
-            condition: Some(ConsistencyCondition {
+            condition: Some(AppendCondition {
                 consistency_marker: Position(1),
-                query: Query {
+                criteria: SourcingCondition {
                     criteria: vec![Criterion {
                         names: vec!["OrderPlaced".into()],
                         tags: vec![tag("orderId", "A")],
@@ -381,9 +425,9 @@ mod tests {
             .unwrap();
 
         let result = store.append(AppendRequest {
-            condition: Some(ConsistencyCondition {
+            condition: Some(AppendCondition {
                 consistency_marker: Position(0),
-                query: Query {
+                criteria: SourcingCondition {
                     criteria: vec![Criterion {
                         names: vec![],
                         tags: vec![tag("orderId", "A")],
@@ -415,14 +459,14 @@ mod tests {
             })
             .unwrap();
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("orderId", "A")],
             }],
         };
 
-        let events = store.source(Position(1), &query).unwrap();
+        let events = store.source(Position(1), &cond).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name, "OrderPlaced");
         assert_eq!(events[1].name, "PaymentReceived");
@@ -473,22 +517,22 @@ mod tests {
             let store = EventStore::open(dir.path()).unwrap();
             assert_eq!(store.head(), Position(3));
 
-            let query = Query {
+            let cond = SourcingCondition {
                 criteria: vec![Criterion {
                     names: vec![],
                     tags: vec![tag("orderId", "A")],
                 }],
             };
-            let events = store.source(Position(1), &query).unwrap();
+            let events = store.source(Position(1), &cond).unwrap();
             assert_eq!(events.len(), 2);
 
-            let query = Query {
+            let cond = SourcingCondition {
                 criteria: vec![Criterion {
                     names: vec![],
                     tags: vec![tag("paymentId", "P1")],
                 }],
             };
-            let events = store.source(Position(1), &query).unwrap();
+            let events = store.source(Position(1), &cond).unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].name, "PaymentReceived");
 

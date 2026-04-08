@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use roaring::RoaringTreemap;
 
-use crate::event::Position;
-use crate::query::{ConsistencyCondition, Criterion, Query};
-use crate::tag::Tag;
+use crate::append::AppendCondition;
+use crate::criteria::{Criterion, SourcingCondition};
+use crate::event::{Position, Tag};
 
 /// Reserved tag key used to index event type names.
 /// When an event with name "OrderPlaced" is appended, we insert a synthetic
@@ -96,29 +96,29 @@ impl TagIndex {
     ///
     /// Returns `Some(position)` of the first conflicting event if the condition
     /// is violated, or `None` if it passes (safe to append).
-    pub fn check_condition(&self, condition: &ConsistencyCondition) -> Option<Position> {
+    pub fn check_condition(&self, condition: &AppendCondition) -> Option<Position> {
         let after = condition.consistency_marker.0;
-        self.find_matching_after(&condition.query, after)
+        self.find_matching_after(&condition.criteria, after)
     }
 
     /// Finds event positions matching a query, starting from `from_position` (inclusive).
     ///
     /// Returns matching positions in ascending order.
-    pub fn query_positions(&self, query: &Query, from_position: Position) -> Vec<u64> {
-        let combined = self.resolve_query(query);
+    pub fn matching_positions(&self, condition: &SourcingCondition, from_position: Position) -> Vec<u64> {
+        let combined = self.resolve(condition);
         match combined {
             Some(bitmap) => bitmap
                 .iter()
                 .filter(|&pos| pos >= from_position.0)
                 .collect(),
-            None => vec![],
+            None => vec![0u64; 0],
         }
     }
 
-    /// Returns the raw roaring bitmap of matching positions for a query.
+    /// Returns the raw roaring bitmap of matching positions.
     /// Used by the source operation for efficient segment skipping.
-    pub fn query_bitmap(&self, query: &Query, from_position: Position) -> Option<RoaringTreemap> {
-        let mut bitmap = self.resolve_query(query)?;
+    pub fn matching_bitmap(&self, condition: &SourcingCondition, from_position: Position) -> Option<RoaringTreemap> {
+        let mut bitmap = self.resolve(condition)?;
         if from_position.0 > 0 {
             bitmap.remove_range(0..from_position.0);
         }
@@ -129,21 +129,21 @@ impl TagIndex {
         }
     }
 
-    /// Finds the first event matching the query after the given position.
-    fn find_matching_after(&self, query: &Query, after: u64) -> Option<Position> {
-        let combined = self.resolve_query(query)?;
+    /// Finds the first event matching the condition after the given position.
+    fn find_matching_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
+        let combined = self.resolve(condition)?;
         combined
             .iter()
             .find(|&pos| pos > after)
             .map(Position)
     }
 
-    /// Resolves a query into a single bitmap of matching positions.
-    /// Query logic: OR across criteria, where each criterion is AND across tags.
-    fn resolve_query(&self, query: &Query) -> Option<RoaringTreemap> {
+    /// Resolves a sourcing condition into a single bitmap of matching positions.
+    /// OR across criteria, where each criterion is AND across tags.
+    fn resolve(&self, condition: &SourcingCondition) -> Option<RoaringTreemap> {
         let mut result: Option<RoaringTreemap> = None;
 
-        for criterion in &query.criteria {
+        for criterion in &condition.criteria {
             if let Some(criterion_bitmap) = self.resolve_criterion(criterion) {
                 match &mut result {
                     Some(existing) => *existing |= &criterion_bitmap,
@@ -230,14 +230,14 @@ mod tests {
         index.index_event(Position(2), "OrderPlaced", &[tag("orderId", "B")]);
         index.index_event(Position(3), "PaymentReceived", &[tag("orderId", "A")]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("orderId", "A")],
             }],
         };
 
-        let positions = index.query_positions(&query, Position(1));
+        let positions = index.matching_positions(&cond, Position(1));
         assert_eq!(positions, vec![1, 3]);
     }
 
@@ -249,14 +249,14 @@ mod tests {
         index.index_event(Position(2), "OrderPlaced", &[tag("orderId", "A"), tag("region", "US")]);
         index.index_event(Position(3), "OrderPlaced", &[tag("orderId", "B"), tag("region", "EU")]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("orderId", "A"), tag("region", "EU")],
             }],
         };
 
-        let positions = index.query_positions(&query, Position(1));
+        let positions = index.matching_positions(&cond, Position(1));
         assert_eq!(positions, vec![1]);
     }
 
@@ -268,14 +268,14 @@ mod tests {
         index.index_event(Position(2), "OrderPlaced", &[tag("orderId", "B")]);
         index.index_event(Position(3), "OrderPlaced", &[tag("orderId", "C")]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![
                 Criterion { names: vec![], tags: vec![tag("orderId", "A")] },
                 Criterion { names: vec![], tags: vec![tag("orderId", "C")] },
             ],
         };
 
-        let positions = index.query_positions(&query, Position(1));
+        let positions = index.matching_positions(&cond, Position(1));
         assert_eq!(positions, vec![1, 3]);
     }
 
@@ -287,14 +287,14 @@ mod tests {
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
         index.index_event(Position(3), "OrderShipped", &[tag("orderId", "A")]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec!["OrderPlaced".into(), "OrderShipped".into()],
                 tags: vec![tag("orderId", "A")],
             }],
         };
 
-        let positions = index.query_positions(&query, Position(1));
+        let positions = index.matching_positions(&cond, Position(1));
         assert_eq!(positions, vec![1, 3]);
     }
 
@@ -305,9 +305,9 @@ mod tests {
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
 
-        let condition = ConsistencyCondition {
+        let condition = AppendCondition {
             consistency_marker: Position(2),
-            query: Query {
+            criteria: SourcingCondition {
                 criteria: vec![Criterion {
                     names: vec![],
                     tags: vec![tag("orderId", "A")],
@@ -326,9 +326,9 @@ mod tests {
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
         index.index_event(Position(3), "OrderCancelled", &[tag("orderId", "A")]);
 
-        let condition = ConsistencyCondition {
+        let condition = AppendCondition {
             consistency_marker: Position(1),
-            query: Query {
+            criteria: SourcingCondition {
                 criteria: vec![Criterion {
                     names: vec![],
                     tags: vec![tag("orderId", "A")],
@@ -346,17 +346,17 @@ mod tests {
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("region", "EU")],
             }],
         };
-        assert_eq!(index.query_positions(&query, Position(1)), vec![]);
+        assert_eq!(index.matching_positions(&cond, Position(1)), vec![0u64; 0]);
 
         index.add_tags(Position(1), &[tag("region", "EU")]);
 
-        assert_eq!(index.query_positions(&query, Position(1)), vec![1]);
+        assert_eq!(index.matching_positions(&cond, Position(1)), vec![1]);
     }
 
     #[test]
@@ -367,21 +367,21 @@ mod tests {
 
         index.remove_tags(Position(1), &[tag("region", "EU")]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("region", "EU")],
             }],
         };
-        assert_eq!(index.query_positions(&query, Position(1)), vec![]);
+        assert_eq!(index.matching_positions(&cond, Position(1)), vec![0u64; 0]);
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("orderId", "A")],
             }],
         };
-        assert_eq!(index.query_positions(&query, Position(1)), vec![1]);
+        assert_eq!(index.matching_positions(&cond, Position(1)), vec![1]);
     }
 
     #[test]
@@ -392,14 +392,14 @@ mod tests {
             index.index_event(Position(i), "Event", &[tag("stream", "main")]);
         }
 
-        let query = Query {
+        let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
                 tags: vec![tag("stream", "main")],
             }],
         };
 
-        let positions = index.query_positions(&query, Position(3));
+        let positions = index.matching_positions(&cond, Position(3));
         assert_eq!(positions, vec![3, 4, 5]);
     }
 }
