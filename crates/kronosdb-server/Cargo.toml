@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 kronosdb-eventstore = { path = "../kronosdb-eventstore" }
+kronosdb-messaging = { path = "../kronosdb-messaging" }
 tonic = "0.13"
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }

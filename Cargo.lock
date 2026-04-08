@@ -442,6 +442,7 @@ name = "kronosdb-server"
 version = "0.1.0"
 dependencies = [
  "kronosdb-eventstore",
+ "kronosdb-messaging",
  "parking_lot",
  "prost",
  "tokio",

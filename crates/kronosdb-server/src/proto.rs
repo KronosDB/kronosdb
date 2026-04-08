@@ -1,8 +1,18 @@
 /// Generated protobuf types and gRPC service definitions.
 
+/// Common types shared across services (SerializedObject, MetadataValue, etc.)
 pub mod kronosdb {
+    tonic::include_proto!("kronosdb");
+
     pub mod eventstore {
         tonic::include_proto!("kronosdb.eventstore");
     }
-    // Command and query proto modules will be added when messaging is implemented.
+
+    pub mod command {
+        tonic::include_proto!("kronosdb.command");
+    }
+
+    pub mod query {
+        tonic::include_proto!("kronosdb.query");
+    }
 }
