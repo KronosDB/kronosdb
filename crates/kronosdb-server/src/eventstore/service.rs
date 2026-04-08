@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -17,8 +17,9 @@ use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer as 
 /// gRPC service implementation for the event store.
 ///
 /// Programs against the `EventStore` trait, not the concrete engine.
-/// The inner store is behind Arc<Mutex<>> because append requires &mut self
-/// and gRPC handlers are called concurrently.
+/// The inner store is behind Arc<Mutex<>> for shared access.
+/// All engine calls are dispatched to `spawn_blocking` to avoid
+/// blocking the tokio async worker threads with synchronous file I/O.
 pub struct EventStoreService {
     store: Arc<Mutex<Box<dyn EventStore>>>,
 }
@@ -44,9 +45,6 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         request: Request<Streaming<pb::AppendRequest>>,
     ) -> Result<Response<pb::AppendResponse>, Status> {
-        // Collect the streaming request into a single append.
-        // The proto defines Append as a client stream, but typically
-        // a single AppendRequest contains all events for one transaction.
         let mut stream = request.into_inner();
         let mut all_events = Vec::new();
         let mut condition = None;
@@ -65,10 +63,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
             events: all_events,
         };
 
-        let response = {
-            let mut store = self.store.lock().await;
-            store.append(request).map_err(to_status)?
-        };
+        let store = Arc::clone(&self.store);
+        let response = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock();
+            store.append(request)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(to_status)?;
 
         Ok(Response::new(pb::AppendResponse {
             first_sequence: response.first_position.0 as i64,
@@ -85,13 +87,18 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let from_position = Position(req.from_sequence as u64);
         let condition = from_proto_criteria(req.criteria);
 
-        let (events, committed) = {
-            let store = self.store.lock().await;
-            let events = store.source(from_position, &condition).map_err(to_status)?;
+        let store = Arc::clone(&self.store);
+        let condition_clone = condition.clone();
+        let (events, committed) = tokio::task::spawn_blocking(move || {
+            let store = store.lock();
+            let events = store.source(from_position, &condition_clone)?;
             let head = store.head();
             let committed = if head.0 > 0 { head.0 - 1 } else { 0 };
-            (events, committed)
-        };
+            Ok::<_, Error>((events, committed))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(to_status)?;
 
         let (tx, rx) = mpsc::channel(128);
 
@@ -103,10 +110,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     ))),
                 };
                 if tx.send(Ok(response)).await.is_err() {
-                    return; // Client disconnected.
+                    return;
                 }
             }
-            // Send the final consistency marker.
             let response = pb::SourceResponse {
                 result: Some(pb::source_response::Result::ConsistencyMarker(
                     committed as i64,
@@ -127,7 +133,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let condition = from_proto_criteria(req.criteria);
 
         let mut event_stream = {
-            let store = self.store.lock().await;
+            let store = self.store.lock();
             store.subscribe(from_position, condition.clone())
         };
 
@@ -136,10 +142,58 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
         tokio::spawn(async move {
             // First: send historical events.
-            {
-                let s = store.lock().await;
-                match s.source(event_stream.cursor, &condition) {
-                    Ok(events) => {
+            let historical = {
+                let store = Arc::clone(&store);
+                let condition = condition.clone();
+                let cursor = event_stream.cursor;
+                tokio::task::spawn_blocking(move || {
+                    let s = store.lock();
+                    s.source(cursor, &condition)
+                })
+                .await
+            };
+
+            match historical {
+                Ok(Ok(events)) => {
+                    for event in &events {
+                        let response = pb::StreamResponse {
+                            event: Some(to_proto_sequenced_event(event)),
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(last) = events.last() {
+                        event_stream.advance_cursor(Position(last.position.0 + 1));
+                    }
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(to_status(e))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(Status::internal(format!("task join error: {e}")))).await;
+                    return;
+                }
+            }
+
+            // Then: live tail.
+            loop {
+                let _committed = event_stream.wait_for_new_events().await;
+
+                let new_events = {
+                    let store = Arc::clone(&store);
+                    let condition = condition.clone();
+                    let cursor = event_stream.cursor;
+                    tokio::task::spawn_blocking(move || {
+                        let s = store.lock();
+                        s.source(cursor, &condition)
+                    })
+                    .await
+                };
+
+                match new_events {
+                    Ok(Ok(events)) => {
                         for event in &events {
                             let response = pb::StreamResponse {
                                 event: Some(to_proto_sequenced_event(event)),
@@ -152,39 +206,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
                             event_stream.advance_cursor(Position(last.position.0 + 1));
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let _ = tx.send(Err(to_status(e))).await;
                         return;
                     }
-                }
-            }
-
-            // Then: live tail.
-            loop {
-                let _committed = event_stream.wait_for_new_events().await;
-
-                let events = {
-                    let s = store.lock().await;
-                    match s.source(event_stream.cursor, &condition) {
-                        Ok(events) => events,
-                        Err(e) => {
-                            let _ = tx.send(Err(to_status(e))).await;
-                            return;
-                        }
+                    Err(e) => {
+                        let _ = tx.send(Err(Status::internal(format!("task join error: {e}")))).await;
+                        return;
                     }
-                };
-
-                for event in &events {
-                    let response = pb::StreamResponse {
-                        event: Some(to_proto_sequenced_event(event)),
-                    };
-                    if tx.send(Ok(response)).await.is_err() {
-                        return; // Client disconnected.
-                    }
-                }
-
-                if let Some(last) = events.last() {
-                    event_stream.advance_cursor(Position(last.position.0 + 1));
                 }
             }
         });
@@ -196,8 +225,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         _request: Request<pb::GetHeadRequest>,
     ) -> Result<Response<pb::GetHeadResponse>, Status> {
-        let store = self.store.lock().await;
-        let head = store.head();
+        let store = Arc::clone(&self.store);
+        let head = tokio::task::spawn_blocking(move || {
+            let store = store.lock();
+            store.head()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+
         Ok(Response::new(pb::GetHeadResponse {
             sequence: head.0 as i64,
         }))
@@ -207,8 +242,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         _request: Request<pb::GetTailRequest>,
     ) -> Result<Response<pb::GetTailResponse>, Status> {
-        let store = self.store.lock().await;
-        let tail = store.tail();
+        let store = Arc::clone(&self.store);
+        let tail = tokio::task::spawn_blocking(move || {
+            let store = store.lock();
+            store.tail()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+
         Ok(Response::new(pb::GetTailResponse {
             sequence: tail.0 as i64,
         }))
@@ -221,8 +262,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let req = request.into_inner();
         let position = Position(req.sequence as u64);
 
-        let store = self.store.lock().await;
-        let tags = store.get_tags(position).map_err(to_status)?;
+        let store = Arc::clone(&self.store);
+        let tags = tokio::task::spawn_blocking(move || {
+            let store = store.lock();
+            store.get_tags(position)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(to_status)?;
 
         Ok(Response::new(pb::GetTagsResponse {
             tags: tags.into_iter().map(to_proto_tag).collect(),
