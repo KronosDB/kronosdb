@@ -1,0 +1,63 @@
+syntax = "proto3";
+package kronosdb;
+option java_multiple_files = true;
+
+/* A serialized object with type information. */
+message SerializedObject {
+  /* The type identifier of the serialized object. */
+  string type = 1;
+  /* The revision of the serialized form. */
+  string revision = 2;
+  /* The serialized data. */
+  bytes data = 3;
+}
+
+/* A metadata value, supporting multiple types. */
+message MetadataValue {
+  oneof data {
+    string text_value = 1;
+    sint64 number_value = 2;
+    bool boolean_value = 3;
+    double double_value = 4;
+    SerializedObject bytes_value = 5;
+  }
+}
+
+/* An instruction for routing or processing a message. */
+message ProcessingInstruction {
+  ProcessingKey key = 1;
+  MetadataValue value = 2;
+}
+
+/* Keys for processing instructions. */
+enum ProcessingKey {
+  /* Use the attached value for consistent routing (sticky sessions). */
+  ROUTING_KEY = 0;
+  /* Relative priority of this message. */
+  PRIORITY = 1;
+  /* Message validity timeout in milliseconds. */
+  TIMEOUT = 2;
+  /* Maximum number of results expected. -1 for unlimited. */
+  NR_OF_RESULTS = 3;
+}
+
+/* Details of an error. */
+message ErrorMessage {
+  string message = 1;
+  string location = 2;
+  repeated string details = 3;
+  string error_code = 4;
+}
+
+/* Flow control: grant permits for the server to send more messages. */
+message FlowControl {
+  string client_id = 1;
+  int64 permits = 2;
+}
+
+/* Acknowledgement of an instruction. */
+message InstructionAck {
+  string instruction_id = 1;
+  bool success = 2;
+  ErrorMessage error = 3;
+}
