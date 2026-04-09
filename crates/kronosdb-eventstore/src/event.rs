@@ -43,6 +43,7 @@ impl Tag {
 
 /// An event as provided by the client for appending.
 /// Does not include a position — that's assigned by the writer.
+#[derive(Clone)]
 pub struct AppendEvent {
     /// Client-provided unique identifier.
     pub identifier: String,

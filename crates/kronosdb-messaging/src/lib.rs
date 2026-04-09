@@ -5,3 +5,6 @@ pub mod query;
 pub mod subscription;
 pub mod api;
 pub mod engine;
+pub mod client;
+pub mod manager;
+pub mod error_codes;

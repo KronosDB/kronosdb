@@ -19,7 +19,7 @@ const IDX_VERSION: u8 = 1;
 
 /// Magic bytes for `.bloom` files.
 const BLOOM_MAGIC: [u8; 4] = *b"KBLM";
-const BLOOM_VERSION: u8 = 1;
+const BLOOM_VERSION: u8 = 2;
 
 /// Desired bloom filter false positive rate.
 const BLOOM_FPR: f64 = 0.01;
@@ -199,6 +199,10 @@ impl SegmentIndex {
     }
 
     /// Reads an index from an `.idx` file.
+    ///
+    /// The bloom filter is NOT reconstructed here — bloom checks go through
+    /// the separate `.bloom` file via the cache. This avoids wasting CPU
+    /// reinserting every key into a bloom filter that's never queried.
     pub fn read_idx(path: &Path) -> Result<Self, Error> {
         let data = fs::read(path)?;
         let mut cursor;
@@ -220,7 +224,6 @@ impl SegmentIndex {
         cursor += 4;
 
         let mut bitmaps = HashMap::with_capacity(count);
-        let mut bloom = GrowableBloom::new(BLOOM_FPR, count.max(1));
 
         for _ in 0..count {
             let key_len =
@@ -228,8 +231,6 @@ impl SegmentIndex {
             cursor += 4;
             let key = data[cursor..cursor + key_len].to_vec();
             cursor += key_len;
-
-            bloom.insert(&key);
 
             let bitmap_size =
                 u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
@@ -254,6 +255,9 @@ impl SegmentIndex {
                     message: format!("failed to deserialize all_positions bitmap: {e}"),
                 })?;
 
+        // Empty bloom — the .bloom file is loaded separately via the cache.
+        let bloom = GrowableBloom::new(BLOOM_FPR, 1);
+
         Ok(Self {
             bitmaps,
             bloom,
@@ -269,11 +273,11 @@ impl SegmentIndex {
         file.write_all(&BLOOM_MAGIC)?;
         file.write_all(&[BLOOM_VERSION])?;
 
-        let json = serde_json::to_vec(&self.bloom).map_err(|e| Error::Corrupted {
+        let encoded = bincode::serialize(&self.bloom).map_err(|e| Error::Corrupted {
             message: format!("failed to serialize bloom filter: {e}"),
         })?;
-        file.write_all(&(json.len() as u32).to_le_bytes())?;
-        file.write_all(&json)?;
+        file.write_all(&(encoded.len() as u32).to_le_bytes())?;
+        file.write_all(&encoded)?;
 
         file.sync_all()?;
         fs::rename(&tmp_path, path)?;
@@ -296,10 +300,10 @@ impl SegmentIndex {
             });
         }
 
-        let json_len =
+        let payload_len =
             u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
         let bloom: GrowableBloom =
-            serde_json::from_slice(&data[9..9 + json_len]).map_err(|e| Error::Corrupted {
+            bincode::deserialize(&data[9..9 + payload_len]).map_err(|e| Error::Corrupted {
                 message: format!("failed to deserialize bloom filter: {e}"),
             })?;
 

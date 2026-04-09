@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::error::Error;
-use crate::store::EventStoreEngine;
+use crate::snapshot::SnapshotStore;
+use crate::store::{EventStoreEngine, StoreOptions};
 
 /// Manages multiple isolated event store contexts.
 ///
@@ -17,21 +19,33 @@ pub struct ContextManager {
     data_dir: PathBuf,
 
     /// Active contexts, keyed by name.
-    contexts: RwLock<HashMap<String, EventStoreEngine>>,
+    contexts: RwLock<HashMap<String, Arc<EventStoreEngine>>>,
 
-    /// Default segment size for new contexts.
-    default_segment_size: u64,
+    /// Snapshot stores per context, keyed by name.
+    snapshot_stores: RwLock<HashMap<String, Arc<SnapshotStore>>>,
+
+    /// Store options for creating new contexts.
+    store_options: StoreOptions,
 }
 
 impl ContextManager {
     /// Creates a new context manager rooted at the given directory.
     pub fn new(data_dir: &Path, default_segment_size: u64) -> Result<Self, Error> {
+        Self::with_options(data_dir, StoreOptions {
+            max_segment_size: default_segment_size,
+            ..Default::default()
+        })
+    }
+
+    /// Creates a new context manager with full store options.
+    pub fn with_options(data_dir: &Path, store_options: StoreOptions) -> Result<Self, Error> {
         std::fs::create_dir_all(data_dir)?;
 
         let mut manager = Self {
             data_dir: data_dir.to_path_buf(),
             contexts: RwLock::new(HashMap::new()),
-            default_segment_size,
+            snapshot_stores: RwLock::new(HashMap::new()),
+            store_options,
         };
 
         // Auto-discover and open existing contexts.
@@ -53,8 +67,11 @@ impl ContextManager {
         }
 
         let context_dir = self.data_dir.join(name);
-        let store = EventStoreEngine::create_with_options(&context_dir, self.default_segment_size)?;
-        contexts.insert(name.to_string(), store);
+        let store = EventStoreEngine::create_with_store_options(&context_dir, &self.store_options)?;
+        contexts.insert(name.to_string(), Arc::new(store));
+
+        let snap_store = SnapshotStore::open(&context_dir.join("snapshots"))?;
+        self.snapshot_stores.write().insert(name.to_string(), Arc::new(snap_store));
 
         Ok(())
     }
@@ -70,6 +87,35 @@ impl ContextManager {
             name: name.to_string(),
         })?;
         f(store)
+    }
+
+    /// Returns the root data directory.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Gets a cloneable reference to a context's event store.
+    /// Useful when you need to pass the store across thread boundaries
+    /// (e.g., `spawn_blocking`).
+    pub fn get_context(&self, name: &str) -> Result<Arc<EventStoreEngine>, Error> {
+        let contexts = self.contexts.read();
+        contexts
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::ContextNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    /// Gets a cloneable reference to a context's snapshot store.
+    pub fn get_snapshot_store(&self, name: &str) -> Result<Arc<SnapshotStore>, Error> {
+        let stores = self.snapshot_stores.read();
+        stores
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::ContextNotFound {
+                name: name.to_string(),
+            })
     }
 
     /// Lists all context names.
@@ -119,8 +165,11 @@ impl ContextManager {
 
             if has_segments {
                 let store =
-                    EventStoreEngine::open_with_options(&path, self.default_segment_size)?;
-                contexts.insert(name, store);
+                    EventStoreEngine::open_with_store_options(&path, &self.store_options)?;
+                contexts.insert(name.clone(), Arc::new(store));
+
+                let snap_store = SnapshotStore::open(&path.join("snapshots"))?;
+                self.snapshot_stores.write().insert(name, Arc::new(snap_store));
             }
         }
 

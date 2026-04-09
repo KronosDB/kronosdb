@@ -158,6 +158,14 @@ impl HandlerRegistry {
     pub fn connected_clients(&self) -> Vec<&ClientId> {
         self.client_subscriptions.keys().collect()
     }
+
+    /// Returns stats: message type name → handler count.
+    pub fn handler_stats(&self) -> Vec<(String, usize)> {
+        self.subscriptions
+            .iter()
+            .map(|(name, entries)| (name.clone(), entries.len()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

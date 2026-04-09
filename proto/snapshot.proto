@@ -1,0 +1,103 @@
+syntax = "proto3";
+package kronosdb.snapshot;
+option java_multiple_files = true;
+
+/* Service providing Snapshot Store RPCs.
+ *
+ * Snapshots are keyed by an opaque binary key (typically entity type + ID)
+ * and sequenced by event store position. They cache projection/read model
+ * state to avoid replaying the full event stream.
+ *
+ * Aligned with the Axon Server DcbSnapshotStore API.
+ */
+service SnapshotStore {
+
+  /* Stores a snapshot. If prune is true, older snapshots for the same key are deleted. */
+  rpc Add(AddSnapshotRequest) returns (AddSnapshotResponse);
+
+  /* Deletes snapshots for a key up to (exclusive) a given sequence. */
+  rpc Delete(DeleteSnapshotsRequest) returns (DeleteSnapshotsResponse);
+
+  /* Lists all snapshots for a key within a sequence range. */
+  rpc List(ListSnapshotsRequest) returns (stream ListSnapshotsResponse);
+
+  /* Gets the snapshot with the highest sequence for a key. */
+  rpc GetLast(GetLastSnapshotRequest) returns (GetLastSnapshotResponse);
+}
+
+/* A snapshot of projection/read model state at a point in the event stream. */
+message Snapshot {
+  /* The name/type of the snapshot (e.g. "OrderSummaryProjection"). */
+  string name = 1;
+  /* The version of the serialized form. */
+  string version = 2;
+  /* The serialized payload (opaque bytes). */
+  bytes payload = 3;
+  /* Timestamp of snapshot creation (millis since epoch). */
+  int64 timestamp = 4;
+  /* Arbitrary key-value metadata. */
+  map<string, string> metadata = 5;
+}
+
+/* Request to store a snapshot. */
+message AddSnapshotRequest {
+  /* The key identifying this snapshot (opaque bytes, typically entity type + NUL + entity ID). */
+  bytes key = 1;
+  /* The event store sequence/position up to which this snapshot was taken. */
+  int64 sequence = 2;
+  /* If true, older snapshots for the same key are pruned after storing. */
+  bool prune = 3;
+  /* The snapshot data. */
+  Snapshot snapshot = 4;
+}
+
+/* Response confirming the snapshot was stored. */
+message AddSnapshotResponse {}
+
+/* Request to delete snapshots for a key.
+ * Deletes all snapshots with sequence in [0, to_sequence). */
+message DeleteSnapshotsRequest {
+  /* The key identifying the snapshots. */
+  bytes key = 1;
+  /* Exclusive upper bound sequence for deletion. */
+  int64 to_sequence = 3;
+}
+
+/* Response confirming deletion. */
+message DeleteSnapshotsResponse {}
+
+/* Request to list snapshots for a key within a sequence range. */
+message ListSnapshotsRequest {
+  /* The key identifying the snapshots. */
+  bytes key = 1;
+  /* Inclusive lower bound sequence. */
+  int64 from_sequence = 2;
+  /* Exclusive upper bound sequence. */
+  int64 to_sequence = 3;
+}
+
+/* A snapshot entry in a list response. */
+message ListSnapshotsResponse {
+  /* The key. */
+  bytes key = 1;
+  /* The sequence. */
+  int64 sequence = 2;
+  /* The snapshot data. */
+  Snapshot snapshot = 3;
+}
+
+/* Request to get the latest snapshot for a key. */
+message GetLastSnapshotRequest {
+  /* The key identifying the snapshot. */
+  bytes key = 1;
+}
+
+/* The latest snapshot for a key, or empty fields if none exists. */
+message GetLastSnapshotResponse {
+  /* The key. */
+  bytes key = 1;
+  /* The sequence of the latest snapshot. */
+  int64 sequence = 2;
+  /* The snapshot data (absent if no snapshot exists). */
+  Snapshot snapshot = 3;
+}

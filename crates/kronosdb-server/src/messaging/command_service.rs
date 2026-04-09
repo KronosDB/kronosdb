@@ -1,36 +1,43 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use kronosdb_messaging::api::MessagingPlatform;
 use kronosdb_messaging::command::{Command, CommandResult};
-use kronosdb_messaging::types::{ClientId, ComponentName, Payload, RoutingKey};
+use kronosdb_messaging::manager::MessagingManager;
+use kronosdb_messaging::types::{ClientId, ComponentName, MetadataValue, Payload, ProcessingInstruction, ProcessingKey, RoutingKey};
 
 use crate::proto::kronosdb::command as pb;
 use crate::proto::kronosdb::command::command_service_server::CommandServiceServer as GrpcCommandServiceServer;
+
+/// gRPC metadata header for context routing.
+const CONTEXT_HEADER: &str = "kronosdb-context";
+const DEFAULT_CONTEXT: &str = "default";
 
 type HandlerSender = mpsc::Sender<Result<pb::CommandHandlerInbound, Status>>;
 type PendingResponses = Arc<Mutex<HashMap<String, oneshot::Sender<CommandResult>>>>;
 
 /// gRPC service implementation for the command bus.
+///
+/// Routes handlers to per-context messaging engines via `kronosdb-context` header.
 pub struct CommandServiceImpl {
-    platform: Arc<dyn MessagingPlatform>,
-    /// Active handler streams: client_id → channel to deliver commands to that handler.
+    messaging: Arc<MessagingManager>,
     handler_streams: Arc<Mutex<HashMap<String, HandlerSender>>>,
-    /// Pending command responses: message_id → oneshot sender to complete the dispatch call.
     pending: PendingResponses,
+    command_timeout: Duration,
 }
 
 impl CommandServiceImpl {
-    pub fn new(platform: Arc<dyn MessagingPlatform>) -> Self {
+    pub fn new(messaging: Arc<MessagingManager>, command_timeout: Duration) -> Self {
         Self {
-            platform,
+            messaging,
             handler_streams: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            command_timeout,
         }
     }
 
@@ -47,10 +54,16 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         &self,
         request: Request<Streaming<pb::CommandHandlerOutbound>>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
+        let context = request.metadata()
+            .get(CONTEXT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(DEFAULT_CONTEXT)
+            .to_string();
+        let platform = self.messaging.get_platform(&context);
+
         let mut inbound = request.into_inner();
         let (handler_tx, handler_rx) = mpsc::channel::<Result<pb::CommandHandlerInbound, Status>>(128);
 
-        let platform = Arc::clone(&self.platform);
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending = Arc::clone(&self.pending);
         let mut client_id: Option<String> = None;
@@ -133,13 +146,19 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         &self,
         request: Request<pb::Command>,
     ) -> Result<Response<pb::CommandResponse>, Status> {
+        let context = request.metadata()
+            .get(CONTEXT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(DEFAULT_CONTEXT)
+            .to_string();
+        let platform = self.messaging.get_platform(&context);
+
         let cmd = request.into_inner();
         let command = from_proto_command(cmd);
         let message_id = command.message_id.clone();
 
         // Dispatch — selects a handler and acquires a permit.
-        let (pending_cmd, response_rx) = self
-            .platform
+        let (pending_cmd, response_rx) = platform
             .dispatch_command(command)
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
@@ -165,16 +184,112 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             .await
             .map_err(|_| Status::unavailable("handler disconnected"))?;
 
-        // Wait for the handler's response.
-        let result = response_rx
-            .await
-            .map_err(|_| Status::unavailable("handler disconnected before responding"))?;
+        // Wait for the handler's response with timeout.
+        let result = match tokio::time::timeout(self.command_timeout, response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                self.pending.lock().remove(&message_id);
+                return Err(Status::unavailable("handler disconnected before responding"));
+            }
+            Err(_) => {
+                self.pending.lock().remove(&message_id);
+                return Err(Status::deadline_exceeded("command dispatch timed out"));
+            }
+        };
 
         Ok(Response::new(to_proto_command_response(result)))
     }
 }
 
 // --- Proto conversions ---
+
+fn proto_mv_to_internal(v: crate::proto::kronosdb::MetadataValue) -> MetadataValue {
+    match v.data {
+        Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => MetadataValue::Text(s),
+        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => MetadataValue::Number(n),
+        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => MetadataValue::Boolean(b),
+        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => MetadataValue::Double(d),
+        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => MetadataValue::Bytes(Payload {
+            payload_type: obj.r#type,
+            revision: obj.revision,
+            data: obj.data,
+        }),
+        None => MetadataValue::Text(String::new()),
+    }
+}
+
+fn internal_mv_to_proto(v: &MetadataValue) -> crate::proto::kronosdb::MetadataValue {
+    let data = match v {
+        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s.clone())),
+        MetadataValue::Number(n) => Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(*n)),
+        MetadataValue::Boolean(b) => Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b)),
+        MetadataValue::Double(d) => Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d)),
+        MetadataValue::Bytes(p) => Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(
+            crate::proto::kronosdb::SerializedObject {
+                r#type: p.payload_type.clone(),
+                revision: p.revision.clone(),
+                data: p.data.clone(),
+            },
+        )),
+    };
+    crate::proto::kronosdb::MetadataValue { data }
+}
+
+fn proto_metadata_to_internal(
+    meta: HashMap<String, crate::proto::kronosdb::MetadataValue>,
+) -> kronosdb_messaging::types::Metadata {
+    meta.into_iter()
+        .map(|(k, v)| (k, proto_mv_to_internal(v)))
+        .collect()
+}
+
+fn internal_metadata_to_proto(
+    meta: &kronosdb_messaging::types::Metadata,
+) -> HashMap<String, crate::proto::kronosdb::MetadataValue> {
+    meta.iter()
+        .map(|(k, v)| (k.clone(), internal_mv_to_proto(v)))
+        .collect()
+}
+
+fn proto_pk_to_internal(key: i32) -> ProcessingKey {
+    match key {
+        1 => ProcessingKey::Priority,
+        2 => ProcessingKey::Timeout,
+        3 => ProcessingKey::NrOfResults,
+        _ => ProcessingKey::RoutingKey, // 0 and unknown
+    }
+}
+
+fn internal_pk_to_proto(key: ProcessingKey) -> i32 {
+    match key {
+        ProcessingKey::RoutingKey => 0,
+        ProcessingKey::Priority => 1,
+        ProcessingKey::Timeout => 2,
+        ProcessingKey::NrOfResults => 3,
+    }
+}
+
+fn proto_pi_to_internal(
+    pis: Vec<crate::proto::kronosdb::ProcessingInstruction>,
+) -> Vec<ProcessingInstruction> {
+    pis.into_iter()
+        .map(|pi| ProcessingInstruction {
+            key: proto_pk_to_internal(pi.key),
+            value: pi.value.map(proto_mv_to_internal),
+        })
+        .collect()
+}
+
+fn internal_pi_to_proto(
+    pis: &[ProcessingInstruction],
+) -> Vec<crate::proto::kronosdb::ProcessingInstruction> {
+    pis.iter()
+        .map(|pi| crate::proto::kronosdb::ProcessingInstruction {
+            key: internal_pk_to_proto(pi.key),
+            value: pi.value.as_ref().map(internal_mv_to_proto),
+        })
+        .collect()
+}
 
 fn from_proto_command(cmd: pb::Command) -> Command {
     let routing_key = cmd.processing_instructions.iter().find_map(|pi| {
@@ -190,6 +305,8 @@ fn from_proto_command(cmd: pb::Command) -> Command {
         }
     });
 
+    let processing_instructions = proto_pi_to_internal(cmd.processing_instructions);
+
     Command {
         message_id: cmd.message_identifier,
         name: cmd.name,
@@ -199,7 +316,8 @@ fn from_proto_command(cmd: pb::Command) -> Command {
             revision: cmd.payload.as_ref().map(|p| p.revision.clone()).unwrap_or_default(),
             data: cmd.payload.map(|p| p.data).unwrap_or_default(),
         },
-        metadata: extract_text_metadata(cmd.metadata),
+        metadata: proto_metadata_to_internal(cmd.metadata),
+        processing_instructions,
         routing_key,
         client_id: ClientId(cmd.client_id),
         component_name: ComponentName(cmd.component_name),
@@ -211,13 +329,19 @@ fn from_proto_command_response(resp: pb::CommandResponse) -> CommandResult {
         message_id: resp.message_identifier,
         request_id: resp.request_identifier,
         error_code: if resp.error_code.is_empty() { None } else { Some(resp.error_code) },
-        error_message: resp.error_message.map(|e| e.message),
+        error: resp.error_message.map(|e| kronosdb_messaging::types::ErrorDetail {
+            message: e.message,
+            location: e.location,
+            details: e.details,
+            error_code: e.error_code,
+        }),
         payload: resp.payload.map(|p| Payload {
             payload_type: p.r#type,
             revision: p.revision,
             data: p.data,
         }),
-        metadata: extract_text_metadata(resp.metadata),
+        metadata: proto_metadata_to_internal(resp.metadata),
+        processing_instructions: proto_pi_to_internal(resp.processing_instructions),
     }
 }
 
@@ -232,8 +356,8 @@ fn to_proto_command_inbound(cmd: &Command) -> pb::CommandHandlerInbound {
                 revision: cmd.payload.revision.clone(),
                 data: cmd.payload.data.clone(),
             }),
-            metadata: Default::default(),
-            processing_instructions: vec![],
+            metadata: internal_metadata_to_proto(&cmd.metadata),
+            processing_instructions: internal_pi_to_proto(&cmd.processing_instructions),
             client_id: cmd.client_id.0.clone(),
             component_name: cmd.component_name.0.clone(),
         })),
@@ -245,31 +369,19 @@ fn to_proto_command_response(result: CommandResult) -> pb::CommandResponse {
     pb::CommandResponse {
         message_identifier: result.message_id,
         error_code: result.error_code.unwrap_or_default(),
-        error_message: result.error_message.map(|msg| crate::proto::kronosdb::ErrorMessage {
-            message: msg,
-            location: String::new(),
-            details: vec![],
-            error_code: String::new(),
+        error_message: result.error.map(|e| crate::proto::kronosdb::ErrorMessage {
+            message: e.message,
+            location: e.location,
+            details: e.details,
+            error_code: e.error_code,
         }),
         payload: result.payload.map(|p| crate::proto::kronosdb::SerializedObject {
             r#type: p.payload_type,
             revision: p.revision,
             data: p.data,
         }),
-        metadata: Default::default(),
-        processing_instructions: vec![],
+        metadata: internal_metadata_to_proto(&result.metadata),
+        processing_instructions: internal_pi_to_proto(&result.processing_instructions),
         request_identifier: result.request_id,
     }
-}
-
-fn extract_text_metadata(
-    metadata: HashMap<String, crate::proto::kronosdb::MetadataValue>,
-) -> Vec<(String, String)> {
-    metadata
-        .into_iter()
-        .filter_map(|(k, v)| match v.data {
-            Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => Some((k, s)),
-            _ => None,
-        })
-        .collect()
 }

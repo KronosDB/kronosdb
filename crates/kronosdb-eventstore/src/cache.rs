@@ -1,27 +1,38 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 
 use growable_bloom_filter::GrowableBloom;
 use lru::LruCache;
+use memmap2::Mmap;
 use parking_lot::Mutex;
 
 use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
 use crate::segment::segment_index::SegmentIndex;
 
-/// Cache for sealed segment indices and bloom filters.
+/// Default number of sealed segment mmaps to cache.
+pub const DEFAULT_MMAP_CACHE_SIZE: usize = 100;
+
+/// Cache for sealed segment indices, bloom filters, and mmap handles.
 ///
 /// Indices (`.idx` files) are the heavy objects — each can be several MB.
 /// Bloom filters (`.bloom` files) are tiny (~1KB) so we cache more of them.
+/// Mmap handles avoid repeated open()/mmap() syscalls for sealed segments.
 ///
 /// Thread-safe via internal Mutex. The lock is only held during cache
 /// lookups/inserts, not during file I/O — we load outside the lock
 /// and insert after.
 pub struct IndexCache {
     /// LRU cache of loaded segment indices, keyed by segment base position.
-    indices: Mutex<LruCache<u64, SegmentIndex>>,
+    /// Arc-wrapped so callers get a cheap shared reference without cloning
+    /// the entire index or holding the cache lock during queries.
+    indices: Mutex<LruCache<u64, Arc<SegmentIndex>>>,
     /// LRU cache of bloom filters, keyed by segment base position.
     blooms: Mutex<LruCache<u64, GrowableBloom>>,
+    /// LRU cache of mmap handles for sealed segments, keyed by base position.
+    /// Sealed segments are immutable, so sharing a single mmap is safe.
+    mmaps: Mutex<LruCache<u64, Arc<Mmap>>>,
 }
 
 impl IndexCache {
@@ -36,6 +47,9 @@ impl IndexCache {
             )),
             blooms: Mutex::new(LruCache::new(
                 NonZeroUsize::new(bloom_capacity.max(1)).unwrap(),
+            )),
+            mmaps: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_MMAP_CACHE_SIZE).unwrap(),
             )),
         }
     }
@@ -76,52 +90,66 @@ impl IndexCache {
     }
 
     /// Gets a segment index, loading from disk if not cached.
+    /// Returns an Arc so the caller can query the index without holding the cache lock.
     pub fn get_index(
         &self,
         segment_path: &Path,
         base_position: u64,
-    ) -> Result<SegmentIndex, Error> {
+    ) -> Result<Arc<SegmentIndex>, Error> {
         // Try cache first.
-        // We can't return a reference from the LRU cache through the Mutex,
-        // so we check if it exists, and if so, remove + reinsert to get ownership.
-        // This is a limitation of the LRU crate with Mutex.
-        //
-        // TODO: Consider using Arc<SegmentIndex> in the cache to allow
-        // shared references without removal.
         {
             let mut indices = self.indices.lock();
-            if let Some(index) = indices.pop(&base_position) {
-                // Put it back (refreshes LRU position) and clone the query result.
-                // Actually, we need to return the index for querying.
-                // For now, load from disk if not cached. The cache avoids
-                // repeated disk reads for the same segment across multiple queries.
-                indices.push(base_position, index);
+            if let Some(index) = indices.get(&base_position) {
+                return Ok(Arc::clone(index));
             }
         }
 
-        // Load from disk.
+        // Not cached — load from disk.
         let idx_path = segment_path.with_extension("idx");
-        let index = SegmentIndex::read_idx(&idx_path)?;
+        let index = Arc::new(SegmentIndex::read_idx(&idx_path)?);
 
         // Cache it (this might evict an older entry).
-        // We return a freshly loaded copy — the cached copy serves future queries.
-        let cached = SegmentIndex::read_idx(&idx_path)?;
         {
             let mut indices = self.indices.lock();
-            indices.push(base_position, cached);
+            indices.put(base_position, Arc::clone(&index));
         }
 
         Ok(index)
     }
 
-    /// Invalidates cache entries for a segment (e.g., after a transformation rewrites it).
-    pub fn invalidate(&self, base_position: u64) {
-        let mut indices = self.indices.lock();
-        indices.pop(&base_position);
-        drop(indices);
+    /// Gets a cached mmap handle for a sealed segment, opening it if not cached.
+    /// Sealed segments are immutable, so the mmap can be safely shared.
+    pub fn get_mmap(
+        &self,
+        segment_path: &Path,
+        base_position: u64,
+    ) -> Result<Arc<Mmap>, Error> {
+        // Try cache first.
+        {
+            let mut mmaps = self.mmaps.lock();
+            if let Some(mmap) = mmaps.get(&base_position) {
+                return Ok(Arc::clone(mmap));
+            }
+        }
 
-        let mut blooms = self.blooms.lock();
-        blooms.pop(&base_position);
+        // Not cached — open and mmap the file.
+        let file = std::fs::File::open(segment_path)?;
+        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+
+        // Cache it.
+        {
+            let mut mmaps = self.mmaps.lock();
+            mmaps.put(base_position, Arc::clone(&mmap));
+        }
+
+        Ok(mmap)
+    }
+
+    /// Invalidates all cache entries for a segment (e.g., after a transformation rewrites it).
+    pub fn invalidate(&self, base_position: u64) {
+        self.indices.lock().pop(&base_position);
+        self.blooms.lock().pop(&base_position);
+        self.mmaps.lock().pop(&base_position);
     }
 }
 
@@ -265,6 +293,10 @@ mod tests {
         let result = index.matching(&cond).unwrap();
         let positions: Vec<u64> = result.iter().collect();
         assert_eq!(positions, vec![1, 2]);
+
+        // Second load — should come from cache (same Arc).
+        let index2 = cache.get_index(&seg_path, base).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&index, &index2));
     }
 
     #[test]
@@ -285,12 +317,13 @@ mod tests {
                 }],
             },
         );
-        let _ = cache.get_index(&seg_path, base);
+        let index1 = cache.get_index(&seg_path, base).unwrap();
 
         // Invalidate.
         cache.invalidate(base);
 
-        // Next access should reload from disk (no crash = success).
-        let _ = cache.get_index(&seg_path, base).unwrap();
+        // Next access should reload from disk (different Arc).
+        let index2 = cache.get_index(&seg_path, base).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&index1, &index2));
     }
 }

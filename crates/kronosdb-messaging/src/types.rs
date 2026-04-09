@@ -9,8 +9,36 @@ pub struct Payload {
     pub data: Vec<u8>,
 }
 
-/// Metadata key-value pairs attached to messages.
-pub type Metadata = Vec<(String, String)>;
+/// A metadata value. Supports multiple types to allow lossless transport
+/// of metadata from any language runtime (Java objects, .NET types, etc.).
+#[derive(Debug, Clone)]
+pub enum MetadataValue {
+    Text(String),
+    Number(i64),
+    Boolean(bool),
+    Double(f64),
+    /// A serialized object (type + revision + bytes).
+    Bytes(Payload),
+}
+
+/// Metadata attached to messages. Opaque to KronosDB — just transported.
+pub type Metadata = std::collections::HashMap<String, MetadataValue>;
+
+/// A processing instruction — routing/priority/timeout hints attached to messages.
+#[derive(Debug, Clone)]
+pub struct ProcessingInstruction {
+    pub key: ProcessingKey,
+    pub value: Option<MetadataValue>,
+}
+
+/// Processing instruction keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessingKey {
+    RoutingKey,
+    Priority,
+    Timeout,
+    NrOfResults,
+}
 
 /// Identifies a connected client instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25,3 +53,18 @@ pub struct ComponentName(pub String);
 /// always go to the same handler instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RoutingKey(pub String);
+
+/// Structured error detail. Mirrors the gRPC ErrorMessage so the full error
+/// context (exception class, stack trace, location) survives the round-trip
+/// through KronosDB without being flattened to a string.
+#[derive(Debug, Clone)]
+pub struct ErrorDetail {
+    /// Human-readable error message.
+    pub message: String,
+    /// Where the error occurred (handler component, server, etc.).
+    pub location: String,
+    /// Additional context — root cause chain, exception class names, stack frames.
+    pub details: Vec<String>,
+    /// Error code (e.g. "AXONIQ-4002" or application-specific).
+    pub error_code: String,
+}

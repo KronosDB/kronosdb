@@ -10,3 +10,4 @@ pub mod cache;
 pub mod store;
 pub mod stream;
 pub mod context;
+pub mod snapshot;

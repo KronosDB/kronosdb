@@ -1,0 +1,54 @@
+syntax = "proto3";
+package kronosdb.raft;
+option java_multiple_files = true;
+
+/* Internal node-to-node Raft consensus transport.
+ * Not exposed to application clients. */
+service RaftTransport {
+  /* RequestVote RPC — candidate requests votes during election. */
+  rpc Vote(RaftVoteRequest) returns (RaftVoteResponse);
+
+  /* AppendEntries RPC — leader replicates log entries to followers. */
+  rpc AppendEntries(RaftAppendEntriesRequest) returns (RaftAppendEntriesResponse);
+
+  /* InstallSnapshot RPC — leader sends snapshot to slow followers. */
+  rpc InstallSnapshot(RaftInstallSnapshotRequest) returns (RaftInstallSnapshotResponse);
+
+  /* ForwardWrite RPC — follower forwards a client write to the leader. */
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+}
+
+/* All Raft RPCs carry opaque bincode-serialized payloads.
+ * This avoids duplicating openraft's complex message types in proto. */
+
+message RaftVoteRequest {
+  bytes data = 1;
+}
+
+message RaftVoteResponse {
+  bytes data = 1;
+}
+
+message RaftAppendEntriesRequest {
+  bytes data = 1;
+}
+
+message RaftAppendEntriesResponse {
+  bytes data = 1;
+}
+
+message RaftInstallSnapshotRequest {
+  bytes data = 1;
+}
+
+message RaftInstallSnapshotResponse {
+  bytes data = 1;
+}
+
+message ForwardWriteRequest {
+  bytes data = 1;
+}
+
+message ForwardWriteResponse {
+  bytes data = 1;
+}

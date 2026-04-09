@@ -1,4 +1,4 @@
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{CommandDispatcher, MessagingPlatform, QueryDispatcher, SubscriptionQueryDispatcher};
 use crate::command::{Command, CommandBus, CommandError, CommandResult, PendingCommand};
@@ -23,6 +23,16 @@ impl MessagingEngine {
             query_bus: QueryBus::new(),
             subscriptions: SubscriptionRegistry::new(),
         }
+    }
+
+    /// Returns command handler stats: command name → handler count.
+    pub fn command_stats(&self) -> Vec<(String, usize)> {
+        self.command_bus.handler_stats()
+    }
+
+    /// Returns query handler stats: query name → handler count.
+    pub fn query_stats(&self) -> Vec<(String, usize)> {
+        self.query_bus.handler_stats()
     }
 }
 
@@ -88,13 +98,8 @@ impl SubscriptionQueryDispatcher for MessagingEngine {
     fn subscribe(
         &self,
         query: SubscriptionQuery,
-    ) -> Result<PendingQuery, SubscriptionError> {
-        let (pending, _rx) = self.subscriptions.open(query)?;
-        // TODO: The rx (update receiver) needs to be returned to the gRPC layer
-        // so it can stream updates to the subscriber. For now we return just the
-        // pending query. The gRPC service will call subscriptions.open() directly
-        // to get both the pending query and the update receiver.
-        Ok(pending)
+    ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError> {
+        self.subscriptions.open(query)
     }
 
     fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate) {
@@ -148,7 +153,8 @@ mod tests {
             name: "CreateOrder".into(),
             timestamp: 0,
             payload: Payload { payload_type: "CreateOrder".into(), revision: "1".into(), data: vec![] },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
+            processing_instructions: vec![],
             routing_key: None,
             client_id: client("dispatcher"),
             component_name: component("test"),
@@ -170,7 +176,8 @@ mod tests {
             name: "GetOrders".into(),
             timestamp: 0,
             payload: Payload { payload_type: "GetOrders".into(), revision: "1".into(), data: vec![] },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
+            processing_instructions: vec![],
             client_id: client("dispatcher"),
             component_name: component("test"),
             expected_results: -1,
@@ -194,7 +201,8 @@ mod tests {
             name: "CreateOrder".into(),
             timestamp: 0,
             payload: Payload { payload_type: "CreateOrder".into(), revision: "1".into(), data: vec![] },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
+            processing_instructions: vec![],
             routing_key: None,
             client_id: client("dispatcher"),
             component_name: component("test"),
@@ -206,7 +214,8 @@ mod tests {
             name: "GetOrders".into(),
             timestamp: 0,
             payload: Payload { payload_type: "GetOrders".into(), revision: "1".into(), data: vec![] },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
+            processing_instructions: vec![],
             client_id: client("dispatcher"),
             component_name: component("test"),
             expected_results: 1,

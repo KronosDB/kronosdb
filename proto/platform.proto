@@ -1,0 +1,74 @@
+syntax = "proto3";
+package kronosdb.platform;
+option java_multiple_files = true;
+
+import "common.proto";
+
+/* Service for client connection lifecycle management.
+ *
+ * Clients connect to this service first to identify themselves,
+ * then open a persistent stream for heartbeat and lifecycle management.
+ */
+service PlatformService {
+  /* Initial connection: client identifies itself and receives server info.
+   * The server registers the client in the connection registry. */
+  rpc GetPlatformServer(ClientIdentification) returns (PlatformInfo);
+
+  /* Persistent bidirectional stream for lifecycle management.
+   * Used for heartbeat exchange and server-initiated instructions. */
+  rpc OpenStream(stream PlatformInbound) returns (stream PlatformOutbound);
+}
+
+/* Client identification, sent on initial connect. */
+message ClientIdentification {
+  /* Unique instance identifier (UUID). Distinguishes instances of the same component. */
+  string client_id = 1;
+  /* Application/component name (e.g. "OrderService"). Shared across instances. */
+  string component_name = 2;
+  /* Client library version. */
+  string version = 3;
+  /* Arbitrary tags for routing hints or metadata. */
+  map<string, string> tags = 4;
+}
+
+/* Server information returned after client identification. */
+message PlatformInfo {
+  /* The node name of this server. */
+  string node_name = 1;
+  /* Server version. */
+  string version = 2;
+  /* Available contexts on this server. */
+  repeated string contexts = 3;
+}
+
+/* Messages sent FROM the client TO the server on the lifecycle stream. */
+message PlatformInbound {
+  oneof request {
+    /* Re-identify on stream open (required as first message). */
+    ClientIdentification register = 1;
+    /* Heartbeat response. */
+    Heartbeat heartbeat = 2;
+    /* Acknowledge a server instruction. */
+    kronosdb.InstructionAck ack = 3;
+  }
+}
+
+/* Messages sent FROM the server TO the client on the lifecycle stream. */
+message PlatformOutbound {
+  oneof request {
+    /* Server node info, sent after registration. */
+    PlatformInfo node_notification = 1;
+    /* Heartbeat request — client must respond. */
+    Heartbeat heartbeat = 2;
+    /* Ask the client to reconnect (e.g. for rebalancing). */
+    RequestReconnect request_reconnect = 3;
+  }
+  /* If set, the client must acknowledge this instruction. */
+  string instruction_id = 10;
+}
+
+/* Heartbeat message for liveness detection. */
+message Heartbeat {}
+
+/* Ask the client to disconnect and reconnect. */
+message RequestReconnect {}
