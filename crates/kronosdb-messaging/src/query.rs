@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 
 use crate::handler::HandlerRegistry;
-use crate::types::{ClientId, ComponentName, Metadata, Payload};
+use crate::types::{ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction};
 
 /// A query to be dispatched.
 #[derive(Debug, Clone)]
@@ -14,8 +14,10 @@ pub struct Query {
     pub timestamp: i64,
     /// The query payload.
     pub payload: Payload,
-    /// Metadata.
+    /// Metadata — opaque to KronosDB, transported losslessly.
     pub metadata: Metadata,
+    /// Processing instructions.
+    pub processing_instructions: Vec<ProcessingInstruction>,
     /// The client that dispatched this query.
     pub client_id: ClientId,
     /// The component name that dispatched this query.
@@ -32,14 +34,16 @@ pub struct QueryResult {
     pub message_id: String,
     /// The query this is a response to.
     pub request_id: String,
-    /// Error code, if failed.
+    /// Error code, if failed (top-level, for quick checks).
     pub error_code: Option<String>,
-    /// Error message, if failed.
-    pub error_message: Option<String>,
+    /// Full error detail preserving the complete error context.
+    pub error: Option<ErrorDetail>,
     /// Result payload, if any.
     pub payload: Option<Payload>,
-    /// Response metadata.
+    /// Response metadata — transported losslessly.
     pub metadata: Metadata,
+    /// Processing instructions on the response.
+    pub processing_instructions: Vec<ProcessingInstruction>,
 }
 
 /// Error dispatching a query.
@@ -49,6 +53,8 @@ pub enum QueryError {
     NoHandlerAvailable { query_name: String },
     /// All handlers are at capacity.
     NoPermitsAvailable { query_name: String },
+    /// Timeout waiting for query response(s).
+    Timeout,
 }
 
 impl std::fmt::Display for QueryError {
@@ -60,6 +66,7 @@ impl std::fmt::Display for QueryError {
             Self::NoPermitsAvailable { query_name } => {
                 write!(f, "all handlers at capacity for query '{query_name}'")
             }
+            Self::Timeout => write!(f, "timeout waiting for query response"),
         }
     }
 }
@@ -116,6 +123,11 @@ impl QueryBus {
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
         let handlers = self.handlers.read();
         handlers.grant_permits(client_id, permits);
+    }
+
+    /// Returns stats: query name → handler count.
+    pub fn handler_stats(&self) -> Vec<(String, usize)> {
+        self.handlers.read().handler_stats()
     }
 
     /// Dispatches a query.
@@ -194,7 +206,8 @@ mod tests {
                 revision: "1".to_string(),
                 data: vec![],
             },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
+            processing_instructions: vec![],
             client_id: client("dispatcher"),
             component_name: component("test"),
             expected_results,

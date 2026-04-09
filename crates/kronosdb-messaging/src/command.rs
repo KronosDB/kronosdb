@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use tokio::sync::oneshot;
 
 use crate::handler::HandlerRegistry;
-use crate::types::{ClientId, ComponentName, Metadata, Payload, RoutingKey};
+use crate::types::{ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction, RoutingKey};
 
 /// A command to be dispatched.
 #[derive(Debug, Clone)]
@@ -18,8 +18,10 @@ pub struct Command {
     pub timestamp: i64,
     /// The command payload.
     pub payload: Payload,
-    /// Metadata.
+    /// Metadata — opaque to KronosDB, transported losslessly.
     pub metadata: Metadata,
+    /// Processing instructions (routing key, priority, timeout, etc.).
+    pub processing_instructions: Vec<ProcessingInstruction>,
     /// Optional routing key for consistent hashing.
     pub routing_key: Option<RoutingKey>,
     /// The client that dispatched this command.
@@ -35,14 +37,16 @@ pub struct CommandResult {
     pub message_id: String,
     /// The command this is a response to.
     pub request_id: String,
-    /// Error code, if failed.
+    /// Error code, if failed (top-level, for quick checks).
     pub error_code: Option<String>,
-    /// Error message, if failed.
-    pub error_message: Option<String>,
+    /// Full error detail preserving message, location, details chain, and error code.
+    pub error: Option<ErrorDetail>,
     /// Result payload, if any.
     pub payload: Option<Payload>,
-    /// Response metadata.
+    /// Response metadata — transported losslessly.
     pub metadata: Metadata,
+    /// Processing instructions on the response.
+    pub processing_instructions: Vec<ProcessingInstruction>,
 }
 
 /// Error dispatching a command.
@@ -179,12 +183,22 @@ impl CommandBus {
             selected
         };
 
-        // Check permits.
-        if !selected.handler.try_acquire_permit() {
-            return Err(CommandError::NoPermitsAvailable {
-                command_name: command.name.clone(),
-            });
-        }
+        // Check permits on the selected handler first.
+        // If selected has no permits, try all handlers before giving up.
+        let selected = if selected.handler.try_acquire_permit() {
+            selected
+        } else {
+            // Fall back: find ANY handler with available permits.
+            let fallback = handler_list.iter().find(|e| e.handler.try_acquire_permit());
+            match fallback {
+                Some(entry) => entry,
+                None => {
+                    return Err(CommandError::NoPermitsAvailable {
+                        command_name: command.name.clone(),
+                    });
+                }
+            }
+        };
 
         let target_handler = selected.handler.client_id.clone();
 
@@ -198,6 +212,11 @@ impl CommandBus {
         };
 
         Ok((pending, response_rx))
+    }
+
+    /// Returns stats: command name → handler count.
+    pub fn handler_stats(&self) -> Vec<(String, usize)> {
+        self.handlers.read().handler_stats()
     }
 
     /// Completes a pending command with a response from the handler.
@@ -241,7 +260,8 @@ mod tests {
                 revision: "1".to_string(),
                 data: vec![],
             },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
+            processing_instructions: vec![],
             routing_key: None,
             client_id: client("dispatcher"),
             component_name: component("test"),
@@ -286,22 +306,10 @@ mod tests {
         bus.grant_permits(&client("node-1"), 100);
         bus.grant_permits(&client("node-2"), 100);
 
-        let mut node1_count = 0;
-        let mut node2_count = 0;
-
         for _ in 0..100 {
             let cmd = make_command("CreateOrder");
-            let (pending, _rx) = bus.dispatch(cmd).unwrap();
-            // Check which handler was selected by looking at which node lost a permit.
-            // Since we don't expose the selected handler directly, we track via the
-            // pending command — in a real system the gRPC layer would route it.
-            // For this test, just verify dispatch succeeds.
-            let _ = pending;
-            node1_count += 1; // Simplified — real test would check handler selection.
+            let (_pending, _rx) = bus.dispatch(cmd).unwrap();
         }
-
-        // All 100 dispatches succeeded — handlers were selected.
-        assert_eq!(node1_count, 100);
     }
 
     #[test]
@@ -315,15 +323,11 @@ mod tests {
         // Same routing key should always go to the same handler.
         let mut cmd1 = make_command("CreateOrder");
         cmd1.routing_key = Some(RoutingKey("order-123".into()));
-        let (p1, _) = bus.dispatch(cmd1).unwrap();
+        let (_p1, _) = bus.dispatch(cmd1).unwrap();
 
         let mut cmd2 = make_command("CreateOrder");
         cmd2.routing_key = Some(RoutingKey("order-123".into()));
-        let (p2, _) = bus.dispatch(cmd2).unwrap();
-
-        // Both should route to the same handler (same routing key).
-        // We can't directly check which handler was selected from the outside,
-        // but the test verifies the dispatch path doesn't crash.
+        let (_p2, _) = bus.dispatch(cmd2).unwrap();
     }
 
     #[test]

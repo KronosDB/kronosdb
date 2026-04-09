@@ -9,30 +9,54 @@ use kronosdb_eventstore::append::{AppendCondition, AppendRequest};
 use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
 use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
 use kronosdb_eventstore::error::Error;
+use kronosdb_raft::cluster::ClusterManager;
 
 use crate::proto::kronosdb::eventstore as pb;
 use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer as GrpcEventStoreServer;
 
+/// Default context name when no `kronosdb-context` header is provided.
+const DEFAULT_CONTEXT: &str = "default";
+
+/// gRPC metadata header key for context routing.
+const CONTEXT_HEADER: &str = "kronosdb-context";
+
 /// gRPC service implementation for the event store.
 ///
-/// Programs against the `EventStore` trait, not the concrete engine.
-/// All operations on EventStore take `&self` (interior mutability),
-/// so no Mutex wrapper is needed. Reads proceed concurrently.
+/// Routes requests to the correct context based on the `kronosdb-context`
+/// gRPC metadata header. Defaults to "default" if not provided.
+///
+/// Uses `ClusterManager` to get the event store — which returns either a raw
+/// `EventStoreEngine` (standalone) or a `RaftEventStore` decorator (clustered).
+///
 /// All engine calls are dispatched to `spawn_blocking` to avoid
 /// blocking the tokio async worker threads with synchronous file I/O.
 pub struct EventStoreService {
-    store: Arc<dyn EventStore>,
+    cluster: Arc<ClusterManager>,
 }
 
 impl EventStoreService {
-    pub fn new(store: Box<dyn EventStore>) -> Self {
-        Self {
-            store: Arc::from(store),
-        }
+    pub fn new(cluster: Arc<ClusterManager>) -> Self {
+        Self { cluster }
     }
 
     pub fn into_server(self) -> GrpcEventStoreServer<Self> {
         GrpcEventStoreServer::new(self)
+    }
+
+    /// Extracts the context name from gRPC request metadata.
+    fn extract_context<T>(request: &Request<T>) -> &str {
+        request
+            .metadata()
+            .get(CONTEXT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(DEFAULT_CONTEXT)
+    }
+
+    /// Gets an event store for the context (raw engine or Raft decorator).
+    fn get_store(&self, context_name: &str) -> Result<Arc<dyn EventStore>, Status> {
+        self.cluster
+            .get_store(context_name)
+            .map_err(to_status)
     }
 }
 
@@ -45,6 +69,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         request: Request<Streaming<pb::AppendRequest>>,
     ) -> Result<Response<pb::AppendResponse>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
         let mut stream = request.into_inner();
         let mut all_events = Vec::new();
         let mut condition = None;
@@ -63,7 +88,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
             events: all_events,
         };
 
-        let store = Arc::clone(&self.store);
+        let store = self.get_store(&context_name)?;
         let response = tokio::task::spawn_blocking(move || {
             store.append(request)
         })
@@ -82,11 +107,12 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         request: Request<pb::SourceRequest>,
     ) -> Result<Response<Self::SourceStream>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
         let req = request.into_inner();
         let from_position = Position(req.from_sequence as u64);
         let condition = from_proto_criteria(req.criteria);
 
-        let store = Arc::clone(&self.store);
+        let store = self.get_store(&context_name)?;
         let condition_clone = condition.clone();
         let (events, committed) = tokio::task::spawn_blocking(move || {
             let events = store.source(from_position, &condition_clone)?;
@@ -126,23 +152,24 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         request: Request<pb::StreamRequest>,
     ) -> Result<Response<Self::StreamStream>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
         let req = request.into_inner();
         let from_position = Position(req.from_sequence as u64);
         let condition = from_proto_criteria(req.criteria);
 
-        let mut event_stream = self.store.subscribe(from_position, condition.clone());
+        let store = self.get_store(&context_name)?;
+        let mut event_stream = store.subscribe(from_position, condition.clone());
 
-        let store = Arc::clone(&self.store);
         let (tx, rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
             // First: send historical events.
             let historical = {
-                let store = Arc::clone(&store);
+                let store2 = Arc::clone(&store);
                 let condition = condition.clone();
                 let cursor = event_stream.cursor;
                 tokio::task::spawn_blocking(move || {
-                    store.source(cursor, &condition)
+                    store2.source(cursor, &condition)
                 })
                 .await
             };
@@ -176,11 +203,11 @@ impl pb::event_store_server::EventStore for EventStoreService {
                 let _committed = event_stream.wait_for_new_events().await;
 
                 let new_events = {
-                    let store = Arc::clone(&store);
+                    let store2 = Arc::clone(&store);
                     let condition = condition.clone();
                     let cursor = event_stream.cursor;
                     tokio::task::spawn_blocking(move || {
-                        store.source(cursor, &condition)
+                        store2.source(cursor, &condition)
                     })
                     .await
                 };
@@ -216,9 +243,10 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
     async fn get_head(
         &self,
-        _request: Request<pb::GetHeadRequest>,
+        request: Request<pb::GetHeadRequest>,
     ) -> Result<Response<pb::GetHeadResponse>, Status> {
-        let store = Arc::clone(&self.store);
+        let context_name = Self::extract_context(&request).to_string();
+        let store = self.get_store(&context_name)?;
         let head = tokio::task::spawn_blocking(move || {
             store.head()
         })
@@ -232,9 +260,10 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
     async fn get_tail(
         &self,
-        _request: Request<pb::GetTailRequest>,
+        request: Request<pb::GetTailRequest>,
     ) -> Result<Response<pb::GetTailResponse>, Status> {
-        let store = Arc::clone(&self.store);
+        let context_name = Self::extract_context(&request).to_string();
+        let store = self.get_store(&context_name)?;
         let tail = tokio::task::spawn_blocking(move || {
             store.tail()
         })
@@ -250,10 +279,11 @@ impl pb::event_store_server::EventStore for EventStoreService {
         &self,
         request: Request<pb::GetTagsRequest>,
     ) -> Result<Response<pb::GetTagsResponse>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
         let req = request.into_inner();
         let position = Position(req.sequence as u64);
 
-        let store = Arc::clone(&self.store);
+        let store = self.get_store(&context_name)?;
         let tags = tokio::task::spawn_blocking(move || {
             store.get_tags(position)
         })
@@ -348,6 +378,9 @@ fn to_status(e: Error) -> Status {
         }
         Error::InvalidContextName { name, reason } => {
             Status::invalid_argument(format!("invalid context name '{name}': {reason}"))
+        }
+        Error::SnapshotNotFound { key } => {
+            Status::not_found(format!("snapshot not found: {key}"))
         }
     }
 }

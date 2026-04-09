@@ -33,6 +33,11 @@ pub enum Error {
         name: String,
         reason: String,
     },
+
+    /// Snapshot not found.
+    SnapshotNotFound {
+        key: String,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -60,6 +65,7 @@ impl std::fmt::Display for Error {
             Error::InvalidContextName { name, reason } => {
                 write!(f, "invalid context name '{name}': {reason}")
             }
+            Error::SnapshotNotFound { key } => write!(f, "snapshot not found: {key}"),
         }
     }
 }

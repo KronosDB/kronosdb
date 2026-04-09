@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::handler::HandlerRegistry;
 use crate::query::PendingQuery;
-use crate::types::{ClientId, ComponentName, Metadata, Payload};
+use crate::types::{ClientId, ComponentName, ErrorDetail, Metadata, Payload};
 
 /// A subscription query — initial query + ongoing updates.
 #[derive(Debug, Clone)]
@@ -40,8 +40,8 @@ pub struct SubscriptionUpdate {
     pub metadata: Metadata,
     /// Error code, if the update represents an error.
     pub error_code: Option<String>,
-    /// Error message.
-    pub error_message: Option<String>,
+    /// Full error detail preserving the complete error context.
+    pub error: Option<ErrorDetail>,
 }
 
 /// Error related to subscription queries.
@@ -171,6 +171,7 @@ impl SubscriptionRegistry {
                 timestamp: query.timestamp,
                 payload: query.payload,
                 metadata: query.metadata,
+                processing_instructions: vec![],
                 client_id: query.client_id,
                 component_name: query.component_name,
                 expected_results: 1,
@@ -254,7 +255,7 @@ mod tests {
                 revision: "1".to_string(),
                 data: vec![],
             },
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
             client_id: client("subscriber"),
             component_name: component("dashboard"),
             initial_permits: 10,
@@ -300,9 +301,9 @@ mod tests {
                 revision: "1".into(),
                 data: b"42".to_vec(),
             }),
-            metadata: vec![],
+            metadata: std::collections::HashMap::new(),
             error_code: None,
-            error_message: None,
+            error: None,
         });
 
         // Subscriber receives it.

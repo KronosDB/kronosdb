@@ -7,11 +7,21 @@ license.workspace = true
 [dependencies]
 kronosdb-eventstore = { path = "../kronosdb-eventstore" }
 kronosdb-messaging = { path = "../kronosdb-messaging" }
-tonic = "0.13"
+kronosdb-raft = { path = "../kronosdb-raft" }
+tonic = { version = "0.13", features = ["tls-ring", "transport"] }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
 tokio-stream = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
 
 [build-dependencies]
 tonic-build = "0.13"

@@ -113,14 +113,25 @@ impl SegmentWriter {
         })
     }
 
-    /// Appends a batch of events to the log as a single durable write.
+    /// Appends a batch of events to the log and fsyncs immediately.
     ///
-    /// All events are written and then fdatasync'd together (group commit).
-    /// Returns the position of the first event and the total count.
-    ///
-    /// This does NOT check DCB conditions — that's the caller's responsibility.
-    /// The caller should check conditions, then call this method.
+    /// All events are written and then fdatasync'd together.
+    /// For higher throughput under concurrent load, use `write_events` + `sync`
+    /// separately to batch fsyncs across multiple callers.
     pub fn append(&mut self, events: &[AppendEvent]) -> Result<(Position, u32), Error> {
+        let result = self.write_events(events)?;
+        if result.1 > 0 {
+            self.sync()?;
+        }
+        Ok(result)
+    }
+
+    /// Writes events to the segment WITHOUT fsyncing.
+    ///
+    /// Events are written to the OS page cache but not guaranteed durable.
+    /// Call `sync()` after to make them durable. This enables group commit:
+    /// multiple callers write events, then a single `sync()` makes them all durable.
+    pub fn write_events(&mut self, events: &[AppendEvent]) -> Result<(Position, u32), Error> {
         if events.is_empty() {
             return Ok((self.next_position, 0));
         }
@@ -139,27 +150,22 @@ impl SegmentWriter {
                 tags: event.tags.clone(),
             };
 
-            // Serialize the event payload.
             self.serialize_buf.clear();
             format::serialize_event(&stored, &mut self.serialize_buf);
 
-            // Build the full record: CRC32C + record_len + flags + payload.
-            let payload_with_flags_len = 1 + self.serialize_buf.len(); // flags byte + serialized event
+            let payload_with_flags_len = 1 + self.serialize_buf.len();
             let total_record_size = RECORD_HEADER_SIZE + self.serialize_buf.len();
 
-            // Check if we need to rotate to a new segment.
             if self.write_offset + total_record_size as u64 > self.max_segment_size {
                 self.rotate_segment()?;
             }
 
-            // Compute CRC32C over flags + payload (NOT over CRC or record_len).
             let crc = {
                 let mut digest = crc32c::crc32c(&[flags::NONE]);
                 digest = crc32c::crc32c_append(digest, &self.serialize_buf);
                 digest
             };
 
-            // Write the record.
             self.record_buf.clear();
             self.record_buf.extend_from_slice(&crc.to_le_bytes());
             self.record_buf
@@ -172,15 +178,23 @@ impl SegmentWriter {
             self.next_position = self.next_position.next();
         }
 
-        // Single fdatasync for the entire batch — group commit.
-        fdatasync(&self.active_file)?;
-
         Ok((first_position, events.len() as u32))
+    }
+
+    /// Fsyncs the active segment to disk, making all written events durable.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        fdatasync(&self.active_file)?;
+        Ok(())
     }
 
     /// Returns the current head position (next position to be assigned).
     pub fn head(&self) -> Position {
         self.next_position
+    }
+
+    /// Returns the base position of the currently active segment.
+    pub fn active_base_position(&self) -> u64 {
+        self.active_base_position
     }
 
     /// Returns the path to the currently active segment file.

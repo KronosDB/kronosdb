@@ -1,4 +1,4 @@
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::command::{Command, CommandError, CommandResult, PendingCommand};
 use crate::query::{PendingQuery, Query, QueryError};
@@ -69,11 +69,11 @@ pub trait QueryDispatcher: Send + Sync {
 /// to subscribers whenever the answer changes.
 pub trait SubscriptionQueryDispatcher: Send + Sync {
     /// Opens a subscription query. Routes to a handler and returns
-    /// the pending query to deliver.
+    /// the pending query to deliver and a receiver for streaming updates.
     fn subscribe(
         &self,
         query: SubscriptionQuery,
-    ) -> Result<PendingQuery, SubscriptionError>;
+    ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError>;
 
     /// Sends an update from a handler to a subscription query subscriber.
     fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate);

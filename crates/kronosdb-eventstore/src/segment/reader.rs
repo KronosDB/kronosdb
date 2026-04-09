@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::Mmap;
 
@@ -13,8 +14,11 @@ use crate::segment::{
 ///
 /// This is designed for sealed (immutable) segments. For the active segment,
 /// the caller should limit reads to the committed position.
+///
+/// The mmap is Arc-wrapped so sealed segments can share a single mapping
+/// via the cache, avoiding repeated open()/mmap() syscalls.
 pub struct SegmentReader {
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     base_position: u64,
 }
 
@@ -23,7 +27,16 @@ impl SegmentReader {
     pub fn open(path: &Path) -> Result<Self, Error> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        Self::from_mmap(Arc::new(mmap))
+    }
 
+    /// Creates a reader from a shared mmap handle (e.g., from the cache).
+    /// Validates the segment header.
+    pub fn from_shared_mmap(mmap: Arc<Mmap>) -> Result<Self, Error> {
+        Self::from_mmap(mmap)
+    }
+
+    fn from_mmap(mmap: Arc<Mmap>) -> Result<Self, Error> {
         if mmap.len() < SEGMENT_HEADER_SIZE {
             return Err(Error::Corrupted {
                 message: "segment file too small for header".into(),

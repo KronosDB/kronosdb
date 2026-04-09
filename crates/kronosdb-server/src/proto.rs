@@ -15,4 +15,16 @@ pub mod kronosdb {
     pub mod query {
         tonic::include_proto!("kronosdb.query");
     }
+
+    pub mod platform {
+        tonic::include_proto!("kronosdb.platform");
+    }
+
+    pub mod snapshot {
+        tonic::include_proto!("kronosdb.snapshot");
+    }
+
+    pub mod raft {
+        tonic::include_proto!("kronosdb.raft");
+    }
 }
