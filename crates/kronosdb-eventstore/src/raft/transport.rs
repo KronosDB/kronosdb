@@ -11,9 +11,9 @@ use openraft::Raft;
 use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
-use crate::proto;
-use crate::proto::raft_transport_server::RaftTransport;
-use crate::types::{RaftRequest, TypeConfig};
+use super::proto;
+use super::proto::raft_transport_server::RaftTransport;
+use super::types::{RaftRequest, TypeConfig};
 
 pub type RaftNode = Raft<TypeConfig>;
 
@@ -66,8 +66,9 @@ impl RaftTransport for RaftTransportService {
         request: Request<proto::RaftAppendEntriesRequest>,
     ) -> Result<Response<proto::RaftAppendEntriesResponse>, Status> {
         let req: openraft::raft::AppendEntriesRequest<TypeConfig> =
-            bincode::deserialize(&request.into_inner().data)
-                .map_err(|e| Status::invalid_argument(format!("deserialize append_entries: {e}")))?;
+            bincode::deserialize(&request.into_inner().data).map_err(|e| {
+                Status::invalid_argument(format!("deserialize append_entries: {e}"))
+            })?;
 
         let resp = self
             .default_raft
@@ -86,8 +87,9 @@ impl RaftTransport for RaftTransportService {
         request: Request<proto::RaftInstallSnapshotRequest>,
     ) -> Result<Response<proto::RaftInstallSnapshotResponse>, Status> {
         let req: openraft::raft::InstallSnapshotRequest<TypeConfig> =
-            bincode::deserialize(&request.into_inner().data)
-                .map_err(|e| Status::invalid_argument(format!("deserialize install_snapshot: {e}")))?;
+            bincode::deserialize(&request.into_inner().data).map_err(|e| {
+                Status::invalid_argument(format!("deserialize install_snapshot: {e}"))
+            })?;
 
         let resp = self
             .default_raft

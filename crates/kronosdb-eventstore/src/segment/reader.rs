@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::event::{Position, StoredEvent};
 
 use crate::segment::{
-    format, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
+    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, format,
 };
 
 /// Reads events from a segment file using memory-mapped I/O.
@@ -78,6 +78,72 @@ impl SegmentReader {
             up_to,
         }
     }
+
+    /// Returns an iterator that also yields the byte offset of each record.
+    /// Used during index building to populate the position→offset table.
+    pub fn iter_with_offsets(&self, up_to: Option<Position>) -> OffsetTrackingIterator<'_> {
+        OffsetTrackingIterator {
+            inner: SegmentIterator {
+                data: &self.mmap,
+                offset: SEGMENT_HEADER_SIZE,
+                up_to,
+            },
+        }
+    }
+
+    /// Reads a single event at the given byte offset within the segment.
+    /// Used for direct seeks when the offset table is available.
+    ///
+    /// This skips all events between the segment header and the target offset,
+    /// reading only the one event at the specified location.
+    pub fn read_event_at(&self, byte_offset: usize) -> Result<StoredEvent, Error> {
+        let data = &*self.mmap;
+
+        if byte_offset + RECORD_HEADER_SIZE > data.len() {
+            return Err(Error::Corrupted {
+                message: format!("offset {byte_offset} beyond segment bounds"),
+            });
+        }
+
+        // Read record header.
+        let stored_crc = u32::from_le_bytes(data[byte_offset..byte_offset + 4].try_into().unwrap());
+        let record_len =
+            u32::from_le_bytes(data[byte_offset + 4..byte_offset + 8].try_into().unwrap()) as usize;
+        let flags_byte = data[byte_offset + 8];
+
+        if record_len == 0 {
+            return Err(Error::Corrupted {
+                message: format!("zero-length record at offset {byte_offset}"),
+            });
+        }
+
+        let payload_len = record_len - 1;
+        let payload_start = byte_offset + RECORD_HEADER_SIZE;
+        let payload_end = payload_start + payload_len;
+
+        if payload_end > data.len() {
+            return Err(Error::Corrupted {
+                message: format!("record at offset {byte_offset} extends beyond segment"),
+            });
+        }
+
+        let payload = &data[payload_start..payload_end];
+
+        // Verify CRC.
+        let computed_crc = {
+            let digest = crc32c::crc32c(&[flags_byte]);
+            crc32c::crc32c_append(digest, payload)
+        };
+
+        if computed_crc != stored_crc {
+            return Err(Error::Corrupted {
+                message: format!("CRC mismatch at offset {byte_offset}"),
+            });
+        }
+
+        let (event, _) = format::deserialize_event(payload)?;
+        Ok(event)
+    }
 }
 
 /// Iterates over event records in a segment.
@@ -100,8 +166,11 @@ impl<'a> Iterator for SegmentIterator<'a> {
             let header_start = self.offset;
 
             // Read record header.
-            let stored_crc =
-                u32::from_le_bytes(self.data[header_start..header_start + 4].try_into().unwrap());
+            let stored_crc = u32::from_le_bytes(
+                self.data[header_start..header_start + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             let record_len = u32::from_le_bytes(
                 self.data[header_start + 4..header_start + 8]
                     .try_into()
@@ -157,13 +226,31 @@ impl<'a> Iterator for SegmentIterator<'a> {
     }
 }
 
+/// Like SegmentIterator but also yields the byte offset of each record's header.
+/// Used during index building to populate the position→offset table.
+pub struct OffsetTrackingIterator<'a> {
+    inner: SegmentIterator<'a>,
+}
+
+impl<'a> Iterator for OffsetTrackingIterator<'a> {
+    /// (byte_offset_of_record_header, Result<StoredEvent>)
+    type Item = (usize, Result<StoredEvent, Error>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Capture the offset BEFORE the inner iterator advances past the record.
+        let record_start = self.inner.offset;
+        let result = self.inner.next()?;
+        Some((record_start, result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::writer::SegmentWriter;
-    use crate::segment::DEFAULT_SEGMENT_SIZE;
     use crate::event::AppendEvent;
     use crate::event::Tag;
+    use crate::segment::DEFAULT_SEGMENT_SIZE;
+    use crate::segment::writer::SegmentWriter;
 
     fn make_event(name: &str, payload: &[u8]) -> AppendEvent {
         AppendEvent {
@@ -182,8 +269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Write events.
-        let mut writer =
-            SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
         let events = vec![
             make_event("OrderPlaced", b"order-data"),
             make_event("PaymentReceived", b"payment-data"),
@@ -202,15 +288,17 @@ mod tests {
         assert_eq!(read_events[0].payload, b"order-data");
         assert_eq!(read_events[1].position, Position(2));
         assert_eq!(read_events[1].name, "PaymentReceived");
-        assert_eq!(read_events[1].metadata, vec![("key".into(), "value".into())]);
+        assert_eq!(
+            read_events[1].metadata,
+            vec![("key".into(), "value".into())]
+        );
     }
 
     #[test]
     fn read_with_position_limit() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut writer =
-            SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
         for i in 0..5 {
             let event = make_event(&format!("Event{i}"), b"data");
             writer.append(&[event]).unwrap();

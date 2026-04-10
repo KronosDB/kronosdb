@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -59,10 +61,16 @@ impl std::fmt::Display for SubscriptionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoHandlerAvailable { query_name } => {
-                write!(f, "no handler available for subscription query '{query_name}'")
+                write!(
+                    f,
+                    "no handler available for subscription query '{query_name}'"
+                )
             }
             Self::NoPermitsAvailable { query_name } => {
-                write!(f, "all handlers at capacity for subscription query '{query_name}'")
+                write!(
+                    f,
+                    "all handlers at capacity for subscription query '{query_name}'"
+                )
             }
             Self::SubscriptionNotFound { subscription_id } => {
                 write!(f, "subscription not found: '{subscription_id}'")
@@ -71,12 +79,29 @@ impl std::fmt::Display for SubscriptionError {
     }
 }
 
+/// Summary of an active subscription query, for admin display.
+#[derive(Debug, Clone)]
+pub struct SubscriptionInfo {
+    pub subscription_id: String,
+    pub query_name: String,
+    pub subscriber_client_id: ClientId,
+    pub subscriber_component: ComponentName,
+    pub handler_client_id: ClientId,
+    pub since_opened: Duration,
+}
+
 /// An active subscription — tracks the channel for sending updates to the subscriber.
 struct ActiveSubscription {
     /// The subscriber's client ID.
     client_id: ClientId,
     /// The handler's client ID that is providing updates.
     handler_client_id: ClientId,
+    /// The query name this subscription is for.
+    query_name: String,
+    /// The component name of the subscriber.
+    component_name: ComponentName,
+    /// When this subscription was opened.
+    opened_at: Instant,
     /// Channel to send updates to the subscriber.
     update_tx: mpsc::Sender<SubscriptionUpdate>,
 }
@@ -86,26 +111,28 @@ struct ActiveSubscription {
 /// Manages the lifecycle of subscription queries: opening, updating,
 /// completing, and cancelling.
 pub struct SubscriptionRegistry {
-    /// Query handler registry (shared with QueryBus for handler lookup).
-    handlers: RwLock<HandlerRegistry>,
+    /// Query handler registry — shared with QueryBus so subscription queries
+    /// can find handlers registered via the regular query bus.
+    handlers: Arc<RwLock<HandlerRegistry>>,
     /// Active subscriptions, keyed by subscription_id.
     active: RwLock<HashMap<String, ActiveSubscription>>,
 }
 
 impl SubscriptionRegistry {
+    /// Creates a registry with its own handler registry (for testing).
     pub fn new() -> Self {
         Self {
-            handlers: RwLock::new(HandlerRegistry::new()),
+            handlers: Arc::new(RwLock::new(HandlerRegistry::new())),
             active: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Creates the registry with a shared handler registry.
-    /// In practice, the query handlers serve both regular queries
-    /// and subscription queries.
-    pub fn with_handlers(handlers: HandlerRegistry) -> Self {
+    /// Creates the registry sharing the QueryBus's handler registry.
+    /// This is the correct constructor for production use — subscription queries
+    /// need to find the same handlers that serve regular queries.
+    pub fn with_shared_handlers(handlers: Arc<RwLock<HandlerRegistry>>) -> Self {
         Self {
-            handlers: RwLock::new(handlers),
+            handlers,
             active: RwLock::new(HashMap::new()),
         }
     }
@@ -131,11 +158,11 @@ impl SubscriptionRegistry {
         query: SubscriptionQuery,
     ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError> {
         let handlers = self.handlers.read();
-        let handler_list = handlers
-            .get_handlers(&query.query_name)
-            .ok_or_else(|| SubscriptionError::NoHandlerAvailable {
+        let handler_list = handlers.get_handlers(&query.query_name).ok_or_else(|| {
+            SubscriptionError::NoHandlerAvailable {
                 query_name: query.query_name.clone(),
-            })?;
+            }
+        })?;
 
         if handler_list.is_empty() {
             return Err(SubscriptionError::NoHandlerAvailable {
@@ -159,6 +186,9 @@ impl SubscriptionRegistry {
         let subscription = ActiveSubscription {
             client_id: query.client_id.clone(),
             handler_client_id: handler_client_id.clone(),
+            query_name: query.query_name.clone(),
+            component_name: query.component_name.clone(),
+            opened_at: Instant::now(),
             update_tx,
         };
 
@@ -231,6 +261,23 @@ impl SubscriptionRegistry {
         let active = self.active.read();
         active.len()
     }
+
+    /// Returns details of all active subscriptions, for admin display.
+    pub fn list_active(&self) -> Vec<SubscriptionInfo> {
+        let now = Instant::now();
+        let active = self.active.read();
+        active
+            .iter()
+            .map(|(id, sub)| SubscriptionInfo {
+                subscription_id: id.clone(),
+                query_name: sub.query_name.clone(),
+                subscriber_client_id: sub.client_id.clone(),
+                subscriber_component: sub.component_name.clone(),
+                handler_client_id: sub.handler_client_id.clone(),
+                since_opened: now.duration_since(sub.opened_at),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -265,7 +312,11 @@ mod tests {
     #[test]
     fn open_subscription() {
         let registry = SubscriptionRegistry::new();
-        registry.subscribe_handler("GetOrderCount".into(), client("handler-1"), component("order-service"));
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
 
         // Grant permits to the handler.
         {
@@ -284,7 +335,11 @@ mod tests {
     #[test]
     fn send_update() {
         let registry = SubscriptionRegistry::new();
-        registry.subscribe_handler("GetOrderCount".into(), client("handler-1"), component("order-service"));
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
         {
             let handlers = registry.handlers.read();
             handlers.grant_permits(&client("handler-1"), 10);
@@ -294,17 +349,20 @@ mod tests {
         let (_pending, mut rx) = registry.open(sub).unwrap();
 
         // Handler sends an update.
-        registry.send_update("sub-1", SubscriptionUpdate {
-            subscription_id: "sub-1".into(),
-            payload: Some(Payload {
-                payload_type: "OrderCount".into(),
-                revision: "1".into(),
-                data: b"42".to_vec(),
-            }),
-            metadata: std::collections::HashMap::new(),
-            error_code: None,
-            error: None,
-        });
+        registry.send_update(
+            "sub-1",
+            SubscriptionUpdate {
+                subscription_id: "sub-1".into(),
+                payload: Some(Payload {
+                    payload_type: "OrderCount".into(),
+                    revision: "1".into(),
+                    data: b"42".to_vec(),
+                }),
+                metadata: std::collections::HashMap::new(),
+                error_code: None,
+                error: None,
+            },
+        );
 
         // Subscriber receives it.
         let update = rx.try_recv().unwrap();
@@ -314,7 +372,11 @@ mod tests {
     #[test]
     fn complete_subscription_closes_channel() {
         let registry = SubscriptionRegistry::new();
-        registry.subscribe_handler("GetOrderCount".into(), client("handler-1"), component("order-service"));
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
         {
             let handlers = registry.handlers.read();
             handlers.grant_permits(&client("handler-1"), 10);
@@ -333,7 +395,11 @@ mod tests {
     #[test]
     fn cancel_subscription() {
         let registry = SubscriptionRegistry::new();
-        registry.subscribe_handler("GetOrderCount".into(), client("handler-1"), component("order-service"));
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
         {
             let handlers = registry.handlers.read();
             handlers.grant_permits(&client("handler-1"), 10);
@@ -351,13 +417,20 @@ mod tests {
         let registry = SubscriptionRegistry::new();
         let sub = make_subscription("sub-1", "NonExistent");
         let result = registry.open(sub);
-        assert!(matches!(result, Err(SubscriptionError::NoHandlerAvailable { .. })));
+        assert!(matches!(
+            result,
+            Err(SubscriptionError::NoHandlerAvailable { .. })
+        ));
     }
 
     #[test]
     fn remove_client_cleans_up_subscriptions() {
         let registry = SubscriptionRegistry::new();
-        registry.subscribe_handler("GetOrderCount".into(), client("handler-1"), component("order-service"));
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
         {
             let handlers = registry.handlers.read();
             handlers.grant_permits(&client("handler-1"), 10);

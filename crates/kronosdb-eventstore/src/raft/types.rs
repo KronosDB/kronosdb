@@ -5,9 +5,9 @@ use openraft::Config;
 use openraft::Entry;
 use serde::{Deserialize, Serialize};
 
-use kronosdb_eventstore::event::AppendEvent;
-use kronosdb_eventstore::criteria::SourcingCondition;
-use kronosdb_eventstore::event::Position;
+use crate::criteria::SourcingCondition;
+use crate::event::AppendEvent;
+use crate::event::Position;
 
 /// Node ID type — simple u64.
 pub type NodeId = u64;
@@ -42,9 +42,7 @@ pub enum RaftRequest {
         condition: Option<RaftAppendCondition>,
     },
     /// Create a new context.
-    CreateContext {
-        name: String,
-    },
+    CreateContext { name: String },
 }
 
 /// Application response returned after applying a Raft log entry.
@@ -99,7 +97,11 @@ impl RaftAppendEvent {
             timestamp: e.timestamp,
             payload: e.payload.clone(),
             metadata: e.metadata.clone(),
-            tags: e.tags.iter().map(|t| (t.key.clone(), t.value.clone())).collect(),
+            tags: e
+                .tags
+                .iter()
+                .map(|t| (t.key.clone(), t.value.clone()))
+                .collect(),
         }
     }
 
@@ -111,19 +113,21 @@ impl RaftAppendEvent {
             timestamp: self.timestamp,
             payload: self.payload.clone(),
             metadata: self.metadata.clone(),
-            tags: self.tags.iter().map(|(k, v)| {
-                kronosdb_eventstore::event::Tag {
+            tags: self
+                .tags
+                .iter()
+                .map(|(k, v)| crate::event::Tag {
                     key: k.clone(),
                     value: v.clone(),
-                }
-            }).collect(),
+                })
+                .collect(),
         }
     }
 }
 
 impl RaftAppendCondition {
-    pub fn to_condition(&self) -> kronosdb_eventstore::append::AppendCondition {
-        kronosdb_eventstore::append::AppendCondition {
+    pub fn to_condition(&self) -> crate::append::AppendCondition {
+        crate::append::AppendCondition {
             consistency_marker: Position(self.consistency_marker),
             criteria: SourcingCondition {
                 criteria: self.criteria.iter().map(|c| c.to_criterion()).collect(),
@@ -133,15 +137,17 @@ impl RaftAppendCondition {
 }
 
 impl RaftCriterion {
-    pub fn to_criterion(&self) -> kronosdb_eventstore::criteria::Criterion {
-        kronosdb_eventstore::criteria::Criterion {
+    pub fn to_criterion(&self) -> crate::criteria::Criterion {
+        crate::criteria::Criterion {
             names: self.names.clone(),
-            tags: self.tags.iter().map(|(k, v)| {
-                kronosdb_eventstore::event::Tag {
+            tags: self
+                .tags
+                .iter()
+                .map(|(k, v)| crate::event::Tag {
                     key: k.clone(),
                     value: v.clone(),
-                }
-            }).collect(),
+                })
+                .collect(),
         }
     }
 }

@@ -14,7 +14,7 @@ use openraft::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NodeId, TypeConfig};
+use super::types::{NodeId, TypeConfig};
 
 /// Vote persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -115,9 +115,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock();
         inner.vote.vote = Some(*vote);
-        write_vote(&inner.dir, &inner.vote).map_err(|e| {
-            StorageError::from_io_error(ErrorSubject::Vote, ErrorVerb::Write, e)
-        })?;
+        write_vote(&inner.dir, &inner.vote)
+            .map_err(|e| StorageError::from_io_error(ErrorSubject::Vote, ErrorVerb::Write, e))?;
         Ok(())
     }
 
@@ -201,8 +200,7 @@ fn purged_path(dir: &Path) -> PathBuf {
 }
 
 fn write_vote(dir: &Path, vote: &PersistedVote) -> Result<(), io::Error> {
-    let data =
-        bincode::serialize(vote).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let data = bincode::serialize(vote).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     atomic_write(&vote_path(dir), &data)
 }
 
@@ -213,8 +211,7 @@ fn read_vote(dir: &Path) -> Option<PersistedVote> {
 
 fn write_log(dir: &Path, log: &BTreeMap<u64, Entry<TypeConfig>>) -> Result<(), io::Error> {
     let entries: Vec<_> = log.values().cloned().collect();
-    let data =
-        bincode::serialize(&entries).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let data = bincode::serialize(&entries).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     atomic_write(&log_path(dir), &data)
 }
 
@@ -229,8 +226,7 @@ fn read_log(dir: &Path) -> Option<BTreeMap<u64, Entry<TypeConfig>>> {
 }
 
 fn write_purged(dir: &Path, log_id: &LogId<NodeId>) -> Result<(), io::Error> {
-    let data =
-        bincode::serialize(log_id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let data = bincode::serialize(log_id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     atomic_write(&purged_path(dir), &data)
 }
 
@@ -420,10 +416,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = LogStore::new(dir.path()).unwrap();
 
-        store.test_insert_entries(vec![
-            blank_entry(1, 1),
-            blank_entry(1, 2),
-        ]);
+        store.test_insert_entries(vec![blank_entry(1, 1), blank_entry(1, 2)]);
 
         let mut reader = store.get_log_reader().await;
         let entries = reader.try_get_log_entries(1..3).await.unwrap();

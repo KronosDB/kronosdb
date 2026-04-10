@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use tokio::sync::oneshot;
 
-use crate::handler::HandlerRegistry;
-use crate::types::{ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction, RoutingKey};
+use crate::handler::{HandlerRegistry, MessageTypeDetail, MessageTypeMetrics, MetricsSnapshot};
+use crate::types::{
+    ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction, RoutingKey,
+};
 
 /// A command to be dispatched.
 #[derive(Debug, Clone)]
@@ -83,6 +86,8 @@ pub struct PendingCommand {
     pub response_tx: oneshot::Sender<CommandResult>,
     /// The client_id of the handler this command was routed to.
     pub target_handler: ClientId,
+    /// When this command was dispatched (for latency tracking).
+    pub dispatched_at: Instant,
 }
 
 /// The command bus. Routes commands to registered handlers.
@@ -92,10 +97,18 @@ pub struct PendingCommand {
 pub struct CommandBus {
     handlers: RwLock<HandlerRegistry>,
     /// Commands that have been dispatched and are awaiting responses.
-    /// Keyed by the command's message_id.
-    pending: RwLock<HashMap<String, oneshot::Sender<CommandResult>>>,
+    /// Keyed by the command's message_id → (sender, command_name, dispatched_at).
+    pending: RwLock<HashMap<String, (oneshot::Sender<CommandResult>, String, Instant)>>,
     /// Round-robin counter for load balancing.
     dispatch_counter: AtomicU64,
+    /// Per-command-type dispatch metrics. Lock-free atomics inside.
+    metrics: RwLock<HashMap<String, MessageTypeMetrics>>,
+}
+
+impl Default for CommandBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommandBus {
@@ -104,6 +117,7 @@ impl CommandBus {
             handlers: RwLock::new(HandlerRegistry::new()),
             pending: RwLock::new(HashMap::new()),
             dispatch_counter: AtomicU64::new(0),
+            metrics: RwLock::new(HashMap::new()),
         }
     }
 
@@ -145,15 +159,21 @@ impl CommandBus {
     ///
     /// Load balancing: weighted round-robin based on load_factor.
     /// Routing key: if present, consistent hashing to the same handler.
-    pub fn dispatch(&self, command: Command) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+    pub fn dispatch(
+        &self,
+        command: Command,
+    ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        let command_name = command.name.clone();
         let handlers = self.handlers.read();
-        let handler_list = handlers
-            .get_handlers(&command.name)
-            .ok_or_else(|| CommandError::NoHandlerAvailable {
+        let handler_list = handlers.get_handlers(&command.name).ok_or_else(|| {
+            self.record_no_handler(&command_name);
+            CommandError::NoHandlerAvailable {
                 command_name: command.name.clone(),
-            })?;
+            }
+        })?;
 
         if handler_list.is_empty() {
+            self.record_no_handler(&command_name);
             return Err(CommandError::NoHandlerAvailable {
                 command_name: command.name.clone(),
             });
@@ -193,6 +213,7 @@ impl CommandBus {
             match fallback {
                 Some(entry) => entry,
                 None => {
+                    self.record_no_permits(&command_name);
                     return Err(CommandError::NoPermitsAvailable {
                         command_name: command.name.clone(),
                     });
@@ -201,6 +222,10 @@ impl CommandBus {
         };
 
         let target_handler = selected.handler.client_id.clone();
+        let now = Instant::now();
+
+        // Record dispatch.
+        self.record_dispatched(&command_name);
 
         // Create the response channel.
         let (response_tx, response_rx) = oneshot::channel();
@@ -209,6 +234,7 @@ impl CommandBus {
             command,
             response_tx,
             target_handler,
+            dispatched_at: now,
         };
 
         Ok((pending, response_rx))
@@ -219,12 +245,94 @@ impl CommandBus {
         self.handlers.read().handler_stats()
     }
 
+    /// Returns detailed handler info + dispatch metrics per command type.
+    pub fn handler_details(&self) -> Vec<MessageTypeDetail> {
+        let handlers = self.handlers.read();
+        let details = handlers.handler_details();
+        let metrics = self.metrics.read();
+
+        details
+            .into_iter()
+            .map(|(name, handlers)| {
+                let snapshot = metrics
+                    .get(&name)
+                    .map(|m| m.snapshot())
+                    .unwrap_or_else(MetricsSnapshot::empty);
+                MessageTypeDetail {
+                    name,
+                    handlers,
+                    metrics: snapshot,
+                }
+            })
+            .collect()
+    }
+
     /// Completes a pending command with a response from the handler.
     /// Called when the handler sends a CommandResult back on its stream.
     pub fn complete(&self, request_id: &str, result: CommandResult) {
         let mut pending = self.pending.write();
-        if let Some(tx) = pending.remove(request_id) {
+        if let Some((tx, command_name, dispatched_at)) = pending.remove(request_id) {
+            let duration_us = dispatched_at.elapsed().as_micros() as u64;
+            let is_error = result.error_code.is_some();
+
+            if let Some(m) = self.metrics.read().get(&command_name) {
+                m.total_duration_us
+                    .fetch_add(duration_us, Ordering::Relaxed);
+                if is_error {
+                    m.failed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    m.succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
             let _ = tx.send(result);
+        }
+    }
+
+    /// Records a command completion from the gRPC layer (success/failure + latency).
+    /// Called when a response comes back from a handler.
+    pub fn record_completion(&self, command_name: &str, is_error: bool, duration_us: u64) {
+        self.get_or_create_metrics(command_name);
+        if let Some(m) = self.metrics.read().get(command_name) {
+            m.total_duration_us
+                .fetch_add(duration_us, Ordering::Relaxed);
+            if is_error {
+                m.failed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                m.succeeded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // ── Metrics helpers (cheap — just atomic increments) ────────────
+
+    fn get_or_create_metrics(&self, name: &str) {
+        // Fast path: already exists.
+        if self.metrics.read().contains_key(name) {
+            return;
+        }
+        // Slow path: insert.
+        self.metrics.write().entry(name.to_string()).or_default();
+    }
+
+    fn record_dispatched(&self, name: &str) {
+        self.get_or_create_metrics(name);
+        if let Some(m) = self.metrics.read().get(name) {
+            m.dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_no_handler(&self, name: &str) {
+        self.get_or_create_metrics(name);
+        if let Some(m) = self.metrics.read().get(name) {
+            m.no_handler.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_no_permits(&self, name: &str) {
+        self.get_or_create_metrics(name);
+        if let Some(m) = self.metrics.read().get(name) {
+            m.no_permits.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -271,7 +379,12 @@ mod tests {
     #[test]
     fn dispatch_to_single_handler() {
         let bus = CommandBus::new();
-        bus.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
         bus.grant_permits(&client("node-1"), 10);
 
         let cmd = make_command("CreateOrder");
@@ -284,25 +397,46 @@ mod tests {
         let bus = CommandBus::new();
         let cmd = make_command("NonExistent");
         let result = bus.dispatch(cmd);
-        assert!(matches!(result, Err(CommandError::NoHandlerAvailable { .. })));
+        assert!(matches!(
+            result,
+            Err(CommandError::NoHandlerAvailable { .. })
+        ));
     }
 
     #[test]
     fn no_permits_returns_error() {
         let bus = CommandBus::new();
-        bus.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
         // No permits granted.
 
         let cmd = make_command("CreateOrder");
         let result = bus.dispatch(cmd);
-        assert!(matches!(result, Err(CommandError::NoPermitsAvailable { .. })));
+        assert!(matches!(
+            result,
+            Err(CommandError::NoPermitsAvailable { .. })
+        ));
     }
 
     #[test]
     fn load_balancing_round_robin() {
         let bus = CommandBus::new();
-        bus.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
-        bus.subscribe("CreateOrder".into(), client("node-2"), component("order-service"), 100);
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-2"),
+            component("order-service"),
+            100,
+        );
         bus.grant_permits(&client("node-1"), 100);
         bus.grant_permits(&client("node-2"), 100);
 
@@ -315,8 +449,18 @@ mod tests {
     #[test]
     fn routing_key_consistent() {
         let bus = CommandBus::new();
-        bus.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
-        bus.subscribe("CreateOrder".into(), client("node-2"), component("order-service"), 100);
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-2"),
+            component("order-service"),
+            100,
+        );
         bus.grant_permits(&client("node-1"), 100);
         bus.grant_permits(&client("node-2"), 100);
 
@@ -333,13 +477,21 @@ mod tests {
     #[test]
     fn remove_client_cleans_up() {
         let bus = CommandBus::new();
-        bus.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
         bus.grant_permits(&client("node-1"), 10);
 
         bus.remove_client(&client("node-1"));
 
         let cmd = make_command("CreateOrder");
         let result = bus.dispatch(cmd);
-        assert!(matches!(result, Err(CommandError::NoHandlerAvailable { .. })));
+        assert!(matches!(
+            result,
+            Err(CommandError::NoHandlerAvailable { .. })
+        ));
     }
 }

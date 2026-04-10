@@ -5,6 +5,8 @@ use parking_lot::RwLock;
 
 use crate::api::MessagingPlatform;
 use crate::engine::MessagingEngine;
+use crate::handler::MessageTypeDetail;
+use crate::subscription::SubscriptionInfo;
 
 /// Manages per-context messaging engines.
 ///
@@ -12,6 +14,12 @@ use crate::engine::MessagingEngine;
 /// Handlers registered in one context are isolated from other contexts.
 pub struct MessagingManager {
     engines: RwLock<HashMap<String, Arc<MessagingEngine>>>,
+}
+
+impl Default for MessagingManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MessagingManager {
@@ -68,6 +76,36 @@ impl MessagingManager {
         let mut stats = Vec::new();
         for engine in engines.values() {
             stats.extend(engine.query_stats());
+        }
+        stats
+    }
+
+    /// Returns detailed command handler info + dispatch metrics, aggregated across all contexts.
+    pub fn all_command_details(&self) -> Vec<MessageTypeDetail> {
+        let engines = self.engines.read();
+        let mut details = Vec::new();
+        for engine in engines.values() {
+            details.extend(engine.command_details());
+        }
+        details
+    }
+
+    /// Returns detailed query handler info + dispatch metrics, aggregated across all contexts.
+    pub fn all_query_details(&self) -> Vec<MessageTypeDetail> {
+        let engines = self.engines.read();
+        let mut details = Vec::new();
+        for engine in engines.values() {
+            details.extend(engine.query_details());
+        }
+        details
+    }
+
+    /// Returns all active subscription queries across all contexts.
+    pub fn all_subscription_stats(&self) -> Vec<SubscriptionInfo> {
+        let engines = self.engines.read();
+        let mut stats = Vec::new();
+        for engine in engines.values() {
+            stats.extend(engine.subscription_stats());
         }
         stats
     }

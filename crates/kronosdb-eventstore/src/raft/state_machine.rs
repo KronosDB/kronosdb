@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use tracing::{warn};
+use tracing::warn;
 
 use openraft::storage::RaftStateMachine;
 use openraft::{
@@ -10,10 +10,10 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use kronosdb_eventstore::append::AppendRequest;
-use kronosdb_eventstore::context::ContextManager;
+use crate::append::AppendRequest;
+use crate::context::ContextManager;
 
-use crate::types::{NodeId, RaftRequest, RaftResponse, TypeConfig};
+use super::types::{NodeId, RaftRequest, RaftResponse, TypeConfig};
 
 /// Raft snapshot: serialized state machine metadata.
 /// The actual event data lives in the EventStoreEngine segments —
@@ -57,7 +57,10 @@ impl EventStoreStateMachine {
                     events: append_events,
                 };
 
-                match self.contexts.with_context(context, |store| store.append(append_req)) {
+                match self
+                    .contexts
+                    .with_context(context, |store| store.append(append_req))
+                {
                     Ok(resp) => RaftResponse::Append {
                         first_position: resp.first_position.0,
                         count: resp.count,
@@ -211,9 +214,9 @@ impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Position;
+    use crate::segment::DEFAULT_SEGMENT_SIZE;
     use openraft::{CommittedLeaderId, Entry, EntryPayload, Membership, RaftLogId};
-    use kronosdb_eventstore::event::Position;
-    use kronosdb_eventstore::segment::DEFAULT_SEGMENT_SIZE;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn log_id(term: u64, index: u64) -> LogId<NodeId> {
@@ -223,12 +226,17 @@ mod tests {
         }
     }
 
-    fn make_append_entry(term: u64, index: u64, context: &str, event_name: &str) -> Entry<TypeConfig> {
+    fn make_append_entry(
+        term: u64,
+        index: u64,
+        context: &str,
+        event_name: &str,
+    ) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(term, index),
             payload: EntryPayload::Normal(RaftRequest::Append {
                 context: context.to_string(),
-                events: vec![crate::types::RaftAppendEvent {
+                events: vec![super::super::types::RaftAppendEvent {
                     identifier: format!("evt-{index}"),
                     name: event_name.to_string(),
                     version: "1.0".to_string(),
@@ -252,9 +260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Leak the tempdir so it lives long enough.
         let dir = Box::leak(Box::new(dir));
-        let contexts = Arc::new(
-            ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap(),
-        );
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
         let sm = EventStoreStateMachine::new(Arc::clone(&contexts));
         (sm, contexts)
@@ -281,7 +287,11 @@ mod tests {
         assert_eq!(responses.len(), 2);
 
         match &responses[0] {
-            RaftResponse::Append { first_position, count, .. } => {
+            RaftResponse::Append {
+                first_position,
+                count,
+                ..
+            } => {
                 assert_eq!(*first_position, 1);
                 assert_eq!(*count, 1);
             }
@@ -289,7 +299,11 @@ mod tests {
         }
 
         match &responses[1] {
-            RaftResponse::Append { first_position, count, .. } => {
+            RaftResponse::Append {
+                first_position,
+                count,
+                ..
+            } => {
                 assert_eq!(*first_position, 2);
                 assert_eq!(*count, 1);
             }
@@ -305,10 +319,9 @@ mod tests {
     async fn apply_tracks_last_applied() {
         let (mut sm, _ctx) = create_sm();
 
-        sm.apply(vec![
-            blank_entry(1, 1),
-            blank_entry(1, 2),
-        ]).await.unwrap();
+        sm.apply(vec![blank_entry(1, 1), blank_entry(1, 2)])
+            .await
+            .unwrap();
 
         let (applied, _) = sm.applied_state().await.unwrap();
         assert_eq!(applied.unwrap().index, 2);
@@ -323,8 +336,18 @@ mod tests {
         voter_set.insert(2u64);
 
         let mut nodes = BTreeMap::new();
-        nodes.insert(1u64, openraft::BasicNode { addr: "addr1".to_string() });
-        nodes.insert(2u64, openraft::BasicNode { addr: "addr2".to_string() });
+        nodes.insert(
+            1u64,
+            openraft::BasicNode {
+                addr: "addr1".to_string(),
+            },
+        );
+        nodes.insert(
+            2u64,
+            openraft::BasicNode {
+                addr: "addr2".to_string(),
+            },
+        );
         let membership = Membership::new(vec![voter_set], nodes);
 
         let entry = Entry {
@@ -374,7 +397,9 @@ mod tests {
     async fn snapshot_roundtrip() {
         let (mut sm, _ctx) = create_sm();
 
-        sm.apply(vec![blank_entry(1, 1), blank_entry(1, 2)]).await.unwrap();
+        sm.apply(vec![blank_entry(1, 1), blank_entry(1, 2)])
+            .await
+            .unwrap();
 
         // Build snapshot.
         let mut builder = sm.get_snapshot_builder().await;

@@ -79,6 +79,12 @@ pub struct ClientRegistry {
     clients: RwLock<HashMap<ClientId, ConnectedClient>>,
 }
 
+impl Default for ClientRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClientRegistry {
     pub fn new() -> Self {
         Self {
@@ -132,6 +138,12 @@ impl ClientRegistry {
     pub fn client_count(&self) -> usize {
         let clients = self.clients.read();
         clients.len()
+    }
+
+    /// Returns the component name of a registered client, if found.
+    pub fn get_component_name(&self, client_id: &ClientId) -> Option<String> {
+        let clients = self.clients.read();
+        clients.get(client_id).map(|c| c.component_name.0.clone())
     }
 
     /// Lists all connected client IDs with their component names.

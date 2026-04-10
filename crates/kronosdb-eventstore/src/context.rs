@@ -31,10 +31,13 @@ pub struct ContextManager {
 impl ContextManager {
     /// Creates a new context manager rooted at the given directory.
     pub fn new(data_dir: &Path, default_segment_size: u64) -> Result<Self, Error> {
-        Self::with_options(data_dir, StoreOptions {
-            max_segment_size: default_segment_size,
-            ..Default::default()
-        })
+        Self::with_options(
+            data_dir,
+            StoreOptions {
+                max_segment_size: default_segment_size,
+                ..Default::default()
+            },
+        )
     }
 
     /// Creates a new context manager with full store options.
@@ -71,7 +74,9 @@ impl ContextManager {
         contexts.insert(name.to_string(), Arc::new(store));
 
         let snap_store = SnapshotStore::open(&context_dir.join("snapshots"))?;
-        self.snapshot_stores.write().insert(name.to_string(), Arc::new(snap_store));
+        self.snapshot_stores
+            .write()
+            .insert(name.to_string(), Arc::new(snap_store));
 
         Ok(())
     }
@@ -157,19 +162,16 @@ impl ContextManager {
             // Check if this directory looks like an event store (has .seg files).
             let has_segments = std::fs::read_dir(&path)?
                 .filter_map(|e| e.ok())
-                .any(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext == "seg")
-                });
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "seg"));
 
             if has_segments {
-                let store =
-                    EventStoreEngine::open_with_store_options(&path, &self.store_options)?;
+                let store = EventStoreEngine::open_with_store_options(&path, &self.store_options)?;
                 contexts.insert(name.clone(), Arc::new(store));
 
                 let snap_store = SnapshotStore::open(&path.join("snapshots"))?;
-                self.snapshot_stores.write().insert(name, Arc::new(snap_store));
+                self.snapshot_stores
+                    .write()
+                    .insert(name, Arc::new(snap_store));
             }
         }
 
@@ -207,10 +209,10 @@ fn validate_context_name(name: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AppendEvent, Position};
     use crate::append::AppendRequest;
-    use crate::segment::DEFAULT_SEGMENT_SIZE;
     use crate::event::Tag;
+    use crate::event::{AppendEvent, Position};
+    use crate::segment::DEFAULT_SEGMENT_SIZE;
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag::from_str(key, value)

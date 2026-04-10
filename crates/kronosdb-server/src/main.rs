@@ -1,32 +1,35 @@
+#![allow(dead_code, clippy::all)]
+
 mod admin;
 mod auth;
 mod config;
-mod proto;
 mod eventstore;
 mod messaging;
 mod platform;
+mod processor;
+mod proto;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::signal;
-use tonic::transport::{Server, Identity, ServerTlsConfig, Certificate};
-use tracing::{info, warn, error};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tracing::{error, info, warn};
 
 use kronosdb_eventstore::context::ContextManager;
+use kronosdb_eventstore::raft::cluster::{ClusterConfig, ClusterManager, NodeType, PeerConfig};
+use kronosdb_eventstore::raft::transport::RaftTransportService;
+use kronosdb_eventstore::raft::types::default_raft_config;
 use kronosdb_eventstore::store::StoreOptions;
 use kronosdb_messaging::client::ClientRegistry;
 use kronosdb_messaging::manager::MessagingManager;
-use kronosdb_raft::cluster::{ClusterConfig, ClusterManager, NodeType, PeerConfig};
-use kronosdb_raft::transport::RaftTransportService;
-use kronosdb_raft::types::default_raft_config;
 
 use crate::config::ServerConfig;
 use crate::eventstore::service::EventStoreService;
 use crate::eventstore::snapshot_service::SnapshotServiceImpl;
 use crate::messaging::command_service::CommandServiceImpl;
 use crate::messaging::query_service::QueryServiceImpl;
-use crate::platform::service::{PlatformServiceImpl, spawn_reaper};
+use crate::platform::service::{ClientChannelRegistry, PlatformServiceImpl, spawn_reaper};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,60 +48,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_segment_size: config.segment_size,
         index_cache_size: config.index_cache_size,
         bloom_cache_size: config.bloom_cache_size,
+        group_commit_interval_ms: config.group_commit_ms,
         ..Default::default()
     };
-    let contexts = Arc::new(ContextManager::with_options(&config.data_dir, store_options)?);
+    let contexts = Arc::new(ContextManager::with_options(
+        &config.data_dir,
+        store_options,
+    )?);
     if !contexts.context_exists("default") {
         contexts.create_context("default")?;
     }
 
-    // Create the cluster manager.
-    let cluster = if config.is_clustered() {
-        let node_id = config.cluster_node_id.unwrap();
-        let node_type = match config.cluster_node_type.as_str() {
-            "passive-backup" => NodeType::PassiveBackup,
-            _ => NodeType::Standard,
-        };
-
-        let voters: Vec<PeerConfig> = config.cluster_peers.iter().map(|p| PeerConfig {
-            id: p.id,
-            addr: p.addr.clone(),
-        }).collect();
-
-        let learners: Vec<PeerConfig> = config.cluster_learners.iter().map(|p| PeerConfig {
-            id: p.id,
-            addr: p.addr.clone(),
-        }).collect();
-
-        let cluster_config = ClusterConfig {
-            node_id,
-            node_type,
-            advertise_addr: config.listen_addr.to_string(),
-            voters,
-            learners,
-            raft_config: default_raft_config(),
-        };
-
-        let cm = Arc::new(ClusterManager::clustered(Arc::clone(&contexts), cluster_config));
-
-        for ctx_name in contexts.list_contexts() {
-            cm.init_context(&ctx_name).await?;
-        }
-
-        cm.bootstrap().await?;
-
-        for learner in &config.cluster_learners {
-            let _ = cm.add_learner("default", learner.id, learner.addr.clone()).await;
-        }
-
-        cm
-    } else {
-        Arc::new(ClusterManager::standalone(Arc::clone(&contexts)))
+    // Create the cluster manager — every node is always a Raft node.
+    // A node with no peers starts as a single-node cluster (instant leader).
+    let node_id = config.cluster_node_id.unwrap_or(1);
+    let node_type = match config.cluster_node_type.as_str() {
+        "passive-backup" => NodeType::PassiveBackup,
+        _ => NodeType::Standard,
     };
 
-    // Create the messaging manager (per-context) and client registry.
+    let voters: Vec<PeerConfig> = if config.cluster_peers.is_empty() {
+        // Single-node: this node is the only voter.
+        vec![PeerConfig {
+            id: node_id,
+            addr: config.listen_addr.to_string(),
+        }]
+    } else {
+        config
+            .cluster_peers
+            .iter()
+            .map(|p| PeerConfig {
+                id: p.id,
+                addr: p.addr.clone(),
+            })
+            .collect()
+    };
+
+    let learners: Vec<PeerConfig> = config
+        .cluster_learners
+        .iter()
+        .map(|p| PeerConfig {
+            id: p.id,
+            addr: p.addr.clone(),
+        })
+        .collect();
+
+    let cluster_config = ClusterConfig {
+        node_id,
+        node_type,
+        advertise_addr: config.listen_addr.to_string(),
+        voters,
+        learners,
+        raft_config: default_raft_config(),
+    };
+
+    let cluster = Arc::new(ClusterManager::new(Arc::clone(&contexts), cluster_config));
+
+    for ctx_name in contexts.list_contexts() {
+        cluster.init_context(&ctx_name).await?;
+    }
+
+    cluster.bootstrap().await?;
+
+    for learner in &config.cluster_learners {
+        let _ = cluster
+            .add_learner("default", learner.id, learner.addr.clone())
+            .await;
+    }
+
+    // Create the messaging manager (per-context) and client registries.
     let messaging = Arc::new(MessagingManager::new());
     let client_registry = Arc::new(ClientRegistry::new());
+    let channel_registry = Arc::new(ClientChannelRegistry::new());
+    let processor_registry = Arc::new(processor::ProcessorRegistry::new());
 
     // Build gRPC services.
     let event_store_service = EventStoreService::new(Arc::clone(&cluster));
@@ -123,6 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_platform = messaging.get_platform("default");
     let platform_service = PlatformServiceImpl::new(
         Arc::clone(&client_registry),
+        Arc::clone(&channel_registry),
+        Arc::clone(&processor_registry),
         default_platform.clone(),
         context_names,
         config.node_name.clone(),
@@ -144,6 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_registry: Arc::clone(&client_registry),
         messaging: Arc::clone(&messaging),
         cluster: Arc::clone(&cluster),
+        processor_registry: Arc::clone(&processor_registry),
+        channel_registry: Arc::clone(&channel_registry),
         started_at: std::time::Instant::now(),
     };
     tokio::spawn(async move {
@@ -152,13 +178,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mode = if cluster.is_clustered() { "cluster" } else { "standalone" };
+    let nodes = if cluster.is_multi_node() {
+        "multi-node"
+    } else {
+        "single-node"
+    };
     let tls_enabled = config.tls_cert.is_some() && config.tls_key.is_some();
     let auth_enabled = config.access_token.is_some();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %config.listen_addr,
-        mode = mode,
+        cluster = nodes,
+        node_id = node_id,
         node = %config.node_name,
         data_dir = %config.data_dir.display(),
         admin = %config.admin_listen_addr,
@@ -168,22 +199,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "KronosDB starting"
     );
 
-    if let Some(nid) = config.cluster_node_id {
-        info!(node_id = nid, node_type = %config.cluster_node_type, "cluster mode");
-    }
-
     // Build auth interceptor (no-op when access_token is None).
     let auth = auth::make_auth_interceptor(config.access_token.clone());
 
     // Import generated gRPC server types.
-    use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer;
-    use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer;
     use crate::proto::kronosdb::command::command_service_server::CommandServiceServer;
-    use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
+    use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer;
     use crate::proto::kronosdb::platform::platform_service_server::PlatformServiceServer;
+    use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
+    use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer;
 
     // Configure TLS if cert and key are provided.
-    let mut server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
+    let mut server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key)
+    {
         let cert = std::fs::read(cert_path)
             .map_err(|e| format!("failed to read TLS cert '{}': {e}", cert_path.display()))?;
         let key = std::fs::read(key_path)
@@ -210,21 +238,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build gRPC router with auth interceptor on client-facing services.
     let mut router = server
-        .add_service(EventStoreServer::with_interceptor(event_store_service, auth.clone()))
-        .add_service(SnapshotStoreServer::with_interceptor(snapshot_service, auth.clone()))
-        .add_service(CommandServiceServer::with_interceptor(command_service, auth.clone()))
-        .add_service(QueryServiceServer::with_interceptor(query_service, auth.clone()))
-        .add_service(PlatformServiceServer::with_interceptor(platform_service, auth));
+        .add_service(EventStoreServer::with_interceptor(
+            event_store_service,
+            auth.clone(),
+        ))
+        .add_service(SnapshotStoreServer::with_interceptor(
+            snapshot_service,
+            auth.clone(),
+        ))
+        .add_service(CommandServiceServer::with_interceptor(
+            command_service,
+            auth.clone(),
+        ))
+        .add_service(QueryServiceServer::with_interceptor(
+            query_service,
+            auth.clone(),
+        ))
+        .add_service(PlatformServiceServer::with_interceptor(
+            platform_service,
+            auth,
+        ));
 
-    // Raft transport is internal cluster traffic — no auth interceptor.
-    if let Some(raft_node) = cluster.get_raft_node("default") {
-        let raft_transport = RaftTransportService::new(raft_node);
-        router = router.add_service(raft_transport.into_server());
-        info!("raft transport enabled");
-    }
+    // Raft transport — always enabled (every node is a Raft node).
+    let raft_node = cluster
+        .get_raft_node("default")
+        .expect("default context Raft node must be initialized");
+    let raft_transport = RaftTransportService::new(raft_node);
+    router = router.add_service(raft_transport.into_server());
+
+    let cr = Arc::clone(&channel_registry);
+    let shutdown = async move {
+        shutdown_signal().await;
+        // Ask all connected clients to reconnect before shutting down.
+        cr.request_reconnect_all().await;
+    };
 
     router
-        .serve_with_shutdown(config.listen_addr, shutdown_signal())
+        .serve_with_shutdown(config.listen_addr, shutdown)
         .await?;
 
     info!("KronosDB shut down gracefully");

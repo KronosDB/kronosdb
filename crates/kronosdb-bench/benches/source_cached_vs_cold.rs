@@ -28,7 +28,11 @@ fn cached_vs_cold_reads(c: &mut Criterion) {
         let _ = store.source(Position(1), &condition).unwrap();
 
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -46,7 +50,11 @@ fn cached_vs_cold_reads(c: &mut Criterion) {
         let store = EventStoreEngine::open_with_store_options(dir.path(), &opts).unwrap();
 
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -88,7 +96,11 @@ fn cache_size_scaling(c: &mut Criterion) {
                 let _ = store.source(Position(1), &condition).unwrap();
 
                 b.iter(|| {
-                    black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+                    black_box(
+                        store
+                            .source(black_box(Position(1)), black_box(&condition))
+                            .unwrap(),
+                    );
                 });
             },
         );

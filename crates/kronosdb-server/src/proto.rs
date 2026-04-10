@@ -23,8 +23,4 @@ pub mod kronosdb {
     pub mod snapshot {
         tonic::include_proto!("kronosdb.snapshot");
     }
-
-    pub mod raft {
-        tonic::include_proto!("kronosdb.raft");
-    }
 }
