@@ -1,0 +1,10 @@
+pub mod clients;
+pub mod cluster;
+pub mod commands;
+pub mod contexts;
+pub mod events;
+pub mod overview;
+pub mod processors;
+pub mod queries;
+pub mod settings;
+pub mod subscriptions;

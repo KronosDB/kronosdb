@@ -1,2 +1,10 @@
 /target
 /reference
+/data
+*.swp
+*.swo
+.DS_Store
+.env
+DESIGN.md
+kronosdb-spec.md
+admin-prototype.html

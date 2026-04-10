@@ -6,7 +6,7 @@
 //! This tests the full read path: segment list lookup → bloom filter check →
 //! index load → bitmap intersection → mmap scan → event deserialization.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use kronosdb_bench::*;
 use kronosdb_eventstore::event::Position;
 use kronosdb_eventstore::store::StoreOptions;
@@ -31,7 +31,11 @@ fn source_single_order(c: &mut Criterion) {
 
     group.bench_function("80K_events", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -54,7 +58,11 @@ fn source_by_customer(c: &mut Criterion) {
 
     group.bench_function("80_matching_events", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -77,7 +85,11 @@ fn source_decision_model(c: &mut Criterion) {
 
     group.bench_function("type_and_tag_filter", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -91,8 +103,8 @@ fn source_nonexistent(c: &mut Criterion) {
     group.sample_size(100);
 
     for &(num_orders, events_per_seg) in &[
-        (10_000, 5_000),   // ~16 segments
-        (50_000, 5_000),   // ~80 segments
+        (10_000, 5_000), // ~16 segments
+        (50_000, 5_000), // ~80 segments
     ] {
         let label = format!("{}K_orders", num_orders / 1_000);
         let dir = tempdir().unwrap();
@@ -105,7 +117,11 @@ fn source_nonexistent(c: &mut Criterion) {
 
         group.bench_function(&label, |b| {
             b.iter(|| {
-                black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+                black_box(
+                    store
+                        .source(black_box(Position(1)), black_box(&condition))
+                        .unwrap(),
+                );
             });
         });
     }
@@ -126,7 +142,11 @@ fn source_from_recent(c: &mut Criterion) {
     // Full replay from start.
     group.bench_function("full_replay", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -134,7 +154,11 @@ fn source_from_recent(c: &mut Criterion) {
     let near_end = Position(70_000); // 80K total events, start at 70K
     group.bench_function("catch_up_last_10pct", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(near_end), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(near_end), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 

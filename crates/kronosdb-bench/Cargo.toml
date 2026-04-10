@@ -39,3 +39,11 @@ harness = false
 [[bench]]
 name = "scale_behavior"
 harness = false
+
+[[bench]]
+name = "group_commit"
+harness = false
+
+[[bench]]
+name = "throughput_sustained"
+harness = false

@@ -7,7 +7,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use kronosdb_bench::*;
 use kronosdb_eventstore::criteria::{Criterion as QueryCriterion, SourcingCondition};
-use kronosdb_eventstore::event::{Position, Tag};
+use kronosdb_eventstore::event::Position;
 use std::hint::black_box;
 use tempfile::tempdir;
 
@@ -25,7 +25,11 @@ fn bloom_filter_effectiveness(c: &mut Criterion) {
 
     group.bench_function("existing_entity", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&hit_condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&hit_condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -35,7 +39,11 @@ fn bloom_filter_effectiveness(c: &mut Criterion) {
 
     group.bench_function("nonexistent_entity", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&miss_condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&miss_condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -50,7 +58,11 @@ fn bloom_filter_effectiveness(c: &mut Criterion) {
 
     group.bench_function("broad_event_type", |b| {
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&broad_condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&broad_condition))
+                    .unwrap(),
+            );
         });
     });
 

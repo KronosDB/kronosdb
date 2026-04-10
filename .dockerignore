@@ -1,0 +1,12 @@
+target/
+data/
+reference/
+.git/
+.github/
+.claude/
+*.md
+!README.md
+LICENSE
+admin-prototype.html
+.DS_Store
+.env

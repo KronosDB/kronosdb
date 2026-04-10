@@ -10,7 +10,10 @@ use tonic::{Request, Response, Status, Streaming};
 use kronosdb_messaging::manager::MessagingManager;
 use kronosdb_messaging::query::Query;
 use kronosdb_messaging::subscription::{SubscriptionQuery, SubscriptionUpdate};
-use kronosdb_messaging::types::{ClientId, ComponentName, ErrorDetail, MetadataValue, Payload, ProcessingInstruction, ProcessingKey};
+use kronosdb_messaging::types::{
+    ClientId, ComponentName, ErrorDetail, MetadataValue, Payload, ProcessingInstruction,
+    ProcessingKey,
+};
 
 use crate::proto::kronosdb::query as pb;
 use crate::proto::kronosdb::query::query_service_server::QueryServiceServer as GrpcQueryServiceServer;
@@ -59,15 +62,18 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         &self,
         request: Request<Streaming<pb::QueryHandlerOutbound>>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
-        let context = request.metadata()
+        let context = request
+            .metadata()
             .get(CONTEXT_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(DEFAULT_CONTEXT)
             .to_string();
+        tracing::info!(context = %context, "Query OpenStream opened");
         let platform = self.messaging.get_platform(&context);
 
         let mut inbound = request.into_inner();
-        let (handler_tx, handler_rx) = mpsc::channel::<Result<pb::QueryHandlerInbound, Status>>(128);
+        let (handler_tx, handler_rx) =
+            mpsc::channel::<Result<pb::QueryHandlerInbound, Status>>(128);
 
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending_queries = Arc::clone(&self.pending_queries);
@@ -83,6 +89,12 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                 match msg.request {
                     Some(pb::query_handler_outbound::Request::Subscribe(sub)) => {
+                        tracing::info!(
+                            query = %sub.query,
+                            client_id = %sub.client_id,
+                            component = %sub.component_name,
+                            "Query handler subscribing"
+                        );
                         client_id = Some(sub.client_id.clone());
 
                         {
@@ -156,7 +168,8 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         &self,
         request: Request<pb::QueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
-        let context = request.metadata()
+        let context = request
+            .metadata()
             .get(CONTEXT_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(DEFAULT_CONTEXT)
@@ -171,8 +184,16 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
             name: req.query.clone(),
             timestamp: req.timestamp,
             payload: Payload {
-                payload_type: req.payload.as_ref().map(|p| p.r#type.clone()).unwrap_or_default(),
-                revision: req.payload.as_ref().map(|p| p.revision.clone()).unwrap_or_default(),
+                payload_type: req
+                    .payload
+                    .as_ref()
+                    .map(|p| p.r#type.clone())
+                    .unwrap_or_default(),
+                revision: req
+                    .payload
+                    .as_ref()
+                    .map(|p| p.revision.clone())
+                    .unwrap_or_default(),
                 data: req.payload.map(|p| p.data).unwrap_or_default(),
             },
             metadata: proto_metadata_to_internal(req.metadata),
@@ -205,20 +226,24 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
             if let Some(tx) = handler_tx {
                 let inbound_query = pb::QueryHandlerInbound {
-                    request: Some(pb::query_handler_inbound::Request::Query(pb::QueryRequest {
-                        message_identifier: message_id.clone(),
-                        query: query_name.clone(),
-                        timestamp: pending.query.timestamp,
-                        payload: Some(crate::proto::kronosdb::SerializedObject {
-                            r#type: pending.query.payload.payload_type.clone(),
-                            revision: pending.query.payload.revision.clone(),
-                            data: pending.query.payload.data.clone(),
-                        }),
-                        metadata: internal_metadata_to_proto(&pending.query.metadata),
-                        processing_instructions: internal_pi_to_proto(&pending.query.processing_instructions),
-                        client_id: pending.query.client_id.0.clone(),
-                        component_name: pending.query.component_name.0.clone(),
-                    })),
+                    request: Some(pb::query_handler_inbound::Request::Query(
+                        pb::QueryRequest {
+                            message_identifier: message_id.clone(),
+                            query: query_name.clone(),
+                            timestamp: pending.query.timestamp,
+                            payload: Some(crate::proto::kronosdb::SerializedObject {
+                                r#type: pending.query.payload.payload_type.clone(),
+                                revision: pending.query.payload.revision.clone(),
+                                data: pending.query.payload.data.clone(),
+                            }),
+                            metadata: internal_metadata_to_proto(&pending.query.metadata),
+                            processing_instructions: internal_pi_to_proto(
+                                &pending.query.processing_instructions,
+                            ),
+                            client_id: pending.query.client_id.0.clone(),
+                            component_name: pending.query.component_name.0.clone(),
+                        },
+                    )),
                     instruction_id: String::new(),
                 };
                 let _ = tx.send(Ok(inbound_query)).await;
@@ -261,7 +286,8 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         &self,
         request: Request<Streaming<pb::SubscriptionQueryRequest>>,
     ) -> Result<Response<Self::SubscriptionStream>, Status> {
-        let context = request.metadata()
+        let context = request
+            .metadata()
             .get(CONTEXT_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(DEFAULT_CONTEXT)
@@ -277,30 +303,53 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                 match msg.request {
                     Some(pb::subscription_query_request::Request::Subscribe(sub)) => {
                         let sub_id = sub.subscription_identifier.clone();
+                        let sub_permits = sub.number_of_permits;
 
                         let subscription = SubscriptionQuery {
                             subscription_id: sub_id.clone(),
-                            query_name: sub.query_request.as_ref().map(|q| q.query.clone()).unwrap_or_default(),
+                            query_name: sub
+                                .query_request
+                                .as_ref()
+                                .map(|q| q.query.clone())
+                                .unwrap_or_default(),
                             timestamp: sub.query_request.as_ref().map(|q| q.timestamp).unwrap_or(0),
                             payload: Payload {
-                                payload_type: sub.query_request.as_ref()
+                                payload_type: sub
+                                    .query_request
+                                    .as_ref()
                                     .and_then(|q| q.payload.as_ref())
                                     .map(|p| p.r#type.clone())
                                     .unwrap_or_default(),
-                                revision: sub.query_request.as_ref()
+                                revision: sub
+                                    .query_request
+                                    .as_ref()
                                     .and_then(|q| q.payload.as_ref())
                                     .map(|p| p.revision.clone())
                                     .unwrap_or_default(),
-                                data: sub.query_request.as_ref()
+                                data: sub
+                                    .query_request
+                                    .as_ref()
                                     .and_then(|q| q.payload.as_ref())
                                     .map(|p| p.data.clone())
                                     .unwrap_or_default(),
                             },
-                            metadata: sub.query_request.as_ref()
+                            metadata: sub
+                                .query_request
+                                .as_ref()
                                 .map(|q| proto_metadata_to_internal(q.metadata.clone()))
                                 .unwrap_or_default(),
-                            client_id: ClientId(sub.query_request.as_ref().map(|q| q.client_id.clone()).unwrap_or_default()),
-                            component_name: ComponentName(sub.query_request.as_ref().map(|q| q.component_name.clone()).unwrap_or_default()),
+                            client_id: ClientId(
+                                sub.query_request
+                                    .as_ref()
+                                    .map(|q| q.client_id.clone())
+                                    .unwrap_or_default(),
+                            ),
+                            component_name: ComponentName(
+                                sub.query_request
+                                    .as_ref()
+                                    .map(|q| q.component_name.clone())
+                                    .unwrap_or_default(),
+                            ),
                             initial_permits: sub.number_of_permits,
                         };
 
@@ -309,29 +358,43 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                                 // Deliver the initial query to the handler.
                                 let handler_tx = {
                                     let streams = handler_streams.lock();
-                                    pending.target_handlers.first()
+                                    pending
+                                        .target_handlers
+                                        .first()
                                         .and_then(|id| streams.get(&id.0).cloned())
                                 };
 
                                 if let Some(tx) = handler_tx {
-                                    let inbound_query = pb::QueryHandlerInbound {
-                                        request: Some(pb::query_handler_inbound::Request::Query(pb::QueryRequest {
-                                            message_identifier: sub_id.clone(),
-                                            query: pending.query.name.clone(),
-                                            timestamp: pending.query.timestamp,
-                                            payload: Some(crate::proto::kronosdb::SerializedObject {
-                                                r#type: pending.query.payload.payload_type.clone(),
-                                                revision: pending.query.payload.revision.clone(),
-                                                data: pending.query.payload.data.clone(),
-                                            }),
-                                            metadata: internal_metadata_to_proto(&pending.query.metadata),
-                                            processing_instructions: internal_pi_to_proto(&pending.query.processing_instructions),
-                                            client_id: pending.query.client_id.0.clone(),
-                                            component_name: pending.query.component_name.0.clone(),
-                                        })),
+                                    // Send as a SubscriptionQueryRequest so the handler
+                                    // knows to register for updates (not just a regular query).
+                                    let inbound_sub = pb::QueryHandlerInbound {
+                                        request: Some(pb::query_handler_inbound::Request::SubscriptionQueryRequest(
+                                            pb::SubscriptionQueryRequest {
+                                                request: Some(pb::subscription_query_request::Request::Subscribe(
+                                                    pb::SubscriptionQuery {
+                                                        subscription_identifier: sub_id.clone(),
+                                                        number_of_permits: sub_permits,
+                                                        query_request: Some(pb::QueryRequest {
+                                                            message_identifier: sub_id.clone(),
+                                                            query: pending.query.name.clone(),
+                                                            timestamp: pending.query.timestamp,
+                                                            payload: Some(crate::proto::kronosdb::SerializedObject {
+                                                                r#type: pending.query.payload.payload_type.clone(),
+                                                                revision: pending.query.payload.revision.clone(),
+                                                                data: pending.query.payload.data.clone(),
+                                                            }),
+                                                            metadata: internal_metadata_to_proto(&pending.query.metadata),
+                                                            processing_instructions: internal_pi_to_proto(&pending.query.processing_instructions),
+                                                            client_id: pending.query.client_id.0.clone(),
+                                                            component_name: pending.query.component_name.0.clone(),
+                                                        }),
+                                                    }
+                                                )),
+                                            }
+                                        )),
                                         instruction_id: String::new(),
                                     };
-                                    let _ = tx.send(Ok(inbound_query)).await;
+                                    let _ = tx.send(Ok(inbound_sub)).await;
                                 }
 
                                 // Spawn a task to drain updates from the registry
@@ -347,9 +410,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                                 });
                             }
                             Err(e) => {
-                                let _ = sub_tx
-                                    .send(Err(Status::unavailable(e.to_string())))
-                                    .await;
+                                let _ = sub_tx.send(Err(Status::unavailable(e.to_string()))).await;
                             }
                         }
                     }
@@ -388,7 +449,9 @@ fn detail_to_proto_error(e: &ErrorDetail) -> crate::proto::kronosdb::ErrorMessag
     }
 }
 
-fn proto_subscription_response_to_update(resp: pb::SubscriptionQueryResponse) -> SubscriptionUpdate {
+fn proto_subscription_response_to_update(
+    resp: pb::SubscriptionQueryResponse,
+) -> SubscriptionUpdate {
     let sub_id = resp.subscription_identifier;
     match resp.response {
         Some(pb::subscription_query_response::Response::Update(upd)) => SubscriptionUpdate {
@@ -399,27 +462,39 @@ fn proto_subscription_response_to_update(resp: pb::SubscriptionQueryResponse) ->
                 data: p.data,
             }),
             metadata: proto_metadata_to_internal(upd.metadata),
-            error_code: if upd.error_code.is_empty() { None } else { Some(upd.error_code) },
+            error_code: if upd.error_code.is_empty() {
+                None
+            } else {
+                Some(upd.error_code)
+            },
             error: upd.error_message.map(proto_error_to_detail),
         },
-        Some(pb::subscription_query_response::Response::InitialResult(result)) => SubscriptionUpdate {
-            subscription_id: sub_id,
-            payload: result.payload.map(|p| Payload {
-                payload_type: p.r#type,
-                revision: p.revision,
-                data: p.data,
-            }),
-            metadata: proto_metadata_to_internal(result.metadata),
-            error_code: if result.error_code.is_empty() { None } else { Some(result.error_code) },
-            error: result.error_message.map(proto_error_to_detail),
-        },
-        Some(pb::subscription_query_response::Response::CompleteExceptionally(err)) => SubscriptionUpdate {
-            subscription_id: sub_id,
-            payload: None,
-            metadata: HashMap::new(),
-            error_code: Some(err.error_code),
-            error: err.error_message.map(proto_error_to_detail),
-        },
+        Some(pb::subscription_query_response::Response::InitialResult(result)) => {
+            SubscriptionUpdate {
+                subscription_id: sub_id,
+                payload: result.payload.map(|p| Payload {
+                    payload_type: p.r#type,
+                    revision: p.revision,
+                    data: p.data,
+                }),
+                metadata: proto_metadata_to_internal(result.metadata),
+                error_code: if result.error_code.is_empty() {
+                    None
+                } else {
+                    Some(result.error_code)
+                },
+                error: result.error_message.map(proto_error_to_detail),
+            }
+        }
+        Some(pb::subscription_query_response::Response::CompleteExceptionally(err)) => {
+            SubscriptionUpdate {
+                subscription_id: sub_id,
+                payload: None,
+                metadata: HashMap::new(),
+                error_code: Some(err.error_code),
+                error: err.error_message.map(proto_error_to_detail),
+            }
+        }
         Some(pb::subscription_query_response::Response::Complete(_)) | None => SubscriptionUpdate {
             subscription_id: sub_id,
             payload: None,
@@ -432,23 +507,27 @@ fn proto_subscription_response_to_update(resp: pb::SubscriptionQueryResponse) ->
 
 fn subscription_update_to_proto(update: SubscriptionUpdate) -> pb::SubscriptionQueryResponse {
     let response = if let Some(ref error_code) = update.error_code {
-        Some(pb::subscription_query_response::Response::CompleteExceptionally(
-            pb::QueryUpdateCompleteExceptionally {
-                client_id: String::new(),
-                component_name: String::new(),
-                error_code: error_code.clone(),
-                error_message: update.error.as_ref().map(detail_to_proto_error),
-            },
-        ))
+        Some(
+            pb::subscription_query_response::Response::CompleteExceptionally(
+                pb::QueryUpdateCompleteExceptionally {
+                    client_id: String::new(),
+                    component_name: String::new(),
+                    error_code: error_code.clone(),
+                    error_message: update.error.as_ref().map(detail_to_proto_error),
+                },
+            ),
+        )
     } else {
         Some(pb::subscription_query_response::Response::Update(
             pb::QueryUpdate {
                 message_identifier: update.subscription_id.clone(),
-                payload: update.payload.map(|p| crate::proto::kronosdb::SerializedObject {
-                    r#type: p.payload_type,
-                    revision: p.revision,
-                    data: p.data,
-                }),
+                payload: update
+                    .payload
+                    .map(|p| crate::proto::kronosdb::SerializedObject {
+                        r#type: p.payload_type,
+                        revision: p.revision,
+                        data: p.data,
+                    }),
                 metadata: internal_metadata_to_proto(&update.metadata),
                 client_id: String::new(),
                 component_name: String::new(),
@@ -470,24 +549,40 @@ fn subscription_update_to_proto(update: SubscriptionUpdate) -> pb::SubscriptionQ
 fn proto_mv_to_internal(v: crate::proto::kronosdb::MetadataValue) -> MetadataValue {
     match v.data {
         Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => MetadataValue::Text(s),
-        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => MetadataValue::Number(n),
-        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => MetadataValue::Boolean(b),
-        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => MetadataValue::Double(d),
-        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => MetadataValue::Bytes(Payload {
-            payload_type: obj.r#type,
-            revision: obj.revision,
-            data: obj.data,
-        }),
+        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => {
+            MetadataValue::Number(n)
+        }
+        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => {
+            MetadataValue::Boolean(b)
+        }
+        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => {
+            MetadataValue::Double(d)
+        }
+        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => {
+            MetadataValue::Bytes(Payload {
+                payload_type: obj.r#type,
+                revision: obj.revision,
+                data: obj.data,
+            })
+        }
         None => MetadataValue::Text(String::new()),
     }
 }
 
 fn internal_mv_to_proto(v: &MetadataValue) -> crate::proto::kronosdb::MetadataValue {
     let data = match v {
-        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s.clone())),
-        MetadataValue::Number(n) => Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(*n)),
-        MetadataValue::Boolean(b) => Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b)),
-        MetadataValue::Double(d) => Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d)),
+        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(
+            s.clone(),
+        )),
+        MetadataValue::Number(n) => Some(
+            crate::proto::kronosdb::metadata_value::Data::NumberValue(*n),
+        ),
+        MetadataValue::Boolean(b) => Some(
+            crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b),
+        ),
+        MetadataValue::Double(d) => Some(
+            crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d),
+        ),
         MetadataValue::Bytes(p) => Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(
             crate::proto::kronosdb::SerializedObject {
                 r#type: p.payload_type.clone(),
