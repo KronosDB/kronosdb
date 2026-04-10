@@ -6,8 +6,8 @@ use crate::error::Error;
 use crate::event::{AppendEvent, Position, StoredEvent};
 
 use crate::segment::{
-    format, segment_path, flags, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC,
-    SEGMENT_VERSION,
+    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format,
+    segment_path,
 };
 
 /// Writes events to segmented append-only log files.
@@ -256,9 +256,10 @@ fn read_segment_header(file: &mut File) -> Result<SegmentHeader, Error> {
     use std::io::Read;
 
     let mut header_buf = [0u8; SEGMENT_HEADER_SIZE];
-    file.read_exact(&mut header_buf).map_err(|_| Error::Corrupted {
-        message: "failed to read segment header".into(),
-    })?;
+    file.read_exact(&mut header_buf)
+        .map_err(|_| Error::Corrupted {
+            message: "failed to read segment header".into(),
+        })?;
 
     if header_buf[0..4] != SEGMENT_MAGIC {
         return Err(Error::Corrupted {
@@ -299,7 +300,8 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
         let _flags = header_buf[8];
 
         // Sanity check record length.
-        if record_len < 1 || offset + RECORD_HEADER_SIZE as u64 + (record_len - 1) as u64 > file_len {
+        if record_len < 1 || offset + RECORD_HEADER_SIZE as u64 + (record_len - 1) as u64 > file_len
+        {
             break; // Torn write — stop here.
         }
 
@@ -414,8 +416,8 @@ fn list_segments(dir: &Path) -> Result<Vec<u64>, io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::DEFAULT_SEGMENT_SIZE;
     use crate::event::Tag;
+    use crate::segment::DEFAULT_SEGMENT_SIZE;
 
     fn make_event(name: &str, payload: &[u8]) -> AppendEvent {
         AppendEvent {
@@ -481,7 +483,11 @@ mod tests {
 
         // We should have multiple segment files.
         let segments = list_segments(dir.path()).unwrap();
-        assert!(segments.len() > 1, "expected segment rotation, got {} segments", segments.len());
+        assert!(
+            segments.len() > 1,
+            "expected segment rotation, got {} segments",
+            segments.len()
+        );
 
         // Recovery should still find the correct head.
         let head = writer.head();

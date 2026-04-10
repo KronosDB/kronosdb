@@ -9,7 +9,10 @@ use tonic::{Request, Response, Status, Streaming};
 
 use kronosdb_messaging::command::{Command, CommandResult};
 use kronosdb_messaging::manager::MessagingManager;
-use kronosdb_messaging::types::{ClientId, ComponentName, MetadataValue, Payload, ProcessingInstruction, ProcessingKey, RoutingKey};
+use kronosdb_messaging::types::{
+    ClientId, ComponentName, MetadataValue, Payload, ProcessingInstruction, ProcessingKey,
+    RoutingKey,
+};
 
 use crate::proto::kronosdb::command as pb;
 use crate::proto::kronosdb::command::command_service_server::CommandServiceServer as GrpcCommandServiceServer;
@@ -54,7 +57,8 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         &self,
         request: Request<Streaming<pb::CommandHandlerOutbound>>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
-        let context = request.metadata()
+        let context = request
+            .metadata()
             .get(CONTEXT_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(DEFAULT_CONTEXT)
@@ -62,7 +66,8 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         let platform = self.messaging.get_platform(&context);
 
         let mut inbound = request.into_inner();
-        let (handler_tx, handler_rx) = mpsc::channel::<Result<pb::CommandHandlerInbound, Status>>(128);
+        let (handler_tx, handler_rx) =
+            mpsc::channel::<Result<pb::CommandHandlerInbound, Status>>(128);
 
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending = Arc::clone(&self.pending);
@@ -78,6 +83,12 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
 
                 match msg.request {
                     Some(pb::command_handler_outbound::Request::Subscribe(sub)) => {
+                        tracing::info!(
+                            command = %sub.command,
+                            client_id = %sub.client_id,
+                            component = %sub.component_name,
+                            "Command handler subscribing"
+                        );
                         client_id = Some(sub.client_id.clone());
 
                         {
@@ -146,7 +157,8 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         &self,
         request: Request<pb::Command>,
     ) -> Result<Response<pb::CommandResponse>, Status> {
-        let context = request.metadata()
+        let context = request
+            .metadata()
             .get(CONTEXT_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(DEFAULT_CONTEXT)
@@ -175,8 +187,9 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             streams.get(target_id).cloned()
         };
 
-        let handler_tx = handler_tx
-            .ok_or_else(|| Status::unavailable(format!("handler '{}' stream not found", target_id)))?;
+        let handler_tx = handler_tx.ok_or_else(|| {
+            Status::unavailable(format!("handler '{}' stream not found", target_id))
+        })?;
 
         let inbound_cmd = to_proto_command_inbound(&pending_cmd.command);
         handler_tx
@@ -189,7 +202,9 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
                 self.pending.lock().remove(&message_id);
-                return Err(Status::unavailable("handler disconnected before responding"));
+                return Err(Status::unavailable(
+                    "handler disconnected before responding",
+                ));
             }
             Err(_) => {
                 self.pending.lock().remove(&message_id);
@@ -206,24 +221,40 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
 fn proto_mv_to_internal(v: crate::proto::kronosdb::MetadataValue) -> MetadataValue {
     match v.data {
         Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => MetadataValue::Text(s),
-        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => MetadataValue::Number(n),
-        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => MetadataValue::Boolean(b),
-        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => MetadataValue::Double(d),
-        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => MetadataValue::Bytes(Payload {
-            payload_type: obj.r#type,
-            revision: obj.revision,
-            data: obj.data,
-        }),
+        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => {
+            MetadataValue::Number(n)
+        }
+        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => {
+            MetadataValue::Boolean(b)
+        }
+        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => {
+            MetadataValue::Double(d)
+        }
+        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => {
+            MetadataValue::Bytes(Payload {
+                payload_type: obj.r#type,
+                revision: obj.revision,
+                data: obj.data,
+            })
+        }
         None => MetadataValue::Text(String::new()),
     }
 }
 
 fn internal_mv_to_proto(v: &MetadataValue) -> crate::proto::kronosdb::MetadataValue {
     let data = match v {
-        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s.clone())),
-        MetadataValue::Number(n) => Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(*n)),
-        MetadataValue::Boolean(b) => Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b)),
-        MetadataValue::Double(d) => Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d)),
+        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(
+            s.clone(),
+        )),
+        MetadataValue::Number(n) => Some(
+            crate::proto::kronosdb::metadata_value::Data::NumberValue(*n),
+        ),
+        MetadataValue::Boolean(b) => Some(
+            crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b),
+        ),
+        MetadataValue::Double(d) => Some(
+            crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d),
+        ),
         MetadataValue::Bytes(p) => Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(
             crate::proto::kronosdb::SerializedObject {
                 r#type: p.payload_type.clone(),
@@ -312,8 +343,16 @@ fn from_proto_command(cmd: pb::Command) -> Command {
         name: cmd.name,
         timestamp: cmd.timestamp,
         payload: Payload {
-            payload_type: cmd.payload.as_ref().map(|p| p.r#type.clone()).unwrap_or_default(),
-            revision: cmd.payload.as_ref().map(|p| p.revision.clone()).unwrap_or_default(),
+            payload_type: cmd
+                .payload
+                .as_ref()
+                .map(|p| p.r#type.clone())
+                .unwrap_or_default(),
+            revision: cmd
+                .payload
+                .as_ref()
+                .map(|p| p.revision.clone())
+                .unwrap_or_default(),
             data: cmd.payload.map(|p| p.data).unwrap_or_default(),
         },
         metadata: proto_metadata_to_internal(cmd.metadata),
@@ -328,13 +367,19 @@ fn from_proto_command_response(resp: pb::CommandResponse) -> CommandResult {
     CommandResult {
         message_id: resp.message_identifier,
         request_id: resp.request_identifier,
-        error_code: if resp.error_code.is_empty() { None } else { Some(resp.error_code) },
-        error: resp.error_message.map(|e| kronosdb_messaging::types::ErrorDetail {
-            message: e.message,
-            location: e.location,
-            details: e.details,
-            error_code: e.error_code,
-        }),
+        error_code: if resp.error_code.is_empty() {
+            None
+        } else {
+            Some(resp.error_code)
+        },
+        error: resp
+            .error_message
+            .map(|e| kronosdb_messaging::types::ErrorDetail {
+                message: e.message,
+                location: e.location,
+                details: e.details,
+                error_code: e.error_code,
+            }),
         payload: resp.payload.map(|p| Payload {
             payload_type: p.r#type,
             revision: p.revision,
@@ -375,11 +420,13 @@ fn to_proto_command_response(result: CommandResult) -> pb::CommandResponse {
             details: e.details,
             error_code: e.error_code,
         }),
-        payload: result.payload.map(|p| crate::proto::kronosdb::SerializedObject {
-            r#type: p.payload_type,
-            revision: p.revision,
-            data: p.data,
-        }),
+        payload: result
+            .payload
+            .map(|p| crate::proto::kronosdb::SerializedObject {
+                r#type: p.payload_type,
+                revision: p.revision,
+                data: p.data,
+            }),
         metadata: internal_metadata_to_proto(&result.metadata),
         processing_instructions: internal_pi_to_proto(&result.processing_instructions),
         request_identifier: result.request_id,

@@ -4,8 +4,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use kronosdb_eventstore::raft::cluster::ClusterManager;
 use kronosdb_eventstore::snapshot::{Snapshot, SnapshotStore};
-use kronosdb_raft::cluster::ClusterManager;
 
 use crate::proto::kronosdb::snapshot as pb;
 use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer as GrpcSnapshotStoreServer;
@@ -106,12 +106,11 @@ impl pb::snapshot_store_server::SnapshotStore for SnapshotServiceImpl {
         let from_sequence = req.from_sequence;
         let to_sequence = req.to_sequence;
 
-        let entries = tokio::task::spawn_blocking(move || {
-            store.list(&key, from_sequence, to_sequence)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(|e| Status::internal(e.to_string()))?;
+        let entries =
+            tokio::task::spawn_blocking(move || store.list(&key, from_sequence, to_sequence))
+                .await
+                .map_err(|e| Status::internal(format!("task join error: {e}")))?
+                .map_err(|e| Status::internal(e.to_string()))?;
 
         let (tx, rx) = mpsc::channel(64);
 

@@ -13,13 +13,15 @@ use kronosdb_eventstore::api::EventStore;
 use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
 use kronosdb_eventstore::event::Position;
+use kronosdb_eventstore::raft::cluster::RaftEngine;
+use kronosdb_eventstore::raft::log_store::LogStore;
+use kronosdb_eventstore::raft::network::NetworkFactory;
+use kronosdb_eventstore::raft::state_machine::EventStoreStateMachine;
+use kronosdb_eventstore::raft::transport::RaftTransportService;
+use kronosdb_eventstore::raft::types::{
+    NodeId, RaftAppendEvent, RaftRequest, RaftResponse, TypeConfig,
+};
 use kronosdb_eventstore::segment::DEFAULT_SEGMENT_SIZE;
-use kronosdb_raft::log_store::LogStore;
-use kronosdb_raft::network::NetworkFactory;
-use kronosdb_raft::node::RaftEventStore;
-use kronosdb_raft::state_machine::EventStoreStateMachine;
-use kronosdb_raft::transport::RaftTransportService;
-use kronosdb_raft::types::{NodeId, RaftAppendEvent, RaftRequest, RaftResponse, TypeConfig};
 
 struct TestNode {
     #[allow(dead_code)]
@@ -32,9 +34,8 @@ struct TestNode {
 
 /// Creates a Raft node and starts its gRPC transport server.
 async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
-    let contexts = Arc::new(
-        ContextManager::new(dir, DEFAULT_SEGMENT_SIZE).expect("create context manager"),
-    );
+    let contexts =
+        Arc::new(ContextManager::new(dir, DEFAULT_SEGMENT_SIZE).expect("create context manager"));
     if !contexts.context_exists("default") {
         contexts.create_context("default").expect("create default");
     }
@@ -51,9 +52,15 @@ async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
     };
 
     let raft = Arc::new(
-        Raft::new(id, Arc::new(config), NetworkFactory, log_store, state_machine)
-            .await
-            .expect("create raft node"),
+        Raft::new(
+            id,
+            Arc::new(config),
+            NetworkFactory,
+            log_store,
+            state_machine,
+        )
+        .await
+        .expect("create raft node"),
     );
 
     // Start gRPC transport server.
@@ -115,10 +122,10 @@ async fn wait_for_head(
 ) -> bool {
     let start = tokio::time::Instant::now();
     loop {
-        if let Ok(store) = contexts.get_context(context) {
-            if store.head() >= expected {
-                return true;
-            }
+        if let Ok(store) = contexts.get_context(context)
+            && store.head() >= expected
+        {
+            return true;
         }
         if start.elapsed() > timeout {
             return false;
@@ -139,9 +146,24 @@ async fn three_node_cluster_replication() {
 
     // Initialize the cluster with all 3 nodes as voters.
     let mut members = BTreeMap::new();
-    members.insert(1, BasicNode { addr: format!("127.0.0.1:{}", base_port) });
-    members.insert(2, BasicNode { addr: format!("127.0.0.1:{}", base_port + 1) });
-    members.insert(3, BasicNode { addr: format!("127.0.0.1:{}", base_port + 2) });
+    members.insert(
+        1,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port),
+        },
+    );
+    members.insert(
+        2,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port + 1),
+        },
+    );
+    members.insert(
+        3,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port + 2),
+        },
+    );
 
     node1
         .raft
@@ -175,9 +197,17 @@ async fn three_node_cluster_replication() {
         condition: None,
     };
 
-    let response = leader.raft.client_write(request).await.expect("append events");
+    let response = leader
+        .raft
+        .client_write(request)
+        .await
+        .expect("append events");
     match &response.data {
-        RaftResponse::Append { first_position, count, .. } => {
+        RaftResponse::Append {
+            first_position,
+            count,
+            ..
+        } => {
             assert_eq!(*first_position, 1);
             assert_eq!(*count, 3);
             println!("Appended 3 events on leader (positions 1-3)");
@@ -232,7 +262,11 @@ async fn three_node_cluster_replication() {
         condition: None,
     };
 
-    leader.raft.client_write(request2).await.expect("append more events");
+    leader
+        .raft
+        .client_write(request2)
+        .await
+        .expect("append more events");
 
     let expected_head2 = Position(6);
     for (name, node) in [("node1", &node1), ("node2", &node2), ("node3", &node3)] {
@@ -261,8 +295,18 @@ async fn passive_backup_receives_replicated_events() {
 
     // Initialize cluster with only the 2 voters.
     let mut members = BTreeMap::new();
-    members.insert(1, BasicNode { addr: format!("127.0.0.1:{}", base_port) });
-    members.insert(2, BasicNode { addr: format!("127.0.0.1:{}", base_port + 1) });
+    members.insert(
+        1,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port),
+        },
+    );
+    members.insert(
+        2,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port + 1),
+        },
+    );
 
     voter1.raft.initialize(members).await.expect("initialize");
 
@@ -277,8 +321,15 @@ async fn passive_backup_receives_replicated_events() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Add the backup as a learner.
-    leader.raft
-        .add_learner(10, BasicNode { addr: format!("127.0.0.1:{}", base_port + 2) }, true)
+    leader
+        .raft
+        .add_learner(
+            10,
+            BasicNode {
+                addr: format!("127.0.0.1:{}", base_port + 2),
+            },
+            true,
+        )
         .await
         .expect("add learner");
     println!("Backup node 10 added as learner");
@@ -313,7 +364,10 @@ async fn passive_backup_receives_replicated_events() {
         "backup should replicate (as learner)"
     );
 
-    println!("All nodes (including passive backup) have head >= {}", expected.0);
+    println!(
+        "All nodes (including passive backup) have head >= {}",
+        expected.0
+    );
 
     // Verify backup can serve reads.
     let condition = SourcingCondition {
@@ -342,9 +396,24 @@ async fn follower_forwards_writes_to_leader() {
     let node3 = start_node(3, base_port + 2, &dir.path().join("node3")).await;
 
     let mut members = BTreeMap::new();
-    members.insert(1, BasicNode { addr: format!("127.0.0.1:{}", base_port) });
-    members.insert(2, BasicNode { addr: format!("127.0.0.1:{}", base_port + 1) });
-    members.insert(3, BasicNode { addr: format!("127.0.0.1:{}", base_port + 2) });
+    members.insert(
+        1,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port),
+        },
+    );
+    members.insert(
+        2,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port + 1),
+        },
+    );
+    members.insert(
+        3,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", base_port + 2),
+        },
+    );
 
     node1.raft.initialize(members).await.expect("initialize");
 
@@ -361,9 +430,9 @@ async fn follower_forwards_writes_to_leader() {
     let follower = if leader_id == 1 { &node2 } else { &node1 };
     println!("Writing through follower node {}", follower.id);
 
-    // Create a RaftEventStore wrapping the follower's Raft node.
+    // Create a RaftEngine wrapping the follower's Raft node.
     let follower_engine = follower.contexts.get_context("default").unwrap();
-    let follower_store = RaftEventStore::new(
+    let follower_store = RaftEngine::new(
         Arc::clone(&follower.raft),
         follower_engine,
         "default".to_string(),
@@ -372,29 +441,34 @@ async fn follower_forwards_writes_to_leader() {
     // Append through the follower — should forward to leader.
     let append_req = kronosdb_eventstore::append::AppendRequest {
         condition: None,
-        events: vec![
-            kronosdb_eventstore::event::AppendEvent {
-                identifier: "evt-1".to_string(),
-                name: "OrderPlaced".to_string(),
-                version: "1.0".to_string(),
-                timestamp: 1712345678000,
-                payload: b"test".to_vec(),
-                metadata: vec![],
-                tags: vec![kronosdb_eventstore::event::Tag {
-                    key: b"orderId".to_vec(),
-                    value: b"order-1".to_vec(),
-                }],
-            },
-        ],
+        events: vec![kronosdb_eventstore::event::AppendEvent {
+            identifier: "evt-1".to_string(),
+            name: "OrderPlaced".to_string(),
+            version: "1.0".to_string(),
+            timestamp: 1712345678000,
+            payload: b"test".to_vec(),
+            metadata: vec![],
+            tags: vec![kronosdb_eventstore::event::Tag {
+                key: b"orderId".to_vec(),
+                value: b"order-1".to_vec(),
+            }],
+        }],
     };
 
-    let result = follower_store.append(append_req);
-    assert!(result.is_ok(), "follower append should succeed via forwarding: {:?}", result.err());
+    let result = follower_store.append(append_req).await;
+    assert!(
+        result.is_ok(),
+        "follower append should succeed via forwarding: {:?}",
+        result.err()
+    );
 
     let resp = result.unwrap();
     assert_eq!(resp.first_position, Position(1));
     assert_eq!(resp.count, 1);
-    println!("Follower write forwarded to leader, got position {}", resp.first_position.0);
+    println!(
+        "Follower write forwarded to leader, got position {}",
+        resp.first_position.0
+    );
 
     // Verify all nodes have the event.
     let timeout = Duration::from_secs(10);

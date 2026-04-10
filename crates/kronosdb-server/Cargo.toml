@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 kronosdb-eventstore = { path = "../kronosdb-eventstore" }
 kronosdb-messaging = { path = "../kronosdb-messaging" }
-kronosdb-raft = { path = "../kronosdb-raft" }
 tonic = { version = "0.13", features = ["tls-ring", "transport"] }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
@@ -22,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = "0.8"
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.13"

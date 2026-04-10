@@ -27,12 +27,12 @@ fn read_latency_vs_volume(c: &mut Criterion) {
     let events_per_segment = 5_000;
 
     for &num_orders in &[
-        1_000,    //     8K events, ~2 segments
-        10_000,   //    80K events, ~16 segments
-        50_000,   //   400K events, ~80 segments
-        125_000,  //  1.0M events, ~200 segments
-        250_000,  //  2.0M events, ~400 segments
-        625_000,  //  5.0M events, ~1000 segments
+        1_000,   //     8K events, ~2 segments
+        10_000,  //    80K events, ~16 segments
+        50_000,  //   400K events, ~80 segments
+        125_000, //  1.0M events, ~200 segments
+        250_000, //  2.0M events, ~400 segments
+        625_000, //  5.0M events, ~1000 segments
     ] {
         let total_events = num_orders * 8;
         let label = if total_events >= 1_000_000 {
@@ -63,7 +63,11 @@ fn read_latency_vs_volume(c: &mut Criterion) {
                 assert_eq!(events.len(), 8);
 
                 b.iter(|| {
-                    black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+                    black_box(
+                        store
+                            .source(black_box(Position(1)), black_box(&condition))
+                            .unwrap(),
+                    );
                 });
             },
         );
@@ -105,7 +109,11 @@ fn bloom_rejection_vs_volume(c: &mut Criterion) {
                 let _ = store.source(Position(1), &condition).unwrap();
 
                 b.iter(|| {
-                    black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+                    black_box(
+                        store
+                            .source(black_box(Position(1)), black_box(&condition))
+                            .unwrap(),
+                    );
                 });
             },
         );
@@ -128,19 +136,19 @@ fn cache_pressure_at_scale(c: &mut Criterion) {
     let num_customers = 12_500; // 10 orders per customer
 
     let dir = tempdir().unwrap();
-    let store = create_multi_segment_store(
-        dir.path(),
-        num_orders,
-        num_customers,
-        events_per_segment,
-    );
+    let store =
+        create_multi_segment_store(dir.path(), num_orders, num_customers, events_per_segment);
 
     // Sequential access: query orders 0, 1, 2, ... (temporal locality, cache-friendly)
     group.bench_function("sequential_access", |b| {
         let mut i = 0usize;
         b.iter(|| {
             let condition = order_condition(i % num_orders);
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
             i += 1;
         });
     });
@@ -152,7 +160,11 @@ fn cache_pressure_at_scale(c: &mut Criterion) {
         b.iter(|| {
             let order_id = (i * stride) % num_orders;
             let condition = order_condition(order_id);
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
             i += 1;
         });
     });

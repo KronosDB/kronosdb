@@ -104,7 +104,11 @@ impl TagIndex {
     /// Finds event positions matching a query, starting from `from_position` (inclusive).
     ///
     /// Returns matching positions in ascending order.
-    pub fn matching_positions(&self, condition: &SourcingCondition, from_position: Position) -> Vec<u64> {
+    pub fn matching_positions(
+        &self,
+        condition: &SourcingCondition,
+        from_position: Position,
+    ) -> Vec<u64> {
         let combined = self.resolve(condition);
         match combined {
             Some(bitmap) => bitmap
@@ -117,7 +121,11 @@ impl TagIndex {
 
     /// Returns the raw roaring bitmap of matching positions.
     /// Used by the source operation for efficient segment skipping.
-    pub fn matching_bitmap(&self, condition: &SourcingCondition, from_position: Position) -> Option<RoaringTreemap> {
+    pub fn matching_bitmap(
+        &self,
+        condition: &SourcingCondition,
+        from_position: Position,
+    ) -> Option<RoaringTreemap> {
         let mut bitmap = self.resolve(condition)?;
         if from_position.0 > 0 {
             bitmap.remove_range(0..from_position.0);
@@ -132,10 +140,7 @@ impl TagIndex {
     /// Finds the first event matching the condition after the given position.
     fn find_matching_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
         let combined = self.resolve(condition)?;
-        combined
-            .iter()
-            .find(|&pos| pos > after)
-            .map(Position)
+        combined.iter().find(|&pos| pos > after).map(Position)
     }
 
     /// Resolves a sourcing condition into a single bitmap of matching positions.
@@ -245,9 +250,21 @@ mod tests {
     fn query_with_and_tags() {
         let mut index = TagIndex::new();
 
-        index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A"), tag("region", "EU")]);
-        index.index_event(Position(2), "OrderPlaced", &[tag("orderId", "A"), tag("region", "US")]);
-        index.index_event(Position(3), "OrderPlaced", &[tag("orderId", "B"), tag("region", "EU")]);
+        index.index_event(
+            Position(1),
+            "OrderPlaced",
+            &[tag("orderId", "A"), tag("region", "EU")],
+        );
+        index.index_event(
+            Position(2),
+            "OrderPlaced",
+            &[tag("orderId", "A"), tag("region", "US")],
+        );
+        index.index_event(
+            Position(3),
+            "OrderPlaced",
+            &[tag("orderId", "B"), tag("region", "EU")],
+        );
 
         let cond = SourcingCondition {
             criteria: vec![Criterion {
@@ -270,8 +287,14 @@ mod tests {
 
         let cond = SourcingCondition {
             criteria: vec![
-                Criterion { names: vec![], tags: vec![tag("orderId", "A")] },
-                Criterion { names: vec![], tags: vec![tag("orderId", "C")] },
+                Criterion {
+                    names: vec![],
+                    tags: vec![tag("orderId", "A")],
+                },
+                Criterion {
+                    names: vec![],
+                    tags: vec![tag("orderId", "C")],
+                },
             ],
         };
 
@@ -363,7 +386,11 @@ mod tests {
     fn remove_tags_updates_forward_index() {
         let mut index = TagIndex::new();
 
-        index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A"), tag("region", "EU")]);
+        index.index_event(
+            Position(1),
+            "OrderPlaced",
+            &[tag("orderId", "A"), tag("region", "EU")],
+        );
 
         index.remove_tags(Position(1), &[tag("region", "EU")]);
 

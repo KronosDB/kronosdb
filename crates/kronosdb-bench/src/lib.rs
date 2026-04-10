@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 //! Shared helpers for KronosDB benchmarks.
 //!
 //! Models a realistic e-commerce domain with orders, payments, and shipments.
@@ -10,7 +12,7 @@
 
 use kronosdb_eventstore::append::AppendRequest;
 use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
-use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
+use kronosdb_eventstore::event::{AppendEvent, Tag};
 use kronosdb_eventstore::store::{EventStoreEngine, StoreOptions};
 use std::path::Path;
 

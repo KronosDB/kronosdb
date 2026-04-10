@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use growable_bloom_filter::GrowableBloom;
 use lru::LruCache;
@@ -10,6 +11,8 @@ use parking_lot::Mutex;
 use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
 use crate::segment::segment_index::SegmentIndex;
+
+const ORD: Ordering = Ordering::Relaxed;
 
 /// Default number of sealed segment mmaps to cache.
 pub const DEFAULT_MMAP_CACHE_SIZE: usize = 100;
@@ -25,14 +28,17 @@ pub const DEFAULT_MMAP_CACHE_SIZE: usize = 100;
 /// and insert after.
 pub struct IndexCache {
     /// LRU cache of loaded segment indices, keyed by segment base position.
-    /// Arc-wrapped so callers get a cheap shared reference without cloning
-    /// the entire index or holding the cache lock during queries.
     indices: Mutex<LruCache<u64, Arc<SegmentIndex>>>,
     /// LRU cache of bloom filters, keyed by segment base position.
     blooms: Mutex<LruCache<u64, GrowableBloom>>,
     /// LRU cache of mmap handles for sealed segments, keyed by base position.
-    /// Sealed segments are immutable, so sharing a single mmap is safe.
     mmaps: Mutex<LruCache<u64, Arc<Mmap>>>,
+
+    // ── Hit/miss counters (lock-free) ──
+    pub index_hits: AtomicU64,
+    pub index_misses: AtomicU64,
+    pub mmap_hits: AtomicU64,
+    pub mmap_misses: AtomicU64,
 }
 
 impl IndexCache {
@@ -51,6 +57,10 @@ impl IndexCache {
             mmaps: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_MMAP_CACHE_SIZE).unwrap(),
             )),
+            index_hits: AtomicU64::new(0),
+            index_misses: AtomicU64::new(0),
+            mmap_hits: AtomicU64::new(0),
+            mmap_misses: AtomicU64::new(0),
         }
     }
 
@@ -100,9 +110,12 @@ impl IndexCache {
         {
             let mut indices = self.indices.lock();
             if let Some(index) = indices.get(&base_position) {
+                self.index_hits.fetch_add(1, ORD);
                 return Ok(Arc::clone(index));
             }
         }
+
+        self.index_misses.fetch_add(1, ORD);
 
         // Not cached — load from disk.
         let idx_path = segment_path.with_extension("idx");
@@ -119,18 +132,17 @@ impl IndexCache {
 
     /// Gets a cached mmap handle for a sealed segment, opening it if not cached.
     /// Sealed segments are immutable, so the mmap can be safely shared.
-    pub fn get_mmap(
-        &self,
-        segment_path: &Path,
-        base_position: u64,
-    ) -> Result<Arc<Mmap>, Error> {
+    pub fn get_mmap(&self, segment_path: &Path, base_position: u64) -> Result<Arc<Mmap>, Error> {
         // Try cache first.
         {
             let mut mmaps = self.mmaps.lock();
             if let Some(mmap) = mmaps.get(&base_position) {
+                self.mmap_hits.fetch_add(1, ORD);
                 return Ok(Arc::clone(mmap));
             }
         }
+
+        self.mmap_misses.fetch_add(1, ORD);
 
         // Not cached — open and mmap the file.
         let file = std::fs::File::open(segment_path)?;
@@ -202,8 +214,8 @@ fn make_bloom_key(key: &[u8], value: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::event::{AppendEvent, Position, Tag};
-    use crate::segment::writer::SegmentWriter;
     use crate::segment::DEFAULT_SEGMENT_SIZE;
+    use crate::segment::writer::SegmentWriter;
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag::from_str(key, value)
@@ -226,7 +238,10 @@ mod tests {
         writer
             .append(&[
                 make_event("OrderPlaced", vec![tag("orderId", "A")]),
-                make_event("PaymentReceived", vec![tag("orderId", "A"), tag("paymentId", "P1")]),
+                make_event(
+                    "PaymentReceived",
+                    vec![tag("orderId", "A"), tag("paymentId", "P1")],
+                ),
             ])
             .unwrap();
         let seg_path = writer.active_segment_path();

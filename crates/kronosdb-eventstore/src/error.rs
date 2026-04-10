@@ -14,30 +14,19 @@ pub enum Error {
     Io(std::io::Error),
 
     /// The event store data is corrupted (e.g., CRC mismatch).
-    Corrupted {
-        message: String,
-    },
+    Corrupted { message: String },
 
     /// The requested context was not found.
-    ContextNotFound {
-        name: String,
-    },
+    ContextNotFound { name: String },
 
     /// A context with this name already exists.
-    ContextAlreadyExists {
-        name: String,
-    },
+    ContextAlreadyExists { name: String },
 
     /// The context name is invalid.
-    InvalidContextName {
-        name: String,
-        reason: String,
-    },
+    InvalidContextName { name: String, reason: String },
 
     /// Snapshot not found.
-    SnapshotNotFound {
-        key: String,
-    },
+    SnapshotNotFound { key: String },
 }
 
 impl From<std::io::Error> for Error {
@@ -49,7 +38,9 @@ impl From<std::io::Error> for Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::ConsistencyConditionViolated { conflicting_position } => {
+            Error::ConsistencyConditionViolated {
+                conflicting_position,
+            } => {
                 write!(
                     f,
                     "consistency condition violated: conflicting event at position {}",

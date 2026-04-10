@@ -1,7 +1,13 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use parking_lot::RwLock;
 
-use crate::handler::HandlerRegistry;
-use crate::types::{ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction};
+use crate::handler::{HandlerRegistry, MessageTypeDetail, MessageTypeMetrics, MetricsSnapshot};
+use crate::types::{
+    ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction,
+};
 
 /// A query to be dispatched.
 #[derive(Debug, Clone)]
@@ -85,14 +91,29 @@ pub struct PendingQuery {
 /// - **Point-to-point**: query goes to one handler (expected_results = 1)
 /// - **Scatter-gather**: query goes to all handlers (expected_results = -1)
 pub struct QueryBus {
-    handlers: RwLock<HandlerRegistry>,
+    handlers: Arc<RwLock<HandlerRegistry>>,
+    /// Per-query-type dispatch metrics.
+    metrics: RwLock<HashMap<String, MessageTypeMetrics>>,
+}
+
+impl Default for QueryBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QueryBus {
     pub fn new() -> Self {
         Self {
-            handlers: RwLock::new(HandlerRegistry::new()),
+            handlers: Arc::new(RwLock::new(HandlerRegistry::new())),
+            metrics: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Returns a shared reference to the handler registry.
+    /// Used by SubscriptionRegistry to share the same handlers.
+    pub fn shared_handlers(&self) -> Arc<RwLock<HandlerRegistry>> {
+        Arc::clone(&self.handlers)
     }
 
     /// Registers a query handler.
@@ -130,6 +151,42 @@ impl QueryBus {
         self.handlers.read().handler_stats()
     }
 
+    /// Returns detailed handler info + dispatch metrics per query type.
+    pub fn handler_details(&self) -> Vec<MessageTypeDetail> {
+        let handlers = self.handlers.read();
+        let details = handlers.handler_details();
+        let metrics = self.metrics.read();
+
+        details
+            .into_iter()
+            .map(|(name, handlers)| {
+                let snapshot = metrics
+                    .get(&name)
+                    .map(|m| m.snapshot())
+                    .unwrap_or_else(MetricsSnapshot::empty);
+                MessageTypeDetail {
+                    name,
+                    handlers,
+                    metrics: snapshot,
+                }
+            })
+            .collect()
+    }
+
+    /// Records a query completion from the gRPC layer.
+    pub fn record_completion(&self, query_name: &str, is_error: bool, duration_us: u64) {
+        self.get_or_create_metrics(query_name);
+        if let Some(m) = self.metrics.read().get(query_name) {
+            m.total_duration_us
+                .fetch_add(duration_us, Ordering::Relaxed);
+            if is_error {
+                m.failed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                m.succeeded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Dispatches a query.
     ///
     /// Returns a `PendingQuery` with the target handler client IDs.
@@ -139,14 +196,17 @@ impl QueryBus {
     /// - `expected_results = 1`: point-to-point (first available handler)
     /// - `expected_results = -1`: scatter-gather (all handlers)
     pub fn dispatch(&self, query: Query) -> Result<PendingQuery, QueryError> {
+        let query_name = query.name.clone();
         let handlers = self.handlers.read();
-        let handler_list = handlers
-            .get_handlers(&query.name)
-            .ok_or_else(|| QueryError::NoHandlerAvailable {
+        let handler_list = handlers.get_handlers(&query.name).ok_or_else(|| {
+            self.record_no_handler(&query_name);
+            QueryError::NoHandlerAvailable {
                 query_name: query.name.clone(),
-            })?;
+            }
+        })?;
 
         if handler_list.is_empty() {
+            self.record_no_handler(&query_name);
             return Err(QueryError::NoHandlerAvailable {
                 query_name: query.name.clone(),
             });
@@ -157,8 +217,11 @@ impl QueryBus {
             let handler = handler_list
                 .iter()
                 .find(|h| h.handler.try_acquire_permit())
-                .ok_or_else(|| QueryError::NoPermitsAvailable {
-                    query_name: query.name.clone(),
+                .ok_or_else(|| {
+                    self.record_no_permits(&query_name);
+                    QueryError::NoPermitsAvailable {
+                        query_name: query.name.clone(),
+                    }
                 })?;
             vec![handler.handler.client_id.clone()]
         } else {
@@ -170,6 +233,7 @@ impl QueryBus {
                 }
             }
             if targets.is_empty() {
+                self.record_no_permits(&query_name);
                 return Err(QueryError::NoPermitsAvailable {
                     query_name: query.name.clone(),
                 });
@@ -177,10 +241,43 @@ impl QueryBus {
             targets
         };
 
+        // Record dispatch.
+        self.record_dispatched(&query_name);
+
         Ok(PendingQuery {
             query,
             target_handlers,
         })
+    }
+
+    // ── Metrics helpers ─────────────────────────────────────────────
+
+    fn get_or_create_metrics(&self, name: &str) {
+        if self.metrics.read().contains_key(name) {
+            return;
+        }
+        self.metrics.write().entry(name.to_string()).or_default();
+    }
+
+    fn record_dispatched(&self, name: &str) {
+        self.get_or_create_metrics(name);
+        if let Some(m) = self.metrics.read().get(name) {
+            m.dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_no_handler(&self, name: &str) {
+        self.get_or_create_metrics(name);
+        if let Some(m) = self.metrics.read().get(name) {
+            m.no_handler.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_no_permits(&self, name: &str) {
+        self.get_or_create_metrics(name);
+        if let Some(m) = self.metrics.read().get(name) {
+            m.no_permits.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -217,8 +314,16 @@ mod tests {
     #[test]
     fn scatter_gather_dispatches_to_all() {
         let bus = QueryBus::new();
-        bus.subscribe("GetOrders".into(), client("node-1"), component("order-service"));
-        bus.subscribe("GetOrders".into(), client("node-2"), component("order-service"));
+        bus.subscribe(
+            "GetOrders".into(),
+            client("node-1"),
+            component("order-service"),
+        );
+        bus.subscribe(
+            "GetOrders".into(),
+            client("node-2"),
+            component("order-service"),
+        );
         bus.grant_permits(&client("node-1"), 10);
         bus.grant_permits(&client("node-2"), 10);
 
@@ -231,8 +336,16 @@ mod tests {
     #[test]
     fn point_to_point_dispatches_to_one() {
         let bus = QueryBus::new();
-        bus.subscribe("GetOrder".into(), client("node-1"), component("order-service"));
-        bus.subscribe("GetOrder".into(), client("node-2"), component("order-service"));
+        bus.subscribe(
+            "GetOrder".into(),
+            client("node-1"),
+            component("order-service"),
+        );
+        bus.subscribe(
+            "GetOrder".into(),
+            client("node-2"),
+            component("order-service"),
+        );
         bus.grant_permits(&client("node-1"), 10);
         bus.grant_permits(&client("node-2"), 10);
 
@@ -253,7 +366,11 @@ mod tests {
     #[test]
     fn no_permits_returns_error() {
         let bus = QueryBus::new();
-        bus.subscribe("GetOrders".into(), client("node-1"), component("order-service"));
+        bus.subscribe(
+            "GetOrders".into(),
+            client("node-1"),
+            component("order-service"),
+        );
         // No permits.
 
         let query = make_query("GetOrders", -1);
@@ -264,7 +381,11 @@ mod tests {
     #[test]
     fn remove_client_cleans_up() {
         let bus = QueryBus::new();
-        bus.subscribe("GetOrders".into(), client("node-1"), component("order-service"));
+        bus.subscribe(
+            "GetOrders".into(),
+            client("node-1"),
+            component("order-service"),
+        );
         bus.grant_permits(&client("node-1"), 10);
 
         bus.remove_client(&client("node-1"));

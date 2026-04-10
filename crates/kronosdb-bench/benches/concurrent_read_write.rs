@@ -11,8 +11,8 @@ use kronosdb_eventstore::append::AppendRequest;
 use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
 use kronosdb_eventstore::store::StoreOptions;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 
 fn reads_under_write_load(c: &mut Criterion) {
@@ -28,11 +28,18 @@ fn reads_under_write_load(c: &mut Criterion) {
     group.bench_function("read_only", |b| {
         let dir = tempdir().unwrap();
         let store = Arc::new(create_ecommerce_store(
-            dir.path(), num_orders, num_customers, &StoreOptions::default(),
+            dir.path(),
+            num_orders,
+            num_customers,
+            &StoreOptions::default(),
         ));
 
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
     });
 
@@ -40,7 +47,10 @@ fn reads_under_write_load(c: &mut Criterion) {
     group.bench_function("read_with_background_writes", |b| {
         let dir = tempdir().unwrap();
         let store = Arc::new(create_ecommerce_store(
-            dir.path(), num_orders, num_customers, &StoreOptions::default(),
+            dir.path(),
+            num_orders,
+            num_customers,
+            &StoreOptions::default(),
         ));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -72,7 +82,11 @@ fn reads_under_write_load(c: &mut Criterion) {
         });
 
         b.iter(|| {
-            black_box(store.source(black_box(Position(1)), black_box(&condition)).unwrap());
+            black_box(
+                store
+                    .source(black_box(Position(1)), black_box(&condition))
+                    .unwrap(),
+            );
         });
 
         stop.store(true, Ordering::Relaxed);

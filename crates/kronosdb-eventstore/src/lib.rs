@@ -1,13 +1,17 @@
+#![allow(clippy::all)]
+
+pub mod api;
+pub mod append;
+pub mod criteria;
 pub mod error;
 pub mod event;
-pub mod criteria;
-pub mod append;
-pub mod api;
 
-pub mod segment;
-pub mod index;
 pub mod cache;
+pub mod context;
+pub mod index;
+pub mod metrics;
+pub mod raft;
+pub mod segment;
+pub mod snapshot;
 pub mod store;
 pub mod stream;
-pub mod context;
-pub mod snapshot;

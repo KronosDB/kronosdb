@@ -1139,17 +1139,24 @@ dependencies = [
 name = "kronosdb-eventstore"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
  "crc32c",
  "growable-bloom-filter",
  "libc",
  "lru",
  "memmap2",
+ "openraft",
  "parking_lot",
+ "prost",
  "roaring",
  "serde",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
 ]
 
 [[package]]
@@ -1161,24 +1168,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kronosdb-raft"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "kronosdb-eventstore",
- "openraft",
- "parking_lot",
- "prost",
- "serde",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tracing",
-]
-
-[[package]]
 name = "kronosdb-server"
 version = "0.1.0"
 dependencies = [
@@ -1186,7 +1175,6 @@ dependencies = [
  "clap",
  "kronosdb-eventstore",
  "kronosdb-messaging",
- "kronosdb-raft",
  "mime_guess",
  "parking_lot",
  "prost",
@@ -1200,6 +1188,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2614,6 +2603,7 @@ version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
 ]

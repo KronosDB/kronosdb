@@ -1,7 +1,110 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::types::{ClientId, ComponentName};
+
+/// Snapshot of a single handler's state, for admin display.
+#[derive(Debug, Clone)]
+pub struct HandlerDetail {
+    pub client_id: String,
+    pub component_name: String,
+    pub load_factor: i32,
+    pub available_permits: i64,
+}
+
+/// Lock-free dispatch metrics for a single message type (command or query).
+///
+/// All fields are atomic — no locks, no allocations on the hot path.
+/// Same pattern as `StoreMetrics` in the eventstore.
+pub struct MessageTypeMetrics {
+    pub dispatched: AtomicU64,
+    pub succeeded: AtomicU64,
+    pub failed: AtomicU64,
+    pub no_handler: AtomicU64,
+    pub no_permits: AtomicU64,
+    /// Cumulative dispatch-to-response duration in microseconds.
+    pub total_duration_us: AtomicU64,
+}
+
+impl Default for MessageTypeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MessageTypeMetrics {
+    pub fn new() -> Self {
+        Self {
+            dispatched: AtomicU64::new(0),
+            succeeded: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            no_handler: AtomicU64::new(0),
+            no_permits: AtomicU64::new(0),
+            total_duration_us: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let dispatched = self.dispatched.load(Ordering::Relaxed);
+        let succeeded = self.succeeded.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let no_handler = self.no_handler.load(Ordering::Relaxed);
+        let no_permits = self.no_permits.load(Ordering::Relaxed);
+        let total_duration_us = self.total_duration_us.load(Ordering::Relaxed);
+        let completed = succeeded + failed;
+        MetricsSnapshot {
+            dispatched,
+            succeeded,
+            failed,
+            no_handler,
+            no_permits,
+            avg_duration_us: if completed > 0 {
+                total_duration_us / completed
+            } else {
+                0
+            },
+            success_rate: if completed > 0 {
+                (succeeded as f64 / completed as f64) * 100.0
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+/// Point-in-time snapshot of dispatch metrics for a message type.
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub dispatched: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub no_handler: u64,
+    pub no_permits: u64,
+    pub avg_duration_us: u64,
+    pub success_rate: f64,
+}
+
+impl MetricsSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            dispatched: 0,
+            succeeded: 0,
+            failed: 0,
+            no_handler: 0,
+            no_permits: 0,
+            avg_duration_us: 0,
+            success_rate: 0.0,
+        }
+    }
+}
+
+/// Combined detail for a message type: handlers + dispatch metrics.
+#[derive(Debug, Clone)]
+pub struct MessageTypeDetail {
+    pub name: String,
+    pub handlers: Vec<HandlerDetail>,
+    pub metrics: MetricsSnapshot,
+}
 
 /// A registered handler — a connected client that can process messages.
 pub struct Handler {
@@ -70,6 +173,12 @@ pub struct HandlerRegistry {
 /// An entry in the handler list for a message type.
 pub struct HandlerEntry {
     pub handler: Handler,
+}
+
+impl Default for HandlerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HandlerRegistry {
@@ -166,6 +275,25 @@ impl HandlerRegistry {
             .map(|(name, entries)| (name.clone(), entries.len()))
             .collect()
     }
+
+    /// Returns detailed handler info per message type, for admin display.
+    pub fn handler_details(&self) -> Vec<(String, Vec<HandlerDetail>)> {
+        self.subscriptions
+            .iter()
+            .map(|(name, entries)| {
+                let details = entries
+                    .iter()
+                    .map(|e| HandlerDetail {
+                        client_id: e.handler.client_id.0.clone(),
+                        component_name: e.handler.component_name.0.clone(),
+                        load_factor: e.handler.load_factor,
+                        available_permits: e.handler.available_permits(),
+                    })
+                    .collect();
+                (name.clone(), details)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -198,8 +326,18 @@ mod tests {
     #[test]
     fn multiple_handlers_for_same_type() {
         let mut registry = HandlerRegistry::new();
-        registry.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
-        registry.subscribe("CreateOrder".into(), client("node-2"), component("order-service"), 100);
+        registry.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        registry.subscribe(
+            "CreateOrder".into(),
+            client("node-2"),
+            component("order-service"),
+            100,
+        );
 
         let handlers = registry.get_handlers("CreateOrder").unwrap();
         assert_eq!(handlers.len(), 2);
@@ -208,8 +346,18 @@ mod tests {
     #[test]
     fn unsubscribe() {
         let mut registry = HandlerRegistry::new();
-        registry.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
-        registry.subscribe("CreateOrder".into(), client("node-2"), component("order-service"), 100);
+        registry.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        registry.subscribe(
+            "CreateOrder".into(),
+            client("node-2"),
+            component("order-service"),
+            100,
+        );
 
         registry.unsubscribe("CreateOrder", &client("node-1"));
 
@@ -221,8 +369,18 @@ mod tests {
     #[test]
     fn remove_client() {
         let mut registry = HandlerRegistry::new();
-        registry.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
-        registry.subscribe("ProcessPayment".into(), client("node-1"), component("order-service"), 100);
+        registry.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        registry.subscribe(
+            "ProcessPayment".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
 
         registry.remove_client(&client("node-1"));
 
@@ -233,7 +391,12 @@ mod tests {
     #[test]
     fn permits() {
         let mut registry = HandlerRegistry::new();
-        registry.subscribe("CreateOrder".into(), client("node-1"), component("order-service"), 100);
+        registry.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
 
         // No permits initially.
         let handlers = registry.get_handlers("CreateOrder").unwrap();

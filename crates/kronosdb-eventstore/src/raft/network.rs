@@ -1,17 +1,18 @@
-use openraft::error::{InstallSnapshotError, RPCError, RaftError};
-use openraft::network::{RaftNetwork, RaftNetworkFactory, RPCOption};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
-};
 use openraft::BasicNode;
+use openraft::error::{InstallSnapshotError, RPCError, RaftError};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
 use tonic::transport::Channel;
 
-use crate::proto::raft_transport_client::RaftTransportClient;
-use crate::proto;
-use crate::types::{NodeId, TypeConfig};
+use super::proto;
+use super::proto::raft_transport_client::RaftTransportClient;
+use super::types::{NodeId, TypeConfig};
 
-type RaftRPCError<E = openraft::error::Infallible> = RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
+type RaftRPCError<E = openraft::error::Infallible> =
+    RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
 
 /// Factory that creates gRPC network connections to peer nodes.
 pub struct NetworkFactory;
@@ -54,23 +55,21 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RaftRPCError> {
-        let data = bincode::serialize(&rpc).map_err(|e| {
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
+        let data = bincode::serialize(&rpc)
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
-        let client = self.get_client().await.map_err(|e| {
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         let resp = client
             .append_entries(proto::RaftAppendEntriesRequest { data })
             .await
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
-        let response: AppendEntriesResponse<NodeId> =
-            bincode::deserialize(&resp.into_inner().data).map_err(|e| {
-                RPCError::Network(openraft::error::NetworkError::new(&e))
-            })?;
+        let response: AppendEntriesResponse<NodeId> = bincode::deserialize(&resp.into_inner().data)
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         Ok(response)
     }
@@ -83,13 +82,13 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let data = bincode::serialize(&rpc).map_err(|e| {
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
+        let data = bincode::serialize(&rpc)
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
-        let client = self.get_client().await.map_err(|e| {
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         let resp = client
             .install_snapshot(proto::RaftInstallSnapshotRequest { data })
@@ -97,9 +96,8 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         let response: InstallSnapshotResponse<NodeId> =
-            bincode::deserialize(&resp.into_inner().data).map_err(|e| {
-                RPCError::Network(openraft::error::NetworkError::new(&e))
-            })?;
+            bincode::deserialize(&resp.into_inner().data)
+                .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         Ok(response)
     }
@@ -109,23 +107,21 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RaftRPCError> {
-        let data = bincode::serialize(&rpc).map_err(|e| {
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
+        let data = bincode::serialize(&rpc)
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
-        let client = self.get_client().await.map_err(|e| {
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         let resp = client
             .vote(proto::RaftVoteRequest { data })
             .await
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
-        let response: VoteResponse<NodeId> =
-            bincode::deserialize(&resp.into_inner().data).map_err(|e| {
-                RPCError::Network(openraft::error::NetworkError::new(&e))
-            })?;
+        let response: VoteResponse<NodeId> = bincode::deserialize(&resp.into_inner().data)
+            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         Ok(response)
     }

@@ -21,7 +21,7 @@ struct Cli {
     node_name: String,
 
     /// Admin HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:8080", env = "KRONOSDB_ADMIN_LISTEN")]
+    #[arg(long, default_value = "127.0.0.1:9240", env = "KRONOSDB_ADMIN_LISTEN")]
     admin_listen: SocketAddr,
 
     /// Segment size in bytes (e.g. 268435456 for 256MB).
@@ -35,6 +35,11 @@ struct Cli {
     /// Number of bloom filters to cache.
     #[arg(long, env = "KRONOSDB_BLOOM_CACHE_SIZE")]
     bloom_cache_size: Option<usize>,
+
+    /// Group commit interval in milliseconds. Batches fsyncs for higher throughput.
+    /// 0 = disabled (fsync per write). Default: 2ms.
+    #[arg(long, env = "KRONOSDB_GROUP_COMMIT_MS")]
+    group_commit_ms: Option<u64>,
 
     /// Command dispatch timeout in seconds.
     #[arg(long, env = "KRONOSDB_COMMAND_TIMEOUT")]
@@ -57,7 +62,6 @@ struct Cli {
     config: Option<PathBuf>,
 
     // --- Cluster options ---
-
     /// Enable clustering with this node ID (u64).
     #[arg(long, env = "KRONOSDB_CLUSTER_NODE_ID")]
     cluster_node_id: Option<u64>,
@@ -75,7 +79,6 @@ struct Cli {
     cluster_learners: Vec<String>,
 
     // --- Security options ---
-
     /// Access token for gRPC authentication. If set, clients must send this token
     /// in the `kronosdb-token` metadata header. If not set, auth is disabled.
     #[arg(long, env = "KRONOSDB_ACCESS_TOKEN")]
@@ -174,6 +177,7 @@ pub struct ServerConfig {
     pub segment_size: u64,
     pub index_cache_size: usize,
     pub bloom_cache_size: usize,
+    pub group_commit_ms: u64,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
     pub heartbeat_interval_secs: u64,
@@ -235,25 +239,33 @@ impl ServerConfig {
             data_dir: cli.data_dir,
             node_name: cli.node_name,
             admin_listen_addr: cli.admin_listen,
-            segment_size: cli.segment_size
+            segment_size: cli
+                .segment_size
                 .or(file_config.storage.segment_size)
                 .unwrap_or(DEFAULT_SEGMENT_SIZE),
-            index_cache_size: cli.index_cache_size
+            index_cache_size: cli
+                .index_cache_size
                 .or(file_config.storage.index_cache_size)
                 .unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            bloom_cache_size: cli.bloom_cache_size
+            bloom_cache_size: cli
+                .bloom_cache_size
                 .or(file_config.storage.bloom_cache_size)
                 .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
-            command_timeout_secs: cli.command_timeout
+            group_commit_ms: cli.group_commit_ms.unwrap_or(2),
+            command_timeout_secs: cli
+                .command_timeout
                 .or(file_config.timeouts.command_timeout)
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT),
-            query_timeout_secs: cli.query_timeout
+            query_timeout_secs: cli
+                .query_timeout
                 .or(file_config.timeouts.query_timeout)
                 .unwrap_or(DEFAULT_QUERY_TIMEOUT),
-            heartbeat_interval_secs: cli.heartbeat_interval
+            heartbeat_interval_secs: cli
+                .heartbeat_interval
                 .or(file_config.timeouts.heartbeat_interval)
                 .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL),
-            heartbeat_timeout_secs: cli.heartbeat_timeout
+            heartbeat_timeout_secs: cli
+                .heartbeat_timeout
                 .or(file_config.timeouts.heartbeat_timeout)
                 .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT),
             cluster_node_id: cli.cluster_node_id,
@@ -261,9 +273,15 @@ impl ServerConfig {
             cluster_peers,
             cluster_learners,
             access_token: cli.access_token.or(file_config.security.access_token),
-            tls_cert: cli.tls_cert.or(file_config.security.tls_cert.map(PathBuf::from)),
-            tls_key: cli.tls_key.or(file_config.security.tls_key.map(PathBuf::from)),
-            tls_ca: cli.tls_ca.or(file_config.security.tls_ca.map(PathBuf::from)),
+            tls_cert: cli
+                .tls_cert
+                .or(file_config.security.tls_cert.map(PathBuf::from)),
+            tls_key: cli
+                .tls_key
+                .or(file_config.security.tls_key.map(PathBuf::from)),
+            tls_ca: cli
+                .tls_ca
+                .or(file_config.security.tls_ca.map(PathBuf::from)),
         })
     }
 
@@ -386,9 +404,18 @@ tls-ca = "/etc/kronosdb/ca.pem"
 "#;
         let config: ConfigFile = toml::from_str(toml).unwrap();
         assert_eq!(config.security.access_token.as_deref(), Some("my-secret"));
-        assert_eq!(config.security.tls_cert.as_deref(), Some("/etc/kronosdb/cert.pem"));
-        assert_eq!(config.security.tls_key.as_deref(), Some("/etc/kronosdb/key.pem"));
-        assert_eq!(config.security.tls_ca.as_deref(), Some("/etc/kronosdb/ca.pem"));
+        assert_eq!(
+            config.security.tls_cert.as_deref(),
+            Some("/etc/kronosdb/cert.pem")
+        );
+        assert_eq!(
+            config.security.tls_key.as_deref(),
+            Some("/etc/kronosdb/key.pem")
+        );
+        assert_eq!(
+            config.security.tls_ca.as_deref(),
+            Some("/etc/kronosdb/ca.pem")
+        );
     }
 
     #[test]
@@ -397,10 +424,11 @@ tls-ca = "/etc/kronosdb/ca.pem"
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             data_dir: "data".into(),
             node_name: "test".into(),
-            admin_listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            admin_listen_addr: "127.0.0.1:9240".parse().unwrap(),
             segment_size: 256 * 1024 * 1024,
             index_cache_size: 50,
             bloom_cache_size: 200,
+            group_commit_ms: 2,
             command_timeout_secs: 30,
             query_timeout_secs: 30,
             heartbeat_interval_secs: 5,
@@ -423,10 +451,11 @@ tls-ca = "/etc/kronosdb/ca.pem"
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             data_dir: "data".into(),
             node_name: "test".into(),
-            admin_listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            admin_listen_addr: "127.0.0.1:9240".parse().unwrap(),
             segment_size: 256 * 1024 * 1024,
             index_cache_size: 50,
             bloom_cache_size: 200,
+            group_commit_ms: 2,
             command_timeout_secs: 30,
             query_timeout_secs: 30,
             heartbeat_interval_secs: 5,
