@@ -1,6 +1,6 @@
 use crate::error::Error;
-use crate::event::{Position, StoredEvent};
 use crate::event::Tag;
+use crate::event::{Position, StoredEvent};
 
 /// Serializes a stored event (with tags) into the binary on-disk format.
 ///
@@ -169,11 +169,10 @@ fn read_string(data: &[u8], cursor: &mut usize) -> Result<String, Error> {
             message: "string extends beyond record boundary".into(),
         });
     }
-    let s = String::from_utf8(data[*cursor..*cursor + len].to_vec()).map_err(|_| {
-        Error::Corrupted {
+    let s =
+        String::from_utf8(data[*cursor..*cursor + len].to_vec()).map_err(|_| Error::Corrupted {
             message: "invalid UTF-8 in string field".into(),
-        }
-    })?;
+        })?;
     *cursor += len;
     Ok(s)
 }

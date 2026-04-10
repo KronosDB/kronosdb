@@ -15,7 +15,8 @@ service PlatformService {
   rpc GetPlatformServer(ClientIdentification) returns (PlatformInfo);
 
   /* Persistent bidirectional stream for lifecycle management.
-   * Used for heartbeat exchange and server-initiated instructions. */
+   * Used for heartbeat exchange, event processor status reporting,
+   * and server-initiated instructions. */
   rpc OpenStream(stream PlatformInbound) returns (stream PlatformOutbound);
 }
 
@@ -50,6 +51,11 @@ message PlatformInbound {
     Heartbeat heartbeat = 2;
     /* Acknowledge a server instruction. */
     kronosdb.InstructionAck ack = 3;
+    /* Event processor status report.
+     * Clients periodically send this to report the state of their event processors. */
+    EventProcessorInfo event_processor_info = 4;
+    /* Result of executing a server instruction (e.g. split/merge outcome). */
+    InstructionResult result = 5;
   }
 }
 
@@ -62,6 +68,18 @@ message PlatformOutbound {
     Heartbeat heartbeat = 2;
     /* Ask the client to reconnect (e.g. for rebalancing). */
     RequestReconnect request_reconnect = 3;
+    /* Instruction to pause a streaming event processor. */
+    EventProcessorReference pause_event_processor = 4;
+    /* Instruction to start a streaming event processor. */
+    EventProcessorReference start_event_processor = 5;
+    /* Instruction to release a specific segment in a streaming event processor. */
+    EventProcessorSegmentReference release_segment = 6;
+    /* Request status information for a specific event processor. */
+    EventProcessorReference request_event_processor_info = 7;
+    /* Instruction to split a segment in a streaming event processor. */
+    EventProcessorSegmentReference split_event_processor_segment = 8;
+    /* Instruction to merge two segments in a streaming event processor. */
+    EventProcessorSegmentReference merge_event_processor_segment = 9;
   }
   /* If set, the client must acknowledge this instruction. */
   string instruction_id = 10;
@@ -72,3 +90,62 @@ message Heartbeat {}
 
 /* Ask the client to disconnect and reconnect. */
 message RequestReconnect {}
+
+/* Status of an event processor, reported by clients.
+ *
+ * Matches the Axon Server protocol shape so the connector can map fields directly. */
+message EventProcessorInfo {
+  /* The logical name of this processor (e.g. "OrderProjection"). */
+  string processor_name = 1;
+  /* The mode: "Tracking", "Subscribing", "Pooled", etc. */
+  string mode = 2;
+  /* Number of threads currently actively processing events. */
+  int32 active_threads = 3;
+  /* Whether the processor is running. */
+  bool running = 4;
+  /* Whether the processor stopped due to an irrecoverable error. */
+  bool error = 5;
+  /* Per-segment status. Only provided by streaming event processors. */
+  repeated SegmentStatus segment_status = 6;
+  /* Number of threads available to assign to segments. 0 if all assigned. */
+  int32 available_threads = 7;
+  /* Token store identifier, if available. Distinguishes processors with the
+   * same name but different token stores. */
+  string token_store_identifier = 8;
+  /* Whether this is a streaming event processor (supports split/merge). */
+  bool is_streaming_processor = 9;
+
+  /* Status of a single segment within a streaming event processor. */
+  message SegmentStatus {
+    /* The segment identifier. */
+    int32 segment_id = 1;
+    /* Whether this segment has caught up with the head of the event stream. */
+    bool caught_up = 2;
+    /* Whether this segment is replaying historic events after a reset. */
+    bool replaying = 3;
+    /* The fraction this segment processes. 2 means 1/2, 4 means 1/4, etc. */
+    int32 one_part_of = 4;
+    /* The approximate position of the tracking token in the stream. */
+    int64 token_position = 5;
+    /* Error state description, if the segment is in error. */
+    string error_state = 6;
+  }
+}
+
+/* Reference to an event processor by name. Used for instructions. */
+message EventProcessorReference {
+  string processor_name = 1;
+}
+
+/* Reference to a specific segment of an event processor. Used for instructions. */
+message EventProcessorSegmentReference {
+  string processor_name = 1;
+  int32 segment_identifier = 2;
+}
+
+/* Result of executing a server instruction. */
+message InstructionResult {
+  string instruction_id = 1;
+  bool success = 2;
+  kronosdb.ErrorMessage error = 3;
+}

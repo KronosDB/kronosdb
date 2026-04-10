@@ -7,9 +7,9 @@ use tonic::{Request, Response, Status, Streaming};
 use kronosdb_eventstore::api::EventStore;
 use kronosdb_eventstore::append::{AppendCondition, AppendRequest};
 use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
-use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
 use kronosdb_eventstore::error::Error;
-use kronosdb_raft::cluster::ClusterManager;
+use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
+use kronosdb_eventstore::raft::cluster::ClusterManager;
 
 use crate::proto::kronosdb::eventstore as pb;
 use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer as GrpcEventStoreServer;
@@ -54,9 +54,7 @@ impl EventStoreService {
 
     /// Gets an event store for the context (raw engine or Raft decorator).
     fn get_store(&self, context_name: &str) -> Result<Arc<dyn EventStore>, Status> {
-        self.cluster
-            .get_store(context_name)
-            .map_err(to_status)
+        self.cluster.get_store(context_name).map_err(to_status)
     }
 }
 
@@ -89,12 +87,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         };
 
         let store = self.get_store(&context_name)?;
-        let response = tokio::task::spawn_blocking(move || {
-            store.append(request)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(to_status)?;
+        let response = store.append(request).await.map_err(to_status)?;
 
         Ok(Response::new(pb::AppendResponse {
             first_sequence: response.first_position.0 as i64,
@@ -111,6 +104,20 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let req = request.into_inner();
         let from_position = Position(req.from_sequence as u64);
         let condition = from_proto_criteria(req.criteria);
+        tracing::info!(
+            from = from_position.0,
+            criteria_count = condition.criteria.len(),
+            criteria = ?condition.criteria.iter().map(|c| format!(
+                "names={:?} tags={:?}",
+                c.names,
+                c.tags.iter().map(|t| format!(
+                    "{}={}",
+                    String::from_utf8_lossy(&t.key),
+                    String::from_utf8_lossy(&t.value)
+                )).collect::<Vec<_>>()
+            )).collect::<Vec<_>>(),
+            "Source request"
+        );
 
         let store = self.get_store(&context_name)?;
         let condition_clone = condition.clone();
@@ -129,9 +136,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
         tokio::spawn(async move {
             for event in events {
                 let response = pb::SourceResponse {
-                    result: Some(pb::source_response::Result::Event(to_proto_sequenced_event(
-                        &event,
-                    ))),
+                    result: Some(pb::source_response::Result::Event(
+                        to_proto_sequenced_event(&event),
+                    )),
                 };
                 if tx.send(Ok(response)).await.is_err() {
                     return;
@@ -168,10 +175,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                 let store2 = Arc::clone(&store);
                 let condition = condition.clone();
                 let cursor = event_stream.cursor;
-                tokio::task::spawn_blocking(move || {
-                    store2.source(cursor, &condition)
-                })
-                .await
+                tokio::task::spawn_blocking(move || store2.source(cursor, &condition)).await
             };
 
             match historical {
@@ -193,7 +197,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     return;
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(Status::internal(format!("task join error: {e}")))).await;
+                    let _ = tx
+                        .send(Err(Status::internal(format!("task join error: {e}"))))
+                        .await;
                     return;
                 }
             }
@@ -206,10 +212,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     let store2 = Arc::clone(&store);
                     let condition = condition.clone();
                     let cursor = event_stream.cursor;
-                    tokio::task::spawn_blocking(move || {
-                        store2.source(cursor, &condition)
-                    })
-                    .await
+                    tokio::task::spawn_blocking(move || store2.source(cursor, &condition)).await
                 };
 
                 match new_events {
@@ -231,7 +234,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         return;
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(Status::internal(format!("task join error: {e}")))).await;
+                        let _ = tx
+                            .send(Err(Status::internal(format!("task join error: {e}"))))
+                            .await;
                         return;
                     }
                 }
@@ -247,11 +252,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
     ) -> Result<Response<pb::GetHeadResponse>, Status> {
         let context_name = Self::extract_context(&request).to_string();
         let store = self.get_store(&context_name)?;
-        let head = tokio::task::spawn_blocking(move || {
-            store.head()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+        let head = tokio::task::spawn_blocking(move || store.head())
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?;
 
         Ok(Response::new(pb::GetHeadResponse {
             sequence: head.0 as i64,
@@ -264,11 +267,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
     ) -> Result<Response<pb::GetTailResponse>, Status> {
         let context_name = Self::extract_context(&request).to_string();
         let store = self.get_store(&context_name)?;
-        let tail = tokio::task::spawn_blocking(move || {
-            store.tail()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+        let tail = tokio::task::spawn_blocking(move || store.tail())
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?;
 
         Ok(Response::new(pb::GetTailResponse {
             sequence: tail.0 as i64,
@@ -284,15 +285,32 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let position = Position(req.sequence as u64);
 
         let store = self.get_store(&context_name)?;
-        let tags = tokio::task::spawn_blocking(move || {
-            store.get_tags(position)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(to_status)?;
+        let tags = tokio::task::spawn_blocking(move || store.get_tags(position))
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::GetTagsResponse {
             tags: tags.into_iter().map(to_proto_tag).collect(),
+        }))
+    }
+
+    async fn get_sequence_at(
+        &self,
+        request: Request<pb::GetSequenceAtRequest>,
+    ) -> Result<Response<pb::GetSequenceAtResponse>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
+        let req = request.into_inner();
+        let timestamp_millis = req.timestamp;
+
+        let store = self.get_store(&context_name)?;
+        let position = tokio::task::spawn_blocking(move || store.get_sequence_at(timestamp_millis))
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?
+            .map_err(to_status)?;
+
+        Ok(Response::new(pb::GetSequenceAtResponse {
+            sequence: position.map(|p| p.0 as i64).unwrap_or(-1),
         }))
     }
 }
@@ -366,7 +384,9 @@ fn to_proto_tag(t: Tag) -> pb::Tag {
 
 fn to_status(e: Error) -> Status {
     match e {
-        Error::ConsistencyConditionViolated { conflicting_position } => Status::aborted(format!(
+        Error::ConsistencyConditionViolated {
+            conflicting_position,
+        } => Status::aborted(format!(
             "consistency condition violated: conflicting event at position {}",
             conflicting_position.0
         )),
@@ -379,8 +399,6 @@ fn to_status(e: Error) -> Status {
         Error::InvalidContextName { name, reason } => {
             Status::invalid_argument(format!("invalid context name '{name}': {reason}"))
         }
-        Error::SnapshotNotFound { key } => {
-            Status::not_found(format!("snapshot not found: {key}"))
-        }
+        Error::SnapshotNotFound { key } => Status::not_found(format!("snapshot not found: {key}")),
     }
 }

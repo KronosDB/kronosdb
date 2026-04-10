@@ -89,7 +89,9 @@ pub trait SubscriptionQueryDispatcher: Send + Sync {
 ///
 /// The gRPC layer programs against this trait. Implementations can be
 /// the direct engine or a cluster-aware decorator that forwards to remote nodes.
-pub trait MessagingPlatform: CommandDispatcher + QueryDispatcher + SubscriptionQueryDispatcher {
+pub trait MessagingPlatform:
+    CommandDispatcher + QueryDispatcher + SubscriptionQueryDispatcher
+{
     /// Removes all subscriptions for a disconnected client (commands, queries, subscriptions).
     fn remove_client(&self, client_id: &ClientId);
 }

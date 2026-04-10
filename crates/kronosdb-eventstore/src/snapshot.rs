@@ -37,17 +37,9 @@ pub struct SnapshotEntry {
 ///     {sequence:020}.snap      # one file per snapshot
 /// ```
 ///
-/// Each `.snap` file is a simple binary format:
-/// ```text
-/// [4] KSNP magic
-/// [1] version (1)
-/// [2] name_len + [N] name
-/// [2] version_len + [N] version
-/// [8] timestamp
-/// [2] metadata_count
-///   for each: [2] key_len + [N] key + [2] value_len + [N] value
-/// [4] payload_len + [N] payload
-/// ```
+/// No in-memory cache — snapshot access patterns have poor temporal locality
+/// (each entity is loaded once per command, then not again for a long time).
+/// The OS page cache handles recently-read files naturally.
 pub struct SnapshotStore {
     dir: PathBuf,
 }
@@ -193,20 +185,16 @@ fn write_snapshot(file: &mut File, snap: &Snapshot) -> Result<(), Error> {
     file.write_all(&SNAP_MAGIC)?;
     file.write_all(&[SNAP_VERSION])?;
 
-    // name
     let name_bytes = snap.name.as_bytes();
     file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
     file.write_all(name_bytes)?;
 
-    // version
     let version_bytes = snap.version.as_bytes();
     file.write_all(&(version_bytes.len() as u16).to_le_bytes())?;
     file.write_all(version_bytes)?;
 
-    // timestamp
     file.write_all(&snap.timestamp.to_le_bytes())?;
 
-    // metadata
     file.write_all(&(snap.metadata.len() as u16).to_le_bytes())?;
     for (k, v) in &snap.metadata {
         let k_bytes = k.as_bytes();
@@ -217,7 +205,6 @@ fn write_snapshot(file: &mut File, snap: &Snapshot) -> Result<(), Error> {
         file.write_all(v_bytes)?;
     }
 
-    // payload
     file.write_all(&(snap.payload.len() as u32).to_le_bytes())?;
     file.write_all(&snap.payload)?;
 
@@ -226,7 +213,6 @@ fn write_snapshot(file: &mut File, snap: &Snapshot) -> Result<(), Error> {
 
 fn read_snapshot(path: &Path) -> Result<Snapshot, Error> {
     let data = fs::read(path)?;
-    // Magic + version
     if data.len() < 5 || data[0..4] != SNAP_MAGIC {
         return Err(Error::Corrupted {
             message: "invalid snapshot magic bytes".into(),
@@ -239,18 +225,14 @@ fn read_snapshot(path: &Path) -> Result<Snapshot, Error> {
     }
     let mut cursor = 5;
 
-    // name
     let name_len = read_u16(&data, &mut cursor) as usize;
     let name = read_string(&data, &mut cursor, name_len)?;
 
-    // version
     let version_len = read_u16(&data, &mut cursor) as usize;
     let version = read_string(&data, &mut cursor, version_len)?;
 
-    // timestamp
     let timestamp = read_i64(&data, &mut cursor);
 
-    // metadata
     let meta_count = read_u16(&data, &mut cursor) as usize;
     let mut metadata = HashMap::with_capacity(meta_count);
     for _ in 0..meta_count {
@@ -261,7 +243,6 @@ fn read_snapshot(path: &Path) -> Result<Snapshot, Error> {
         metadata.insert(k, v);
     }
 
-    // payload
     let payload_len = read_u32(&data, &mut cursor) as usize;
     let payload = data[cursor..cursor + payload_len].to_vec();
 
@@ -314,9 +295,7 @@ mod tests {
             version: "1.0".to_string(),
             payload: payload.to_vec(),
             timestamp: 1712345678000,
-            metadata: HashMap::from([
-                ("source".to_string(), "test".to_string()),
-            ]),
+            metadata: HashMap::from([("source".to_string(), "test".to_string())]),
         }
     }
 
@@ -343,9 +322,15 @@ mod tests {
         let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
 
         let key = b"projection-1";
-        store.add(key, 10, &make_snapshot("P", b"v1"), false).unwrap();
-        store.add(key, 50, &make_snapshot("P", b"v2"), false).unwrap();
-        store.add(key, 30, &make_snapshot("P", b"v3"), false).unwrap();
+        store
+            .add(key, 10, &make_snapshot("P", b"v1"), false)
+            .unwrap();
+        store
+            .add(key, 50, &make_snapshot("P", b"v2"), false)
+            .unwrap();
+        store
+            .add(key, 30, &make_snapshot("P", b"v3"), false)
+            .unwrap();
 
         let entry = store.get_last(key).unwrap().unwrap();
         assert_eq!(entry.sequence, 50);
@@ -366,12 +351,19 @@ mod tests {
         let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
 
         let key = b"proj";
-        store.add(key, 10, &make_snapshot("P", b"a"), false).unwrap();
-        store.add(key, 20, &make_snapshot("P", b"b"), false).unwrap();
-        store.add(key, 30, &make_snapshot("P", b"c"), false).unwrap();
-        store.add(key, 40, &make_snapshot("P", b"d"), false).unwrap();
+        store
+            .add(key, 10, &make_snapshot("P", b"a"), false)
+            .unwrap();
+        store
+            .add(key, 20, &make_snapshot("P", b"b"), false)
+            .unwrap();
+        store
+            .add(key, 30, &make_snapshot("P", b"c"), false)
+            .unwrap();
+        store
+            .add(key, 40, &make_snapshot("P", b"d"), false)
+            .unwrap();
 
-        // [20, 40) → sequences 20, 30
         let entries = store.list(key, 20, 40).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 20);
@@ -384,11 +376,16 @@ mod tests {
         let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
 
         let key = b"proj";
-        store.add(key, 10, &make_snapshot("P", b"a"), false).unwrap();
-        store.add(key, 20, &make_snapshot("P", b"b"), false).unwrap();
-        store.add(key, 30, &make_snapshot("P", b"c"), false).unwrap();
+        store
+            .add(key, 10, &make_snapshot("P", b"a"), false)
+            .unwrap();
+        store
+            .add(key, 20, &make_snapshot("P", b"b"), false)
+            .unwrap();
+        store
+            .add(key, 30, &make_snapshot("P", b"c"), false)
+            .unwrap();
 
-        // Delete [0, 25) → removes 10 and 20
         store.delete(key, 25).unwrap();
 
         let entries = store.list(key, 0, i64::MAX).unwrap();
@@ -402,9 +399,12 @@ mod tests {
         let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
 
         let key = b"proj";
-        store.add(key, 10, &make_snapshot("P", b"a"), false).unwrap();
-        store.add(key, 20, &make_snapshot("P", b"b"), false).unwrap();
-        // Add with prune — should delete sequence 10 and 20
+        store
+            .add(key, 10, &make_snapshot("P", b"a"), false)
+            .unwrap();
+        store
+            .add(key, 20, &make_snapshot("P", b"b"), false)
+            .unwrap();
         store.add(key, 30, &make_snapshot("P", b"c"), true).unwrap();
 
         let entries = store.list(key, 0, i64::MAX).unwrap();
@@ -417,8 +417,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
 
-        store.add(b"key-a", 10, &make_snapshot("A", b"a"), false).unwrap();
-        store.add(b"key-b", 10, &make_snapshot("B", b"b"), false).unwrap();
+        store
+            .add(b"key-a", 10, &make_snapshot("A", b"a"), false)
+            .unwrap();
+        store
+            .add(b"key-b", 10, &make_snapshot("B", b"b"), false)
+            .unwrap();
 
         let a = store.get_last(b"key-a").unwrap().unwrap();
         let b = store.get_last(b"key-b").unwrap().unwrap();
@@ -432,7 +436,10 @@ mod tests {
         let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
 
         let mut metadata = HashMap::new();
-        metadata.insert("position-type".to_string(), "GlobalIndexPosition".to_string());
+        metadata.insert(
+            "position-type".to_string(),
+            "GlobalIndexPosition".to_string(),
+        );
         metadata.insert("source".to_string(), "order-service".to_string());
 
         let snap = Snapshot {
@@ -448,12 +455,11 @@ mod tests {
         let entry = store.get_last(b"test-key").unwrap().unwrap();
         assert_eq!(entry.snapshot.name, "OrderProjection");
         assert_eq!(entry.snapshot.version, "2.1");
-        assert_eq!(entry.snapshot.payload, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02]);
+        assert_eq!(
+            entry.snapshot.payload,
+            vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02]
+        );
         assert_eq!(entry.snapshot.timestamp, 1712345678999);
         assert_eq!(entry.snapshot.metadata.len(), 2);
-        assert_eq!(
-            entry.snapshot.metadata.get("position-type").unwrap(),
-            "GlobalIndexPosition"
-        );
     }
 }

@@ -1,7 +1,7 @@
 pub mod format;
-pub mod writer;
 pub mod reader;
 pub mod segment_index;
+pub mod writer;
 
 use std::path::{Path, PathBuf};
 

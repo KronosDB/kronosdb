@@ -24,6 +24,10 @@ service EventStore {
   /* Gets tags for an event by its sequence position. */
   rpc GetTags (GetTagsRequest) returns (GetTagsResponse);
 
+  /* Gets the sequence number of the first event at or after the given timestamp.
+     Used by event processors to support time-based replay (e.g., Axon's tokenAt). */
+  rpc GetSequenceAt (GetSequenceAtRequest) returns (GetSequenceAtResponse);
+
   /* Tag mutations (AddTags/RemoveTags) and other transformations are admin
      operations handled via a separate HTTP admin API, not this gRPC service. */
 }
@@ -150,4 +154,15 @@ message GetTagsRequest {
 
 message GetTagsResponse {
   repeated Tag tags = 1;
+}
+
+message GetSequenceAtRequest {
+  /* Timestamp in milliseconds since epoch. */
+  int64 timestamp = 1;
+}
+
+message GetSequenceAtResponse {
+  /* Sequence of the first event at or after the given timestamp.
+     -1 if no such event exists. */
+  int64 sequence = 1;
 }

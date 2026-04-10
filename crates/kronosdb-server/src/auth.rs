@@ -33,10 +33,8 @@ mod tests {
 
     fn request_with_token(token: &str) -> Request<()> {
         let mut req = Request::new(());
-        req.metadata_mut().insert(
-            "kronosdb-token",
-            MetadataValue::try_from(token).unwrap(),
-        );
+        req.metadata_mut()
+            .insert("kronosdb-token", MetadataValue::try_from(token).unwrap());
         req
     }
 
