@@ -9,7 +9,12 @@ use std::path::{Path, PathBuf};
 pub const SEGMENT_MAGIC: [u8; 4] = *b"KRON";
 
 /// Current segment format version.
-pub const SEGMENT_VERSION: u8 = 1;
+///
+/// v1: event records only.
+/// v2: event records interleaved with Raft entry markers (log-as-state).
+///     The record's flags byte discriminates record type — readers that want
+///     events skip markers, readers that want Raft entries skip events.
+pub const SEGMENT_VERSION: u8 = 2;
 
 /// Segment file header size in bytes.
 /// Layout: [4 magic] [1 version] [8 base_position] = 13 bytes
@@ -24,11 +29,30 @@ pub const RECORD_HEADER_SIZE: usize = 9;
 pub const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Record flags.
+///
+/// Bits 4-7 discriminate record type. Bits 0-3 are per-type sub-flags.
 pub mod flags {
-    /// No special flags.
+    /// Deprecated alias for EVENT. Kept for call sites that haven't migrated.
     pub const NONE: u8 = 0x00;
-    /// This record is part of a transaction batch (reserved for future use).
-    pub const BATCH: u8 = 0x01;
+    /// Event record: payload is a serialized `StoredEvent`.
+    pub const EVENT: u8 = 0x00;
+    /// Raft entry marker: payload is a serialized `RaftMarker`.
+    /// In v2 segments, markers precede the event records they refer to
+    /// (for Normal entries with events); Membership/Blank entries stand alone.
+    pub const RAFT_MARKER: u8 = 0x10;
+
+    /// Mask to extract the record type (high nibble).
+    pub const TYPE_MASK: u8 = 0xF0;
+
+    /// Returns true if this flags byte denotes an event record.
+    pub fn is_event(flags: u8) -> bool {
+        flags & TYPE_MASK == EVENT
+    }
+
+    /// Returns true if this flags byte denotes a Raft entry marker.
+    pub fn is_raft_marker(flags: u8) -> bool {
+        flags & TYPE_MASK == RAFT_MARKER
+    }
 }
 
 /// Generates the segment file path for a given base position.

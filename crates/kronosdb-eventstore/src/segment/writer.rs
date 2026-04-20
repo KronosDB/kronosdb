@@ -9,6 +9,7 @@ use crate::segment::{
     RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format,
     segment_path,
 };
+use crate::segment::format::RaftMarker;
 
 /// Writes events to segmented append-only log files.
 ///
@@ -40,7 +41,7 @@ impl SegmentWriter {
     /// Creates a new SegmentWriter, starting a fresh segment log in the given directory.
     ///
     /// `start_position` is the position to assign to the first event written.
-    /// For a new database this is Position(1). For recovery, it's the position
+    /// For a new database this is Position(0). For recovery, it's the position
     /// after the last valid event found during recovery.
     pub fn new(dir: &Path, start_position: Position, max_segment_size: u64) -> Result<Self, Error> {
         std::fs::create_dir_all(dir)?;
@@ -139,46 +140,104 @@ impl SegmentWriter {
         let first_position = self.next_position;
 
         for event in events {
-            let stored = StoredEvent {
-                position: self.next_position,
-                identifier: event.identifier.clone(),
-                name: event.name.clone(),
-                version: event.version.clone(),
-                timestamp: event.timestamp,
-                payload: event.payload.clone(),
-                metadata: event.metadata.clone(),
-                tags: event.tags.clone(),
-            };
-
-            self.serialize_buf.clear();
-            format::serialize_event(&stored, &mut self.serialize_buf);
-
-            let payload_with_flags_len = 1 + self.serialize_buf.len();
-            let total_record_size = RECORD_HEADER_SIZE + self.serialize_buf.len();
-
-            if self.write_offset + total_record_size as u64 > self.max_segment_size {
-                self.rotate_segment()?;
-            }
-
-            let crc = {
-                let mut digest = crc32c::crc32c(&[flags::NONE]);
-                digest = crc32c::crc32c_append(digest, &self.serialize_buf);
-                digest
-            };
-
-            self.record_buf.clear();
-            self.record_buf.extend_from_slice(&crc.to_le_bytes());
-            self.record_buf
-                .extend_from_slice(&(payload_with_flags_len as u32).to_le_bytes());
-            self.record_buf.push(flags::NONE);
-            self.record_buf.extend_from_slice(&self.serialize_buf);
-
-            self.active_file.write_all(&self.record_buf)?;
-            self.write_offset += total_record_size as u64;
-            self.next_position = self.next_position.next();
+            self.write_one_event(event)?;
         }
 
         Ok((first_position, events.len() as u32))
+    }
+
+    /// Writes a Raft log entry — a `RaftMarker` followed, for Normal entries,
+    /// by `event_count` event records. The marker and all its events are
+    /// written as one atomic unit: if they don't fit in the current segment,
+    /// we rotate first. This guarantees a Raft entry never straddles a
+    /// segment boundary, which keeps sealed segments self-contained.
+    ///
+    /// Returns the first-event position (if any events) and the count.
+    /// For Membership/Blank entries (no events), first_position is the
+    /// current next_position and count is 0.
+    pub fn write_raft_entry(
+        &mut self,
+        marker: &RaftMarker,
+        events: &[AppendEvent],
+    ) -> Result<(Position, u32), Error> {
+        // Compute the total bytes we need. Rotate up front if the whole
+        // entry doesn't fit — this prevents a marker from ending up in one
+        // segment and its events in another.
+        let marker_len = estimate_marker_size(marker);
+        let events_len: usize = events
+            .iter()
+            .map(|e| RECORD_HEADER_SIZE + estimate_event_size(e))
+            .sum();
+        let total = marker_len + events_len;
+
+        if self.write_offset + total as u64 > self.max_segment_size {
+            self.rotate_segment()?;
+        }
+
+        // Write the marker first.
+        self.serialize_buf.clear();
+        format::serialize_raft_marker(marker, &mut self.serialize_buf);
+        let payload = std::mem::take(&mut self.serialize_buf);
+        self.write_record(flags::RAFT_MARKER, &payload)?;
+        self.serialize_buf = payload;
+
+        let first_position = self.next_position;
+        for event in events {
+            self.write_one_event(event)?;
+        }
+
+        Ok((first_position, events.len() as u32))
+    }
+
+    /// Writes a single event record, rotating the segment if needed.
+    fn write_one_event(&mut self, event: &AppendEvent) -> Result<(), Error> {
+        let stored = StoredEvent {
+            position: self.next_position,
+            identifier: event.identifier.clone(),
+            name: event.name.clone(),
+            version: event.version.clone(),
+            timestamp: event.timestamp,
+            payload: event.payload.clone(),
+            metadata: event.metadata.clone(),
+            tags: event.tags.clone(),
+        };
+
+        self.serialize_buf.clear();
+        format::serialize_event(&stored, &mut self.serialize_buf);
+        let payload = std::mem::take(&mut self.serialize_buf);
+        self.write_record(flags::EVENT, &payload)?;
+        self.serialize_buf = payload;
+
+        self.next_position = self.next_position.next();
+        Ok(())
+    }
+
+    /// Low-level: writes a single record to the active segment.
+    /// Rotates the segment if the record doesn't fit.
+    fn write_record(&mut self, flags_byte: u8, payload: &[u8]) -> Result<(), Error> {
+        let payload_with_flags_len = 1 + payload.len();
+        let total_record_size = RECORD_HEADER_SIZE + payload.len();
+
+        if self.write_offset + total_record_size as u64 > self.max_segment_size {
+            self.rotate_segment()?;
+        }
+
+        let crc = {
+            let mut digest = crc32c::crc32c(&[flags_byte]);
+            digest = crc32c::crc32c_append(digest, payload);
+            digest
+        };
+
+        self.record_buf.clear();
+        self.record_buf.extend_from_slice(&crc.to_le_bytes());
+        self.record_buf
+            .extend_from_slice(&(payload_with_flags_len as u32).to_le_bytes());
+        self.record_buf.push(flags_byte);
+        self.record_buf.extend_from_slice(payload);
+
+        self.active_file.write_all(&self.record_buf)?;
+        self.write_offset += total_record_size as u64;
+        Ok(())
     }
 
     /// Fsyncs the active segment to disk, making all written events durable.
@@ -235,6 +294,32 @@ impl SegmentWriter {
 /// Segment file header as read from disk.
 struct SegmentHeader {
     base_position: u64,
+}
+
+/// Upper bound on the serialized size of a Raft marker record (header + payload).
+fn estimate_marker_size(marker: &RaftMarker) -> usize {
+    // Fixed marker payload is 23 bytes; extra is variable.
+    RECORD_HEADER_SIZE + 23 + marker.extra.len()
+}
+
+/// Upper bound on the serialized size of an event payload (without record header).
+/// Matches the layout in format::serialize_event.
+fn estimate_event_size(event: &AppendEvent) -> usize {
+    let mut n = 8 // position
+        + 2 + event.identifier.len()
+        + 2 + event.name.len()
+        + 2 + event.version.len()
+        + 8 // timestamp
+        + 2; // metadata_count
+    for (k, v) in &event.metadata {
+        n += 2 + k.len() + 2 + v.len();
+    }
+    n += 2; // tag_count
+    for tag in &event.tags {
+        n += 2 + tag.key.len() + 2 + tag.value.len();
+    }
+    n += 4 + event.payload.len(); // payload_len + payload
+    n
 }
 
 fn create_segment_file(path: &Path) -> Result<File, io::Error> {
@@ -323,8 +408,9 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
             break; // Corruption or torn write — stop here.
         }
 
-        // Extract the position from the payload (first 8 bytes of the serialized event).
-        if payload_buf.len() >= 8 {
+        // Only event records advance next_position. Raft markers (and any
+        // future non-event record types) are skipped for position accounting.
+        if flags::is_event(_flags) && payload_buf.len() >= 8 {
             let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
             last_position = Some(Position(position));
         }
@@ -436,7 +522,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Write some events.
-        let mut writer = SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
 
         let events = vec![
             make_event("OrderPlaced", b"order-1"),
@@ -445,26 +531,115 @@ mod tests {
         ];
 
         let (first_pos, count) = writer.append(&events).unwrap();
-        assert_eq!(first_pos, Position(1));
+        assert_eq!(first_pos, Position(0));
         assert_eq!(count, 3);
-        assert_eq!(writer.head(), Position(4));
+        assert_eq!(writer.head(), Position(3));
 
         // Drop the writer and reopen via recovery.
         drop(writer);
 
         let recovered = SegmentWriter::open(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        assert_eq!(recovered.head(), Position(4));
+        assert_eq!(recovered.head(), Position(3));
+    }
+
+    #[test]
+    fn raft_entry_writes_marker_and_events() {
+        use crate::segment::format::{RaftEntryType, RaftMarker};
+        use crate::segment::reader::SegmentReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
+
+        // Write: marker(normal, 2 events), marker(blank), marker(normal, 1 event).
+        let events1 = vec![
+            make_event("OrderPlaced", b"o1"),
+            make_event("PaymentReceived", b"p1"),
+        ];
+        let (first, count) = writer
+            .write_raft_entry(&RaftMarker::normal(1, 1, 2), &events1)
+            .unwrap();
+        assert_eq!(first, Position(0));
+        assert_eq!(count, 2);
+
+        let (_, count) = writer
+            .write_raft_entry(&RaftMarker::blank(1, 2), &[])
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let events2 = vec![make_event("OrderShipped", b"s1")];
+        let (first, _) = writer
+            .write_raft_entry(&RaftMarker::normal(1, 3, 1), &events2)
+            .unwrap();
+        assert_eq!(first, Position(2));
+
+        writer.sync().unwrap();
+        let seg_path = writer.active_segment_path();
+        drop(writer);
+
+        // Event iterator should skip markers — returns 3 events total.
+        let reader = SegmentReader::open(&seg_path).unwrap();
+        let events: Vec<_> = reader
+            .iter(None)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].name, "OrderPlaced");
+        assert_eq!(events[1].name, "PaymentReceived");
+        assert_eq!(events[2].name, "OrderShipped");
+
+        // Raft marker iterator should see all 3 markers.
+        let markers: Vec<_> = reader
+            .iter_raft_markers()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(markers.len(), 3);
+        assert_eq!(markers[0].1.index, 1);
+        assert_eq!(markers[0].1.event_count, 2);
+        assert_eq!(markers[0].1.entry_type, RaftEntryType::Normal);
+        assert_eq!(markers[1].1.index, 2);
+        assert_eq!(markers[1].1.entry_type, RaftEntryType::Blank);
+        assert_eq!(markers[2].1.index, 3);
+        assert_eq!(markers[2].1.event_count, 1);
+    }
+
+    #[test]
+    fn raft_entry_survives_recovery() {
+        use crate::segment::format::RaftMarker;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut writer =
+                SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
+            writer
+                .write_raft_entry(
+                    &RaftMarker::normal(1, 1, 2),
+                    &[
+                        make_event("OrderPlaced", b"a"),
+                        make_event("PaymentReceived", b"b"),
+                    ],
+                )
+                .unwrap();
+            writer
+                .write_raft_entry(&RaftMarker::blank(1, 2), &[])
+                .unwrap();
+            writer.sync().unwrap();
+        }
+
+        // Reopen — recovery should skip the marker (non-event record) and set
+        // next_position based on the last event record's position.
+        let recovered = SegmentWriter::open(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
+        assert_eq!(recovered.head(), Position(2));
     }
 
     #[test]
     fn empty_append() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
 
         let (first_pos, count) = writer.append(&[]).unwrap();
-        assert_eq!(first_pos, Position(1));
+        assert_eq!(first_pos, Position(0));
         assert_eq!(count, 0);
-        assert_eq!(writer.head(), Position(1));
+        assert_eq!(writer.head(), Position(0));
     }
 
     #[test]
@@ -473,7 +648,7 @@ mod tests {
 
         // Use a tiny segment size to force rotation.
         let tiny_segment = SEGMENT_HEADER_SIZE as u64 + 200;
-        let mut writer = SegmentWriter::new(dir.path(), Position(1), tiny_segment).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), tiny_segment).unwrap();
 
         // Write events until we get a rotation.
         for i in 0..5 {
