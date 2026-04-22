@@ -19,6 +19,98 @@ use super::types::{NodeId, TypeConfig};
 #[cfg(feature = "bench-instrumentation")]
 use super::bench_instrumentation::{self as bi, Region, Timer};
 
+// --- Phase 2 log-store format + config contracts (D-01, D-04, D-05, D-07) ---
+//
+// These items are the new-log-store contracts the rest of Phase 2 builds on.
+// They are introduced here WITHOUT replacing the existing `RaftLogStorage`
+// impl below; Plan 02-03 replaces the impl body against these names.
+
+/// Default segment cap (D-01). Size-based rotation only (D-03).
+pub const DEFAULT_SEGMENT_CAP: u64 = 16 * 1024 * 1024; // 16 MiB
+/// Default idle window before a group-commit batch fsyncs (D-07).
+pub const DEFAULT_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_micros(200);
+/// Default buffered-bytes trigger for an early group-commit fsync (D-07).
+pub const DEFAULT_BUFFERED_CAP: usize = 1024 * 1024; // 1 MiB
+
+/// Tunable knobs for the Phase 2 segmented Raft log store.
+///
+/// Introduced by Plan 02-01 so downstream plans reference named fields rather
+/// than magic numbers. Defaults match CONTEXT.md D-01 / D-07: 16 MiB segments,
+/// 200 µs idle window, 1 MiB buffered-byte trigger.
+#[derive(Debug, Clone)]
+pub struct LogStoreConfig {
+    /// Size cap (bytes) at which the active segment is sealed and rotated.
+    pub segment_cap: u64,
+    /// Quiet window before the first caller drives a group-commit fsync.
+    pub idle_window: std::time::Duration,
+    /// Buffered-byte threshold that triggers an early group-commit fsync.
+    pub buffered_cap: usize,
+}
+
+impl Default for LogStoreConfig {
+    fn default() -> Self {
+        Self {
+            segment_cap: DEFAULT_SEGMENT_CAP,
+            idle_window: DEFAULT_IDLE_WINDOW,
+            buffered_cap: DEFAULT_BUFFERED_CAP,
+        }
+    }
+}
+
+/// On-disk log-record format helpers (D-04).
+///
+/// Record layout: `[u32 len_be][bincode(Entry<TypeConfig>)][u32 crc32c_le]`.
+/// `len_be` is big-endian so the width matches the LOG-01 spec and is endian-
+/// stable across any consumer that reads raw headers. `crc32c_le` is
+/// little-endian to match the `crc32c` crate's native output and the existing
+/// `segment::writer` record convention.
+///
+/// Consumed by Plan 02-02 (Segment primitive) and Plan 02-04 (startup index
+/// rebuild + torn-tail truncation); this plan adds the helpers only.
+#[allow(dead_code)] // Wired up by later Phase 2 plans.
+mod record {
+    /// Size of a log-record header on disk: 4-byte big-endian length.
+    pub const LEN_PREFIX: usize = 4;
+    /// Size of the trailing CRC on a record.
+    pub const CRC_SUFFIX: usize = 4;
+
+    /// Encode a record into `out`. Clears `out` first.
+    ///
+    /// Layout: 4-byte BE length of `payload`, then `payload`, then 4-byte
+    /// LE `crc32c(payload)`.
+    pub fn encode(payload: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        let crc = crc32c::crc32c(payload);
+        out.extend_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Total on-disk size for a record whose bincode payload is `payload_len`.
+    pub const fn total_size(payload_len: usize) -> usize {
+        LEN_PREFIX + payload_len + CRC_SUFFIX
+    }
+
+    /// Decode a length prefix from a 4-byte BE slice.
+    pub fn decode_len_be(buf: &[u8; LEN_PREFIX]) -> u32 {
+        u32::from_be_bytes(*buf)
+    }
+
+    /// Decode a trailing CRC from a 4-byte LE slice.
+    pub fn decode_crc_le(buf: &[u8; CRC_SUFFIX]) -> u32 {
+        u32::from_le_bytes(*buf)
+    }
+}
+
+/// Filename for a log segment keyed by the first log index it contains (D-05).
+///
+/// Layout mirrors SCOPE §5.2: `log-<16-digit-zero-padded-first-index>.bin`.
+/// Consumed by Plan 02-02's Segment primitive and Plan 02-03's LogStore impl.
+#[allow(dead_code)] // Wired up by later Phase 2 plans.
+fn segment_filename(first_index: u64) -> String {
+    format!("log-{:016}.bin", first_index)
+}
+
 /// Vote persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedVote {
@@ -426,6 +518,107 @@ mod tests {
         let mut reader = store.get_log_reader().await;
         let entries = reader.try_get_log_entries(1..3).await.unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    // --- Phase 2 format/config contract tests (Plan 02-01) ---
+
+    #[test]
+    fn log_store_config_defaults_match_constants() {
+        let cfg = LogStoreConfig::default();
+        assert_eq!(cfg.segment_cap, DEFAULT_SEGMENT_CAP);
+        assert_eq!(cfg.segment_cap, 16 * 1024 * 1024);
+        assert_eq!(cfg.idle_window, DEFAULT_IDLE_WINDOW);
+        assert_eq!(cfg.idle_window, std::time::Duration::from_micros(200));
+        assert_eq!(cfg.buffered_cap, DEFAULT_BUFFERED_CAP);
+        assert_eq!(cfg.buffered_cap, 1024 * 1024);
+    }
+
+    #[test]
+    fn record_encode_layout_round_trip() {
+        let payload: Vec<u8> = (0u8..37).collect();
+        let mut buf = Vec::with_capacity(record::total_size(payload.len()));
+        record::encode(&payload, &mut buf);
+
+        // Total encoded length equals total_size(payload).
+        assert_eq!(buf.len(), record::total_size(payload.len()));
+        assert_eq!(
+            buf.len(),
+            record::LEN_PREFIX + payload.len() + record::CRC_SUFFIX
+        );
+
+        // Length prefix decodes to payload.len() as BE u32.
+        let len_bytes: [u8; record::LEN_PREFIX] =
+            buf[..record::LEN_PREFIX].try_into().unwrap();
+        assert_eq!(record::decode_len_be(&len_bytes), payload.len() as u32);
+
+        // Payload bytes survive encoding.
+        assert_eq!(
+            &buf[record::LEN_PREFIX..record::LEN_PREFIX + payload.len()],
+            payload.as_slice()
+        );
+
+        // Trailing CRC decodes to crc32c(payload) as LE u32.
+        let crc_bytes: [u8; record::CRC_SUFFIX] = buf
+            [record::LEN_PREFIX + payload.len()..]
+            .try_into()
+            .unwrap();
+        assert_eq!(record::decode_crc_le(&crc_bytes), crc32c::crc32c(&payload));
+    }
+
+    #[test]
+    fn record_encode_clears_existing_buffer() {
+        let payload = b"phase-2-record".to_vec();
+        let mut buf = vec![0xAA; 128]; // pre-existing garbage
+        record::encode(&payload, &mut buf);
+        assert_eq!(buf.len(), record::total_size(payload.len()));
+    }
+
+    #[test]
+    fn record_corrupt_payload_detected_by_crc() {
+        let payload = b"the-quick-brown-fox".to_vec();
+        let mut buf = Vec::new();
+        record::encode(&payload, &mut buf);
+
+        // Flip a byte inside the payload region.
+        let mutate_at = record::LEN_PREFIX + 3;
+        buf[mutate_at] ^= 0xFF;
+
+        let mutated_payload = &buf[record::LEN_PREFIX..record::LEN_PREFIX + payload.len()];
+        let trailing_crc_bytes: [u8; record::CRC_SUFFIX] = buf
+            [record::LEN_PREFIX + payload.len()..]
+            .try_into()
+            .unwrap();
+        let stored_crc = record::decode_crc_le(&trailing_crc_bytes);
+        let recomputed_crc = crc32c::crc32c(mutated_payload);
+
+        assert_ne!(
+            stored_crc, recomputed_crc,
+            "CRC must not match a mutated payload"
+        );
+    }
+
+    #[test]
+    fn record_empty_payload_is_just_header_plus_crc() {
+        let mut buf = Vec::new();
+        record::encode(&[], &mut buf);
+        assert_eq!(buf.len(), record::total_size(0));
+        let len_bytes: [u8; record::LEN_PREFIX] =
+            buf[..record::LEN_PREFIX].try_into().unwrap();
+        assert_eq!(record::decode_len_be(&len_bytes), 0);
+        let crc_bytes: [u8; record::CRC_SUFFIX] =
+            buf[record::LEN_PREFIX..].try_into().unwrap();
+        assert_eq!(record::decode_crc_le(&crc_bytes), crc32c::crc32c(&[]));
+    }
+
+    #[test]
+    fn segment_filename_is_zero_padded_16_digits() {
+        assert_eq!(segment_filename(0), "log-0000000000000000.bin");
+        assert_eq!(segment_filename(1), "log-0000000000000001.bin");
+        assert_eq!(segment_filename(42), "log-0000000000000042.bin");
+        assert_eq!(
+            segment_filename(u64::MAX),
+            format!("log-{:016}.bin", u64::MAX)
+        );
     }
 }
 
