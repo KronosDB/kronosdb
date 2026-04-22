@@ -65,9 +65,8 @@ impl Default for LogStoreConfig {
 /// little-endian to match the `crc32c` crate's native output and the existing
 /// `segment::writer` record convention.
 ///
-/// Consumed by Plan 02-02 (Segment primitive) and Plan 02-04 (startup index
-/// rebuild + torn-tail truncation); this plan adds the helpers only.
-#[allow(dead_code)] // Wired up by later Phase 2 plans.
+/// Consumed by Plan 02-02's Segment primitive (`read_record_at`, test-path
+/// encoding) and Plan 02-04 (startup index rebuild + torn-tail truncation).
 mod record {
     /// Size of a log-record header on disk: 4-byte big-endian length.
     pub const LEN_PREFIX: usize = 4;
@@ -78,6 +77,7 @@ mod record {
     ///
     /// Layout: 4-byte BE length of `payload`, then `payload`, then 4-byte
     /// LE `crc32c(payload)`.
+    #[allow(dead_code)] // Consumed by Plan 02-03's LogStore write path; Plan 02-02 exercises it via tests.
     pub fn encode(payload: &[u8], out: &mut Vec<u8>) {
         out.clear();
         out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -87,6 +87,7 @@ mod record {
     }
 
     /// Total on-disk size for a record whose bincode payload is `payload_len`.
+    #[allow(dead_code)] // Consumed by Plan 02-03 / 02-04; Plan 02-02 exercises it via tests + the `needs_rotation` contract.
     pub const fn total_size(payload_len: usize) -> usize {
         LEN_PREFIX + payload_len + CRC_SUFFIX
     }
@@ -105,10 +106,256 @@ mod record {
 /// Filename for a log segment keyed by the first log index it contains (D-05).
 ///
 /// Layout mirrors SCOPE §5.2: `log-<16-digit-zero-padded-first-index>.bin`.
-/// Consumed by Plan 02-02's Segment primitive and Plan 02-03's LogStore impl.
-#[allow(dead_code)] // Wired up by later Phase 2 plans.
+/// Consumed by Plan 02-02's `Segment::create` and Plan 02-03's LogStore impl.
 fn segment_filename(first_index: u64) -> String {
     format!("log-{:016}.bin", first_index)
+}
+
+// --- Phase 2 Plan 02-02: Segment primitive (D-02, D-03, D-14) ---
+//
+// An internal, single-file append-only segment. Plan 02-03's `LogStore` will
+// own a `Vec<SegmentMeta>` for sealed segments plus one active `Segment`.
+// This primitive deliberately does NOT implement group commit, does NOT
+// know about `Entry<TypeConfig>`, and does NOT touch the
+// `RaftLogStorage<TypeConfig>` trait. It owns one file, appends pre-encoded
+// record bytes, fsyncs on explicit `sync()`, rotates on size only, and
+// reads a single record by `(path, offset)` via `File::read_at` (pread,
+// never mmap per D-14).
+
+/// Cheap metadata about a sealed segment, held in LogStore (Plan 02-03).
+///
+/// `byte_len` is the authoritative length of valid data in the segment
+/// (post-`seal()` truncation) and is the source of truth for both the
+/// in-memory index and the startup scan — not the on-disk file length,
+/// which during the active-segment lifetime is the preallocated `cap`.
+#[allow(dead_code)] // Consumed by Plan 02-03's LogStore.
+pub(super) struct SegmentMeta {
+    pub first_index: u64,
+    pub path: std::path::PathBuf,
+    pub byte_len: u64,
+}
+
+/// Active (writable) segment. Owns one open file.
+///
+/// Invariants:
+/// - `write_offset <= cap` at all times (rotation is size-only per D-03).
+/// - On Linux the file is preallocated via `fallocate`; elsewhere via
+///   `File::set_len(cap)` (D-02). Either way the on-disk file length is
+///   >= `write_offset` during the active lifetime.
+/// - `sync()` fires exactly one fdatasync (Linux) / `F_FULLFSYNC` (macOS) /
+///   `sync_data` (else); the bench-instrumentation fsync counter bumps
+///   exactly once per successful sync.
+#[allow(dead_code)] // Fields consumed by Plan 02-03's LogStore.
+pub(super) struct Segment {
+    pub first_index: u64,
+    pub path: std::path::PathBuf,
+    file: std::fs::File,
+    pub write_offset: u64,
+    pub cap: u64,
+}
+
+#[allow(dead_code)] // Methods consumed by Plan 02-03's LogStore.
+impl Segment {
+    /// Create a new, preallocated segment at `dir/log-<16-digit>.bin`.
+    ///
+    /// Uses `fallocate` on Linux and `File::set_len(cap)` elsewhere (D-02).
+    /// The file is opened read+write; `write_offset` starts at 0.
+    pub fn create(
+        dir: &std::path::Path,
+        first_index: u64,
+        cap: u64,
+    ) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(segment_filename(first_index));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        preallocate(&file, cap)?;
+        Ok(Self {
+            first_index,
+            path,
+            file,
+            write_offset: 0,
+            cap,
+        })
+    }
+
+    /// Open an existing segment for append, positioning `write_offset` at
+    /// `byte_len`. Caller provides the recovered length (Plan 02-04 computes
+    /// this during startup scan via per-record CRC validation on the active
+    /// segment — headers-only scan for sealed segments per D-15).
+    pub fn open_for_append(
+        path: std::path::PathBuf,
+        first_index: u64,
+        byte_len: u64,
+        cap: u64,
+    ) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        use std::io::Seek;
+        (&file).seek(std::io::SeekFrom::Start(byte_len))?;
+        Ok(Self {
+            first_index,
+            path,
+            file,
+            write_offset: byte_len,
+            cap,
+        })
+    }
+
+    /// Returns true iff `self.write_offset + next_record_len > self.cap`.
+    /// Rotation is size-only (D-03); no time or purge-driven triggers.
+    pub fn needs_rotation(&self, next_record_len: usize) -> bool {
+        self.write_offset
+            .checked_add(next_record_len as u64)
+            .map(|end| end > self.cap)
+            .unwrap_or(true)
+    }
+
+    /// Append pre-encoded record bytes (produced by `record::encode`) to the
+    /// file WITHOUT fsync. Advances `write_offset`. Returns the byte offset
+    /// at which the record started. Cheap by design — Plan 02-03's group
+    /// commit batches many of these before one explicit `sync()`.
+    pub fn append_bytes(&mut self, record: &[u8]) -> std::io::Result<u64> {
+        use std::io::Write;
+        let start = self.write_offset;
+        (&self.file).write_all(record)?;
+        self.write_offset = start + record.len() as u64;
+        Ok(start)
+    }
+
+    /// One fsync: fdatasync on Linux, F_FULLFSYNC on macOS, `sync_data` else.
+    /// Bumps `bench_instrumentation::bump_fsync()` exactly once after success
+    /// under the feature flag. No counter bump on error.
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        fdatasync(&self.file)?;
+        #[cfg(feature = "bench-instrumentation")]
+        bi::bump_fsync();
+        Ok(())
+    }
+
+    /// Truncate the on-disk file to `self.write_offset`. Used by `seal()` when
+    /// rotating, and by Plan 02-04's startup scan when the torn-tail write
+    /// offset is less than the preallocated file length. Does NOT re-
+    /// preallocate — callers that intend to keep writing must either pass
+    /// through `seal()` + `create()` a fresh segment, or re-run `preallocate`
+    /// out-of-band. Plan 02-04's recovery path calls this on the active
+    /// segment and then resumes appending (file will grow organically until
+    /// rotation; preallocation benefits are bounded to the unrecovered tail).
+    pub fn truncate_to_write_offset(&mut self) -> std::io::Result<()> {
+        self.file.set_len(self.write_offset)
+    }
+
+    /// Seal this segment: fsync, truncate to `write_offset` (trims the
+    /// preallocated tail), return `SegmentMeta`. Consumes self. Used when
+    /// Plan 02-03 rotates to a new active segment.
+    pub fn seal(self) -> std::io::Result<SegmentMeta> {
+        fdatasync(&self.file)?;
+        #[cfg(feature = "bench-instrumentation")]
+        bi::bump_fsync();
+        self.file.set_len(self.write_offset)?;
+        Ok(SegmentMeta {
+            first_index: self.first_index,
+            path: self.path,
+            byte_len: self.write_offset,
+        })
+    }
+}
+
+/// Pread-read a single record at `offset` in `path`. Returns the payload
+/// bytes with the 4-byte length prefix and 4-byte CRC trailer stripped.
+/// Verifies CRC; returns `ErrorKind::InvalidData` on mismatch. Uses
+/// `File::read_at` on unix (D-14) — never mmap.
+#[allow(dead_code)] // Consumed by Plan 02-03's read path.
+pub(super) fn read_record_at(
+    path: &std::path::Path,
+    offset: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(path)?;
+
+    let mut len_buf = [0u8; record::LEN_PREFIX];
+    file.read_exact_at(&mut len_buf, offset)?;
+    let payload_len = record::decode_len_be(&len_buf) as usize;
+
+    let payload_offset = offset + record::LEN_PREFIX as u64;
+    let mut payload = vec![0u8; payload_len];
+    file.read_exact_at(&mut payload, payload_offset)?;
+
+    let crc_offset = payload_offset + payload_len as u64;
+    let mut crc_buf = [0u8; record::CRC_SUFFIX];
+    file.read_exact_at(&mut crc_buf, crc_offset)?;
+    let stored_crc = record::decode_crc_le(&crc_buf);
+    let computed_crc = crc32c::crc32c(&payload);
+
+    if stored_crc != computed_crc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "record crc mismatch",
+        ));
+    }
+    Ok(payload)
+}
+
+/// Pre-allocate disk space for a segment file (D-02).
+///
+/// On Linux uses `fallocate` (contiguous blocks, fdatasync skips metadata
+/// update); elsewhere falls back to `File::set_len(cap)`. Mirrors the arms
+/// in `segment::writer::preallocate` — kept inline here to avoid a cross-
+/// module dependency (planner's discretion per the plan text). Errors on
+/// unsupported platforms fall through to `set_len`.
+fn preallocate(file: &std::fs::File, cap: u64) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: libc::fallocate is a well-defined syscall; fd is valid for
+        // the lifetime of `file`.
+        let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, cap as i64) };
+        if ret != 0 {
+            // Fall back to set_len on filesystems that don't support fallocate.
+            return file.set_len(cap);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        file.set_len(cap)
+    }
+}
+
+/// One-fsync helper (D-02 platform split):
+/// - Linux: `fdatasync` (skips inode metadata — enabled by preallocation).
+/// - macOS: `F_FULLFSYNC` via `fcntl` (the only way past the drive write
+///   cache on macOS; regular `fsync`/`sync_data` do not guarantee durability).
+/// - Other unix: `sync_data()` as the closest portable equivalent.
+fn fdatasync(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::fdatasync(file.as_raw_fd()) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        file.sync_data()
+    }
 }
 
 /// Vote persisted to disk.
@@ -622,6 +869,142 @@ mod tests {
             segment_filename(u64::MAX),
             format!("log-{:016}.bin", u64::MAX)
         );
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    //! Plan 02-02 tests: exercise `Segment` + `SegmentMeta` + `read_record_at`
+    //! in isolation, without openraft or `LogStore` involvement.
+
+    use super::*;
+    use std::io::Write as _;
+
+    /// Helper: encode a record whose payload is `payload`, returning the
+    /// on-disk bytes a caller would hand to `Segment::append_bytes`.
+    fn encoded(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(record::total_size(payload.len()));
+        record::encode(payload, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn create_then_append_then_sync_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = Segment::create(dir.path(), 1, 64 * 1024).unwrap();
+
+        let payload = b"hello".to_vec();
+        let rec = encoded(&payload);
+        let start = seg.append_bytes(&rec).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(seg.write_offset, rec.len() as u64);
+
+        seg.sync().unwrap();
+
+        // Filename should match segment_filename helper (D-05).
+        assert_eq!(
+            seg.path.file_name().unwrap().to_str().unwrap(),
+            "log-0000000000000001.bin"
+        );
+
+        // Pread the record back and confirm payload round-trips.
+        let got = read_record_at(&seg.path, start).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn needs_rotation_true_when_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = Segment::create(dir.path(), 1, 256).unwrap();
+        // Simulate a write_offset near cap without actually writing 250 bytes
+        // to disk — the predicate is arithmetic only.
+        seg.write_offset = 250;
+
+        // A record larger than the remaining 6 bytes must trigger rotation.
+        assert!(seg.needs_rotation(32));
+        // A record that exactly fits must NOT trigger rotation (== cap is
+        // allowed; only `>` does per the invariant).
+        assert!(!seg.needs_rotation(6));
+        // Tiny record well within remaining space.
+        assert!(!seg.needs_rotation(1));
+    }
+
+    #[test]
+    fn seal_truncates_to_write_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap: u64 = 1024 * 1024;
+        let mut seg = Segment::create(dir.path(), 7, cap).unwrap();
+
+        let payload = b"seal-truncation-check".to_vec();
+        let rec = encoded(&payload);
+        seg.append_bytes(&rec).unwrap();
+        let expected_len = record::total_size(payload.len()) as u64;
+        assert_eq!(seg.write_offset, expected_len);
+
+        let meta = seg.seal().unwrap();
+        assert_eq!(meta.first_index, 7);
+        assert_eq!(meta.byte_len, expected_len);
+
+        // On-disk length must match byte_len (preallocated tail trimmed).
+        let md = std::fs::metadata(&meta.path).unwrap();
+        assert_eq!(md.len(), expected_len);
+    }
+
+    #[cfg(feature = "bench-instrumentation")]
+    #[test]
+    fn fsync_counter_bumps_on_sync() {
+        use crate::raft::bench_instrumentation::fsync_count;
+
+        // NOTE: FSYNC_COUNTER is a process-global `AtomicU64` shared across
+        // all tests in the binary. `cargo test` runs tests on multiple
+        // threads by default, so we cannot assert an exact delta — other
+        // tests' syncs may bump the counter between our snapshots. Assert
+        // a lower bound (≥ 2) instead: two `sync()` calls must contribute
+        // at least two bumps to the global counter.
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = Segment::create(dir.path(), 1, 64 * 1024).unwrap();
+        let rec = encoded(b"x");
+        seg.append_bytes(&rec).unwrap();
+
+        let before = fsync_count();
+        seg.sync().unwrap();
+        seg.sync().unwrap();
+        let after = fsync_count();
+        assert!(
+            after - before >= 2,
+            "two sync() calls must contribute at least 2 fsync bumps (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn read_record_at_detects_crc_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seg = Segment::create(dir.path(), 1, 64 * 1024).unwrap();
+
+        let payload = b"corruption-check".to_vec();
+        let rec = encoded(&payload);
+        let start = seg.append_bytes(&rec).unwrap();
+        seg.sync().unwrap();
+        let path = seg.path.clone();
+        drop(seg);
+
+        // Corrupt a single payload byte in-place. The record layout is
+        // [4 BE len][payload][4 LE crc]; offset `start + 4` is the first
+        // payload byte.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap();
+            use std::io::Seek;
+            f.seek(std::io::SeekFrom::Start(start + record::LEN_PREFIX as u64))
+                .unwrap();
+            f.write_all(&[0xFFu8]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let err = read_record_at(&path, start).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
 
