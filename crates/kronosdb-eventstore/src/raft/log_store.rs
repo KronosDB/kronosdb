@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{NodeId, TypeConfig};
 
+#[cfg(feature = "bench-instrumentation")]
+use super::bench_instrumentation::{self as bi, Region, Timer};
+
 /// Vote persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedVote {
@@ -210,6 +213,8 @@ fn read_vote(dir: &Path) -> Option<PersistedVote> {
 }
 
 fn write_log(dir: &Path, log: &BTreeMap<u64, Entry<TypeConfig>>) -> Result<(), io::Error> {
+    #[cfg(feature = "bench-instrumentation")]
+    let _t = Timer::new(Region::LogBincodeRewrite);
     let entries: Vec<_> = log.values().cloned().collect();
     let data = bincode::serialize(&entries).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     atomic_write(&log_path(dir), &data)
@@ -425,6 +430,8 @@ mod tests {
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), io::Error> {
+    #[cfg(feature = "bench-instrumentation")]
+    let _t = Timer::new(Region::LogAtomicWrite);
     let tmp = path.with_extension("tmp");
 
     // Write + fsync the file contents.
@@ -433,6 +440,8 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), io::Error> {
     io::Write::write_all(&mut writer, data)?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
+    #[cfg(feature = "bench-instrumentation")]
+    bi::bump_fsync();
 
     // Atomic rename.
     std::fs::rename(&tmp, path)?;
@@ -441,6 +450,8 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), io::Error> {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
+            #[cfg(feature = "bench-instrumentation")]
+            bi::bump_fsync();
         }
     }
 

@@ -11,6 +11,9 @@ use crate::segment::{
 };
 use crate::segment::format::RaftMarker;
 
+#[cfg(feature = "bench-instrumentation")]
+use crate::raft::bench_instrumentation::{self as bi, Region, Timer};
+
 /// Writes events to segmented append-only log files.
 ///
 /// Manages the active segment, handles rotation when a segment fills up,
@@ -120,6 +123,8 @@ impl SegmentWriter {
     /// For higher throughput under concurrent load, use `write_events` + `sync`
     /// separately to batch fsyncs across multiple callers.
     pub fn append(&mut self, events: &[AppendEvent]) -> Result<(Position, u32), Error> {
+        #[cfg(feature = "bench-instrumentation")]
+        let _t = Timer::new(Region::SegmentAppend);
         let result = self.write_events(events)?;
         if result.1 > 0 {
             self.sync()?;
@@ -243,6 +248,8 @@ impl SegmentWriter {
     /// Fsyncs the active segment to disk, making all written events durable.
     pub fn sync(&mut self) -> Result<(), Error> {
         fdatasync(&self.active_file)?;
+        #[cfg(feature = "bench-instrumentation")]
+        bi::bump_fsync();
         Ok(())
     }
 
@@ -266,6 +273,8 @@ impl SegmentWriter {
     fn rotate_segment(&mut self) -> Result<(), Error> {
         // Sync the current segment before sealing.
         fdatasync(&self.active_file)?;
+        #[cfg(feature = "bench-instrumentation")]
+        bi::bump_fsync();
 
         // Truncate the sealed segment to its actual data size.
         // It was pre-allocated to max_segment_size, so we trim the unused space.
