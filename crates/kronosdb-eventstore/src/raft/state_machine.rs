@@ -15,6 +15,9 @@ use crate::context::ContextManager;
 
 use super::types::{NodeId, RaftRequest, RaftResponse, TypeConfig};
 
+#[cfg(feature = "bench-instrumentation")]
+use super::bench_instrumentation::{Region, Timer};
+
 /// Raft snapshot: serialized state machine metadata.
 /// The actual event data lives in the EventStoreEngine segments —
 /// we just need to track what's been applied.
@@ -51,6 +54,8 @@ impl EventStoreStateMachine {
                 events,
                 condition,
             } => {
+                #[cfg(feature = "bench-instrumentation")]
+                let _t = Timer::new(Region::ApplyEventPath);
                 let append_events: Vec<_> = events.iter().map(|e| e.to_event()).collect();
                 let append_req = AppendRequest {
                     condition: condition.as_ref().map(|c| c.to_condition()),
