@@ -739,16 +739,12 @@ fn scan_active_segment(
 }
 
 impl LogStore {
-    /// Construct a log store using the default `LogStoreConfig`.
-    ///
-    /// Preserves the single-argument signature that `raft::cluster` already
-    /// calls — no cluster-side change required.
-    pub fn new(dir: &Path) -> io::Result<Self> {
-        Self::with_config(dir, LogStoreConfig::default())
-    }
-
     /// Construct a log store with an explicit `LogStoreConfig`.
-    pub fn with_config(dir: &Path, config: LogStoreConfig) -> io::Result<Self> {
+    ///
+    /// Plan 02-05 collapsed the old 1-arg backward-compat facade into this
+    /// single constructor — every call site now passes a `LogStoreConfig`
+    /// (typically `LogStoreConfig::default()`).
+    pub fn new(dir: &Path, config: LogStoreConfig) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
 
         let vote = load_vote(dir);
@@ -1397,7 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_log_state_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
         let state = store.get_log_state().await.unwrap();
         assert!(state.last_log_id.is_none());
         assert!(state.last_purged_log_id.is_none());
@@ -1406,7 +1402,7 @@ mod tests {
     #[tokio::test]
     async fn append_then_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         store
             .append_test(vec![
@@ -1430,7 +1426,7 @@ mod tests {
     #[tokio::test]
     async fn truncate_drops_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         store
             .append_test(vec![
@@ -1464,7 +1460,7 @@ mod tests {
             segment_cap: 1,
             ..LogStoreConfig::default()
         };
-        let mut store = LogStore::with_config(dir.path(), cfg).unwrap();
+        let mut store = LogStore::new(dir.path(), cfg).unwrap();
 
         // Append three entries — rotation sealing two prior segments.
         store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
@@ -1508,7 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn vote_persists_atomic_write() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         assert!(store.read_vote().await.unwrap().is_none());
 
@@ -1528,7 +1524,7 @@ mod tests {
         use crate::raft::bench_instrumentation::fsync_count;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         // Baseline counter.
         let before = fsync_count();
@@ -1568,7 +1564,7 @@ mod tests {
         // by the real openraft integration in `raft/cluster.rs` + the
         // cluster_test.rs suite.
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         store
             .append_test(vec![blank_entry(1, 1), blank_entry(1, 2)])
@@ -1598,7 +1594,7 @@ mod tests {
         use crate::raft::bench_instrumentation::fsync_count;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         // save_committed NOT called → committed_dirty is false.
         let before = fsync_count();
@@ -1709,7 +1705,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let mut store = LogStore::new(dir.path()).unwrap();
+            let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
             store
                 .append_test(vec![
                     blank_entry(1, 1),
@@ -1723,7 +1719,7 @@ mod tests {
         } // Drop the store — segments remain on disk.
 
         // Re-open on the same dir; rebuild_index should reconstruct the tail.
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
         let state = store.get_log_state().await.unwrap();
         assert_eq!(
             state.last_log_id.unwrap().index,
@@ -1743,7 +1739,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let mut store = LogStore::new(dir.path()).unwrap();
+            let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
             store.save_vote(&Vote::new(3, 1)).await.unwrap();
             store.save_committed(Some(log_id(2, 10))).await.unwrap();
             // D-10: save_committed is I/O-free; drive one append so the
@@ -1751,7 +1747,7 @@ mod tests {
             store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
         }
 
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
         assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
         assert_eq!(
             store.read_committed().await.unwrap(),
@@ -1772,7 +1768,7 @@ mod tests {
                 segment_cap: 1,
                 ..LogStoreConfig::default()
             };
-            let mut store = LogStore::with_config(dir.path(), cfg).unwrap();
+            let mut store = LogStore::new(dir.path(), cfg).unwrap();
 
             store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
             store.append_test(vec![blank_entry(1, 2)]).await.unwrap();
@@ -1801,7 +1797,7 @@ mod tests {
             segment_cap: 1,
             ..LogStoreConfig::default()
         };
-        let mut store = LogStore::with_config(dir.path(), cfg).unwrap();
+        let mut store = LogStore::new(dir.path(), cfg).unwrap();
         let state = store.get_log_state().await.unwrap();
         assert_eq!(
             state.last_purged_log_id.unwrap().index,
@@ -1841,7 +1837,7 @@ mod tests {
         let active_path;
         let clean_byte_len;
         {
-            let mut store = LogStore::new(dir.path()).unwrap();
+            let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
             store
                 .append_test(vec![
                     blank_entry(1, 1),
@@ -1893,7 +1889,7 @@ mod tests {
         }
 
         // Step 4: reopen LogStore. Expected: torn tail detected + truncated.
-        let mut store = LogStore::new(dir.path()).unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
 
         // Step 5: 3 valid records still readable.
         let entries = store.try_get_log_entries(1..10).await.unwrap();
@@ -1941,7 +1937,7 @@ mod tests {
         // Append a mix of batch sizes: 1, then 3 at once, then 1.
         let snapshot;
         {
-            let mut store = LogStore::new(dir.path()).unwrap();
+            let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
             store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
             store
                 .append_test(vec![
@@ -1955,7 +1951,7 @@ mod tests {
             snapshot = store.debug_index();
         }
 
-        let store = LogStore::new(dir.path()).unwrap();
+        let store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
         let rebuilt = store.debug_index();
 
         assert_eq!(
