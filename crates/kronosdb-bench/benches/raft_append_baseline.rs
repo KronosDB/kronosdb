@@ -354,12 +354,16 @@ fn bench_raft_append_baseline(c: &mut Criterion) {
 criterion_group!(benches, bench_raft_append_baseline);
 criterion_main!(benches);
 
-// Explicit ties to the four named regions — satisfies the acceptance check
-// that the source file references every Region variant.
+// Explicit ties to every Region variant — satisfies the acceptance check
+// that the source file references every Region variant. Updated in Plan
+// 02-01 (D-19): the obsolete bincode-rewrite variant was replaced by
+// `LogGroupCommit`, `LogRecordWrite`, and `LogIndexRebuild`.
 #[allow(dead_code)]
-fn _region_names() -> [&'static str; 4] {
+fn _region_names() -> [&'static str; 6] {
     [
-        Region::LogBincodeRewrite.as_str(),
+        Region::LogGroupCommit.as_str(),
+        Region::LogRecordWrite.as_str(),
+        Region::LogIndexRebuild.as_str(),
         Region::LogAtomicWrite.as_str(),
         Region::ApplyEventPath.as_str(),
         Region::SegmentAppend.as_str(),
