@@ -1,6 +1,10 @@
 /target
 /reference
 /data
+
+# Phase 1 baseline bench intermediate data -- Criterion HTML and per-run JSONL records
+target/criterion/
+target/baseline-records/
 *.swp
 *.swo
 .DS_Store
