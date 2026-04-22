@@ -6,10 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
-kronosdb-eventstore = { path = "../kronosdb-eventstore" }
+kronosdb-eventstore = { path = "../kronosdb-eventstore", features = ["bench-instrumentation"] }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [package.metadata.release]
 release = false
@@ -46,4 +49,8 @@ harness = false
 
 [[bench]]
 name = "throughput_sustained"
+harness = false
+
+[[bench]]
+name = "raft_append_baseline"
 harness = false
