@@ -436,6 +436,308 @@ struct LogStoreInner {
     committed_dirty: bool,
 }
 
+/// Scan `dir` for `log-*.bin` files, rebuild the in-memory index, and return
+/// `(sealed, active, index, last_log_id)`.
+///
+/// D-15: sealed segments (every log file except the highest-indexed) were
+/// fdatasync'd before sealing during Plan 02-03's rotation path, so their
+/// records are known good. The active (highest-indexed) segment is scanned
+/// with per-record CRC validation; the first CRC mismatch or short read is a
+/// torn-tail event and the file is `set_len`'d back to the offset of the last
+/// valid record (CRASH-01).
+///
+/// Phase-2 simplification: sealed segments currently get CRC validation too,
+/// because deriving each record's `log_index` requires deserializing the
+/// bincode payload (cheap on Phase-2-sized segments and avoids a header
+/// format change). Phase-7 PERF-04 can strip the CRC step on sealed segments
+/// per the D-15 optimization if startup-scan time becomes a concern — see the
+/// `TODO(phase 7)` inside `scan_sealed_segment`.
+fn rebuild_index(
+    dir: &Path,
+    config: &LogStoreConfig,
+) -> io::Result<(
+    Vec<SegmentMeta>,
+    Option<Segment>,
+    BTreeMap<u64, (u64, u64, u32)>,
+    Option<LogId<NodeId>>,
+)> {
+    #[cfg(feature = "bench-instrumentation")]
+    let _t = Timer::new(Region::LogIndexRebuild);
+
+    // 1. Enumerate `log-<first_index>.bin` files and sort by first_index asc.
+    let mut segment_paths: Vec<(u64, PathBuf)> = Vec::new();
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), None, BTreeMap::new(), None));
+        }
+        Err(e) => return Err(e),
+    };
+    for entry in read_dir {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(first_index) = parse_segment_first_index(&path) else {
+            continue;
+        };
+        segment_paths.push((first_index, path));
+    }
+    segment_paths.sort_by_key(|(fi, _)| *fi);
+
+    if segment_paths.is_empty() {
+        return Ok((Vec::new(), None, BTreeMap::new(), None));
+    }
+
+    let mut index: BTreeMap<u64, (u64, u64, u32)> = BTreeMap::new();
+    let mut sealed: Vec<SegmentMeta> = Vec::new();
+
+    // 2. Scan every segment except the last one (sealed → headers-only walk
+    //    with correctness-first CRC validation; see Phase-7 note above).
+    let last_idx = segment_paths.len() - 1;
+    for (i, (first_index, path)) in segment_paths.iter().enumerate() {
+        if i == last_idx {
+            break;
+        }
+        let byte_len = scan_sealed_segment(path, *first_index, &mut index)?;
+        sealed.push(SegmentMeta {
+            first_index: *first_index,
+            path: path.clone(),
+            byte_len,
+        });
+    }
+
+    // 3. Scan the active (last) segment with per-record CRC validation +
+    //    torn-tail truncation.
+    let (active_first_index, active_path) = &segment_paths[last_idx];
+    let valid_offset =
+        scan_active_segment(active_path, *active_first_index, &mut index)?;
+
+    // Truncate the preallocated / torn tail back to the last valid offset if
+    // the on-disk file length is larger. Open for write only; no fsync here —
+    // the next real append will fsync and cover this truncation.
+    let on_disk_len = std::fs::metadata(active_path)?.len();
+    if on_disk_len > valid_offset {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(active_path)?;
+        f.set_len(valid_offset)?;
+    }
+
+    // Re-open the active segment for append at the recovered offset. Use the
+    // larger of `config.segment_cap` and `valid_offset` as the cap so
+    // `needs_rotation` still behaves sensibly after recovery — a segment
+    // previously grown beyond the current config cap continues to be usable
+    // until the next rotation trigger (matches the invariant that the active
+    // segment never shrinks its cap during its lifetime).
+    let cap = std::cmp::max(config.segment_cap, valid_offset);
+    let active = Some(Segment::open_for_append(
+        active_path.clone(),
+        *active_first_index,
+        valid_offset,
+        cap,
+    )?);
+
+    // 4. Compute last_log_id from the rebuilt index (highest key → pread the
+    //    record → bincode-decode → pull `log_id`). Cold path; the O(1)
+    //    cache in LogStoreInner is maintained from here on.
+    let last_log_id = if let Some((&max_idx, &(seg_id, offset, _))) = index.iter().next_back() {
+        // Prefer the active segment's path if the tail entry lives there,
+        // else fall back to the matching sealed entry's path.
+        let path = if *active_first_index == seg_id {
+            active_path.clone()
+        } else {
+            sealed
+                .iter()
+                .find(|m| m.first_index == seg_id)
+                .map(|m| m.path.clone())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("segment first_index={} missing for tail key {}", seg_id, max_idx),
+                    )
+                })?
+        };
+        let payload = read_record_at(&path, offset)?;
+        let entry: Entry<TypeConfig> = bincode::deserialize(&payload).map_err(bincode_err)?;
+        Some(*entry.get_log_id())
+    } else {
+        None
+    };
+
+    Ok((sealed, active, index, last_log_id))
+}
+
+/// Parse `log-<16-digit>.bin` filenames into their `first_index` keys. Returns
+/// `None` for any path whose filename does not match the segment pattern so
+/// unrelated files (vote.bin, committed.bin, purged.bin, stray .tmp) are
+/// skipped silently.
+fn parse_segment_first_index(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("log-")?;
+    let digits = rest.strip_suffix(".bin")?;
+    // Reject filenames whose digit-part is not exactly 16 ASCII digits — keeps
+    // the parser strict against accidental siblings like `log-.bin.tmp`.
+    if digits.len() != 16 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// Walk a sealed segment record-by-record, inserting each record's
+/// (segment_id, byte_offset, record_len) into `index` keyed by the entry's
+/// `log_index`. Returns the total byte length of valid records found
+/// (used as `SegmentMeta::byte_len`).
+///
+/// TODO(phase 7): Skip CRC + bincode-deserialize on sealed segments per D-15
+/// optimization. Requires either (a) a sidecar `.idx` file, or (b) stashing
+/// `log_index` inside the record header. Neither is justified at Phase-2
+/// segment sizes (16 MiB default, rarely more than a handful of segments
+/// live before purge). PERF-04 can revisit if startup-scan time grows.
+fn scan_sealed_segment(
+    path: &Path,
+    first_index: u64,
+    index: &mut BTreeMap<u64, (u64, u64, u32)>,
+) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut offset: u64 = 0;
+
+    while offset + record::LEN_PREFIX as u64 <= file_len {
+        let mut len_buf = [0u8; record::LEN_PREFIX];
+        // A sealed segment is set_len'd to write_offset by `Segment::seal`, so
+        // any short-read or end-of-file here means we walked all records.
+        if file.read_exact_at(&mut len_buf, offset).is_err() {
+            break;
+        }
+        let payload_len = record::decode_len_be(&len_buf) as usize;
+        let total = record::total_size(payload_len);
+        let record_end = offset
+            .checked_add(total as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record offset overflow"))?;
+        if record_end > file_len {
+            // A sealed segment must not have partial records; if we see one
+            // the on-disk state is corrupt. Stop here with the valid prefix.
+            break;
+        }
+
+        // Read + CRC-validate payload (Phase-2 correctness-first; see TODO).
+        let payload_offset = offset + record::LEN_PREFIX as u64;
+        let mut payload = vec![0u8; payload_len];
+        file.read_exact_at(&mut payload, payload_offset)?;
+        let mut crc_buf = [0u8; record::CRC_SUFFIX];
+        file.read_exact_at(&mut crc_buf, payload_offset + payload_len as u64)?;
+        let stored_crc = record::decode_crc_le(&crc_buf);
+        let computed_crc = crc32c::crc32c(&payload);
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sealed segment {} record at offset {} crc mismatch",
+                    path.display(),
+                    offset
+                ),
+            ));
+        }
+
+        let entry: Entry<TypeConfig> = bincode::deserialize(&payload).map_err(bincode_err)?;
+        let log_index = entry.get_log_id().index;
+        index.insert(log_index, (first_index, offset, total as u32));
+
+        offset = record_end;
+    }
+
+    Ok(offset)
+}
+
+/// Walk the active segment record-by-record with full CRC validation.
+/// Returns the byte offset of the first invalid / torn record (== the valid
+/// `write_offset` for the reconstituted `Segment`). The caller is responsible
+/// for `set_len`-truncating the file to this offset if it is less than the
+/// on-disk file length.
+///
+/// Terminates on any of: short-read of the length prefix, record length
+/// exceeding remaining file bytes, short-read of payload or trailing CRC, or
+/// CRC mismatch. These are the torn-tail shapes CRASH-01 needs to cover —
+/// Plan 02-03's group commit fsyncs the record + CRC together, so a torn tail
+/// can only appear as an incomplete write of the trailing bytes.
+fn scan_active_segment(
+    path: &Path,
+    first_index: u64,
+    index: &mut BTreeMap<u64, (u64, u64, u32)>,
+) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut offset: u64 = 0;
+
+    while offset + record::LEN_PREFIX as u64 <= file_len {
+        let mut len_buf = [0u8; record::LEN_PREFIX];
+        if file.read_exact_at(&mut len_buf, offset).is_err() {
+            break;
+        }
+        let payload_len = record::decode_len_be(&len_buf) as usize;
+
+        // Preallocated tail: once we hit an all-zero length prefix on a
+        // never-written region, treat it as end-of-log. Without this check a
+        // fresh segment whose preallocated tail decodes as a record of length
+        // 0 would falsely succeed CRC (crc32c of empty is a fixed constant),
+        // producing phantom zero-payload entries. Empty-payload real records
+        // are never generated by `append_buffer` (bincode-encoded entries are
+        // always non-empty), so treating len=0 as end-of-log is safe.
+        if payload_len == 0 {
+            break;
+        }
+
+        let total = record::total_size(payload_len);
+        let record_end = match offset.checked_add(total as u64) {
+            Some(end) => end,
+            None => break,
+        };
+        if record_end > file_len {
+            // Torn write: length prefix indicates more bytes than the file
+            // actually has. Stop at `offset` (the START of the torn record).
+            break;
+        }
+
+        let payload_offset = offset + record::LEN_PREFIX as u64;
+        let mut payload = vec![0u8; payload_len];
+        if file.read_exact_at(&mut payload, payload_offset).is_err() {
+            break;
+        }
+        let mut crc_buf = [0u8; record::CRC_SUFFIX];
+        if file
+            .read_exact_at(&mut crc_buf, payload_offset + payload_len as u64)
+            .is_err()
+        {
+            break;
+        }
+        let stored_crc = record::decode_crc_le(&crc_buf);
+        let computed_crc = crc32c::crc32c(&payload);
+        if stored_crc != computed_crc {
+            // Torn or corrupt: stop at the start of this record (`offset`).
+            break;
+        }
+
+        let entry: Entry<TypeConfig> = match bincode::deserialize::<Entry<TypeConfig>>(&payload) {
+            Ok(e) => e,
+            Err(_) => {
+                // CRC passed but bincode failed — treat as torn (a real
+                // append would never write a payload that CRCs to its
+                // prefix'd length but doesn't decode as Entry). Stop here.
+                break;
+            }
+        };
+        let log_index = entry.get_log_id().index;
+        index.insert(log_index, (first_index, offset, total as u32));
+
+        offset = record_end;
+    }
+
+    Ok(offset)
+}
+
 impl LogStore {
     /// Construct a log store using the default `LogStoreConfig`.
     ///
@@ -453,15 +755,13 @@ impl LogStore {
         let committed = load_committed(dir);
         let last_purged = load_purged(dir);
 
-        // TODO(plan 02-04): rebuild `sealed` + `active` + `index` + `last_log_id`
-        // by scanning `dir` for `log-*.bin` files, headers-only scanning the
-        // sealed segments and CRC-validating the active segment's tail. Until
-        // Plan 02-04 lands, cross-restart recovery is NOT supported and tests
-        // in this plan only exercise a single `LogStore` lifetime.
-        let sealed: Vec<SegmentMeta> = Vec::new();
-        let active: Option<Segment> = None;
-        let index: BTreeMap<u64, (u64, u64, u32)> = BTreeMap::new();
-        let last_log_id: Option<LogId<NodeId>> = None;
+        // Plan 02-04: rebuild `sealed` + `active` + `index` + `last_log_id` by
+        // scanning `dir` for `log-*.bin` files. Sealed segments get a header-
+        // walking scan (with CRC validation as a correctness-first Phase-2
+        // simplification — see `rebuild_index` for the Phase-7 optimization
+        // note); the active (highest-indexed) segment gets per-record CRC
+        // validation and torn-tail truncation to satisfy CRASH-01.
+        let (sealed, active, index, last_log_id) = rebuild_index(dir, &config)?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(LogStoreInner {
@@ -718,6 +1018,15 @@ impl LogStore {
             inner.pending_callbacks.push(cb);
         }
         Ok(())
+    }
+
+    /// Test-only snapshot of the in-memory index (Plan 02-04 restart tests).
+    ///
+    /// Exposes the private `index` BTreeMap so restart tests can compare the
+    /// pre-shutdown index against the rebuilt-from-disk index key-for-key.
+    #[cfg(test)]
+    pub(crate) fn debug_index(&self) -> BTreeMap<u64, (u64, u64, u32)> {
+        self.inner.lock().index.clone()
     }
 
     /// Test-only append path that bypasses the `LogFlushed` callback.
@@ -1390,6 +1699,270 @@ mod tests {
         assert_eq!(
             segment_filename(u64::MAX),
             format!("log-{:016}.bin", u64::MAX)
+        );
+    }
+
+    // --- Plan 02-04 startup-recovery tests ---
+
+    #[tokio::test]
+    async fn round_trip_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = LogStore::new(dir.path()).unwrap();
+            store
+                .append_test(vec![
+                    blank_entry(1, 1),
+                    blank_entry(1, 2),
+                    blank_entry(1, 3),
+                    blank_entry(1, 4),
+                    blank_entry(1, 5),
+                ])
+                .await
+                .unwrap();
+        } // Drop the store — segments remain on disk.
+
+        // Re-open on the same dir; rebuild_index should reconstruct the tail.
+        let mut store = LogStore::new(dir.path()).unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_log_id.unwrap().index,
+            5,
+            "last_log_id must survive restart"
+        );
+
+        let entries = store.try_get_log_entries(1..6).await.unwrap();
+        assert_eq!(entries.len(), 5);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.get_log_id().index, (i + 1) as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn vote_and_committed_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = LogStore::new(dir.path()).unwrap();
+            store.save_vote(&Vote::new(3, 1)).await.unwrap();
+            store.save_committed(Some(log_id(2, 10))).await.unwrap();
+            // D-10: save_committed is I/O-free; drive one append so the
+            // committed.bin fold actually hits disk.
+            store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
+        }
+
+        let mut store = LogStore::new(dir.path()).unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(log_id(2, 10))
+        );
+    }
+
+    #[tokio::test]
+    async fn purged_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let purged_index;
+        {
+            // segment_cap=1 forces rotation on every append → the first two
+            // appends seal a segment each; we then purge at the end-of-first-
+            // sealed boundary.
+            let cfg = LogStoreConfig {
+                segment_cap: 1,
+                ..LogStoreConfig::default()
+            };
+            let mut store = LogStore::with_config(dir.path(), cfg).unwrap();
+
+            store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
+            store.append_test(vec![blank_entry(1, 2)]).await.unwrap();
+            store.append_test(vec![blank_entry(1, 3)]).await.unwrap();
+
+            // Capture the last index of the first sealed segment, then purge.
+            purged_index = {
+                let inner = store.inner.lock();
+                assert!(!inner.sealed.is_empty(), "expected sealed segments");
+                sealed_segment_last_index(&inner.sealed, inner.active.as_ref(), 0, &inner.index)
+            };
+            let first_sealed_path = {
+                let inner = store.inner.lock();
+                inner.sealed[0].path.clone()
+            };
+            store.purge(log_id(1, purged_index)).await.unwrap();
+            assert!(
+                std::fs::metadata(&first_sealed_path).is_err(),
+                "first sealed segment file must be unlinked by purge"
+            );
+        }
+
+        // Re-open and assert last_purged matches + the old first-sealed file
+        // is still absent (purge is persistent).
+        let cfg = LogStoreConfig {
+            segment_cap: 1,
+            ..LogStoreConfig::default()
+        };
+        let mut store = LogStore::with_config(dir.path(), cfg).unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_purged_log_id.unwrap().index,
+            purged_index,
+            "last_purged_log_id must survive restart"
+        );
+        // The originally-purged segment's file index=1 is gone — we cannot
+        // probe its specific path generically, but the sealed Vec after
+        // restart must not contain an entry whose last_index <= purged_index.
+        let inner = store.inner.lock();
+        for (i, meta) in inner.sealed.iter().enumerate() {
+            let last = sealed_segment_last_index(&inner.sealed, inner.active.as_ref(), i, &inner.index);
+            assert!(
+                last > purged_index,
+                "sealed segment first_index={} last_index={} must be above purged={}",
+                meta.first_index,
+                last,
+                purged_index,
+            );
+        }
+    }
+
+    /// CRASH-01 deterministic torn-tail test (D-17).
+    ///
+    /// Appends 3 clean records, drops the store cleanly (records fully
+    /// durable), manually appends a truncated record header + partial payload
+    /// into the active segment, reopens the store, and verifies:
+    /// 1. The torn tail is truncated (set_len back to end-of-record-3).
+    /// 2. The 3 valid records remain readable.
+    /// 3. `last_log_id.index == 3` — no phantom 4th entry appears.
+    #[tokio::test]
+    async fn torn_tail_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Step 1 + 2: append 3 entries, drop cleanly. Use a large segment_cap
+        // so all three land in the same (active) segment.
+        let active_path;
+        let clean_byte_len;
+        {
+            let mut store = LogStore::new(dir.path()).unwrap();
+            store
+                .append_test(vec![
+                    blank_entry(1, 1),
+                    blank_entry(1, 2),
+                    blank_entry(1, 3),
+                ])
+                .await
+                .unwrap();
+
+            let inner = store.inner.lock();
+            let active = inner.active.as_ref().unwrap();
+            active_path = active.path.clone();
+            clean_byte_len = active.write_offset;
+        }
+
+        // Step 3: manually append a torn record onto the active segment.
+        // Shape: write a 4-byte big-endian length prefix claiming a 64-byte
+        // payload, then write only 32 bytes of garbage — no CRC trailer, no
+        // full payload. This is the length-prefix-plus-short-payload torn-
+        // write variant from the plan text.
+        {
+            use std::os::unix::fs::FileExt;
+
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&active_path)
+                .unwrap();
+            let claimed_payload_len: u32 = 64;
+            let len_prefix = claimed_payload_len.to_be_bytes();
+            f.write_at(&len_prefix, clean_byte_len).unwrap();
+            let garbage = vec![0xCDu8; 32];
+            f.write_at(&garbage, clean_byte_len + len_prefix.len() as u64)
+                .unwrap();
+            // Do NOT fsync — the test simulates a torn tail that was
+            // in-flight when the process died.
+            drop(f);
+
+            // The on-disk file length is now at least clean_byte_len + 4 + 32
+            // (and possibly more if the segment was preallocated).
+            let on_disk_len = std::fs::metadata(&active_path).unwrap().len();
+            assert!(
+                on_disk_len > clean_byte_len,
+                "manual tamper must grow file beyond clean_byte_len \
+                 (on_disk={}, clean={})",
+                on_disk_len,
+                clean_byte_len
+            );
+        }
+
+        // Step 4: reopen LogStore. Expected: torn tail detected + truncated.
+        let mut store = LogStore::new(dir.path()).unwrap();
+
+        // Step 5: 3 valid records still readable.
+        let entries = store.try_get_log_entries(1..10).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "torn-tail recovery must leave 3 valid records; got {}",
+            entries.len()
+        );
+        assert_eq!(entries[0].get_log_id().index, 1);
+        assert_eq!(entries[1].get_log_id().index, 2);
+        assert_eq!(entries[2].get_log_id().index, 3);
+
+        // Step 6: no phantom 4th entry.
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_log_id.unwrap().index,
+            3,
+            "last_log_id must be 3 after torn-tail recovery"
+        );
+
+        // Step 7: active segment file length matches the sum of record_len
+        // values for indices 1..=3 (the in-memory index's authoritative size).
+        {
+            let inner = store.inner.lock();
+            let expected_bytes: u64 = inner
+                .index
+                .values()
+                .map(|(_, _, len)| *len as u64)
+                .sum();
+            let on_disk_len = std::fs::metadata(&active_path).unwrap().len();
+            assert_eq!(
+                on_disk_len, expected_bytes,
+                "active segment must be truncated to exactly the sum of valid record_lens \
+                 (on_disk={}, expected={})",
+                on_disk_len, expected_bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn index_rebuild_matches_pre_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Append a mix of batch sizes: 1, then 3 at once, then 1.
+        let snapshot;
+        {
+            let mut store = LogStore::new(dir.path()).unwrap();
+            store.append_test(vec![blank_entry(1, 1)]).await.unwrap();
+            store
+                .append_test(vec![
+                    blank_entry(1, 2),
+                    blank_entry(1, 3),
+                    blank_entry(1, 4),
+                ])
+                .await
+                .unwrap();
+            store.append_test(vec![blank_entry(1, 5)]).await.unwrap();
+            snapshot = store.debug_index();
+        }
+
+        let store = LogStore::new(dir.path()).unwrap();
+        let rebuilt = store.debug_index();
+
+        assert_eq!(
+            rebuilt, snapshot,
+            "rebuilt index must match pre-shutdown index key-for-key and \
+             value-for-value (rebuilt={:?}, snapshot={:?})",
+            rebuilt, snapshot
         );
     }
 }
