@@ -56,3 +56,21 @@ build-all: build connector-install
 # Inspect a .seg file (dumps events or summary)
 inspect-segment *ARGS:
     cargo run -q -p kronosdb-eventstore --bin inspect_segment -- {{ARGS}}
+
+# Phase 1 baseline: run the Raft-append baseline bench on 4dcffcd and regenerate
+# .planning/phases/01-baseline/BASELINE.md + baseline-4dcffcd.json.
+#
+# Clears previous per-run JSONL records, runs the Criterion bench with the
+# bench-instrumentation feature enabled (auto-enabled via kronosdb-bench's dep),
+# then aggregates. Safe to re-run; overwrites both artifacts.
+bench-baseline:
+    @echo "-> clearing previous baseline records"
+    @rm -rf target/baseline-records
+    @echo "-> running raft_append_baseline (this can take several minutes)"
+    cargo bench -p kronosdb-bench --bench raft_append_baseline
+    @echo "-> aggregating into .planning/phases/01-baseline/"
+    cargo run -q -p kronosdb-bench --bin aggregate_baseline -- \
+        --records target/baseline-records \
+        --out-dir .planning/phases/01-baseline \
+        --commit 4dcffcd
+    @echo "OK .planning/phases/01-baseline/BASELINE.md and baseline-4dcffcd.json updated"
