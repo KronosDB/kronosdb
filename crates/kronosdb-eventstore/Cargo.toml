@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Off by default. Enabled by the kronosdb-bench crate for phase-1 baseline measurement.
+# Inserts scoped std::time::Instant timers at four named hotspots plus an fsync syscall
+# counter. Must compile out completely when the feature is off — no runtime cost in release.
+bench-instrumentation = []
+
 [dependencies]
 crc32c = "0.6"
 memmap2 = "0.9"
