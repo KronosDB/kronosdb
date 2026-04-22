@@ -16,12 +16,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The four named hotspots. Names MUST match the CSV/JSON schema plan 01-02 writes.
+/// Named hotspots measured by the `bench-instrumentation` feature.
+///
+/// Phase 1 baseline (plans 01-01..01-03) established four regions; Phase 2
+/// (plan 02-01, D-19) retires the obsolete bincode-rewrite variant in favour
+/// of three new variants that cover the new log-store hotspots:
+/// `LogGroupCommit`, `LogRecordWrite`, and `LogIndexRebuild`. `LogAtomicWrite`
+/// stays because `vote.bin` / `purged.bin` still go through `atomic_write`.
+///
+/// Region name strings are the stable key used by the bench harness, JSONL
+/// records, and BASELINE.md / future COMPARISON.md tables — do not rename
+/// the strings without updating those artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Region {
-    /// log_store::append — bincode rewrite of the full BTreeMap log.
-    LogBincodeRewrite,
+    /// log_store group-commit drive: flush buffered records + write
+    /// `committed.bin` + fsync + fire FIFO `LogFlushed` callbacks.
+    LogGroupCommit,
+    /// log_store single-`append()` work: bincode-encode entries and buffer
+    /// record bytes into the active segment (excludes the fsync).
+    LogRecordWrite,
+    /// log_store startup index rebuild: scan segments + per-record CRC
+    /// validation on the active segment + torn-tail truncation.
+    LogIndexRebuild,
     /// log_store::atomic_write — tmp write + fsync + rename + dir fsync.
+    /// Still used by `vote.bin` / `purged.bin` (D-11, D-12).
     LogAtomicWrite,
     /// state_machine::apply_request — the event-path match arm (Append variant).
     ApplyEventPath,
@@ -32,7 +50,9 @@ pub enum Region {
 impl Region {
     pub fn as_str(self) -> &'static str {
         match self {
-            Region::LogBincodeRewrite => "log_bincode_rewrite",
+            Region::LogGroupCommit => "log_group_commit",
+            Region::LogRecordWrite => "log_record_write",
+            Region::LogIndexRebuild => "log_index_rebuild",
             Region::LogAtomicWrite => "log_atomic_write",
             Region::ApplyEventPath => "apply_event_path",
             Region::SegmentAppend => "segment_append",
@@ -69,9 +89,14 @@ pub struct Sample {
 ///
 /// Plan 01-02's bench harness may construct these from drained samples when
 /// emitting CSV/JSONL output. Kept here so the schema lives with the regions.
+/// Updated in Plan 02-01 (D-19): the retired bincode-rewrite field is
+/// replaced by `log_group_commit_ns`, `log_record_write_ns`, and
+/// `log_index_rebuild_ns` reflecting Phase 2's new hotspots.
 #[derive(Debug, Clone, Default)]
 pub struct AppendRecord {
-    pub log_bincode_rewrite_ns: u64,
+    pub log_group_commit_ns: u64,
+    pub log_record_write_ns: u64,
+    pub log_index_rebuild_ns: u64,
     pub log_atomic_write_ns: u64,
     pub apply_event_path_ns: u64,
     pub segment_append_ns: u64,

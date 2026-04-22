@@ -305,8 +305,11 @@ fn read_vote(dir: &Path) -> Option<PersistedVote> {
 }
 
 fn write_log(dir: &Path, log: &BTreeMap<u64, Entry<TypeConfig>>) -> Result<(), io::Error> {
-    #[cfg(feature = "bench-instrumentation")]
-    let _t = Timer::new(Region::LogBincodeRewrite);
+    // NOTE (Plan 02-01, D-19): the Phase 1 bincode-rewrite region timer that
+    // used to wrap this helper was removed along with the retired Region
+    // variant. `write_log` is slated for deletion in Plan 02-03 when the
+    // RaftLogStorage impl moves to the new segmented path; until then it
+    // runs without per-region timing.
     let entries: Vec<_> = log.values().cloned().collect();
     let data = bincode::serialize(&entries).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     atomic_write(&log_path(dir), &data)
