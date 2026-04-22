@@ -22,7 +22,7 @@ use crate::event::{Position, SequencedEvent, Tag};
 use crate::store::EventStoreEngine;
 use crate::stream::EventStream;
 
-use super::log_store::LogStore;
+use super::log_store::{LogStore, LogStoreConfig};
 use super::network::NetworkFactory;
 use super::proto;
 use super::proto::raft_transport_client::RaftTransportClient;
@@ -104,7 +104,8 @@ impl ClusterManager {
             .data_dir()
             .join(context_name)
             .join("raft");
-        let log_store = LogStore::new(&raft_dir).map_err(Error::Io)?;
+        let log_store =
+            LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
 
         // Create state machine wrapping the context manager.
         let state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager));
