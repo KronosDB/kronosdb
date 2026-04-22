@@ -1132,7 +1132,10 @@ dependencies = [
  "criterion",
  "kronosdb-eventstore",
  "rand",
+ "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
