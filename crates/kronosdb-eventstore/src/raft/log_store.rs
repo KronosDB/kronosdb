@@ -1501,6 +1501,118 @@ mod tests {
         );
     }
 
+    /// SNAP-03 / Phase 4: after a snapshot is installed, openraft signals a
+    /// purge with the snapshot's `last_log_id`. The LogStore must drop every
+    /// sealed segment whose highest index ≤ that log_id and keep the
+    /// surviving tail readable.
+    ///
+    /// These tests live in-crate (not in tests/snapshot_purge.rs) because the
+    /// append driver `append_test` is `#[cfg(test)] pub(crate)` and openraft's
+    /// `LogFlushed::new` callback constructor is `pub(crate)` — neither is
+    /// reachable from an integration test crate. See log_store.rs line ~1028
+    /// for the rationale.
+    #[tokio::test]
+    async fn purge_after_snapshot_install() {
+        let dir = tempfile::tempdir().unwrap();
+        // segment_cap=1 forces every record into its own sealed segment —
+        // same pattern as purge_drops_sealed_segment_files_o1 above.
+        let cfg = LogStoreConfig {
+            segment_cap: 1,
+            ..LogStoreConfig::default()
+        };
+        let mut store = LogStore::new(dir.path(), cfg).unwrap();
+
+        for i in 1..=30u64 {
+            store
+                .append_test(vec![blank_entry(1, i)])
+                .await
+                .expect("append");
+        }
+
+        // Simulate openraft's post-install purge signal with
+        // snapshot.last_log_id.index = 15.
+        store.purge(log_id(1, 15)).await.expect("purge");
+
+        // Surviving tail: get_log_state must report a last_log_id whose
+        // index is >= 16.
+        let state = store.get_log_state().await.unwrap();
+        let last = state.last_log_id.expect("surviving tail has a last_log_id").index;
+        assert!(last >= 16, "expected surviving tail last_index >= 16, got {last}");
+
+        // Read the tail. Every returned entry must have index >= 16. Exact
+        // count depends on segment rotation timing; the invariant is that
+        // no entry with index <= 15 survives.
+        let tail = store
+            .try_get_log_entries(16..31)
+            .await
+            .expect("read tail");
+        assert!(!tail.is_empty(), "expected at least one surviving entry");
+        for e in &tail {
+            assert!(
+                e.log_id.index >= 16,
+                "purge must not leave entries with index <= 15 (got {})",
+                e.log_id.index
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_then_read_surviving_tail_no_stale_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LogStoreConfig {
+            segment_cap: 1,
+            ..LogStoreConfig::default()
+        };
+        let mut store = LogStore::new(dir.path(), cfg).unwrap();
+        for i in 1..=30u64 {
+            store.append_test(vec![blank_entry(1, i)]).await.unwrap();
+        }
+
+        store.purge(log_id(1, 10)).await.expect("purge");
+
+        // Below-cut reads must be empty — the in-memory index must have no
+        // keys <= 10 after purge.
+        let below = store.try_get_log_entries(1..11).await.expect("read below");
+        assert!(
+            below.is_empty(),
+            "expected no entries with index <= 10 after purge, got {}",
+            below.len()
+        );
+
+        let above = store.try_get_log_entries(11..31).await.expect("read above");
+        assert!(!above.is_empty(), "surviving tail should be readable");
+        for e in &above {
+            assert!(
+                e.log_id.index >= 11,
+                "read above returned stale entry with index {}",
+                e.log_id.index
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LogStoreConfig {
+            segment_cap: 1,
+            ..LogStoreConfig::default()
+        };
+        let mut store = LogStore::new(dir.path(), cfg).unwrap();
+        for i in 1..=30u64 {
+            store.append_test(vec![blank_entry(1, i)]).await.unwrap();
+        }
+
+        store.purge(log_id(1, 15)).await.expect("first purge");
+        // Second call at the same log_id must succeed (no-op).
+        store.purge(log_id(1, 15)).await.expect("second purge must be no-op");
+
+        let state = store.get_log_state().await.unwrap();
+        assert!(
+            state.last_log_id.is_some(),
+            "tail must survive idempotent second purge"
+        );
+    }
+
     #[tokio::test]
     async fn vote_persists_atomic_write() {
         let dir = tempfile::tempdir().unwrap();
