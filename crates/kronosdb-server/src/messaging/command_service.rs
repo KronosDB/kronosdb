@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -22,14 +22,16 @@ const CONTEXT_HEADER: &str = "kronosdb-context";
 const DEFAULT_CONTEXT: &str = "default";
 
 type HandlerSender = mpsc::Sender<Result<pb::CommandHandlerInbound, Status>>;
-type PendingResponses = Arc<Mutex<HashMap<String, oneshot::Sender<CommandResult>>>>;
+type PendingResponses = Arc<DashMap<String, oneshot::Sender<CommandResult>>>;
 
 /// gRPC service implementation for the command bus.
 ///
 /// Routes handlers to per-context messaging engines via `kronosdb-context` header.
+/// Both `handler_streams` and `pending` are sharded maps so concurrent
+/// dispatches and response completions don't contend on a single mutex.
 pub struct CommandServiceImpl {
     messaging: Arc<MessagingManager>,
-    handler_streams: Arc<Mutex<HashMap<String, HandlerSender>>>,
+    handler_streams: Arc<DashMap<String, HandlerSender>>,
     pending: PendingResponses,
     command_timeout: Duration,
 }
@@ -38,8 +40,8 @@ impl CommandServiceImpl {
     pub fn new(messaging: Arc<MessagingManager>, command_timeout: Duration) -> Self {
         Self {
             messaging,
-            handler_streams: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            handler_streams: Arc::new(DashMap::new()),
+            pending: Arc::new(DashMap::new()),
             command_timeout,
         }
     }
@@ -66,8 +68,11 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         let platform = self.messaging.get_platform(&context);
 
         let mut inbound = request.into_inner();
+        // 4096 absorbs dispatch bursts without blocking the send.await
+        // path; each queued entry is a small proto so worst-case memory
+        // stays bounded.
         let (handler_tx, handler_rx) =
-            mpsc::channel::<Result<pb::CommandHandlerInbound, Status>>(128);
+            mpsc::channel::<Result<pb::CommandHandlerInbound, Status>>(4096);
 
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending = Arc::clone(&self.pending);
@@ -91,10 +96,7 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                         );
                         client_id = Some(sub.client_id.clone());
 
-                        {
-                            let mut streams = handler_streams.lock();
-                            streams.insert(sub.client_id.clone(), handler_tx.clone());
-                        }
+                        handler_streams.insert(sub.client_id.clone(), handler_tx.clone());
 
                         platform.subscribe_command(
                             sub.command,
@@ -127,9 +129,9 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                         let result = from_proto_command_response(resp);
                         let request_id = result.request_id.clone();
 
-                        // Complete the pending dispatch call.
-                        let mut pending_map = pending.lock();
-                        if let Some(tx) = pending_map.remove(&request_id) {
+                        // Complete the pending dispatch call. Sharded map
+                        // so we don't contend with concurrent dispatches.
+                        if let Some((_, tx)) = pending.remove(&request_id) {
                             let _ = tx.send(result);
                         }
                     }
@@ -141,7 +143,7 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             // Handler disconnected — clean up.
             if let Some(cid) = client_id {
                 platform.remove_client(&ClientId(cid.clone()));
-                handler_streams.lock().remove(&cid);
+                handler_streams.remove(&cid);
 
                 // Fail all pending commands for this handler.
                 // (In practice, the oneshot receivers will get a RecvError
@@ -175,17 +177,15 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
         // Store the response channel so the handler stream can complete it.
-        {
-            let mut pending_map = self.pending.lock();
-            pending_map.insert(message_id.clone(), pending_cmd.response_tx);
-        }
+        self.pending
+            .insert(message_id.clone(), pending_cmd.response_tx);
 
         // Find the selected handler's stream and deliver the command.
         let target_id = &pending_cmd.target_handler.0;
-        let handler_tx = {
-            let streams = self.handler_streams.lock();
-            streams.get(target_id).cloned()
-        };
+        let handler_tx = self
+            .handler_streams
+            .get(target_id)
+            .map(|r| r.value().clone());
 
         let handler_tx = handler_tx.ok_or_else(|| {
             Status::unavailable(format!("handler '{}' stream not found", target_id))
@@ -201,13 +201,13 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         let result = match tokio::time::timeout(self.command_timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
-                self.pending.lock().remove(&message_id);
+                self.pending.remove(&message_id);
                 return Err(Status::unavailable(
                     "handler disconnected before responding",
                 ));
             }
             Err(_) => {
-                self.pending.lock().remove(&message_id);
+                self.pending.remove(&message_id);
                 return Err(Status::deadline_exceeded("command dispatch timed out"));
             }
         };
