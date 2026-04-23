@@ -1,8 +1,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use tracing::warn;
-
 use openraft::storage::RaftStateMachine;
 use openraft::{
     Entry, EntryPayload, LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder, Snapshot,
@@ -12,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::append::AppendRequest;
 use crate::context::ContextManager;
+use crate::error::Error;
 
 use super::types::{NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConfig};
 
@@ -47,7 +46,18 @@ impl EventStoreStateMachine {
     }
 
     /// Apply a single Raft request to the event store.
-    fn apply_request(&self, req: &RaftRequest) -> RaftResponse {
+    ///
+    /// Returns `Result<RaftResponse, StorageError<NodeId>>` so every apply-time
+    /// error is explicitly classified per D-04..D-08:
+    /// - DCB consistency violations → `Ok(RaftResponse::AppendRejected { .. })`
+    ///   (deterministic, valid apply response).
+    /// - Deterministic-apply violations (`ContextNotFound`, `Io`, `Corrupted`)
+    ///   → `Err(StorageError<NodeId>)` (openraft halts the node cleanly).
+    /// - `ContextAlreadyExists` on `CreateContext` replay → idempotent success.
+    fn apply_request(
+        &self,
+        req: &RaftRequest,
+    ) -> Result<RaftResponse, StorageError<NodeId>> {
         match req {
             RaftRequest::Append {
                 context,
@@ -66,25 +76,97 @@ impl EventStoreStateMachine {
                     .contexts
                     .with_context(context, |store| store.append(append_req))
                 {
-                    Ok(resp) => RaftResponse::Append {
+                    Ok(resp) => Ok(RaftResponse::Append {
                         first_position: resp.first_position.0,
                         count: resp.count,
                         consistency_marker: resp.consistency_marker.0,
-                    },
-                    Err(e) => {
-                        // Log but don't fail the state machine — Raft entries are committed
-                        // and must be applied. DCB violations on followers are expected
-                        // (the leader already validated).
-                        warn!(context = %context, error = %e, "state machine apply error");
-                        RaftResponse::Ok
+                    }),
+                    Err(Error::ConsistencyConditionViolated {
+                        conflicting_position,
+                    }) => {
+                        // D-04: DCB violation is deterministic across nodes given the
+                        // same prior state. Return as a successful apply response with
+                        // the typed rejection variant; the apply Result is Ok here —
+                        // AppendRejected is not a StorageError.
+                        Ok(RaftResponse::AppendRejected {
+                            reason: RaftRejectReason::ConsistencyConditionViolated {
+                                conflicting_position: conflicting_position.0,
+                            },
+                        })
+                    }
+                    Err(Error::ContextNotFound { name }) => {
+                        // D-05: Follower determinism violation. CreateContext for this
+                        // name must have committed before this append — if we get here,
+                        // log replay is out of order. Halt the node via StorageError.
+                        Err(StorageError::from_io_error(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("apply: context not found: {name}"),
+                            ),
+                        ))
+                    }
+                    Err(Error::Io(io_err)) => {
+                        // D-06: Unexpected storage I/O failure during deterministic apply.
+                        // Node can no longer be trusted to stay in lockstep.
+                        Err(StorageError::from_io_error(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            io_err,
+                        ))
+                    }
+                    Err(Error::Corrupted { message }) => {
+                        // D-07: Corruption detected at apply time; halt the node.
+                        Err(StorageError::from_io_error(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+                        ))
+                    }
+                    Err(other) => {
+                        // Any other Error variant (InvalidContextName, ContextAlreadyExists,
+                        // SnapshotNotFound) is not expected on the append path; treat as
+                        // fatal determinism violation rather than silently Ok.
+                        Err(StorageError::from_io_error(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("unexpected apply error: {other}"),
+                            ),
+                        ))
                     }
                 }
             }
             RaftRequest::CreateContext { name } => {
-                if let Err(e) = self.contexts.create_context(name) {
-                    warn!(name = %name, error = %e, "state machine create context error");
+                match self.contexts.create_context(name) {
+                    Ok(()) => Ok(RaftResponse::ContextCreated),
+                    Err(Error::ContextAlreadyExists { .. }) => {
+                        // D-08: idempotent replay of a committed CreateContext is
+                        // expected during log replay; not an error.
+                        tracing::debug!(name = %name, "create_context: already exists (replay)");
+                        Ok(RaftResponse::ContextCreated)
+                    }
+                    Err(Error::InvalidContextName { name, reason }) => {
+                        Err(StorageError::from_io_error(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("invalid context name '{name}': {reason}"),
+                            ),
+                        ))
+                    }
+                    Err(other) => Err(StorageError::from_io_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("create_context unexpected error: {other}"),
+                        ),
+                    )),
                 }
-                RaftResponse::ContextCreated
             }
         }
     }
@@ -117,7 +199,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
 
             match entry.payload {
                 EntryPayload::Normal(req) => {
-                    let resp = self.apply_request(&req);
+                    let resp = self.apply_request(&req)?;
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref membership) => {
