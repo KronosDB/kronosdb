@@ -532,4 +532,29 @@ mod tests {
 
         assert!(cluster.context_manager().context_exists("default"));
     }
+
+    /// DCB-03 regression guard: `conditional_propose_lock` was the propose-time
+    /// TOCTOU guard added in 04e0cbf. This worktree started from 4dcffcd so the
+    /// identifier is absent. Apply-time authority (Phase 3) makes the lock dead
+    /// weight; reintroducing it would re-install the bug it was defending against.
+    /// This test fails loudly if the identifier ever reappears in this file.
+    #[test]
+    fn dcb_03_guard_no_conditional_propose_lock_in_cluster_rs() {
+        const SOURCE: &str = include_str!("cluster.rs");
+        // We count occurrences of the identifier and require the count to equal
+        // the known-good count for this test's own mentions (docstring, name,
+        // assertion message). Any occurrence outside this test bumps the count
+        // and fails the guard — which is the intended contract.
+        let occurrences = SOURCE.matches("conditional_propose_lock").count();
+        // This constant must be updated ONLY when changing this test's body.
+        // Set deliberately wrong during RED phase so the test fails first.
+        const EXPECTED_SELF_MENTIONS: usize = 0;
+        assert_eq!(
+            occurrences, EXPECTED_SELF_MENTIONS,
+            "DCB-03 regression: 'conditional_propose_lock' should appear exactly \
+             {EXPECTED_SELF_MENTIONS} times (all inside dcb_03_guard_no_conditional_propose_lock_in_cluster_rs); \
+             found {occurrences}. Apply-time authority makes this lock unnecessary — \
+             do not reintroduce it."
+        );
+    }
 }
