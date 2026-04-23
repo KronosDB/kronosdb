@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::api::EventStore;
-use crate::append::{AppendRequest, AppendResponse};
+use crate::append::{AppendRequest, AppendResponse, AppliedLogId};
 use crate::cache::IndexCache;
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
@@ -452,6 +452,32 @@ impl EventStoreEngine {
     /// 3. Updates the in-memory tag index
     /// 4. Advances the committed position
     pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        self.append_internal(request, None)
+    }
+
+    /// Like `append`, but atomically persists the applied Raft `LogId` alongside
+    /// the events by emitting a `RaftMarker::normal(term, index, count)` record
+    /// in the same segment fsync. Used by the Raft state machine so boot-time
+    /// recovery can reconstruct `last_applied` from segment scan — no sidecar
+    /// file, no extra fsync.
+    ///
+    /// For empty event batches (condition-only or rejected-after-check) this
+    /// method does not emit a marker — `last_applied` will be recovered from
+    /// the next Normal entry that produces events. Membership/Blank entries
+    /// are not persisted here; see `state_machine::apply` for rationale.
+    pub fn append_with_raft(
+        &self,
+        request: AppendRequest,
+        applied: AppliedLogId,
+    ) -> Result<AppendResponse, Error> {
+        self.append_internal(request, Some(applied))
+    }
+
+    fn append_internal(
+        &self,
+        request: AppendRequest,
+        applied: Option<AppliedLogId>,
+    ) -> Result<AppendResponse, Error> {
         let timer = Timer::start();
 
         let target_epoch = if self.sync_state.enabled {
@@ -526,8 +552,32 @@ impl EventStoreEngine {
 
             let old_active_base = writer.active_base_position();
 
-            // Step 2: Write events.
-            let (first_position, count) = if self.sync_state.enabled {
+            // Step 2: Write events (+ Raft marker, if threaded in).
+            //
+            // When `applied` is Some, we route through `SegmentWriter::write_raft_entry`
+            // which emits a `RaftMarker::normal(term, index, count)` record *before* the
+            // event records in the same segment. That marker is the durable witness of
+            // `last_applied` — on restart, scanning raft markers across all segments
+            // reconstructs it without an extra fsync or sidecar file. The marker + its
+            // events are guaranteed not to straddle a segment boundary (see
+            // `write_raft_entry` pre-rotate check).
+            let (first_position, count) = if let Some(log_id) = applied {
+                let count_u16 = u16::try_from(request.events.len()).map_err(|_| Error::Corrupted {
+                    message: "raft-marked append exceeds u16::MAX events".into(),
+                })?;
+                let marker = crate::segment::format::RaftMarker::normal(
+                    log_id.term,
+                    log_id.index,
+                    count_u16,
+                );
+                let result = writer.write_raft_entry(&marker, &request.events)?;
+                if !self.sync_state.enabled {
+                    // Immediate mode: the non-Raft `writer.append` does its own fsync,
+                    // but `write_raft_entry` does not. Preserve strict durability here.
+                    writer.sync()?;
+                }
+                result
+            } else if self.sync_state.enabled {
                 // Group commit: write without fsync. Sync thread handles it.
                 writer.write_events(&request.events)?
             } else {
@@ -895,6 +945,43 @@ impl EventStoreEngine {
         }
 
         Ok(events)
+    }
+
+    /// Scans all on-disk segments for persisted `RaftMarker` records and
+    /// returns the maximum `(term, index)` seen. Used on boot to reconstruct
+    /// the Raft state-machine's `last_applied` without any sidecar file.
+    ///
+    /// Cheap enough for boot: sealed segments have bounded size (256 MB default)
+    /// and only markers are deserialized; event payloads are skipped by the
+    /// `iter_raft_markers` iterator. Returns `None` if no markers are present
+    /// (fresh store, or legacy data written before this plan).
+    pub fn max_applied_log_id(&self) -> Result<Option<AppliedLogId>, Error> {
+        use crate::segment::format::RaftEntryType;
+
+        let seg_list = self.segments.read().clone();
+        let mut best: Option<(u64, u64)> = None;
+        for &base in &seg_list.bases {
+            let seg_path = segment::segment_path(&self.dir, base);
+            let reader = match SegmentReader::open(&seg_path) {
+                Ok(r) => r,
+                Err(_) => continue, // Missing / unreadable segments don't contribute.
+            };
+            for item in reader.iter_raft_markers() {
+                let (_, marker) = match item {
+                    Ok(m) => m,
+                    Err(_) => break, // Torn tail in this segment — stop scanning it.
+                };
+                // Membership and Blank markers are informational here (we don't
+                // persist them in this plan), but if any appear just honour their
+                // term/index as well — they cannot decrease the max.
+                let _ = RaftEntryType::Normal; // readability
+                let candidate = (marker.term, marker.index);
+                if best.map(|b| candidate > b).unwrap_or(true) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        Ok(best.map(|(term, index)| AppliedLogId { term, index }))
     }
 
     /// Returns every stored event with position >= `from_position` up to the
