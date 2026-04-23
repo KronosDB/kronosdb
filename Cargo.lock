@@ -1188,6 +1188,7 @@ dependencies = [
 name = "kronosdb-messaging"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "parking_lot",
  "tokio",
 ]
@@ -1198,6 +1199,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "dashmap",
  "kronosdb-eventstore",
  "kronosdb-messaging",
  "mime_guess",
