@@ -284,8 +284,10 @@ pub struct EventStoreEngine {
     /// The segment writer. Behind Arc<Mutex> — shared with the group commit sync thread.
     writer: Arc<parking_lot::Mutex<SegmentWriter>>,
 
-    /// The tag index for the active segment. Protected by RwLock for concurrent read access.
-    tag_index: Arc<RwLock<TagIndex>>,
+    /// TagIndex is internally sharded (DashMap over tag keys + a brief
+    /// Mutex on all_positions). No outer lock — concurrent writers with
+    /// disjoint tag keys don't contend.
+    tag_index: Arc<TagIndex>,
 
     /// Group commit synchronization.
     sync_state: Arc<SyncState>,
@@ -346,7 +348,7 @@ impl EventStoreEngine {
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
-            tag_index: Arc::new(RwLock::new(TagIndex::new())),
+            tag_index: Arc::new(TagIndex::new()),
             sync_state,
             committed_position: Arc::new(AtomicU64::new(0)),
             commit_tx,
@@ -386,8 +388,8 @@ impl EventStoreEngine {
 
         // Rebuild the active segment's tag index from its events.
         // Sealed segments have their own `.idx` files on disk.
-        let mut tag_index = TagIndex::new();
-        rebuild_active_segment_index(dir, &mut tag_index)?;
+        let tag_index = TagIndex::new();
+        rebuild_active_segment_index(dir, &tag_index)?;
 
         // Build the cached segment list from disk (one-time cost on startup).
         let all_bases = segment::list_segment_files(dir)?;
@@ -411,7 +413,7 @@ impl EventStoreEngine {
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
-            tag_index: Arc::new(RwLock::new(tag_index)),
+            tag_index: Arc::new(tag_index),
             sync_state,
             committed_position: Arc::new(AtomicU64::new(committed)),
             commit_tx,
@@ -505,8 +507,8 @@ impl EventStoreEngine {
                 }
 
                 // Check the active segment via in-memory tag index.
-                let index = self.tag_index.read();
-                if let Some(conflicting_pos) = index.check_condition(condition) {
+                // tag_index is internally sharded; no lock needed.
+                if let Some(conflicting_pos) = self.tag_index.check_condition(condition) {
                     return Err(Error::ConsistencyConditionViolated {
                         conflicting_position: conflicting_pos,
                     });
@@ -543,13 +545,12 @@ impl EventStoreEngine {
             }
 
             // Step 3: Update in-memory tag index.
-            {
-                let mut index = self.tag_index.write();
-                let mut pos = first_position;
-                for event in &request.events {
-                    index.index_event(pos, &event.name, &event.tags);
-                    pos = pos.next();
-                }
+            // TagIndex is internally sharded — concurrent callers indexing events
+            // with different tag keys proceed in parallel.
+            let mut pos = first_position;
+            for event in &request.events {
+                self.tag_index.index_event(pos, &event.name, &event.tags);
+                pos = pos.next();
             }
 
             // Step 4: Advance committed position.
@@ -749,8 +750,11 @@ impl EventStoreEngine {
                 (bm, Some(idx))
             } else {
                 // Active segment — use in-memory index.
-                let index = self.tag_index.read();
-                (index.matching_bitmap(condition, from_position), None)
+                // tag_index is internally sharded; no lock needed.
+                (
+                    self.tag_index.matching_bitmap(condition, from_position),
+                    None,
+                )
             };
 
             let matching_positions = match matching_positions {
@@ -840,8 +844,11 @@ impl EventStoreEngine {
                 let bm = idx.matching(condition);
                 (bm, Some(idx))
             } else {
-                let index = self.tag_index.read();
-                (index.matching_bitmap(condition, from_position), None)
+                // tag_index is internally sharded; no lock needed.
+                (
+                    self.tag_index.matching_bitmap(condition, from_position),
+                    None,
+                )
             };
 
             let matching_positions = match matching_positions {
@@ -1011,7 +1018,7 @@ fn count_sealed_segments(dir: &Path, bases: &[u64], active_base: u64) -> usize {
 /// Sealed segments have `.idx` companion files on disk and don't need replay.
 /// Only the active segment (the last one without `.idx`) is replayed.
 /// If a sealed segment is missing its `.idx`, it's rebuilt from the segment data.
-fn rebuild_active_segment_index(dir: &Path, index: &mut TagIndex) -> Result<(), Error> {
+fn rebuild_active_segment_index(dir: &Path, index: &TagIndex) -> Result<(), Error> {
     let segments = segment::list_segment_files(dir)?;
 
     for base_pos in segments {

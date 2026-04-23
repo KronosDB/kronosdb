@@ -17,6 +17,7 @@ memmap2 = "0.9"
 libc = "0.2"
 roaring = "0.10"
 parking_lot = "0.12"
+dashmap = "6"
 growable-bloom-filter = "2"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
