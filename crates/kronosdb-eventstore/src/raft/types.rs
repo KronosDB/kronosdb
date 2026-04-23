@@ -3,6 +3,7 @@ use std::io::Cursor;
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Entry;
+use openraft::SnapshotPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::criteria::SourcingCondition;
@@ -172,12 +173,19 @@ impl RaftCriterion {
     }
 }
 
+/// Default cadence for the Raft snapshot policy (D-04): build a snapshot
+/// every N log entries since the last one. At ≥ 1 k ev/s (Phase 7 target)
+/// this is roughly one snapshot per minute. Refine empirically in Phase 7.
+/// Integration tests override this to a much smaller N to exercise install.
+pub const RAFT_SNAPSHOT_LOGS_SINCE_LAST: u64 = 10_000;
+
 /// Helper to build a Raft config with sensible defaults.
 pub fn default_raft_config() -> Config {
     Config {
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(RAFT_SNAPSHOT_LOGS_SINCE_LAST),
         ..Default::default()
     }
 }
@@ -204,6 +212,25 @@ mod tests {
             } => assert_eq!(conflicting_position, 42),
             other => panic!("expected AppendRejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_raft_config_enables_snapshot_policy() {
+        let cfg = default_raft_config();
+        match cfg.snapshot_policy {
+            openraft::SnapshotPolicy::LogsSinceLast(n) => {
+                assert_eq!(n, RAFT_SNAPSHOT_LOGS_SINCE_LAST);
+                assert_eq!(n, 10_000);
+            }
+            other => panic!("expected LogsSinceLast(10_000), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_raft_config_snapshot_policy_is_stable() {
+        let a = default_raft_config().snapshot_policy;
+        let b = default_raft_config().snapshot_policy;
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 
     #[test]
