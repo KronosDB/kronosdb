@@ -889,6 +889,65 @@ impl EventStoreEngine {
 
         Ok(events)
     }
+
+    /// Returns every stored event with position >= `from_position` up to the
+    /// current committed head, in ascending position order, with tags attached.
+    ///
+    /// Used by the Raft snapshot builder (Phase 4, SNAP-01). Unlike `source` /
+    /// `source_stored`, this applies no criterion filter — every event matches.
+    /// Walks sealed segments (via cached mmap) and the active segment with no
+    /// readdir / stat calls in the hot loop; iteration mirrors the same
+    /// segment-list walk used by `source` / `source_stored`.
+    ///
+    /// Scope note: this is an inherent method on `EventStoreEngine`, not a
+    /// trait method on `EventStore`. The trait is the client-facing contract
+    /// (kept wire-stable per PROJECT.md constraint); snapshot building is
+    /// internal to the Raft state-machine path.
+    pub fn source_all(&self, from_position: Position) -> Result<Vec<StoredEvent>, Error> {
+        let committed = self.committed_position.load(Ordering::Acquire);
+        let seg_list = self.segments.read().clone();
+        if seg_list.bases.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut events = Vec::new();
+        for (i, &base) in seg_list.bases.iter().enumerate() {
+            if base > committed {
+                break;
+            }
+            let seg_path = segment::segment_path(&self.dir, base);
+            let is_last = i + 1 == seg_list.bases.len();
+            let seg_end = if !is_last {
+                seg_list.bases[i + 1] - 1
+            } else {
+                committed
+            };
+            if seg_end < from_position.0 {
+                continue;
+            }
+
+            let reader = if seg_list.is_sealed(i) {
+                let mmap = self.cache.get_mmap(&seg_path, base)?;
+                SegmentReader::from_shared_mmap(mmap)?
+            } else {
+                SegmentReader::open(&seg_path)?
+            };
+
+            // `iter(Some(up_to))` stops once it sees a position >= up_to;
+            // pass committed+1 so every committed event is yielded.
+            for result in reader.iter(Some(Position(committed + 1))) {
+                let stored = result?;
+                if stored.position.0 < from_position.0 {
+                    continue;
+                }
+                if stored.position.0 > committed {
+                    break;
+                }
+                events.push(stored);
+            }
+        }
+        Ok(events)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1255,5 +1314,75 @@ mod tests {
 
             assert!(result.is_ok(), "condition with fresh marker should pass");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // source_all — Phase 4 SNAP-01 (Task 1)
+    // Tag-bearing sequential dump of all events. Used by the Raft
+    // snapshot builder. Unlike `source` / `source_stored`, no criterion
+    // filter is applied — every committed event is emitted in ascending
+    // position order with its original tags.
+    // ------------------------------------------------------------------
+    #[test]
+    fn source_all_returns_all_events_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        for (i, name) in ["A", "B", "C"].iter().enumerate() {
+            engine
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![AppendEvent {
+                        identifier: format!("id-{i}"),
+                        name: (*name).to_string(),
+                        version: "1.0".into(),
+                        timestamp: 1712345678000,
+                        payload: vec![],
+                        metadata: vec![],
+                        tags: vec![Tag::from_str("k", &format!("v{i}"))],
+                    }],
+                })
+                .unwrap();
+        }
+        let all = engine.source_all(Position(1)).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].position, Position(1));
+        assert_eq!(all[1].position, Position(2));
+        assert_eq!(all[2].position, Position(3));
+        assert_eq!(all[0].name, "A");
+        assert_eq!(all[0].tags.len(), 1);
+    }
+
+    #[test]
+    fn source_all_empty_engine_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        let all = engine.source_all(Position(1)).unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn source_all_honours_from_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        for i in 0..3 {
+            engine
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![AppendEvent {
+                        identifier: format!("id-{i}"),
+                        name: "E".into(),
+                        version: "1.0".into(),
+                        timestamp: 0,
+                        payload: vec![],
+                        metadata: vec![],
+                        tags: vec![],
+                    }],
+                })
+                .unwrap();
+        }
+        let tail = engine.source_all(Position(2)).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].position, Position(2));
+        assert_eq!(tail[1].position, Position(3));
     }
 }
