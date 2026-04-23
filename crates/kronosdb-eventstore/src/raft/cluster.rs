@@ -210,9 +210,19 @@ impl ClusterManager {
             match raft.initialize(members).await {
                 Ok(_) => {}
                 Err(e) => {
-                    // Already initialized is not an error.
+                    // Already initialized is not an error. openraft 0.9 surfaces this
+                    // through several phrasings depending on the path hit:
+                    //   - "already initialized"                     (fresh-leader path)
+                    //   - "NotAllowed"                               (older match phrasing)
+                    //   - "not allowed to initialize ... last_log_id" (post-crash restart
+                    //     path: the log already contains entries, so re-initializing
+                    //     the cluster is a no-op we explicitly want to swallow —
+                    //     discovered in Phase 6 kill-mid-append testing)
                     let msg = format!("{e}");
-                    if !msg.contains("already initialized") && !msg.contains("NotAllowed") {
+                    let is_already_initialized = msg.contains("already initialized")
+                        || msg.contains("NotAllowed")
+                        || msg.contains("not allowed to initialize");
+                    if !is_already_initialized {
                         return Err(Error::Corrupted {
                             message: format!("failed to bootstrap cluster: {e}"),
                         });
