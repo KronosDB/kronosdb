@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::append::AppendRequest;
 use crate::context::ContextManager;
 
-use super::types::{NodeId, RaftRequest, RaftResponse, TypeConfig};
+use super::types::{NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConfig};
 
 #[cfg(feature = "bench-instrumentation")]
 use super::bench_instrumentation::{Region, Timer};
@@ -387,15 +387,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_to_nonexistent_context_doesnt_crash() {
+    async fn apply_to_nonexistent_context_returns_fatal_storage_error() {
         let (mut sm, _ctx) = create_sm();
-
         let entry = make_append_entry(1, 1, "nonexistent", "OrderPlaced");
-        let responses = sm.apply(vec![entry]).await.unwrap();
+        let result = sm.apply(vec![entry]).await;
+        assert!(
+            result.is_err(),
+            "expected fatal StorageError on missing context, got {result:?}"
+        );
+    }
 
-        // Should return Ok (with warning), not crash.
+    fn make_conditional_append_entry(
+        term: u64,
+        index: u64,
+        context: &str,
+        event_name: &str,
+        consistency_marker: u64,
+    ) -> Entry<TypeConfig> {
+        Entry {
+            log_id: log_id(term, index),
+            payload: EntryPayload::Normal(RaftRequest::Append {
+                context: context.to_string(),
+                events: vec![super::super::types::RaftAppendEvent {
+                    identifier: format!("evt-{index}"),
+                    name: event_name.to_string(),
+                    version: "1.0".to_string(),
+                    timestamp: 1712345678000,
+                    payload: b"data".to_vec(),
+                    metadata: vec![],
+                    tags: vec![(b"id".to_vec(), b"1".to_vec())],
+                }],
+                condition: Some(super::super::types::RaftAppendCondition {
+                    consistency_marker,
+                    criteria: vec![super::super::types::RaftCriterion {
+                        names: vec![],
+                        tags: vec![(b"id".to_vec(), b"1".to_vec())],
+                    }],
+                }),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_returns_append_rejected_on_dcb_violation() {
+        let (mut sm, contexts) = create_sm();
+
+        // First entry: unconditional append, tags id=1, lands at position 1.
+        let e1 = make_append_entry(1, 1, "default", "OrderPlaced");
+        sm.apply(vec![e1]).await.unwrap();
+        let store = contexts.get_context("default").unwrap();
+        let head_after_first = store.head();
+
+        // Second entry: conditional append with consistency_marker=0 and
+        // criterion matching id=1 — should be rejected because the first
+        // event already matches.
+        let e2 = make_conditional_append_entry(1, 2, "default", "OrderPlaced", 0);
+        let responses = sm.apply(vec![e2]).await.unwrap();
         assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], RaftResponse::Ok));
+        match &responses[0] {
+            RaftResponse::AppendRejected {
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position,
+                    },
+            } => {
+                assert_eq!(*conflicting_position, 1);
+            }
+            other => panic!("expected AppendRejected, got {other:?}"),
+        }
+
+        // DCB rejection must NOT advance head.
+        assert_eq!(store.head(), head_after_first);
+    }
+
+    #[tokio::test]
+    async fn apply_create_context_idempotent_on_replay() {
+        let (mut sm, contexts) = create_sm();
+
+        let e1 = Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Normal(RaftRequest::CreateContext {
+                name: "orders".to_string(),
+            }),
+        };
+        let e2 = Entry {
+            log_id: log_id(1, 2),
+            payload: EntryPayload::Normal(RaftRequest::CreateContext {
+                name: "orders".to_string(),
+            }),
+        };
+
+        let responses = sm.apply(vec![e1, e2]).await.unwrap();
+        assert_eq!(responses.len(), 2);
+        assert!(matches!(responses[0], RaftResponse::ContextCreated));
+        assert!(matches!(responses[1], RaftResponse::ContextCreated));
+        assert!(contexts.context_exists("orders"));
     }
 
     #[tokio::test]
