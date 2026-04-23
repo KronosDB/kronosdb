@@ -58,6 +58,26 @@ pub enum RaftResponse {
     ContextCreated,
     /// No-op / membership change applied.
     Ok,
+    /// Apply-time rejection of an append (e.g. DCB consistency violation).
+    ///
+    /// Returned by the state machine when `apply` cannot honour the
+    /// `RaftRequest` against the current committed state (D-01). Downstream
+    /// (cluster.rs) maps this back to the existing `Error` taxonomy for the
+    /// client-facing surface (D-02) so connector wire contracts stay stable.
+    AppendRejected { reason: RaftRejectReason },
+}
+
+/// Reason an apply-time append was rejected.
+///
+/// Extensible: future rejection classes add variants here rather than
+/// changing `RaftResponse`'s shape (D-01, D-03). `u64` (not `event::Position`)
+/// on the wire keeps this serde surface decoupled from the event-layer type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RaftRejectReason {
+    /// The DCB consistency condition was violated at apply time.
+    /// `conflicting_position` is the `u64` form of `event::Position` of
+    /// the event that caused the rejection.
+    ConsistencyConditionViolated { conflicting_position: u64 },
 }
 
 /// Serializable version of AppendEvent (for Raft log entries).
