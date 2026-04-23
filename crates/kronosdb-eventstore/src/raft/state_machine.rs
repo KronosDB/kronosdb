@@ -17,13 +17,50 @@ use super::types::{NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConf
 #[cfg(feature = "bench-instrumentation")]
 use super::bench_instrumentation::{Region, Timer};
 
-/// Raft snapshot: serialized state machine metadata.
-/// The actual event data lives in the EventStoreEngine segments —
-/// we just need to track what's been applied.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Snapshot body version. Increment on breaking layout changes so an
+/// older install path can detect and refuse incompatible payloads.
+/// Phase 4 ships at version 1; Phase 4-03 may evolve it.
+const SNAPSHOT_VERSION: u8 = 1;
+
+/// Raft snapshot payload — the bytes that live in `Snapshot.snapshot`
+/// (the `Cursor<Vec<u8>>` per D-02). Carries every context's events,
+/// head position (implied by the last event's position), and tags;
+/// the per-context tag index is NOT serialized because 04-02's install
+/// rebuilds it deterministically by re-appending events.
+///
+/// Field order is the canonical bincode layout for v1: changing it
+/// requires bumping `SNAPSHOT_VERSION` and adding a migration branch
+/// in the install path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StateMachineSnapshot {
+    version: u8,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
+    contexts: Vec<ContextSnapshot>,
+}
+
+/// Per-context slice of the snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextSnapshot {
+    name: String,
+    /// Events ordered by position ascending, covering positions 1..head.
+    events: Vec<SnapshotEvent>,
+}
+
+/// One event frozen for transport in a snapshot. Mirrors `StoredEvent`
+/// field-for-field but uses `(Vec<u8>, Vec<u8>)` tag tuples to stay in
+/// lock-step with `RaftAppendEvent`'s wire shape (types.rs:84-93) so
+/// 04-02's install can re-append these via `AppendEvent` directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotEvent {
+    position: u64,
+    identifier: String,
+    name: String,
+    version: String,
+    timestamp: i64,
+    payload: Vec<u8>,
+    metadata: Vec<(String, String)>,
+    tags: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// The Raft state machine.
@@ -220,6 +257,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         EventStoreSnapshotBuilder {
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
+            contexts: Arc::clone(&self.contexts),
         }
     }
 
@@ -252,24 +290,80 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        // For now, we don't persist Raft snapshots — the event store segments
-        // ARE the durable state. On restart, Raft replays from the log.
-        // This can be optimized later with periodic Raft snapshots.
-        Ok(None)
+        // openraft contract: return None iff there is no snapshot to offer.
+        // Before any apply there is nothing to snapshot; after the first
+        // apply we can always materialize a fresh snapshot on demand from
+        // the authoritative segment state.
+        if self.last_applied.is_none() {
+            return Ok(None);
+        }
+        let mut builder = EventStoreSnapshotBuilder {
+            last_applied: self.last_applied,
+            last_membership: self.last_membership.clone(),
+            contexts: Arc::clone(&self.contexts),
+        };
+        Ok(Some(builder.build_snapshot().await?))
     }
 }
 
 /// Builds a Raft snapshot from the current state machine state.
+///
+/// Holds a cloned `Arc<ContextManager>` so `build_snapshot` can walk every
+/// context via `list_contexts` + `get_context`, calling the new
+/// `EventStoreEngine::source_all` helper for each to materialize the
+/// per-context event stream (Phase 4, SNAP-01).
 pub struct EventStoreSnapshotBuilder {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
+    contexts: Arc<ContextManager>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+        let names = self.contexts.list_contexts();
+        let mut context_snaps = Vec::with_capacity(names.len());
+        for name in names {
+            let engine = self.contexts.get_context(&name).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("snapshot: get_context({name}) failed: {e}"),
+                    ),
+                )
+            })?;
+            let stored = engine.source_all(crate::event::Position(1)).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("snapshot: source_all({name}) failed: {e}"),
+                    ),
+                )
+            })?;
+            let events = stored
+                .into_iter()
+                .map(|s| SnapshotEvent {
+                    position: s.position.0,
+                    identifier: s.identifier,
+                    name: s.name,
+                    version: s.version,
+                    timestamp: s.timestamp,
+                    payload: s.payload,
+                    metadata: s.metadata,
+                    tags: s.tags.into_iter().map(|t| (t.key, t.value)).collect(),
+                })
+                .collect();
+            context_snaps.push(ContextSnapshot { name, events });
+        }
+
         let sm_snapshot = StateMachineSnapshot {
+            version: SNAPSHOT_VERSION,
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
+            contexts: context_snaps,
         };
 
         let data = bincode::serialize(&sm_snapshot).map_err(|e| {
@@ -580,6 +674,17 @@ mod tests {
 
         assert_eq!(snapshot.meta.last_log_id.unwrap().index, 2);
 
+        // Inspect the payload bytes directly — the test state machine has
+        // one context ("default") created in create_sm(); the two applied
+        // entries are blank (Membership/Blank payloads, no Append), so
+        // "default" must be present with zero events and version=1.
+        let bytes = snapshot.snapshot.get_ref().clone();
+        let decoded: StateMachineSnapshot = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.version, SNAPSHOT_VERSION);
+        assert_eq!(decoded.contexts.len(), 1);
+        assert_eq!(decoded.contexts[0].name, "default");
+        assert!(decoded.contexts[0].events.is_empty());
+
         // Install snapshot into a fresh state machine.
         let (mut sm2, _ctx2) = create_sm();
         let data = snapshot.snapshot;
@@ -587,5 +692,100 @@ mod tests {
 
         let (applied, _) = sm2.applied_state().await.unwrap();
         assert_eq!(applied.unwrap().index, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4 SNAP-01 (Task 2): real snapshot payload — contexts + events.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_current_snapshot_none_before_apply() {
+        let (mut sm, _ctx) = create_sm();
+        let snap = sm.get_current_snapshot().await.unwrap();
+        assert!(snap.is_none(), "expected None before any apply, got Some");
+    }
+
+    #[tokio::test]
+    async fn get_current_snapshot_some_after_apply() {
+        let (mut sm, _ctx) = create_sm();
+        sm.apply(vec![make_append_entry(1, 1, "default", "A")])
+            .await
+            .unwrap();
+        let snap = sm
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("expected Some snapshot after apply");
+        assert_eq!(snap.meta.last_log_id.unwrap().index, 1);
+    }
+
+    #[tokio::test]
+    async fn build_snapshot_carries_all_events_from_all_contexts() {
+        let (mut sm, contexts) = create_sm();
+        contexts.create_context("orders").unwrap();
+        contexts.create_context("payments").unwrap();
+        let entries = vec![
+            make_append_entry(1, 1, "orders", "OrderPlaced"),
+            make_append_entry(1, 2, "orders", "OrderShipped"),
+            make_append_entry(1, 3, "orders", "OrderDelivered"),
+            make_append_entry(1, 4, "payments", "PaymentReceived"),
+            make_append_entry(1, 5, "payments", "PaymentReconciled"),
+        ];
+        sm.apply(entries).await.unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let bytes = snap.snapshot.get_ref().clone();
+        let decoded: StateMachineSnapshot = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.version, SNAPSHOT_VERSION);
+        assert_eq!(decoded.last_applied.unwrap().index, 5);
+        // list_contexts() returns names sorted; look up by name rather
+        // than positional index.
+        let orders = decoded
+            .contexts
+            .iter()
+            .find(|c| c.name == "orders")
+            .unwrap();
+        let payments = decoded
+            .contexts
+            .iter()
+            .find(|c| c.name == "payments")
+            .unwrap();
+        assert_eq!(orders.events.len(), 3);
+        assert_eq!(payments.events.len(), 2);
+        assert_eq!(orders.events[0].position, 1);
+        assert_eq!(orders.events[1].position, 2);
+        assert_eq!(orders.events[2].position, 3);
+        assert_eq!(orders.events[0].name, "OrderPlaced");
+        assert_eq!(payments.events[0].position, 1);
+        assert_eq!(payments.events[1].position, 2);
+        // "default" context from create_sm() is present but empty:
+        let default = decoded
+            .contexts
+            .iter()
+            .find(|c| c.name == "default")
+            .unwrap();
+        assert!(default.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrips_event_tags() {
+        let (mut sm, _ctx) = create_sm();
+        sm.apply(vec![make_append_entry(1, 1, "default", "Tagged")])
+            .await
+            .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let bytes = snap.snapshot.get_ref().clone();
+        let decoded: StateMachineSnapshot = bincode::deserialize(&bytes).unwrap();
+        let default = decoded
+            .contexts
+            .iter()
+            .find(|c| c.name == "default")
+            .unwrap();
+        assert_eq!(default.events.len(), 1);
+        // make_append_entry seeds one tag: ("id", index_as_bytes).
+        assert_eq!(default.events[0].tags.len(), 1);
+        assert_eq!(default.events[0].tags[0].0, b"id");
+        assert_eq!(default.events[0].tags[0].1, b"1");
     }
 }
