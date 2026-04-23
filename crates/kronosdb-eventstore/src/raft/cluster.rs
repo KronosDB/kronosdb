@@ -28,8 +28,8 @@ use super::proto;
 use super::proto::raft_transport_client::RaftTransportClient;
 use super::state_machine::EventStoreStateMachine;
 use super::types::{
-    NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRequest, RaftResponse,
-    TypeConfig,
+    NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRejectReason, RaftRequest,
+    RaftResponse, TypeConfig,
 };
 
 /// Node type determines how a node participates in the cluster.
@@ -420,6 +420,20 @@ impl EventStore for RaftEngine {
                 count,
                 consistency_marker: Position(consistency_marker),
             }),
+            RaftResponse::AppendRejected {
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position,
+                    },
+            } => {
+                // D-02: Apply-time DCB rejection surfaces as the same typed error
+                // the direct (non-Raft) append path in store.rs::EventStoreEngine::append
+                // returns. service.rs::to_status already maps this to Status::aborted
+                // with the position — wire contract unchanged for connectors.
+                Err(Error::ConsistencyConditionViolated {
+                    conflicting_position: Position(conflicting_position),
+                })
+            }
             _ => Err(Error::Corrupted {
                 message: "unexpected raft response type for append".into(),
             }),
@@ -547,8 +561,9 @@ mod tests {
         // and fails the guard — which is the intended contract.
         let occurrences = SOURCE.matches("conditional_propose_lock").count();
         // This constant must be updated ONLY when changing this test's body.
-        // Set deliberately wrong during RED phase so the test fails first.
-        const EXPECTED_SELF_MENTIONS: usize = 0;
+        // The identifier appears here in the docstring, the function name, the
+        // match-string literal, and the assertion message — total 5 mentions.
+        const EXPECTED_SELF_MENTIONS: usize = 5;
         assert_eq!(
             occurrences, EXPECTED_SELF_MENTIONS,
             "DCB-03 regression: 'conditional_propose_lock' should appear exactly \
