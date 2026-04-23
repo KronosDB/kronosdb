@@ -281,6 +281,134 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
             )
         })?;
 
+        // Version check BEFORE any destructive action (atomicity guard — a
+        // payload we cannot interpret must NOT wipe follower state). The
+        // unknown-version error literal below is the sole site of that
+        // string in the module; 04-01 deliberately left its stub untouched
+        // so the literal appears exactly once.
+        if sm_snapshot.version != SNAPSHOT_VERSION {
+            return Err(StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Read,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unsupported snapshot version {}", sm_snapshot.version),
+                ),
+            ));
+        }
+
+        // D-03: wipe-and-replace. Close existing engines, remove context dirs,
+        // fsync data_dir — all inside ContextManager::reset_all.
+        self.contexts.reset_all().map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("install_snapshot: reset_all failed: {e}"),
+                ),
+            )
+        })?;
+
+        // Rebuild each context by creating it and re-appending its events
+        // with no condition. Positions align because disk was wiped: a fresh
+        // engine assigns Position(1) to its first append, matching what the
+        // leader's snapshot records.
+        for ctx in &sm_snapshot.contexts {
+            self.contexts.create_context(&ctx.name).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "install_snapshot: create_context({}) failed: {e}",
+                            ctx.name
+                        ),
+                    ),
+                )
+            })?;
+
+            if ctx.events.is_empty() {
+                continue;
+            }
+
+            // Rebuild event list for this context. Each SnapshotEvent becomes
+            // an AppendEvent in the same order; append all of them in a
+            // single AppendRequest to preserve the leader's intra-batch
+            // position ordering.
+            let append_events: Vec<crate::event::AppendEvent> = ctx
+                .events
+                .iter()
+                .map(|se| crate::event::AppendEvent {
+                    identifier: se.identifier.clone(),
+                    name: se.name.clone(),
+                    version: se.version.clone(),
+                    timestamp: se.timestamp,
+                    payload: se.payload.clone(),
+                    metadata: se.metadata.clone(),
+                    tags: se
+                        .tags
+                        .iter()
+                        .map(|(k, v)| crate::event::Tag {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+
+            // Per apply-time authority (Phase 3): install is NOT an apply.
+            // Condition is None unconditionally — snapshot bytes are
+            // authoritative; DCB evaluation must NOT run here. This append
+            // call also rebuilds the per-context tag index (bloom filter +
+            // per-tag roaring bitmap) as a side effect — see must_haves truth
+            // about tag index rebuild.
+            let expected_first_pos = ctx.events.first().map(|e| e.position);
+            let resp = self
+                .contexts
+                .with_context(&ctx.name, |engine| {
+                    engine.append(crate::append::AppendRequest {
+                        condition: None,
+                        events: append_events,
+                    })
+                })
+                .map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("install_snapshot: append({}) failed: {e}", ctx.name),
+                        ),
+                    )
+                })?;
+
+            // Sanity: the first position assigned must match what the leader
+            // recorded for this event. If disk wipe + fresh create_context
+            // did not produce Position(1), something is very wrong and we
+            // must halt rather than apply on a divergent base.
+            if let Some(expected) = expected_first_pos {
+                if resp.first_position.0 != expected {
+                    return Err(StorageError::from_io_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "install_snapshot: position drift in {}: leader={} follower={}",
+                                ctx.name, expected, resp.first_position.0
+                            ),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // D-06: restore last_applied and last_membership LAST, after all
+        // context state is rebuilt successfully. Doing it last means a
+        // partial-install crash leaves last_applied unchanged so a retry
+        // rewinds all the way.
         self.last_applied = sm_snapshot.last_applied;
         self.last_membership = sm_snapshot.last_membership;
 
@@ -765,6 +893,202 @@ mod tests {
             .find(|c| c.name == "default")
             .unwrap();
         assert!(default.events.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4 SNAP-02 (Task 2): install_snapshot wipe-and-replace.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn install_snapshot_restores_single_context_events() {
+        // Leader: apply 3 events to "default".
+        let (mut leader_sm, leader_ctx) = create_sm();
+        leader_sm
+            .apply(vec![
+                make_append_entry(1, 1, "default", "A"),
+                make_append_entry(1, 2, "default", "B"),
+                make_append_entry(1, 3, "default", "C"),
+            ])
+            .await
+            .unwrap();
+        let mut builder = leader_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        // Fresh follower — different tempdir, different ContextManager.
+        let (mut follower_sm, follower_ctx) = create_sm();
+        follower_sm
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        let engine = follower_ctx.get_context("default").unwrap();
+        let all = engine.source_all(crate::event::Position(1)).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].position.0, 1);
+        assert_eq!(all[1].position.0, 2);
+        assert_eq!(all[2].position.0, 3);
+        assert_eq!(all[0].name, "A");
+        let (applied, _) = follower_sm.applied_state().await.unwrap();
+        assert_eq!(applied.unwrap().index, 3);
+
+        drop(leader_ctx);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_removes_context_absent_from_snapshot() {
+        // Leader: only "default" with 1 event.
+        let (mut leader_sm, _leader_ctx) = create_sm();
+        leader_sm
+            .apply(vec![make_append_entry(1, 1, "default", "A")])
+            .await
+            .unwrap();
+        let mut builder = leader_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        // Follower: has "stale" with events, plus "default" with its own events
+        // — divergent state representing a lagging rejoiner.
+        let (mut follower_sm, follower_ctx) = create_sm();
+        follower_ctx.create_context("stale").unwrap();
+        follower_sm
+            .apply(vec![
+                make_append_entry(1, 1, "stale", "old1"),
+                make_append_entry(1, 2, "stale", "old2"),
+                make_append_entry(1, 3, "default", "follower-diverged"),
+            ])
+            .await
+            .unwrap();
+        assert!(follower_ctx.context_exists("stale"));
+
+        // Install — "stale" must be removed, "default" must be rebuilt.
+        follower_sm
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        assert!(
+            !follower_ctx.context_exists("stale"),
+            "stale context should be wiped by install"
+        );
+        assert!(follower_ctx.context_exists("default"));
+        let engine = follower_ctx.get_context("default").unwrap();
+        let all = engine.source_all(crate::event::Position(1)).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "A", "follower's divergent event was wiped");
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_restores_last_applied_and_membership() {
+        let (mut leader_sm, _) = create_sm();
+        // Apply two entries to drive last_applied forward.
+        leader_sm
+            .apply(vec![
+                make_append_entry(2, 7, "default", "X"),
+                make_append_entry(2, 8, "default", "Y"),
+            ])
+            .await
+            .unwrap();
+        let mut builder = leader_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let meta = snap.meta.clone();
+
+        let (mut follower_sm, _) = create_sm();
+        follower_sm
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        let (applied, _) = follower_sm.applied_state().await.unwrap();
+        assert_eq!(applied, meta.last_log_id);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_rejects_unknown_version_without_wiping() {
+        let (mut follower_sm, follower_ctx) = create_sm();
+        follower_ctx.create_context("orders").unwrap();
+        follower_sm
+            .apply(vec![make_append_entry(1, 1, "orders", "Existing")])
+            .await
+            .unwrap();
+
+        // Hand-roll a bogus payload with version=99. Serde is structural: we
+        // build a struct that shares the layout but carries a different u8.
+        #[derive(serde::Serialize)]
+        struct BogusSnap {
+            version: u8,
+            last_applied: Option<LogId<NodeId>>,
+            last_membership: StoredMembership<NodeId, openraft::BasicNode>,
+            contexts: Vec<ContextSnapshot>,
+        }
+        let bogus = BogusSnap {
+            version: 99,
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+            contexts: vec![],
+        };
+        let bytes = bincode::serialize(&bogus).unwrap();
+        let cursor = Box::new(Cursor::new(bytes));
+        let meta: SnapshotMeta<NodeId, openraft::BasicNode> = SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "bogus".into(),
+        };
+
+        let result = follower_sm.install_snapshot(&meta, cursor).await;
+        assert!(result.is_err(), "expected version-mismatch StorageError");
+        // Crucially, the follower's state was NOT wiped:
+        assert!(follower_ctx.context_exists("orders"));
+        let engine = follower_ctx.get_context("orders").unwrap();
+        assert_eq!(
+            engine.source_all(crate::event::Position(1)).unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_multi_context_roundtrip() {
+        let (mut leader_sm, leader_ctx) = create_sm();
+        leader_ctx.create_context("orders").unwrap();
+        leader_ctx.create_context("payments").unwrap();
+        leader_sm
+            .apply(vec![
+                make_append_entry(1, 1, "orders", "O1"),
+                make_append_entry(1, 2, "orders", "O2"),
+                make_append_entry(1, 3, "orders", "O3"),
+                make_append_entry(1, 4, "payments", "P1"),
+                make_append_entry(1, 5, "payments", "P2"),
+            ])
+            .await
+            .unwrap();
+        let mut builder = leader_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        let (mut follower_sm, follower_ctx) = create_sm();
+        follower_sm
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        let orders = follower_ctx.get_context("orders").unwrap();
+        let payments = follower_ctx.get_context("payments").unwrap();
+        assert_eq!(
+            orders.source_all(crate::event::Position(1)).unwrap().len(),
+            3
+        );
+        assert_eq!(
+            payments
+                .source_all(crate::event::Position(1))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            orders.source_all(crate::event::Position(1)).unwrap()[0].name,
+            "O1"
+        );
+        assert_eq!(
+            payments.source_all(crate::event::Position(1)).unwrap()[0].name,
+            "P1"
+        );
     }
 
     #[tokio::test]
