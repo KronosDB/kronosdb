@@ -102,6 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_config: default_raft_config(),
     };
 
+    // Log what the durability configuration means for this node. This is the
+    // operational "nicety" — a one-liner that makes it obvious whether the operator
+    // has chosen a safe, crash-tolerant setup. Strict-only: Window mode is
+    // out-of-scope per PROJECT.md non-goals.
+    log_durability_summary(&cluster_config, config.group_commit_ms);
+
     let cluster = Arc::new(ClusterManager::new(Arc::clone(&contexts), cluster_config));
 
     for ctx_name in contexts.list_contexts() {
@@ -302,5 +308,30 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => info!("received Ctrl+C, shutting down"),
         _ = terminate => info!("received SIGTERM, shutting down"),
+    }
+}
+
+/// Logs a single structured summary of the durability configuration at
+/// startup. Strict-only — window/loss-window durability is out-of-scope
+/// for this project (see PROJECT.md non-goals). If a gated window mode
+/// lands in v2 DUR-01/DUR-02, this helper gets new arms at that time.
+fn log_durability_summary(cluster: &ClusterConfig, group_commit_ms: u64) {
+    let voter_count = cluster.voters.len();
+    let multi_node = voter_count > 1;
+
+    if multi_node {
+        info!(
+            durability = "strict",
+            voters = voter_count,
+            group_commit_ms,
+            "multi-node, strict durability: every write blocks on local fsync before ack — crash-safe"
+        );
+    } else {
+        info!(
+            durability = "strict",
+            voters = voter_count,
+            group_commit_ms,
+            "single-node, strict durability: every write blocks until fsync — crash-safe"
+        );
     }
 }
