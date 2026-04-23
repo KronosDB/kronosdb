@@ -161,3 +161,47 @@ pub fn default_raft_config() -> Config {
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_rejected_roundtrip_bincode() {
+        let r = RaftResponse::AppendRejected {
+            reason: RaftRejectReason::ConsistencyConditionViolated {
+                conflicting_position: 42,
+            },
+        };
+        let bytes = bincode::serialize(&r).expect("serialize");
+        let decoded: RaftResponse = bincode::deserialize(&bytes).expect("deserialize");
+        match decoded {
+            RaftResponse::AppendRejected {
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position,
+                    },
+            } => assert_eq!(conflicting_position, 42),
+            other => panic!("expected AppendRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_variants_still_roundtrip() {
+        let cases = vec![
+            RaftResponse::Append {
+                first_position: 1,
+                count: 2,
+                consistency_marker: 3,
+            },
+            RaftResponse::ContextCreated,
+            RaftResponse::Ok,
+        ];
+        for r in cases {
+            let bytes = bincode::serialize(&r).expect("serialize");
+            let decoded: RaftResponse = bincode::deserialize(&bytes).expect("deserialize");
+            // Debug-string equality is sufficient — no PartialEq on RaftResponse today.
+            assert_eq!(format!("{r:?}"), format!("{decoded:?}"));
+        }
+    }
+}
