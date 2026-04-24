@@ -1187,6 +1187,7 @@ dependencies = [
  "chrono",
  "criterion",
  "kronosdb-eventstore",
+ "openraft",
  "rand",
  "serde",
  "serde_json",
