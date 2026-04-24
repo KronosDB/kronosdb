@@ -1081,8 +1081,20 @@ impl LogStore {
     /// buffer + group-commit pipeline without a callback, so in-crate tests
     /// can verify disk side-effects, index state, and fsync behavior.
     /// Production `append` is unaffected.
-    #[cfg(test)]
-    pub(crate) async fn append_test(
+    ///
+    /// Visibility widened to `#[cfg(any(test, feature = "bench-instrumentation"))]`
+    /// in Plan 07-01 so the `log_store_only` microbench (PERF-02) can drive
+    /// `LogStore::append` directly without a `LogFlushed` callback — the bench
+    /// crate pulls this via `kronosdb-eventstore`'s `bench-instrumentation`
+    /// dev-feature. Declared `pub` under either gate so the sibling
+    /// `kronosdb-bench` crate (which depends on `kronosdb-eventstore` with
+    /// `features = ["bench-instrumentation"]`) can reach it; when only the
+    /// `test` gate triggers (in-crate unit tests), `pub` on a `#[cfg(test)]`
+    /// item is still crate-local because `#[cfg(test)]` items never leak
+    /// into downstream crates' builds. Production release builds
+    /// (no test, no bench-instrumentation) do not compile this helper at all.
+    #[cfg(any(test, feature = "bench-instrumentation"))]
+    pub async fn append_test(
         &mut self,
         entries: Vec<Entry<TypeConfig>>,
     ) -> Result<(), StorageError<NodeId>> {
