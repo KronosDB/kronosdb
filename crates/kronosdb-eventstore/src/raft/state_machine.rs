@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use openraft::storage::RaftStateMachine;
 use openraft::{
-    Entry, EntryPayload, LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder, Snapshot,
-    SnapshotMeta, StorageError, StoredMembership,
+    CommittedLeaderId, Entry, EntryPayload, LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder,
+    Snapshot, SnapshotMeta, StorageError, StoredMembership,
 };
 use serde::{Deserialize, Serialize};
 
@@ -74,12 +74,30 @@ pub struct EventStoreStateMachine {
 }
 
 impl EventStoreStateMachine {
-    pub fn new(contexts: Arc<ContextManager>) -> Self {
-        Self {
+    /// Construct a state machine, recovering `last_applied` from on-disk
+    /// `RaftMarker` records in each context's event segments (Option D).
+    ///
+    /// On fresh data dirs (no contexts discovered) or legacy data predating
+    /// marker writes, recovery yields `None` and the state machine starts
+    /// with `last_applied = None` — identical to pre-Option D semantics.
+    ///
+    /// NodeId is reconstructed as `0` because marker records store only
+    /// `(term, index)`: openraft's `LogId` equality comparison treats the
+    /// node-id field as part of `leader_id`, so using a fixed sentinel is
+    /// sound for the recovery path where we only need openraft to accept
+    /// `applied_state()` as "something at least this high is applied".
+    /// Subsequent `apply()` calls overwrite `last_applied` with the full
+    /// real `LogId` carried on each entry.
+    pub fn new(contexts: Arc<ContextManager>) -> Result<Self, Error> {
+        let last_applied = contexts.max_applied_log_id()?.map(|applied| LogId {
+            leader_id: CommittedLeaderId::new(applied.term, 0),
+            index: applied.index,
+        });
+        Ok(Self {
             contexts,
-            last_applied: None,
+            last_applied,
             last_membership: StoredMembership::default(),
-        }
+        })
     }
 
     /// Apply a single Raft request to the event store.
@@ -588,7 +606,7 @@ mod tests {
         let dir = Box::leak(Box::new(dir));
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let sm = EventStoreStateMachine::new(Arc::clone(&contexts));
+        let sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
         (sm, contexts)
     }
 
