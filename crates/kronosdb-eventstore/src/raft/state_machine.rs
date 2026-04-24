@@ -63,6 +63,21 @@ struct SnapshotEvent {
     tags: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Outcome of `EventStoreStateMachine::reconcile_with_log`.
+///
+/// Surfaced to `cluster::init_context` so it can take follow-up action
+/// that cannot be done from inside the state machine (the SM has no
+/// handle to `LogStore` and cannot promote `committed` itself).
+#[derive(Debug, Clone, Default)]
+pub struct Reconciliation {
+    /// True when `last_applied` was rewritten with the real log entry's
+    /// `LogId` (resolves the `node_id=0` sentinel mismatch).
+    pub last_applied_rewritten: bool,
+    /// Present when the caller must promote `log.committed` to the given
+    /// `LogId` to satisfy invariant I1 (`last_applied <= committed`).
+    pub committed_promoted_to: Option<LogId<NodeId>>,
+}
+
 /// The Raft state machine.
 ///
 /// Applies committed Raft log entries to the local EventStoreEngine.
@@ -103,6 +118,145 @@ impl EventStoreStateMachine {
             last_applied,
             last_membership: StoredMembership::default(),
         })
+    }
+
+    /// Reconciles the state-machine's recovered `last_applied` against the
+    /// log store's view of the world.
+    ///
+    /// Marker-based recovery (`new` above) reconstructs `last_applied` with
+    /// a sentinel `node_id=0` because a `RaftMarker` only stores `(term,
+    /// index)`. openraft's `LogId` equality is `(term, node_id, index)` —
+    /// with a sentinel, the SM's recovered `last_applied` does not compare
+    /// equal to the log entry at the same index (which has the real
+    /// `node_id`). Empirically this produces two CRASH-02 shapes:
+    ///
+    /// - **Shape 1 (node ahead):** marker-durable apply of index I whose
+    ///   log-flushed callback didn't fire pre-crash. On restart:
+    ///   `applied=I (sentinel)`, `committed=I-1`. openraft starts replay
+    ///   from `committed+1=I` and, due to sentinel mismatch, re-delivers
+    ///   entry I (and later entries) to `apply()`, which calls
+    ///   `append_with_raft` for each — double-writing events into the
+    ///   segment. Heads diverge: restarted node's head overshoots.
+    ///
+    /// - **Shape 2 (node behind):** marker-durable apply of index I; log
+    ///   has `committed=I`, `last_log>I`. Sentinel mismatch confuses
+    ///   openraft's "apply after catch-up" path: entries beyond I are
+    ///   never delivered to the SM. Heads diverge: restarted node stays
+    ///   at head=I while survivors advance.
+    ///
+    /// # Fix
+    ///
+    /// 1. If the log contains an entry at `last_applied.index`, replace
+    ///    the SM's `last_applied` with that entry's full `LogId` (real
+    ///    `node_id`). This resolves Shape 2 and also prevents Shape 1's
+    ///    double-apply path because openraft's equality comparison now
+    ///    succeeds for entry I — replay starts from `applied+1 = I+1`.
+    ///
+    /// 2. If the SM's `last_applied.index > log.committed.index`, the
+    ///    markers reflect a durable local apply whose log-flushed callback
+    ///    didn't complete pre-crash. The local log entry at that index
+    ///    MUST be present (markers are only written after the entry is
+    ///    in the log batch) and, by Raft log-matching, any future leader
+    ///    winning election must preserve it. It is therefore safe to
+    ///    promote `log.committed` up to `last_applied.index`. This
+    ///    resolves Shape 1's `applied > committed` asymmetry.
+    ///
+    /// `reconcile_with_log` is idempotent: on a cluster that crashed
+    /// without in-flight applies (clean shutdown), the log entry at
+    /// `last_applied.index` already matches the SM's `last_applied` term
+    /// and index, and `committed >= last_applied`, so no mutation happens.
+    pub fn reconcile_with_log<F>(
+        &mut self,
+        log_last: Option<LogId<NodeId>>,
+        log_committed: Option<LogId<NodeId>>,
+        read_entry: F,
+    ) -> Result<Reconciliation, Error>
+    where
+        F: FnOnce(u64) -> Result<Option<LogId<NodeId>>, Error>,
+    {
+        let Some(sm_applied) = self.last_applied else {
+            // Fresh data dir / no markers yet — nothing to reconcile. The
+            // SM's `last_applied` is already `None` and openraft will
+            // start from committed/log state alone.
+            tracing::info!(
+                target: "raft.recovery",
+                "reconcile: state machine has no last_applied — nothing to reconcile"
+            );
+            return Ok(Reconciliation::default());
+        };
+
+        // Invariant I0 (structural): marker-durable apply cannot exceed
+        // the log's last entry. A marker is only written inside the same
+        // append that persists the log entry; if the marker is on disk
+        // but the log entry is missing, the log store was corrupted or
+        // rebuilt from a stale source.
+        if let Some(last) = log_last {
+            if sm_applied.index > last.index {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "reconcile: state machine last_applied (index {}) exceeds log last_log_id (index {}); log and event segments are inconsistent",
+                        sm_applied.index, last.index
+                    ),
+                });
+            }
+        } else {
+            // Log has no entries but SM has markers. Same contradiction.
+            return Err(Error::Corrupted {
+                message: format!(
+                    "reconcile: state machine last_applied (index {}) set but raft log is empty; log and event segments are inconsistent",
+                    sm_applied.index
+                ),
+            });
+        }
+
+        let mut report = Reconciliation::default();
+
+        // I3: rewrite last_applied's node_id to match the real log entry.
+        let real_entry_log_id = read_entry(sm_applied.index)?;
+        if let Some(real) = real_entry_log_id {
+            if real != sm_applied {
+                tracing::info!(
+                    target: "raft.recovery",
+                    old = ?sm_applied,
+                    new = ?real,
+                    "reconcile: rewriting state machine last_applied with real log entry LogId"
+                );
+                self.last_applied = Some(real);
+                report.last_applied_rewritten = true;
+            }
+        } else {
+            // Entry at sm_applied.index is missing from the log. This
+            // means the log was truncated below the state machine's
+            // apply point — a situation that should only arise if a
+            // snapshot install advanced the SM but left old log entries
+            // purged. Leave last_applied as-is; openraft will treat the
+            // sentinel node_id as "at least this index applied" and rely
+            // on snapshot-install membership to move forward.
+            tracing::warn!(
+                target: "raft.recovery",
+                ?sm_applied,
+                "reconcile: log has no entry at last_applied.index — keeping sentinel (likely post-snapshot install)"
+            );
+        }
+
+        // I1: promote committed up to last_applied if marker-evidence is
+        // ahead of the log-flushed callback's recorded commit.
+        let sm_applied_final = self.last_applied.expect("set above or unchanged");
+        let should_promote = match log_committed {
+            Some(c) => c.index < sm_applied_final.index,
+            None => true,
+        };
+        if should_promote {
+            tracing::info!(
+                target: "raft.recovery",
+                old = ?log_committed,
+                new = ?sm_applied_final,
+                "reconcile: promoting log committed to match state machine last_applied"
+            );
+            report.committed_promoted_to = Some(sm_applied_final);
+        }
+
+        Ok(report)
     }
 
     /// Apply a single Raft request to the event store.
@@ -1161,5 +1315,199 @@ mod tests {
         assert_eq!(default.events[0].tags.len(), 1);
         assert_eq!(default.events[0].tags[0].0, b"id");
         assert_eq!(default.events[0].tags[0].1, b"1");
+    }
+
+    /// Sentinel-to-real rewrite of `last_applied` when the log has an entry
+    /// at the same index. This is the Shape-2 fix: without it, openraft
+    /// compares `last_applied` (node_id=0) to log entry (node_id=1) and
+    /// refuses to deliver subsequent entries to the state machine.
+    #[test]
+    fn reconcile_rewrites_sentinel_last_applied_with_real_log_id() {
+        // SM recovered from markers: sentinel node_id=0, index=12.
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
+        contexts.create_context("default").unwrap();
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        sm.last_applied = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: 12,
+        });
+
+        // Log reports last=14, committed=14. Entry at index 12 carries the
+        // real leader node_id=1 (the pre-crash leader).
+        let log_last = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 14,
+        });
+        let log_committed = log_last;
+        let real_at_12 = LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 12,
+        };
+
+        let report = sm
+            .reconcile_with_log(log_last, log_committed, |idx| {
+                assert_eq!(idx, 12, "should query log entry at sm.last_applied.index");
+                Ok(Some(real_at_12))
+            })
+            .expect("reconcile should succeed");
+
+        assert!(report.last_applied_rewritten, "sentinel must be rewritten");
+        assert!(
+            report.committed_promoted_to.is_none(),
+            "committed already >= last_applied"
+        );
+        assert_eq!(sm.last_applied, Some(real_at_12));
+    }
+
+    /// Committed promotion when marker evidence is ahead of the recorded
+    /// log committed. This is the Shape-1 fix: markers at index 12 are
+    /// durable but `committed.bin` still reads 11 because the log-flushed
+    /// callback didn't fire before crash. Promoting committed prevents
+    /// openraft from re-delivering entry 12 to the SM via apply.
+    #[test]
+    fn reconcile_promotes_committed_when_apply_ahead_of_log_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
+        contexts.create_context("default").unwrap();
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        sm.last_applied = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: 12,
+        });
+
+        let log_last = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 14,
+        });
+        let log_committed = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 11,
+        });
+        let real_at_12 = LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 12,
+        };
+
+        let report = sm
+            .reconcile_with_log(log_last, log_committed, |_| Ok(Some(real_at_12)))
+            .expect("reconcile should succeed");
+
+        assert!(report.last_applied_rewritten);
+        assert_eq!(
+            report.committed_promoted_to, Some(real_at_12),
+            "committed must be promoted to the real log_id at the apply index"
+        );
+    }
+
+    /// Clean shutdown: SM's last_applied already matches the log entry's
+    /// LogId, and committed >= applied. Reconciliation must be a no-op.
+    #[test]
+    fn reconcile_is_noop_on_clean_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
+        contexts.create_context("default").unwrap();
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let real_at_10 = LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 10,
+        };
+        sm.last_applied = Some(real_at_10);
+
+        let log_last = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 10,
+        });
+        let log_committed = log_last;
+
+        let report = sm
+            .reconcile_with_log(log_last, log_committed, |_| Ok(Some(real_at_10)))
+            .expect("reconcile should succeed");
+
+        assert!(!report.last_applied_rewritten, "already real — no rewrite");
+        assert!(
+            report.committed_promoted_to.is_none(),
+            "committed already matches — no promote"
+        );
+        assert_eq!(sm.last_applied, Some(real_at_10));
+    }
+
+    /// Fresh data dir: SM has no last_applied, log is empty. Reconcile
+    /// must short-circuit without querying the log.
+    #[test]
+    fn reconcile_short_circuits_when_state_machine_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
+        contexts.create_context("default").unwrap();
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        assert!(sm.last_applied.is_none());
+
+        let report = sm
+            .reconcile_with_log(None, None, |_| {
+                panic!("read_entry must not be called when SM is empty")
+            })
+            .expect("reconcile should succeed");
+
+        assert!(!report.last_applied_rewritten);
+        assert!(report.committed_promoted_to.is_none());
+    }
+
+    /// SM has last_applied but the log is missing the entry at that index
+    /// (would only occur after snapshot install that purged old log
+    /// entries). Expected: warn-and-proceed, leave sentinel in place,
+    /// don't promote committed past last_log. Caller remains free to
+    /// continue; openraft snapshot-install path moves forward on its own.
+    #[test]
+    fn reconcile_keeps_sentinel_when_log_entry_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
+        contexts.create_context("default").unwrap();
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let sentinel = LogId {
+            leader_id: CommittedLeaderId::new(5, 0),
+            index: 20,
+        };
+        sm.last_applied = Some(sentinel);
+
+        let log_last = Some(LogId {
+            leader_id: CommittedLeaderId::new(5, 1),
+            index: 20,
+        });
+        let log_committed = log_last;
+
+        let report = sm
+            .reconcile_with_log(log_last, log_committed, |_| Ok(None))
+            .expect("reconcile should succeed");
+
+        assert!(!report.last_applied_rewritten);
+        assert!(report.committed_promoted_to.is_none());
+        assert_eq!(sm.last_applied, Some(sentinel), "sentinel kept on miss");
+    }
+
+    /// SM says last_applied > log's last_log_id. This is structurally
+    /// impossible (markers are written alongside log entries) and indicates
+    /// corruption. Reconciliation must return Err, not silently proceed.
+    #[test]
+    fn reconcile_errors_when_state_machine_ahead_of_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
+        contexts.create_context("default").unwrap();
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        sm.last_applied = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: 50,
+        });
+
+        let log_last = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 10,
+        });
+
+        let err = sm
+            .reconcile_with_log(log_last, log_last, |_| {
+                panic!("should not be called — bail out before read")
+            })
+            .expect_err("should error on SM-ahead-of-log");
+        matches!(err, Error::Corrupted { .. });
     }
 }
