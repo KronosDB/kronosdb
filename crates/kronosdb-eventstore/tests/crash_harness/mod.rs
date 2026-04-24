@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Generated client stubs — compiled by crates/kronosdb-eventstore/build.rs
@@ -74,16 +75,44 @@ pub struct SpawnConfig {
     pub group_commit_ms: Option<u64>,
 }
 
+/// Ensures the kronosdb-server binary is built once before any crash test runs it.
+/// Build script cannot do this (would be re-entrant through the eventstore → server
+/// → eventstore dev-dependency edge), so we do it on first spawn via `cargo build`.
+/// Runs exactly once per test-binary process.
+fn ensure_server_built() {
+    static BUILT: OnceLock<Mutex<bool>> = OnceLock::new();
+    let m = BUILT.get_or_init(|| Mutex::new(false));
+    let mut guard = m.lock().unwrap();
+    if *guard {
+        return;
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap();
+    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .current_dir(workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("kronosdb-server")
+        .arg("--bin")
+        .arg("kronosdb-server")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("invoke cargo build -p kronosdb-server");
+    assert!(status.success(), "cargo build -p kronosdb-server failed");
+    *guard = true;
+}
+
 /// Spawn kronosdb-server as a child. Returns immediately after spawn — caller must
 /// call `wait_until_ready`.
 pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
-    // `KRONOSDB_SERVER_BIN` is set by crates/kronosdb-eventstore/build.rs. That script
-    // locates `target/<profile>/kronosdb-server` (and runs `cargo build -p kronosdb-server`
-    // if the binary is missing) and exports the absolute path via rustc-env. Stable
+    // `KRONOSDB_SERVER_BIN` is set by crates/kronosdb-eventstore/build.rs. Stable
     // Cargo does NOT expose `CARGO_BIN_EXE_kronosdb-server` for cross-package bins, and
     // adding `[lib]` to kronosdb-server is explicitly out of scope for Phase 6 (the
-    // plan forbids touching the server crate at all — see acceptance criteria).
-    // Synonym for `CARGO_BIN_EXE_kronosdb-server` in intent; different mechanism.
+    // plan forbids touching the server crate — see acceptance criteria). The
+    // harness explicitly rebuilds the binary once per test-binary process via
+    // `ensure_server_built` below. Semantic synonym for `CARGO_BIN_EXE_kronosdb-server`.
+    ensure_server_built();
     let bin = env!("KRONOSDB_SERVER_BIN");
     let listen: SocketAddr = format!("127.0.0.1:{}", cfg.listen_port).parse().unwrap();
     let admin: SocketAddr = format!("127.0.0.1:{}", cfg.admin_port).parse().unwrap();
@@ -267,12 +296,19 @@ pub struct SegmentScanResult {
 
 /// Scan a raft log segment (log-*.bin) using Phase 2's format:
 ///   [u32 len_be][bincode payload][u32 crc32c_le], CRC over payload only.
+///
+/// A "torn tail" is post-last-valid-record bytes that do NOT belong to either
+/// (a) a valid record or (b) preallocated zero padding. A preallocated-zero
+/// tail (len_prefix == 0x00000000) is explicit EOF per Phase 2 D-15 and NOT
+/// a torn record; we report it via `preallocated_tail_bytes` distinct from
+/// `torn_tail_bytes`.
 pub fn scan_raft_log_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
     let mut f = std::fs::File::open(path)?;
     let total_len = f.metadata()?.len();
     let mut offset: u64 = 0;
     let mut valid_records: u64 = 0;
     let mut torn_reason: Option<String> = None;
+    let mut hit_preallocated_zero = false;
 
     loop {
         if total_len - offset < 4 {
@@ -286,6 +322,7 @@ pub fn scan_raft_log_segment(path: &Path) -> std::io::Result<SegmentScanResult> 
         let payload_len = u32::from_be_bytes(len_buf) as u64;
         if payload_len == 0 {
             // Preallocated zero-tail — legitimate EOF per Phase 2 D-15.
+            hit_preallocated_zero = true;
             break;
         }
         if total_len - offset < 4 + payload_len + 4 {
@@ -309,9 +346,14 @@ pub fn scan_raft_log_segment(path: &Path) -> std::io::Result<SegmentScanResult> 
         offset += 4 + payload_len + 4;
     }
 
-    let torn_tail_bytes = total_len
-        .saturating_sub(offset)
-        .saturating_sub(if torn_reason.is_some() { 4 } else { 0 });
+    // Preallocated zero tail is NOT a torn record.
+    let torn_tail_bytes = if hit_preallocated_zero {
+        0
+    } else {
+        total_len
+            .saturating_sub(offset)
+            .saturating_sub(if torn_reason.is_some() { 4 } else { 0 })
+    };
     Ok(SegmentScanResult {
         path: path.to_path_buf(),
         valid_records,
@@ -348,6 +390,7 @@ pub fn scan_event_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
     let mut offset: u64 = 13;
     let mut valid_records: u64 = 0;
     let mut torn_reason: Option<String> = None;
+    let mut hit_preallocated_zero = false;
 
     loop {
         if total_len - offset < 9 {
@@ -362,6 +405,10 @@ pub fn scan_event_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
         let record_len = u32::from_le_bytes([rh[4], rh[5], rh[6], rh[7]]) as u64;
         let flags = rh[8];
         if record_len == 0 {
+            // Preallocated zero record header — event segments are preallocated
+            // to segment_size (e.g. 256 MB) and the tail is all zeros until the
+            // next rotation writes records into it. Not a torn record.
+            hit_preallocated_zero = true;
             break;
         }
         let payload_len = record_len.saturating_sub(1);
@@ -383,7 +430,11 @@ pub fn scan_event_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
         offset += 9 + payload_len;
     }
 
-    let torn_tail_bytes = total_len.saturating_sub(offset);
+    let torn_tail_bytes = if hit_preallocated_zero {
+        0
+    } else {
+        total_len.saturating_sub(offset)
+    };
     Ok(SegmentScanResult {
         path: path.to_path_buf(),
         valid_records,

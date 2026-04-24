@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_dir = "../../proto";
@@ -25,13 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[proto_dir],
         )?;
 
-    // Phase 6 Task 1: export the path to the `kronosdb-server` binary so integration
-    // tests can spawn it without an artifact-dependency (stable Cargo does not expose
-    // CARGO_BIN_EXE_* for cross-package bins, and kronosdb-server has no `[lib]` target
-    // so a regular dev-dependency is ignored). This derives the path from
-    // `CARGO_MANIFEST_DIR` (…/crates/kronosdb-eventstore) → …/target/<profile>/kronosdb-server
-    // and, if the binary is missing, runs `cargo build -p kronosdb-server` to produce it.
-    // Idempotent: no-op when the binary is already built.
+    // Phase 6 Task 1: export the path where the `kronosdb-server` binary is expected
+    // to live so integration tests can spawn it without an artifact-dependency.
+    // Stable Cargo does not expose `CARGO_BIN_EXE_*` for cross-package bins, and
+    // kronosdb-server has no `[lib]` target (so a regular dev-dependency is ignored).
+    // We do NOT invoke `cargo build` from this build script — doing so would be
+    // re-entrant through the eventstore → server → eventstore dependency edge.
+    // Instead the crash harness (tests/crash_harness/mod.rs) ensures the binary is
+    // built once at the start of each test run via `cargo build -p kronosdb-server`.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
         .parent()
@@ -48,30 +48,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join(&profile)
         .join(bin_name);
 
-    if !bin_path.exists() {
-        // Build the server binary with the same profile as the current compile unit.
-        let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-        cmd.current_dir(workspace_root)
-            .arg("build")
-            .arg("-p")
-            .arg("kronosdb-server")
-            .arg("--bin")
-            .arg("kronosdb-server");
-        if profile == "release" {
-            cmd.arg("--release");
-        }
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(format!("cargo build -p kronosdb-server exited with {status}").into());
-        }
-    }
-
     println!(
         "cargo:rustc-env=KRONOSDB_SERVER_BIN={}",
         bin_path.display()
     );
-    // Re-run build.rs if the binary is removed/rebuilt.
-    println!("cargo:rerun-if-changed={}", bin_path.display());
+    println!("cargo:rerun-if-changed=build.rs");
 
     Ok(())
 }
