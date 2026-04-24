@@ -59,3 +59,11 @@ harness = false
 [[bench]]
 name = "raft_append_baseline"
 harness = false
+
+[[bench]]
+name = "log_store_only"
+harness = false
+
+[[bench]]
+name = "raft_append_3node"
+harness = false
