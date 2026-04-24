@@ -370,32 +370,83 @@ fn read_segment_header(file: &mut File) -> Result<SegmentHeader, Error> {
     Ok(SegmentHeader { base_position })
 }
 
-/// Scans the segment from after the header, validating CRCs.
-/// Returns (write_offset, next_position) — the offset to resume writing
+/// Scans the segment from after the header, validating CRCs and enforcing
+/// marker-group atomicity.
+///
+/// Returns `(write_offset, next_position)` — the offset to resume writing
 /// and the next position to assign.
+///
+/// # Marker-authoritative recovery
+///
+/// A Raft apply fsyncs as a single unit: one `RaftMarker` record followed
+/// (for `Normal` entries) by exactly `event_count` event records. A crash
+/// mid-fsync can leave three possible on-disk states for a group:
+///
+/// 1. **Marker not durable** — nothing from this group reached disk; the
+///    previous complete group is the tail.
+/// 2. **Marker durable, 0..k events durable** (where `k < event_count`) —
+///    orphan events with no matching acknowledged Raft log entry. These
+///    MUST be truncated: Raft replay from `committed+1` will re-issue the
+///    apply, and keeping orphans would either double-apply or diverge the
+///    event segment from the cluster (root cause of CRASH-02 Shape 1 /
+///    Shape 2 in the three-node convergence tests).
+/// 3. **Marker + all `event_count` events durable** — complete group;
+///    keep in full.
+///
+/// Algorithm: walk records, tracking `last_complete_offset` (the tail of
+/// the last fully-committed group). When a marker opens a group, it sets
+/// `pending_events_remaining` to `event_count`; each subsequent event
+/// decrements it. Only when the counter reaches zero do we advance
+/// `last_complete_offset`. On corruption, CRC failure, or a marker
+/// arriving mid-group, we stop and return `last_complete_offset` — the
+/// orphan tail is truncated by the caller via `file.set_len(write_offset)`.
+///
+/// # Legacy / snapshot-install fallback
+///
+/// Segments written via `SegmentWriter::append()` (the non-Raft path used
+/// by the snapshot-install rebuild in `state_machine::install_snapshot`)
+/// contain no markers. For those, marker-authoritative recovery would
+/// truncate every event. When we complete the scan without seeing any
+/// marker, we fall back to the pre-Option-D behavior: accept every
+/// CRC-valid event record up to the first torn/corrupt record.
 fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
     use std::io::{Read, Seek, SeekFrom};
 
     let file_len = file.seek(SeekFrom::End(0))?;
     file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
 
+    // Marker-group tracking.
     let mut offset = SEGMENT_HEADER_SIZE as u64;
-    let mut last_position: Option<Position> = None;
+    let mut last_complete_offset = offset;
+    let mut last_complete_position: Option<Position> = None;
+    // Fallback tracking (no markers in segment).
+    let mut fallback_tail_offset = offset;
+    let mut fallback_last_position: Option<Position> = None;
+    let mut seen_any_marker = false;
+    // Pending-group state.
+    let mut pending_events_remaining: u32 = 0;
+    let mut pending_last_position: Option<Position> = None;
+    // Set to true when we observe a malformed record mid-scan; disables
+    // the zero-markers fallback (the corruption is real, not a marker-vs-no-marker
+    // ambiguity).
+    let mut corruption_seen = false;
 
     while offset + RECORD_HEADER_SIZE as u64 <= file_len {
         // Read the record header.
         let mut header_buf = [0u8; RECORD_HEADER_SIZE];
         if file.read_exact(&mut header_buf).is_err() {
+            corruption_seen = true;
             break;
         }
 
         let stored_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
         let record_len = u32::from_le_bytes(header_buf[4..8].try_into().unwrap()) as usize;
-        let _flags = header_buf[8];
+        let flags_byte = header_buf[8];
 
         // Sanity check record length.
         if record_len < 1 || offset + RECORD_HEADER_SIZE as u64 + (record_len - 1) as u64 > file_len
         {
+            corruption_seen = true;
             break; // Torn write — stop here.
         }
 
@@ -403,31 +454,112 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
         let payload_len = record_len - 1; // subtract the flags byte
         let mut payload_buf = vec![0u8; payload_len];
         if file.read_exact(&mut payload_buf).is_err() {
+            corruption_seen = true;
             break;
         }
 
         // Verify CRC over flags + payload.
         let computed_crc = {
-            let mut digest = crc32c::crc32c(&[_flags]);
+            let mut digest = crc32c::crc32c(&[flags_byte]);
             digest = crc32c::crc32c_append(digest, &payload_buf);
             digest
         };
 
         if computed_crc != stored_crc {
+            corruption_seen = true;
             break; // Corruption or torn write — stop here.
         }
 
-        // Only event records advance next_position. Raft markers (and any
-        // future non-event record types) are skipped for position accounting.
-        if flags::is_event(_flags) && payload_buf.len() >= 8 {
+        let record_end = offset + RECORD_HEADER_SIZE as u64 + payload_len as u64;
+
+        // Fallback bookkeeping: track the furthest CRC-valid event record,
+        // regardless of marker-group state. Used only when the whole segment
+        // contains no markers.
+        if flags::is_event(flags_byte) && payload_buf.len() >= 8 {
             let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
-            last_position = Some(Position(position));
+            fallback_last_position = Some(Position(position));
+            fallback_tail_offset = record_end;
         }
 
-        offset += RECORD_HEADER_SIZE as u64 + payload_len as u64;
+        if flags::is_raft_marker(flags_byte) {
+            // A marker arriving while a previous group is still pending means
+            // the previous group's event tail was truncated by a crash. Stop
+            // at `last_complete_offset` — the orphan marker and any events
+            // after it are dropped.
+            if pending_events_remaining > 0 {
+                break;
+            }
+            seen_any_marker = true;
+
+            match format::deserialize_raft_marker(&payload_buf) {
+                Ok((marker, _)) => {
+                    if marker.event_count == 0 {
+                        // Blank / Membership entry: group is trivially complete.
+                        last_complete_offset = record_end;
+                        // No event written; `last_complete_position` unchanged.
+                    } else {
+                        pending_events_remaining = marker.event_count as u32;
+                        pending_last_position = None;
+                        // Do NOT yet advance `last_complete_offset` — we only
+                        // commit the group after all `event_count` events.
+                    }
+                }
+                Err(_) => {
+                    // Deserialize failure after CRC pass is unexpected; be
+                    // conservative and stop at the last complete group.
+                    corruption_seen = true;
+                    break;
+                }
+            }
+        } else if flags::is_event(flags_byte) {
+            if pending_events_remaining > 0 {
+                // Event belongs to the currently pending marker-group.
+                if payload_buf.len() >= 8 {
+                    let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
+                    pending_last_position = Some(Position(position));
+                }
+                pending_events_remaining -= 1;
+                if pending_events_remaining == 0 {
+                    // Group complete — commit it.
+                    last_complete_offset = record_end;
+                    if let Some(pos) = pending_last_position.take() {
+                        last_complete_position = Some(pos);
+                    }
+                }
+            } else if !seen_any_marker {
+                // Zero-markers fallback (legacy/snapshot-install rebuild):
+                // accept every CRC-valid event. `last_complete_offset` is
+                // updated so that, should we later encounter a marker, we
+                // correctly treat this prefix as committed; but the primary
+                // authority for the fallback is `fallback_tail_offset`.
+                if payload_buf.len() >= 8 {
+                    let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
+                    last_complete_position = Some(Position(position));
+                }
+                last_complete_offset = record_end;
+            } else {
+                // Event after a complete group, with no opening marker for
+                // this event → orphan. Stop.
+                break;
+            }
+        }
+        // Other record types (none defined today): ignore, do not advance
+        // any committed offset.
+
+        offset = record_end;
     }
 
-    let next_position = match last_position {
+    // Zero-markers fallback: a segment that made it through the scan with
+    // no markers and no mid-stream corruption uses pre-Option-D behavior.
+    // This path is exercised by the snapshot-install rebuild, where
+    // `EventStoreEngine::append` writes events without a Raft marker.
+    let (final_offset, final_position) = if !seen_any_marker && !corruption_seen {
+        (fallback_tail_offset, fallback_last_position)
+    } else {
+        (last_complete_offset, last_complete_position)
+    };
+
+    let next_position = match final_position {
         Some(pos) => pos.next(),
         None => {
             // No valid records in this segment. Read the base position from the header.
@@ -437,7 +569,7 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
         }
     };
 
-    Ok((offset, next_position))
+    Ok((final_offset, next_position))
 }
 
 /// Pre-allocates disk space for a file.
