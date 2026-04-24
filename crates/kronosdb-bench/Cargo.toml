@@ -14,11 +14,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Needed by the log_store_only microbench (Plan 07-01) so it can construct
-# `Entry<TypeConfig>` directly and drive `LogStore::append_test`. Must match
-# the version + features pinned in `kronosdb-eventstore/Cargo.toml` so there's
-# only one `openraft` in the dep graph.
+# openraft: log_store_only (07-01) constructs `Entry<TypeConfig>` directly and
+# drives `LogStore::append_test`; raft_append_3node (07-02) drives Raft per-node.
+# Must match the version + features pinned in `kronosdb-eventstore/Cargo.toml`
+# so there is only one `openraft` in the dep graph.
+# tonic: raft_append_3node binds its own gRPC transport per node.
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+tonic = { version = "0.13", features = ["transport"] }
 
 [[bin]]
 name = "aggregate_baseline"
