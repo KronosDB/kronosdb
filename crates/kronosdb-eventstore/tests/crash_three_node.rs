@@ -9,8 +9,9 @@ use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
 use pb::Tag;
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tonic::transport::Channel;
@@ -23,7 +24,7 @@ const WRITER_TASKS: usize = 4;
 const KILL_DELAY_MIN_MS: u64 = 50; // D-04 LITERAL — same as 1-node
 const KILL_DELAY_MAX_MS: u64 = 500; // D-04 LITERAL
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn crash_three_node_ten_iterations() {
@@ -254,15 +255,262 @@ async fn writer_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn post_restart_verify(
-    _iter: usize,
-    _tmp: &tempfile::TempDir,
-    _acks_path: &std::path::Path,
-    _acks_before_restart: usize,
-    _srvs: &mut Vec<ServerHandle>,
-    _leader_idx: usize,
-    _listen: [u16; 3],
-    _admin: [u16; 3],
-    _peers_str: Vec<(u64, String)>,
+    iter: usize,
+    tmp: &tempfile::TempDir,
+    acks_path: &std::path::Path,
+    acks_before_restart: usize,
+    srvs: &mut Vec<ServerHandle>,
+    leader_idx: usize,
+    listen: [u16; 3],
+    admin: [u16; 3],
+    peers_str: Vec<(u64, String)>,
 ) {
-    panic!("post_restart_verify not implemented — Task 2 must fill this in");
+    // Wait for survivors to elect a new leader (do NOT drive more writes — Phase 6 scope).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Restart the killed node against its same data dir.
+    let killed_data_dir = tmp
+        .path()
+        .join(format!("node{}", leader_idx + 1))
+        .join("data");
+    let cfg = SpawnConfig {
+        data_dir: killed_data_dir.clone(),
+        listen_port: listen[leader_idx],
+        admin_port: admin[leader_idx],
+        node_id: (leader_idx + 1) as u64,
+        peers: peers_str.clone(),
+        group_commit_ms: Some(2),
+    };
+    srvs[leader_idx] = spawn_server(&cfg).expect("respawn killed node");
+    wait_until_ready(srvs[leader_idx].listen, READY_TIMEOUT)
+        .await
+        .expect("restarted node ready");
+
+    // Grace for follower catch-up.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Read ack sidecar (shared helper from crash_harness).
+    let acked = read_ack_sidecar(acks_path).expect("read acks");
+    assert_eq!(acked.len(), acks_before_restart, "iter {iter}: sidecar drift");
+
+    // Wait for cross-node head convergence. Raft replication after the killed
+    // node rejoins is asynchronous; the node needs time to receive append_entries
+    // from the new leader and apply them. Poll all three nodes' heads until
+    // they all agree (or CONVERGENCE_TIMEOUT elapses, which signals a real bug).
+    {
+        let start = Instant::now();
+        let mut clients: Vec<EventStoreClient<Channel>> = Vec::new();
+        for srv in srvs.iter() {
+            let addr = format!("http://{}", srv.listen);
+            let channel = Channel::from_shared(addr)
+                .unwrap()
+                .connect()
+                .await
+                .expect("connect for convergence poll");
+            clients.push(EventStoreClient::new(channel));
+        }
+        let mut last_log = Instant::now();
+        loop {
+            let mut heads = Vec::new();
+            for c in clients.iter_mut() {
+                let h = c
+                    .get_head(pb::GetHeadRequest {})
+                    .await
+                    .expect("get_head")
+                    .into_inner()
+                    .sequence;
+                heads.push(h);
+            }
+            if heads.iter().all(|h| *h == heads[0]) && heads[0] > 1 {
+                eprintln!(
+                    "iter {iter}: converged at head={} (after {:?})",
+                    heads[0],
+                    start.elapsed()
+                );
+                break;
+            }
+            if last_log.elapsed() > Duration::from_secs(2) {
+                eprintln!(
+                    "iter {iter}: waiting on convergence... heads={:?} (elapsed {:?})",
+                    heads,
+                    start.elapsed()
+                );
+                last_log = Instant::now();
+            }
+            if start.elapsed() > CONVERGENCE_TIMEOUT {
+                // Print per-node log/event segment counts for diagnosis.
+                for i in 0..3 {
+                    let data_dir = tmp.path().join(format!("node{}", i + 1)).join("data");
+                    if let Ok((log_rs, event_rs, _)) = scan_all_segments(&data_dir, "default") {
+                        eprintln!(
+                            "iter {iter} node{}: raft log records={}, event records={}",
+                            i + 1,
+                            log_rs,
+                            event_rs
+                        );
+                    }
+                }
+                panic!(
+                    "iter {iter}: heads did not converge within {:?}: {:?} — CRASH-02/CRASH-03 VIOLATION",
+                    CONVERGENCE_TIMEOUT, heads
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    // For EACH node: scan segments + Source-All + record head.
+    let mut per_node_events: Vec<HashMap<i64, Vec<u8>>> = Vec::new();
+    let mut per_node_head: Vec<i64> = Vec::new();
+
+    for (i, srv) in srvs.iter().enumerate() {
+        // Raw CRC scan (CRASH-02 torn detection, per-node).
+        let data_dir = tmp.path().join(format!("node{}", i + 1)).join("data");
+        let (log_rs, event_rs, scans) =
+            scan_all_segments(&data_dir, "default").expect("scan segments");
+        for s in &scans {
+            assert_eq!(
+                s.torn_tail_bytes,
+                0,
+                "iter {iter} node{}: POST-RESTART torn tail in {}: {} bytes ({:?}) — CRASH-02 VIOLATION",
+                i + 1,
+                s.path.display(),
+                s.torn_tail_bytes,
+                s.torn_reason
+            );
+        }
+        eprintln!(
+            "iter {iter} node{}: CRC scan clean ({} log, {} events)",
+            i + 1,
+            log_rs,
+            event_rs
+        );
+
+        // Connect + Source-All via per-aggregate criteria (empty criteria returns
+        // nothing in this DCB engine; union one criterion per aggregate mirrors
+        // the 1-node test's read pattern).
+        let addr = format!("http://{}", srv.listen);
+        let channel = Channel::from_shared(addr)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap_or_else(|e| panic!("iter {iter}: connect node{}: {e}", i + 1));
+        let mut client = EventStoreClient::new(channel);
+
+        // Head was already waited-on above in the convergence loop; this is
+        // a direct read now.
+        let head = client
+            .get_head(pb::GetHeadRequest {})
+            .await
+            .expect("get_head")
+            .into_inner()
+            .sequence;
+        per_node_head.push(head);
+        eprintln!("iter {iter} node{}: head={head}", i + 1);
+
+        let criteria: Vec<pb::Criterion> = (0..AGGREGATES)
+            .map(|a| pb::Criterion {
+                names: vec![],
+                tags: vec![Tag {
+                    key: b"agg".to_vec(),
+                    value: format!("agg-{a}").into_bytes(),
+                }],
+            })
+            .collect();
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.source(pb::SourceRequest {
+                from_sequence: 0,
+                criteria,
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("iter {iter} node{}: source rpc open timeout", i + 1))
+        .expect("source")
+        .into_inner();
+        let mut events: HashMap<i64, Vec<u8>> = HashMap::new();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(15), stream.message())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "iter {iter} node{}: source stream message timeout (events so far = {})",
+                        i + 1,
+                        events.len()
+                    )
+                })
+                .expect("stream msg");
+            let Some(resp) = msg else { break };
+            if let Some(pb::source_response::Result::Event(ev)) = resp.result {
+                let payload = ev.event.map(|e| e.payload).unwrap_or_default();
+                events.insert(ev.sequence, payload);
+            }
+        }
+        eprintln!(
+            "iter {iter} node{}: Source returned {} events",
+            i + 1,
+            events.len()
+        );
+        per_node_events.push(events);
+    }
+
+    // Cross-node head convergence.
+    let head0 = per_node_head[0];
+    for (i, h) in per_node_head.iter().enumerate() {
+        assert_eq!(
+            *h, head0,
+            "iter {iter}: head divergence — node{} head = {}, node1 head = {} (CRASH-02 PHANTOM / CRASH-03 DIVERGENCE)",
+            i + 1,
+            h,
+            head0
+        );
+    }
+
+    // Cross-node event-set equality.
+    let keys0: BTreeSet<i64> = per_node_events[0].keys().copied().collect();
+    for (i, events) in per_node_events.iter().enumerate() {
+        let keys: BTreeSet<i64> = events.keys().copied().collect();
+        assert_eq!(
+            keys,
+            keys0,
+            "iter {iter}: event-set divergence — node{} keys differ from node1",
+            i + 1
+        );
+        for k in &keys {
+            assert_eq!(
+                events.get(k),
+                per_node_events[0].get(k),
+                "iter {iter}: payload divergence — event at seq={} differs between node1 and node{}",
+                k,
+                i + 1
+            );
+        }
+    }
+
+    // CRASH-03 under replication: every acked write present on EVERY node.
+    for rec in &acked {
+        for (i, events) in per_node_events.iter().enumerate() {
+            let payload = events.get(&rec.server_sequence).unwrap_or_else(|| {
+                panic!(
+                    "iter {iter} node{}: acked write at server_sequence={} MISSING — CRASH-03 VIOLATION",
+                    i + 1,
+                    rec.server_sequence
+                )
+            });
+            let got_hash = hash_payload(payload);
+            assert_eq!(
+                got_hash, rec.payload_hash,
+                "iter {iter} node{}: payload hash mismatch at seq={} — CRASH-03 CONTENT VIOLATION",
+                i + 1,
+                rec.server_sequence
+            );
+        }
+    }
+
+    eprintln!(
+        "iter {iter}: OK  acked={}, readable={}, head={}",
+        acked.len(),
+        per_node_events[0].len(),
+        head0
+    );
 }
