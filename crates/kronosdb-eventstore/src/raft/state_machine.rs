@@ -93,6 +93,11 @@ impl EventStoreStateMachine {
             leader_id: CommittedLeaderId::new(applied.term, 0),
             index: applied.index,
         });
+        tracing::info!(
+            target: "raft.recovery",
+            last_applied = ?last_applied,
+            "state machine recovered from on-disk markers"
+        );
         Ok(Self {
             contexts,
             last_applied,
