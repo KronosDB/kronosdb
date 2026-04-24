@@ -8,7 +8,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::append::AppendRequest;
+use crate::append::{AppendRequest, AppliedLogId};
 use crate::context::ContextManager;
 use crate::error::Error;
 
@@ -94,6 +94,7 @@ impl EventStoreStateMachine {
     fn apply_request(
         &self,
         req: &RaftRequest,
+        log_id: &LogId<NodeId>,
     ) -> Result<RaftResponse, StorageError<NodeId>> {
         match req {
             RaftRequest::Append {
@@ -109,9 +110,18 @@ impl EventStoreStateMachine {
                     events: append_events,
                 };
 
+                // Piggyback `last_applied` onto the event-segment fsync by
+                // routing through `append_with_raft`. The segment writer
+                // emits a `RaftMarker::normal(term, index, count)` inline
+                // with the events; on restart, scanning markers recovers
+                // `last_applied` with no extra fsync and no sidecar file.
+                let applied = AppliedLogId {
+                    term: log_id.leader_id.get_term(),
+                    index: log_id.index,
+                };
                 match self
                     .contexts
-                    .with_context(context, |store| store.append(append_req))
+                    .with_context(context, |store| store.append_with_raft(append_req, applied))
                 {
                     Ok(resp) => Ok(RaftResponse::Append {
                         first_position: resp.first_position.0,
@@ -232,16 +242,23 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         let mut responses = Vec::new();
 
         for entry in entries {
-            self.last_applied = Some(*entry.get_log_id());
+            let log_id = *entry.get_log_id();
+            self.last_applied = Some(log_id);
 
             match entry.payload {
                 EntryPayload::Normal(req) => {
-                    let resp = self.apply_request(&req)?;
+                    // Only Normal entries produce durable effects via the event
+                    // segment — thread the entry's LogId down so the segment
+                    // writer can emit a `RaftMarker::normal(term, index, count)`
+                    // record inside the same fsync. Membership/Blank below do
+                    // NOT emit markers; they're recovered as idempotent replay
+                    // past `last_applied` on restart.
+                    let resp = self.apply_request(&req, &log_id)?;
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref membership) => {
                     self.last_membership =
-                        StoredMembership::new(Some(*entry.get_log_id()), membership.clone());
+                        StoredMembership::new(Some(log_id), membership.clone());
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Blank => {
