@@ -91,9 +91,9 @@ bench-baseline:
 # Phase 7 Wave 2 (Plan 07-04) extends this or invokes it alongside the
 # log_store_only and raft_append_3node benches.
 bench-linux:
-    @echo "-> running raft_append_baseline inside orbstack Docker (rust:1-bookworm)"
+    @echo "-> running bench suite inside orbstack Docker (rust:1-bookworm)"
     docker run --rm \
-        -v "$PWD":/work:ro \
+        -v "$PWD":/work \
         -v kronosdb-linux-target:/src/target \
         -w /src \
         rust:1-bookworm bash -c '\
@@ -106,20 +106,11 @@ bench-linux:
             cargo bench -p kronosdb-bench --bench raft_append_3node; \
             cargo run -q -p kronosdb-bench --bin aggregate_baseline -- \
                 --records /src/target/baseline-records \
-                --out-dir /src/.planning/phases/07-benchmarks-reassessment \
+                --out-dir /work/.planning/phases/07-benchmarks-reassessment \
                 --commit phase-7-linux; \
-        '
-    @echo "-> copying aggregator output out of the container volume"
-    docker run --rm \
-        -v "$PWD":/work \
-        -v kronosdb-linux-target:/src/target \
-        -w /src \
-        rust:1-bookworm bash -c '\
-            set -euo pipefail; \
-            cp /src/.planning/phases/07-benchmarks-reassessment/baseline-phase-7-linux.json \
+            mv /work/.planning/phases/07-benchmarks-reassessment/baseline-phase-7-linux.json \
                /work/.planning/phases/07-benchmarks-reassessment/phase-7-linux.json; \
-            rm -f /src/.planning/phases/07-benchmarks-reassessment/baseline-phase-7-linux.json; \
-            rm -f /src/.planning/phases/07-benchmarks-reassessment/BASELINE.md; \
+            rm -f /work/.planning/phases/07-benchmarks-reassessment/BASELINE.md; \
         '
     @echo "OK .planning/phases/07-benchmarks-reassessment/phase-7-linux.json written"
 
