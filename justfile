@@ -102,6 +102,8 @@ bench-linux:
             rsync -a --delete --exclude=target --exclude=.git /work/ /src/; \
             rm -rf /src/target/baseline-records; \
             cargo bench -p kronosdb-bench --bench raft_append_baseline; \
+            cargo bench -p kronosdb-bench --bench log_store_only; \
+            cargo bench -p kronosdb-bench --bench raft_append_3node; \
             cargo run -q -p kronosdb-bench --bin aggregate_baseline -- \
                 --records /src/target/baseline-records \
                 --out-dir /src/.planning/phases/07-benchmarks-reassessment \
@@ -120,3 +122,31 @@ bench-linux:
             rm -f /src/.planning/phases/07-benchmarks-reassessment/BASELINE.md; \
         '
     @echo "OK .planning/phases/07-benchmarks-reassessment/phase-7-linux.json written"
+
+# Phase 7 macOS run: all three benches + aggregate into phase-7-macos.json.
+# Diagnostic only per CONTEXT.md D-01 -- Linux is the gate.
+#
+# Runs raft_append_baseline (1-node E2E), log_store_only (PERF-02 microbench),
+# and raft_append_3node (informational) back-to-back, then invokes
+# aggregate_baseline with --out-dir targeting the phase-07 directory. The
+# aggregator-emitted baseline-phase-7-macos.json is renamed to phase-7-macos.json
+# (D-14 artifact layout) and the generic BASELINE.md is removed -- Phase 7's
+# human-readable artifact is 07-PERF.md, authored by hand.
+bench-phase-7-macos:
+    @echo "-> clearing baseline-records"
+    @rm -rf target/baseline-records
+    @echo "-> running raft_append_baseline (1-node E2E)"
+    cargo bench -p kronosdb-bench --bench raft_append_baseline
+    @echo "-> running log_store_only (PERF-02 microbench)"
+    cargo bench -p kronosdb-bench --bench log_store_only
+    @echo "-> running raft_append_3node (informational)"
+    cargo bench -p kronosdb-bench --bench raft_append_3node
+    @echo "-> aggregating into .planning/phases/07-benchmarks-reassessment/"
+    cargo run -q -p kronosdb-bench --bin aggregate_baseline -- \
+        --records target/baseline-records \
+        --out-dir .planning/phases/07-benchmarks-reassessment \
+        --commit phase-7-macos
+    @mv .planning/phases/07-benchmarks-reassessment/baseline-phase-7-macos.json \
+        .planning/phases/07-benchmarks-reassessment/phase-7-macos.json
+    @rm -f .planning/phases/07-benchmarks-reassessment/BASELINE.md
+    @echo "OK .planning/phases/07-benchmarks-reassessment/phase-7-macos.json written"
