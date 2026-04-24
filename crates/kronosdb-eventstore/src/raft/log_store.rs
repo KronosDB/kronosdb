@@ -759,6 +759,15 @@ impl LogStore {
         // validation and torn-tail truncation to satisfy CRASH-01.
         let (sealed, active, index, last_log_id) = rebuild_index(dir, &config)?;
 
+        tracing::info!(
+            target: "raft.recovery",
+            ?last_log_id,
+            ?committed,
+            ?last_purged,
+            ?vote,
+            "log_store recovered from disk"
+        );
+
         Ok(Self {
             inner: Arc::new(Mutex::new(LogStoreInner {
                 dir: dir.to_path_buf(),
@@ -775,6 +784,46 @@ impl LogStore {
                 committed_dirty: false,
             })),
         })
+    }
+
+    /// Returns the recovered `last_log_id` without going through the async
+    /// `RaftLogStorage` trait. Used by `cluster::init_context`'s
+    /// reconciliation pass (which runs before `Raft::new` and therefore
+    /// before any `async fn` on the trait can be invoked — see D-09).
+    pub fn last_log_id(&self) -> Option<LogId<NodeId>> {
+        self.inner.lock().last_log_id
+    }
+
+    /// Returns the recovered `committed` without going through the async
+    /// `RaftLogStorage` trait. Same rationale as `last_log_id`.
+    pub fn committed(&self) -> Option<LogId<NodeId>> {
+        self.inner.lock().committed
+    }
+
+    /// Reads the log entry at `log_index`, if present. Synchronous
+    /// counterpart to `try_get_log_entries(index..=index)` for the
+    /// reconciliation pass.
+    pub fn entry_at(&self, log_index: u64) -> io::Result<Option<Entry<TypeConfig>>> {
+        let inner = self.inner.lock();
+        read_entry_at(&inner, log_index)
+    }
+
+    /// Synchronously bumps `committed` to `new_committed` and marks
+    /// `committed_dirty` so the next `save_committed` fsync (triggered by
+    /// the first post-start append) persists it. Used by reconciliation
+    /// to promote `committed` up to the state machine's `last_applied`
+    /// when marker-evidence shows apply was durable but the log_flushed
+    /// callback didn't fire before crash (CRASH-02 Shape 1).
+    pub fn promote_committed(&self, new_committed: LogId<NodeId>) {
+        let mut inner = self.inner.lock();
+        let higher = match inner.committed {
+            Some(existing) if existing.index >= new_committed.index => existing,
+            _ => new_committed,
+        };
+        if inner.committed != Some(higher) {
+            inner.committed = Some(higher);
+            inner.committed_dirty = true;
+        }
     }
 }
 
@@ -1194,6 +1243,15 @@ fn truncate_inner(inner: &mut LogStoreInner, log_id: LogId<NodeId>) -> io::Resul
             if let Some(rewind_to) = first_cut_offset {
                 active.write_offset = rewind_to;
                 active.file.set_len(rewind_to)?;
+                // CRITICAL: `set_len` does NOT move the file cursor. Subsequent
+                // writes through `Segment::append_bytes` use `write_all` on
+                // `&File`, which writes at the current cursor position (not at
+                // `write_offset`). Without this seek, the next append writes
+                // at the pre-truncate cursor position, leaving a sparse hole
+                // from `rewind_to` up to that cursor and causing subsequent
+                // `read_record_at(rewind_to)` to return EOF/garbage.
+                use std::io::Seek;
+                (&active.file).seek(std::io::SeekFrom::Start(rewind_to))?;
                 fdatasync(&active.file)?;
                 #[cfg(feature = "bench-instrumentation")]
                 bi::bump_fsync();

@@ -110,7 +110,26 @@ impl ClusterManager {
         // Create state machine wrapping the context manager. `new` recovers
         // `last_applied` from segment markers so the post-restart state matches
         // what the log store will report as committed (Option D).
-        let state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
+        let mut state_machine =
+            EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
+
+        // Reconciliation pass: bring `state_machine.last_applied` and
+        // `log_store.committed` into a consistent shape before handing both
+        // to openraft. Without this pass, `last_applied`'s sentinel
+        // `node_id=0` from marker-only recovery produces two CRASH-02
+        // failure shapes (see `state_machine::reconcile_with_log` for the
+        // full root-cause writeup). This pass is idempotent on a clean
+        // shutdown and is the only new I/O added to the startup path
+        // beyond the pre-fix recovery (no fsync, two in-memory lookups).
+        let log_last = log_store.last_log_id();
+        let log_committed = log_store.committed();
+        let report = state_machine.reconcile_with_log(log_last, log_committed, |idx| {
+            let entry = log_store.entry_at(idx).map_err(Error::Io)?;
+            Ok(entry.map(|e| *openraft::RaftLogId::get_log_id(&e)))
+        })?;
+        if let Some(new_committed) = report.committed_promoted_to {
+            log_store.promote_committed(new_committed);
+        }
 
         // Create Raft node.
         let raft = Raft::new(
