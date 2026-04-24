@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::append::AppliedLogId;
 use crate::error::Error;
 use crate::snapshot::SnapshotStore;
 use crate::store::{EventStoreEngine, StoreOptions};
@@ -135,6 +136,36 @@ impl ContextManager {
     pub fn context_exists(&self, name: &str) -> bool {
         let contexts = self.contexts.read();
         contexts.contains_key(name)
+    }
+
+    /// Returns the maximum applied Raft `LogId` across every active context,
+    /// reconstructed from on-disk `RaftMarker` records in each context's
+    /// event segments. Used at Raft state-machine construction time to
+    /// recover `last_applied` without a sidecar file (Option D).
+    ///
+    /// Returns `Ok(None)` if no context holds any marker (fresh data dir or
+    /// legacy data written before this plan). On a multi-context deployment,
+    /// the true `last_applied` is the max across all of them because the
+    /// Raft log is a single stream that all contexts apply from.
+    pub fn max_applied_log_id(&self) -> Result<Option<AppliedLogId>, Error> {
+        let contexts = self.contexts.read();
+        let mut best: Option<AppliedLogId> = None;
+        for store in contexts.values() {
+            if let Some(candidate) = store.max_applied_log_id()? {
+                best = Some(match best {
+                    Some(cur) => {
+                        // Compare by (term, index) lexicographic order.
+                        if (candidate.term, candidate.index) > (cur.term, cur.index) {
+                            candidate
+                        } else {
+                            cur
+                        }
+                    }
+                    None => candidate,
+                });
+            }
+        }
+        Ok(best)
     }
 
     /// Drains every active context and removes its on-disk subdirectory.
