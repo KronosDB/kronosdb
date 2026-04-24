@@ -105,6 +105,18 @@ impl SegmentWriter {
         file.set_len(write_offset)?;
         preallocate(&file, max_segment_size);
 
+        // CRITICAL: `set_len` / `preallocate` do NOT reposition the file cursor.
+        // `recover_segment` left the cursor at end-of-scan (past `write_offset`
+        // when recovery truncated torn records or stopped at an orphan marker).
+        // Subsequent writes through `write_record` use `write_all` on the file
+        // directly, which writes at the cursor position — so without this seek,
+        // new records would land past `write_offset` with a sparse hole from
+        // `write_offset` up to the stale cursor, and the in-memory `write_offset`
+        // would diverge from the actual disk offset. The reader iterator would
+        // then see records in the hole as `record_len == 0` and stop early.
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(write_offset))?;
+
         Ok(Self {
             dir: dir.to_path_buf(),
             max_segment_size,
