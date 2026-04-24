@@ -107,8 +107,10 @@ impl ClusterManager {
         let log_store =
             LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
 
-        // Create state machine wrapping the context manager.
-        let state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager));
+        // Create state machine wrapping the context manager. `new` recovers
+        // `last_applied` from segment markers so the post-restart state matches
+        // what the log store will report as committed (Option D).
+        let state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
 
         // Create Raft node.
         let raft = Raft::new(
