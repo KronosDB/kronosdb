@@ -447,6 +447,16 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         self.last_applied = sm_snapshot.last_applied;
         self.last_membership = sm_snapshot.last_membership;
 
+        // TODO(06-02): persist `last_applied` after install_snapshot so a
+        // subsequent restart does NOT rediscover `last_applied = None` from
+        // marker scan and force openraft to re-apply every committed entry
+        // past the snapshot. The rebuild appends above go through the plain
+        // `engine.append(...)` path, which writes no RaftMarker. Current
+        // tests don't exercise install-then-restart, so this is DEFERRED.
+        // Preferred fix: thread `sm_snapshot.last_applied` into the first
+        // rebuild-append via `append_with_raft` (Option 3 in plan 06-01
+        // remaining_work). Requires extending the rebuild loop to emit ONE
+        // synthetic marker even when the snapshot has no events.
         Ok(())
     }
 
