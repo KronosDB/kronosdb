@@ -104,14 +104,12 @@ impl ClusterManager {
             .data_dir()
             .join(context_name)
             .join("raft");
-        let log_store =
-            LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
+        let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
 
         // Create state machine wrapping the context manager. `new` recovers
         // `last_applied` from segment markers so the post-restart state matches
         // what the log store will report as committed (Option D).
-        let mut state_machine =
-            EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
+        let mut state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
 
         // Reconciliation pass: bring `state_machine.last_applied` and
         // `log_store.committed` into a consistent shape before handing both

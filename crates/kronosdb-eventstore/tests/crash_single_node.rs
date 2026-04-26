@@ -164,11 +164,7 @@ async fn run_one_iteration(iter: usize) {
         from_sequence: 0,
         criteria,
     };
-    let mut stream = client
-        .source(req)
-        .await
-        .expect("source rpc")
-        .into_inner();
+    let mut stream = client.source(req).await.expect("source rpc").into_inner();
     while let Some(resp) = stream.message().await.expect("stream msg") {
         if let Some(pb::source_response::Result::Event(ev)) = resp.result {
             let seq = ev.sequence;
@@ -287,7 +283,7 @@ async fn writer_loop(
                 value: agg_id.clone().into_bytes(),
             }],
         };
-        let condition = if client_seq % 3 != 0 {
+        let condition = if !client_seq.is_multiple_of(3) {
             Some(pb::ConsistencyCondition {
                 consistency_marker: 0,
                 criteria: vec![pb::Criterion {

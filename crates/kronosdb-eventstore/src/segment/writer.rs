@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::event::{AppendEvent, Position, StoredEvent};
 
+use crate::segment::format::RaftMarker;
 use crate::segment::{
     RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format,
     segment_path,
 };
-use crate::segment::format::RaftMarker;
 
 #[cfg(feature = "bench-instrumentation")]
 use crate::raft::bench_instrumentation::{self as bi, Region, Timer};
@@ -731,10 +731,7 @@ mod tests {
 
         // Event iterator should skip markers — returns 3 events total.
         let reader = SegmentReader::open(&seg_path).unwrap();
-        let events: Vec<_> = reader
-            .iter(None)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let events: Vec<_> = reader.iter(None).collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].name, "OrderPlaced");
         assert_eq!(events[1].name, "PaymentReceived");

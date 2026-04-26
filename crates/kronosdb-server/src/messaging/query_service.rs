@@ -212,8 +212,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let (response_tx, mut response_rx) = mpsc::channel::<pb::QueryResponse>(64);
 
         // Register in pending map so handler responses route here.
-        self.pending_queries
-            .insert(message_id.clone(), response_tx);
+        self.pending_queries.insert(message_id.clone(), response_tx);
 
         // Deliver the query to each target handler.
         for target_client_id in &pending.target_handlers {
@@ -354,12 +353,9 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         match platform.subscribe(subscription) {
                             Ok((pending, mut update_rx)) => {
                                 // Deliver the initial query to the handler.
-                                let handler_tx = pending
-                                    .target_handlers
-                                    .first()
-                                    .and_then(|id| {
-                                        handler_streams.get(&id.0).map(|r| r.value().clone())
-                                    });
+                                let handler_tx = pending.target_handlers.first().and_then(|id| {
+                                    handler_streams.get(&id.0).map(|r| r.value().clone())
+                                });
 
                                 if let Some(tx) = handler_tx {
                                     // Send as a SubscriptionQueryRequest so the handler

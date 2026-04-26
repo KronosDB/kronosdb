@@ -434,8 +434,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref membership) => {
-                    self.last_membership =
-                        StoredMembership::new(Some(log_id), membership.clone());
+                    self.last_membership = StoredMembership::new(Some(log_id), membership.clone());
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Blank => {
@@ -515,10 +514,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
                     openraft::ErrorVerb::Write,
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!(
-                            "install_snapshot: create_context({}) failed: {e}",
-                            ctx.name
-                        ),
+                        format!("install_snapshot: create_context({}) failed: {e}", ctx.name),
                     ),
                 )
             })?;
@@ -1395,7 +1391,8 @@ mod tests {
 
         assert!(report.last_applied_rewritten);
         assert_eq!(
-            report.committed_promoted_to, Some(real_at_12),
+            report.committed_promoted_to,
+            Some(real_at_12),
             "committed must be promoted to the real log_id at the apply index"
         );
     }

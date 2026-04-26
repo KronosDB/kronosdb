@@ -39,9 +39,7 @@ use kronosdb_eventstore::append::{AppendCondition, AppendRequest};
 use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::criteria::{Criterion as DcbCriterion, SourcingCondition};
 use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
-use kronosdb_eventstore::raft::bench_instrumentation::{
-    self as bi, Region, VecSink,
-};
+use kronosdb_eventstore::raft::bench_instrumentation::{self as bi, Region, VecSink};
 use kronosdb_eventstore::raft::cluster::{ClusterConfig, ClusterManager, NodeType, PeerConfig};
 use kronosdb_eventstore::raft::types::default_raft_config;
 use kronosdb_eventstore::segment::DEFAULT_SEGMENT_SIZE;
@@ -101,9 +99,8 @@ struct Fixture {
 fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     let rt = Runtime::new().expect("tokio runtime");
-    let ctx = Arc::new(
-        ContextManager::new(tmp.path(), DEFAULT_SEGMENT_SIZE).expect("context manager"),
-    );
+    let ctx =
+        Arc::new(ContextManager::new(tmp.path(), DEFAULT_SEGMENT_SIZE).expect("context manager"));
     ctx.create_context("default").expect("create default");
 
     // advertise_addr can be any address string; single-voter Raft never opens
@@ -112,7 +109,10 @@ fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
         node_id: 1,
         node_type: NodeType::Standard,
         advertise_addr: "127.0.0.1:50051".into(),
-        voters: vec![PeerConfig { id: 1, addr: "127.0.0.1:50051".into() }],
+        voters: vec![PeerConfig {
+            id: 1,
+            addr: "127.0.0.1:50051".into(),
+        }],
         learners: vec![],
         raft_config: default_raft_config(),
     };
@@ -143,7 +143,10 @@ fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
     // For conditional/never-match cells, seed one event with a known tag so the
     // apply-time DCB check has something to conflict with. Unconditional and
     // conditional/always-match cells don't need it but harmlessly include it.
-    if matches!((kind, selectivity), (Kind::Conditional, Selectivity::NeverMatch)) {
+    if matches!(
+        (kind, selectivity),
+        (Kind::Conditional, Selectivity::NeverMatch)
+    ) {
         let seed = AppendEvent {
             identifier: "bench-seed-0".into(),
             name: "BenchSeed".into(),
@@ -153,11 +156,19 @@ fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
             metadata: vec![],
             tags: vec![Tag::from_str(SEED_TAG_KEY, SEED_TAG_VALUE)],
         };
-        let req = AppendRequest { condition: None, events: vec![seed] };
+        let req = AppendRequest {
+            condition: None,
+            events: vec![seed],
+        };
         rt.block_on(store.append(req)).expect("seed append");
     }
 
-    Fixture { _tmp: tmp, _ctx: ctx, store, rt }
+    Fixture {
+        _tmp: tmp,
+        _ctx: ctx,
+        store,
+        rt,
+    }
 }
 
 // --- Request builders ---

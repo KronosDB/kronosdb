@@ -71,8 +71,7 @@ async fn start_node(id: NodeId, port: u16, dir: &Path) -> TestNode {
     }
 
     let raft_dir = dir.join("raft");
-    let log_store =
-        LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
+    let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
     let state_machine =
         EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
 
@@ -134,11 +133,7 @@ async fn wait_for_leader(raft: &Raft<TypeConfig>, timeout: Duration) -> Option<N
     }
 }
 
-async fn wait_for_head(
-    contexts: &ContextManager,
-    expected: Position,
-    timeout: Duration,
-) -> bool {
+async fn wait_for_head(contexts: &ContextManager, expected: Position, timeout: Duration) -> bool {
     let start = tokio::time::Instant::now();
     loop {
         if let Ok(store) = contexts.get_context("default")
@@ -261,9 +256,7 @@ async fn run_three_node_workload() {
                     Ok(_) => {
                         winners.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(ref err)
-                        if matches!(err, Error::ConsistencyConditionViolated { .. }) =>
-                    {
+                    Err(ref err) if matches!(err, Error::ConsistencyConditionViolated { .. }) => {
                         rejected.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {

@@ -475,7 +475,10 @@ mod tests {
             for i in 0..3 {
                 store.append(AppendRequest {
                     condition: None,
-                    events: vec![make_event(&format!("E{i}"), vec![tag("k", &format!("v{i}"))])],
+                    events: vec![make_event(
+                        &format!("E{i}"),
+                        vec![tag("k", &format!("v{i}"))],
+                    )],
                 })?;
             }
             Ok(())

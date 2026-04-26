@@ -124,7 +124,11 @@ fn boot_log_store() -> Fixture {
     // cluster.rs) so log-side throughput numbers are apples-to-apples
     // with raft_append_baseline's log-side column.
     let store = LogStore::new(tmp.path(), LogStoreConfig::default()).expect("log store");
-    Fixture { _tmp: tmp, store, rt }
+    Fixture {
+        _tmp: tmp,
+        store,
+        rt,
+    }
 }
 
 // --- Record emission (matches Phase-1 JSONL schema consumed by aggregate_baseline) ---

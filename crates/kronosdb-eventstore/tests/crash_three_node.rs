@@ -4,6 +4,8 @@
 //!
 //! Lives in kronosdb-eventstore per D-06.
 
+#![allow(clippy::result_large_err)]
+
 mod crash_harness;
 use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
@@ -208,7 +210,7 @@ async fn writer_loop(
                 value: agg_id.clone().into_bytes(),
             }],
         };
-        let condition = if client_seq % 3 != 0 {
+        let condition = if !client_seq.is_multiple_of(3) {
             Some(pb::ConsistencyCondition {
                 consistency_marker: 0,
                 criteria: vec![pb::Criterion {
@@ -259,7 +261,7 @@ async fn post_restart_verify(
     tmp: &tempfile::TempDir,
     acks_path: &std::path::Path,
     acks_before_restart: usize,
-    srvs: &mut Vec<ServerHandle>,
+    srvs: &mut [ServerHandle],
     leader_idx: usize,
     listen: [u16; 3],
     admin: [u16; 3],
@@ -291,7 +293,11 @@ async fn post_restart_verify(
 
     // Read ack sidecar (shared helper from crash_harness).
     let acked = read_ack_sidecar(acks_path).expect("read acks");
-    assert_eq!(acked.len(), acks_before_restart, "iter {iter}: sidecar drift");
+    assert_eq!(
+        acked.len(),
+        acks_before_restart,
+        "iter {iter}: sidecar drift"
+    );
 
     // Wait for cross-node head convergence. Raft replication after the killed
     // node rejoins is asynchronous; the node needs time to receive append_entries
@@ -458,7 +464,8 @@ async fn post_restart_verify(
     let head0 = per_node_head[0];
     for (i, h) in per_node_head.iter().enumerate() {
         assert_eq!(
-            *h, head0,
+            *h,
+            head0,
             "iter {iter}: head divergence — node{} head = {}, node1 head = {} (CRASH-02 PHANTOM / CRASH-03 DIVERGENCE)",
             i + 1,
             h,
@@ -499,7 +506,8 @@ async fn post_restart_verify(
             });
             let got_hash = hash_payload(payload);
             assert_eq!(
-                got_hash, rec.payload_hash,
+                got_hash,
+                rec.payload_hash,
                 "iter {iter} node{}: payload hash mismatch at seq={} — CRASH-03 CONTENT VIOLATION",
                 i + 1,
                 rec.server_sequence
