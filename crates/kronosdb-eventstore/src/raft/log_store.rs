@@ -160,11 +160,7 @@ impl Segment {
     ///
     /// Uses `fallocate` on Linux and `File::set_len(cap)` elsewhere (D-02).
     /// The file is opened read+write; `write_offset` starts at 0.
-    pub fn create(
-        dir: &std::path::Path,
-        first_index: u64,
-        cap: u64,
-    ) -> std::io::Result<Self> {
+    pub fn create(dir: &std::path::Path, first_index: u64, cap: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(segment_filename(first_index));
         let file = std::fs::OpenOptions::new()
@@ -268,10 +264,7 @@ impl Segment {
 /// bytes with the 4-byte length prefix and 4-byte CRC trailer stripped.
 /// Verifies CRC; returns `ErrorKind::InvalidData` on mismatch. Uses
 /// `File::read_at` on unix (D-14) — never mmap.
-pub(super) fn read_record_at(
-    path: &std::path::Path,
-    offset: u64,
-) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_record_at(path: &std::path::Path, offset: u64) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
 
     let file = std::fs::File::open(path)?;
@@ -508,17 +501,14 @@ fn rebuild_index(
     // 3. Scan the active (last) segment with per-record CRC validation +
     //    torn-tail truncation.
     let (active_first_index, active_path) = &segment_paths[last_idx];
-    let valid_offset =
-        scan_active_segment(active_path, *active_first_index, &mut index)?;
+    let valid_offset = scan_active_segment(active_path, *active_first_index, &mut index)?;
 
     // Truncate the preallocated / torn tail back to the last valid offset if
     // the on-disk file length is larger. Open for write only; no fsync here —
     // the next real append will fsync and cover this truncation.
     let on_disk_len = std::fs::metadata(active_path)?.len();
     if on_disk_len > valid_offset {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(active_path)?;
+        let f = std::fs::OpenOptions::new().write(true).open(active_path)?;
         f.set_len(valid_offset)?;
     }
 
@@ -552,7 +542,10 @@ fn rebuild_index(
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("segment first_index={} missing for tail key {}", seg_id, max_idx),
+                        format!(
+                            "segment first_index={} missing for tail key {}",
+                            seg_id, max_idx
+                        ),
                     )
                 })?
         };
@@ -862,10 +855,7 @@ fn resolve_segment_path(inner: &LogStoreInner, segment_id: u64) -> Option<PathBu
 /// Read the entry at `log_index` using the in-memory index. Returns `Ok(None)`
 /// if the index does not contain the key. Used by both the `LogStore` and
 /// `LogReader` read paths.
-fn read_entry_at(
-    inner: &LogStoreInner,
-    log_index: u64,
-) -> io::Result<Option<Entry<TypeConfig>>> {
+fn read_entry_at(inner: &LogStoreInner, log_index: u64) -> io::Result<Option<Entry<TypeConfig>>> {
     let (segment_id, byte_offset, _record_len) = match inner.index.get(&log_index) {
         Some(t) => *t,
         None => return Ok(None),
@@ -939,9 +929,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock();
         inner.vote = Some(*vote);
-        let data = bincode::serialize(vote).map_err(bincode_err).map_err(|e| {
-            StorageError::from_io_error(ErrorSubject::Vote, ErrorVerb::Write, e)
-        })?;
+        let data = bincode::serialize(vote)
+            .map_err(bincode_err)
+            .map_err(|e| StorageError::from_io_error(ErrorSubject::Vote, ErrorVerb::Write, e))?;
         atomic_write(&vote_path(&inner.dir), &data)
             .map_err(|e| StorageError::from_io_error(ErrorSubject::Vote, ErrorVerb::Write, e))?;
         Ok(())
@@ -1019,7 +1009,9 @@ impl LogStore {
 
         for entry in entries {
             let log_id = *entry.get_log_id();
-            let payload = bincode::serialize(&entry).map_err(bincode_err).map_err(io_err)?;
+            let payload = bincode::serialize(&entry)
+                .map_err(bincode_err)
+                .map_err(io_err)?;
             record::encode(&payload, &mut rec_buf);
 
             // Rotate if needed. If the active segment doesn't exist yet (fresh
@@ -1035,20 +1027,22 @@ impl LogStore {
                     let meta = active.seal().map_err(io_err)?;
                     inner.sealed.push(meta);
                 }
-                let new_active = Segment::create(
-                    &inner.dir,
-                    log_id.index,
-                    inner.config.segment_cap,
-                )
-                .map_err(io_err)?;
+                let new_active =
+                    Segment::create(&inner.dir, log_id.index, inner.config.segment_cap)
+                        .map_err(io_err)?;
                 inner.active = Some(new_active);
             }
 
-            let active = inner.active.as_mut().expect("active segment established above");
+            let active = inner
+                .active
+                .as_mut()
+                .expect("active segment established above");
             let offset = active.append_bytes(&rec_buf).map_err(io_err)?;
             let segment_id = active.first_index;
             let record_len = rec_buf.len() as u32;
-            inner.index.insert(log_id.index, (segment_id, offset, record_len));
+            inner
+                .index
+                .insert(log_id.index, (segment_id, offset, record_len));
             inner.buffered_bytes += rec_buf.len();
 
             // Maintain last_log_id cache (the incoming stream is append-ordered;
@@ -1127,38 +1121,38 @@ impl LogStore {
         // Drive the fsync. On success, fire callbacks with Ok; on failure,
         // fire them all with the same StorageError (D-09). We capture the
         // result here so the callback-firing branch is uniform.
-        let drive_result: Result<(), StorageError<NodeId>> = (|| -> Result<(), StorageError<NodeId>> {
-            // Fold committed.bin into this batch if dirty (D-10).
-            if inner.committed_dirty {
-                let data = bincode::serialize(&inner.committed)
-                    .map_err(bincode_err)
-                    .map_err(io_err)?;
-                let path = committed_path(&inner.dir);
-                // Direct overwrite; durability established by the sync_data below.
-                let mut f = std::fs::File::create(&path).map_err(io_err)?;
-                io::Write::write_all(&mut f, &data).map_err(io_err)?;
-                f.sync_data().map_err(io_err)?;
-                #[cfg(feature = "bench-instrumentation")]
-                bi::bump_fsync();
-                inner.committed_dirty = false;
-            }
+        let drive_result: Result<(), StorageError<NodeId>> =
+            (|| -> Result<(), StorageError<NodeId>> {
+                // Fold committed.bin into this batch if dirty (D-10).
+                if inner.committed_dirty {
+                    let data = bincode::serialize(&inner.committed)
+                        .map_err(bincode_err)
+                        .map_err(io_err)?;
+                    let path = committed_path(&inner.dir);
+                    // Direct overwrite; durability established by the sync_data below.
+                    let mut f = std::fs::File::create(&path).map_err(io_err)?;
+                    io::Write::write_all(&mut f, &data).map_err(io_err)?;
+                    f.sync_data().map_err(io_err)?;
+                    #[cfg(feature = "bench-instrumentation")]
+                    bi::bump_fsync();
+                    inner.committed_dirty = false;
+                }
 
-            // One covering fsync on the active segment (if one exists — an
-            // append call always establishes one before reaching here; but
-            // `save_committed` can drive a group-commit indirectly if we ever
-            // add an explicit flush method. Today: only `append` drives.)
-            if let Some(active) = inner.active.as_mut() {
-                active.sync().map_err(io_err)?;
-            }
+                // One covering fsync on the active segment (if one exists — an
+                // append call always establishes one before reaching here; but
+                // `save_committed` can drive a group-commit indirectly if we ever
+                // add an explicit flush method. Today: only `append` drives.)
+                if let Some(active) = inner.active.as_mut() {
+                    active.sync().map_err(io_err)?;
+                }
 
-            inner.buffered_bytes = 0;
-            Ok(())
-        })();
+                inner.buffered_bytes = 0;
+                Ok(())
+            })();
 
         // Fire callbacks in FIFO order (D-08). On failure each callback gets
         // an equivalent error (D-09).
-        let callbacks: Vec<LogFlushed<TypeConfig>> =
-            inner.pending_callbacks.drain(..).collect();
+        let callbacks: Vec<LogFlushed<TypeConfig>> = inner.pending_callbacks.drain(..).collect();
 
         // Drop the lock before firing callbacks — openraft may reenter the
         // log store from within a callback's synchronous tail.
@@ -1296,7 +1290,9 @@ fn truncate_inner(inner: &mut LogStoreInner, log_id: LogId<NodeId>) -> io::Resul
             // the current sealed file's on-disk length as the cap (we don't
             // re-preallocate — recovery cold path).
             let meta = inner.sealed.remove(last_idx);
-            let cap = std::fs::metadata(&meta.path).map(|m| m.len()).unwrap_or(rewind_to);
+            let cap = std::fs::metadata(&meta.path)
+                .map(|m| m.len())
+                .unwrap_or(rewind_to);
             let active =
                 Segment::open_for_append(meta.path.clone(), meta.first_index, rewind_to, cap)?;
             active.file.set_len(rewind_to)?;
@@ -1314,25 +1310,21 @@ fn truncate_inner(inner: &mut LogStoreInner, log_id: LogId<NodeId>) -> io::Resul
     }
 
     // 5) Refresh the cached last_log_id from the now-pruned index.
-    inner.last_log_id = inner
-        .index
-        .iter()
-        .next_back()
-        .map(|(k, _)| LogId {
-            // The stored index doesn't carry leader_id; re-read the record
-            // to get the authoritative log_id. This path is cold (truncate
-            // is rare), so one pread is acceptable.
-            leader_id: match read_entry_at(inner, *k) {
-                Ok(Some(e)) => e.get_log_id().leader_id,
-                _ => {
-                    // Fallback: synthesize a leader_id from term=0 vote
-                    // holder. This should not happen in practice because
-                    // a truncated entry still has a valid record on disk.
-                    openraft::CommittedLeaderId::new(0, 0)
-                }
-            },
-            index: *k,
-        });
+    inner.last_log_id = inner.index.iter().next_back().map(|(k, _)| LogId {
+        // The stored index doesn't carry leader_id; re-read the record
+        // to get the authoritative log_id. This path is cold (truncate
+        // is rare), so one pread is acceptable.
+        leader_id: match read_entry_at(inner, *k) {
+            Ok(Some(e)) => e.get_log_id().leader_id,
+            _ => {
+                // Fallback: synthesize a leader_id from term=0 vote
+                // holder. This should not happen in practice because
+                // a truncated entry still has a valid record on disk.
+                openraft::CommittedLeaderId::new(0, 0)
+            }
+        },
+        index: *k,
+    });
 
     Ok(())
 }
@@ -1540,7 +1532,10 @@ mod tests {
         // At this point: at least one sealed segment exists.
         {
             let inner = store.inner.lock();
-            assert!(!inner.sealed.is_empty(), "expected rotation to produce sealed segments");
+            assert!(
+                !inner.sealed.is_empty(),
+                "expected rotation to produce sealed segments"
+            );
         }
 
         // Capture sealed paths + their last indices before purge.
@@ -1606,16 +1601,19 @@ mod tests {
         // Surviving tail: get_log_state must report a last_log_id whose
         // index is >= 16.
         let state = store.get_log_state().await.unwrap();
-        let last = state.last_log_id.expect("surviving tail has a last_log_id").index;
-        assert!(last >= 16, "expected surviving tail last_index >= 16, got {last}");
+        let last = state
+            .last_log_id
+            .expect("surviving tail has a last_log_id")
+            .index;
+        assert!(
+            last >= 16,
+            "expected surviving tail last_index >= 16, got {last}"
+        );
 
         // Read the tail. Every returned entry must have index >= 16. Exact
         // count depends on segment rotation timing; the invariant is that
         // no entry with index <= 15 survives.
-        let tail = store
-            .try_get_log_entries(16..31)
-            .await
-            .expect("read tail");
+        let tail = store.try_get_log_entries(16..31).await.expect("read tail");
         assert!(!tail.is_empty(), "expected at least one surviving entry");
         for e in &tail {
             assert!(
@@ -1674,7 +1672,10 @@ mod tests {
 
         store.purge(log_id(1, 15)).await.expect("first purge");
         // Second call at the same log_id must succeed (no-op).
-        store.purge(log_id(1, 15)).await.expect("second purge must be no-op");
+        store
+            .purge(log_id(1, 15))
+            .await
+            .expect("second purge must be no-op");
 
         let state = store.get_log_state().await.unwrap();
         assert!(
@@ -1817,15 +1818,13 @@ mod tests {
             buf.len(),
             record::LEN_PREFIX + payload.len() + record::CRC_SUFFIX
         );
-        let len_bytes: [u8; record::LEN_PREFIX] =
-            buf[..record::LEN_PREFIX].try_into().unwrap();
+        let len_bytes: [u8; record::LEN_PREFIX] = buf[..record::LEN_PREFIX].try_into().unwrap();
         assert_eq!(record::decode_len_be(&len_bytes), payload.len() as u32);
         assert_eq!(
             &buf[record::LEN_PREFIX..record::LEN_PREFIX + payload.len()],
             payload.as_slice()
         );
-        let crc_bytes: [u8; record::CRC_SUFFIX] = buf
-            [record::LEN_PREFIX + payload.len()..]
+        let crc_bytes: [u8; record::CRC_SUFFIX] = buf[record::LEN_PREFIX + payload.len()..]
             .try_into()
             .unwrap();
         assert_eq!(record::decode_crc_le(&crc_bytes), crc32c::crc32c(&payload));
@@ -1861,11 +1860,9 @@ mod tests {
         let mut buf = Vec::new();
         record::encode(&[], &mut buf);
         assert_eq!(buf.len(), record::total_size(0));
-        let len_bytes: [u8; record::LEN_PREFIX] =
-            buf[..record::LEN_PREFIX].try_into().unwrap();
+        let len_bytes: [u8; record::LEN_PREFIX] = buf[..record::LEN_PREFIX].try_into().unwrap();
         assert_eq!(record::decode_len_be(&len_bytes), 0);
-        let crc_bytes: [u8; record::CRC_SUFFIX] =
-            buf[record::LEN_PREFIX..].try_into().unwrap();
+        let crc_bytes: [u8; record::CRC_SUFFIX] = buf[record::LEN_PREFIX..].try_into().unwrap();
         assert_eq!(record::decode_crc_le(&crc_bytes), crc32c::crc32c(&[]));
     }
 
@@ -1931,10 +1928,7 @@ mod tests {
 
         let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
         assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
-        assert_eq!(
-            store.read_committed().await.unwrap(),
-            Some(log_id(2, 10))
-        );
+        assert_eq!(store.read_committed().await.unwrap(), Some(log_id(2, 10)));
     }
 
     #[tokio::test]
@@ -1991,7 +1985,8 @@ mod tests {
         // restart must not contain an entry whose last_index <= purged_index.
         let inner = store.inner.lock();
         for (i, meta) in inner.sealed.iter().enumerate() {
-            let last = sealed_segment_last_index(&inner.sealed, inner.active.as_ref(), i, &inner.index);
+            let last =
+                sealed_segment_last_index(&inner.sealed, inner.active.as_ref(), i, &inner.index);
             assert!(
                 last > purged_index,
                 "sealed segment first_index={} last_index={} must be above purged={}",
@@ -2097,11 +2092,7 @@ mod tests {
         // values for indices 1..=3 (the in-memory index's authoritative size).
         {
             let inner = store.inner.lock();
-            let expected_bytes: u64 = inner
-                .index
-                .values()
-                .map(|(_, _, len)| *len as u64)
-                .sum();
+            let expected_bytes: u64 = inner.index.values().map(|(_, _, len)| *len as u64).sum();
             let on_disk_len = std::fs::metadata(&active_path).unwrap().len();
             assert_eq!(
                 on_disk_len, expected_bytes,
@@ -2244,10 +2235,7 @@ mod segment_tests {
         drop(seg);
 
         {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             use std::io::Seek;
             f.seek(std::io::SeekFrom::Start(start + record::LEN_PREFIX as u64))
                 .unwrap();

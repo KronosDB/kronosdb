@@ -105,16 +105,14 @@ struct BenchNode {
 /// Boot one openraft node with its own context manager, log store, state
 /// machine, and gRPC transport. Matches `cluster_test.rs::start_node` shape.
 async fn start_node(id: NodeId, port: u16, dir: &Path) -> BenchNode {
-    let contexts = Arc::new(
-        ContextManager::new(dir, DEFAULT_SEGMENT_SIZE).expect("create context manager"),
-    );
+    let contexts =
+        Arc::new(ContextManager::new(dir, DEFAULT_SEGMENT_SIZE).expect("create context manager"));
     if !contexts.context_exists("default") {
         contexts.create_context("default").expect("create default");
     }
 
     let raft_dir = dir.join("raft");
-    let log_store =
-        LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
+    let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
     let state_machine =
         EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
 
@@ -391,8 +389,8 @@ fn bench_raft_append_3node(c: &mut Criterion) {
         let sink = Arc::new(VecSink::new());
         bi::install_sink(sink.clone());
 
-        let mut out = File::create(records_dir().join(format!("{cell}.jsonl")))
-            .expect("open jsonl");
+        let mut out =
+            File::create(records_dir().join(format!("{cell}.jsonl"))).expect("open jsonl");
 
         // Single probe append to validate semantics before measuring. If this
         // fails we haven't wasted a measurement window on a broken cluster.

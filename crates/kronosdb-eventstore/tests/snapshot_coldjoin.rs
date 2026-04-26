@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::storage::RaftStateMachine;
-use openraft::{BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, Raft, SnapshotPolicy};
+use openraft::{
+    BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, Raft, SnapshotPolicy,
+};
 use tonic::transport::Server;
 
 use kronosdb_eventstore::context::ContextManager;
@@ -24,8 +26,8 @@ use kronosdb_eventstore::raft::network::NetworkFactory;
 use kronosdb_eventstore::raft::state_machine::EventStoreStateMachine;
 use kronosdb_eventstore::raft::transport::RaftTransportService;
 use kronosdb_eventstore::raft::types::{
-    NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRejectReason,
-    RaftRequest, RaftResponse, TypeConfig,
+    NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRejectReason, RaftRequest,
+    RaftResponse, TypeConfig,
 };
 use kronosdb_eventstore::segment::DEFAULT_SEGMENT_SIZE;
 
@@ -40,16 +42,14 @@ struct TestNode {
 }
 
 async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
-    let contexts = Arc::new(
-        ContextManager::new(dir, DEFAULT_SEGMENT_SIZE).expect("create context manager"),
-    );
+    let contexts =
+        Arc::new(ContextManager::new(dir, DEFAULT_SEGMENT_SIZE).expect("create context manager"));
     if !contexts.context_exists("default") {
         contexts.create_context("default").expect("create default");
     }
 
     let raft_dir = dir.join("raft");
-    let log_store = LogStore::new(&raft_dir, LogStoreConfig::default())
-        .expect("create log store");
+    let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
     let state_machine =
         EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
 
@@ -63,9 +63,15 @@ async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
     };
 
     let raft = Arc::new(
-        Raft::new(id, Arc::new(config), NetworkFactory, log_store, state_machine)
-            .await
-            .expect("create raft node"),
+        Raft::new(
+            id,
+            Arc::new(config),
+            NetworkFactory,
+            log_store,
+            state_machine,
+        )
+        .await
+        .expect("create raft node"),
     );
 
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -79,7 +85,12 @@ async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    TestNode { id, raft, contexts, addr }
+    TestNode {
+        id,
+        raft,
+        contexts,
+        addr,
+    }
 }
 
 async fn wait_for_leader(raft: &Raft<TypeConfig>, timeout: Duration) -> Option<NodeId> {
@@ -153,14 +164,28 @@ async fn snapshot_coldjoin_apply_consistency() {
     // "host:port" — NetworkFactory prepends "http://" when building the
     // tonic endpoint (see raft/network.rs). Prefixing here would double up.
     let mut members = BTreeMap::new();
-    members.insert(1, BasicNode { addr: format!("127.0.0.1:{}", 19500) });
-    members.insert(2, BasicNode { addr: format!("127.0.0.1:{}", 19501) });
+    members.insert(
+        1,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", 19500),
+        },
+    );
+    members.insert(
+        2,
+        BasicNode {
+            addr: format!("127.0.0.1:{}", 19501),
+        },
+    );
     node1.raft.initialize(members).await.expect("initialize");
 
     let leader = wait_for_leader(&node1.raft, Duration::from_secs(5))
         .await
         .expect("leader elected");
-    let leader_raft = if leader == 1 { &node1.raft } else { &node2.raft };
+    let leader_raft = if leader == 1 {
+        &node1.raft
+    } else {
+        &node2.raft
+    };
     let leader_contexts: Arc<ContextManager> = if leader == 1 {
         Arc::clone(&node1.contexts)
     } else {
@@ -196,15 +221,33 @@ async fn snapshot_coldjoin_apply_consistency() {
     let dir3 = tempfile::tempdir().unwrap();
     let node3 = start_node(3, 19502, dir3.path()).await;
     // NB: node3 starts fresh — ContextManager is empty, no prior state.
-    assert!(node3.contexts.list_contexts().iter().any(|n| n == "default"));
-    node3.contexts.with_context("default", |engine| {
-        assert_eq!(engine.head(), Position(1),
-            "node3 starts empty — head is sentinel 1 before any events");
-        Ok(())
-    }).unwrap();
+    assert!(
+        node3
+            .contexts
+            .list_contexts()
+            .iter()
+            .any(|n| n == "default")
+    );
+    node3
+        .contexts
+        .with_context("default", |engine| {
+            assert_eq!(
+                engine.head(),
+                Position(1),
+                "node3 starts empty — head is sentinel 1 before any events"
+            );
+            Ok(())
+        })
+        .unwrap();
 
     leader_raft
-        .add_learner(3, BasicNode { addr: format!("127.0.0.1:{}", 19502) }, true)
+        .add_learner(
+            3,
+            BasicNode {
+                addr: format!("127.0.0.1:{}", 19502),
+            },
+            true,
+        )
         .await
         .expect("add_learner");
 
@@ -229,10 +272,7 @@ async fn snapshot_coldjoin_apply_consistency() {
     );
 
     // --- ASSERT 1: apply-consistent head position on default. ---
-    let leader_head = leader_contexts
-        .get_context("default")
-        .unwrap()
-        .head();
+    let leader_head = leader_contexts.get_context("default").unwrap().head();
     let follower_head = node3.contexts.get_context("default").unwrap().head();
     assert_eq!(
         leader_head, follower_head,
@@ -243,10 +283,10 @@ async fn snapshot_coldjoin_apply_consistency() {
     // Build sibling state machines sharing each node's live ContextManager.
     // These siblings are NOT wired into openraft — they're a direct handle
     // into the apply() path for deterministic side-by-side comparison.
-    let mut leader_sibling = EventStoreStateMachine::new(Arc::clone(&leader_contexts))
-        .expect("recover leader sibling");
-    let mut follower_sibling = EventStoreStateMachine::new(Arc::clone(&node3.contexts))
-        .expect("recover follower sibling");
+    let mut leader_sibling =
+        EventStoreStateMachine::new(Arc::clone(&leader_contexts)).expect("recover leader sibling");
+    let mut follower_sibling =
+        EventStoreStateMachine::new(Arc::clone(&node3.contexts)).expect("recover follower sibling");
 
     // Craft a conditional append that MUST be rejected: criterion matches
     // tag orderId=order-1 which was appended in the loop above, with
@@ -283,14 +323,16 @@ async fn snapshot_coldjoin_apply_consistency() {
     match (&leader_responses[0], &follower_responses[0]) {
         (
             RaftResponse::AppendRejected {
-                reason: RaftRejectReason::ConsistencyConditionViolated {
-                    conflicting_position: lp
-                },
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position: lp,
+                    },
             },
             RaftResponse::AppendRejected {
-                reason: RaftRejectReason::ConsistencyConditionViolated {
-                    conflicting_position: fp
-                },
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position: fp,
+                    },
             },
         ) => {
             assert_eq!(
@@ -298,9 +340,7 @@ async fn snapshot_coldjoin_apply_consistency() {
                 "SNAP-02 GATE FAILED: leader conflicting_position={lp} \
                  follower conflicting_position={fp} — apply-consistency broken"
             );
-            eprintln!(
-                "SNAP-02 GATE PASSED: both nodes rejected at conflicting_position={lp}"
-            );
+            eprintln!("SNAP-02 GATE PASSED: both nodes rejected at conflicting_position={lp}");
         }
         (l, f) => panic!(
             "SNAP-02 GATE FAILED: expected both AppendRejected with matching \
@@ -318,8 +358,13 @@ async fn snapshot_coldjoin_apply_consistency() {
     // To avoid mutating the shared "default" context (which would race with
     // Raft log apply), create a dedicated context on each side and apply
     // there. Both should return Ok(Append) with count=1.
-    leader_contexts.create_context("leader-success-ctx").unwrap();
-    node3.contexts.create_context("follower-success-ctx").unwrap();
+    leader_contexts
+        .create_context("leader-success-ctx")
+        .unwrap();
+    node3
+        .contexts
+        .create_context("follower-success-ctx")
+        .unwrap();
 
     let accept_leader = RaftRequest::Append {
         context: "leader-success-ctx".to_string(),
@@ -356,10 +401,7 @@ async fn snapshot_coldjoin_apply_consistency() {
         .expect("follower sibling apply accept");
 
     match (&leader_accept[0], &follower_accept[0]) {
-        (
-            RaftResponse::Append { count: lc, .. },
-            RaftResponse::Append { count: fc, .. },
-        ) => {
+        (RaftResponse::Append { count: lc, .. }, RaftResponse::Append { count: fc, .. }) => {
             assert_eq!(*lc, 1);
             assert_eq!(*fc, 1);
             assert_eq!(lc, fc, "count mismatch: leader={lc} follower={fc}");
@@ -391,9 +433,7 @@ async fn snapshot_coldjoin_apply_consistency() {
         .data;
     match smoke_resp {
         RaftResponse::AppendRejected { .. } => {}
-        other => panic!(
-            "smoke test expected cluster-transport AppendRejected, got {other:?}"
-        ),
+        other => panic!("smoke test expected cluster-transport AppendRejected, got {other:?}"),
     }
 
     // cleanup (tempdirs drop via their handles). Avoid touching node.addr here —

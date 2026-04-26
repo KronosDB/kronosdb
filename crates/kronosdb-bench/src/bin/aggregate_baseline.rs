@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use kronosdb_bench::baseline_aggregate::{aggregate_records, AppendRecord, Summary};
+use kronosdb_bench::baseline_aggregate::{AppendRecord, Summary, aggregate_records};
 
 fn parse_args() -> (PathBuf, PathBuf, String) {
     let args: Vec<String> = std::env::args().collect();
@@ -58,8 +58,8 @@ fn load_records(dir: &Path) -> BTreeMap<String, Vec<AppendRecord>> {
             if line.trim().is_empty() {
                 continue;
             }
-            let rec: AppendRecord = serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
+            let rec: AppendRecord =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
             out.entry(rec.cell.clone()).or_default().push(rec);
         }
     }
@@ -140,7 +140,7 @@ BLOCKED until this discrepancy is investigated. Likely causes to rule out:\n\n\
             c.samples,
         ));
     }
-    s.push_str("\n");
+    s.push('\n');
 
     // --- Per-region breakdown of headline cell ---
     s.push_str("## Per-region Breakdown (Headline cell)\n\n");
@@ -160,7 +160,7 @@ BLOCKED until this discrepancy is investigated. Likely causes to rule out:\n\n\
                 share,
             ));
         }
-        s.push_str("\n");
+        s.push('\n');
     } else {
         s.push_str("_Headline cell not present in records._\n\n");
     }

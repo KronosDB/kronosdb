@@ -43,15 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "kronosdb-server"
     };
-    let bin_path = workspace_root
-        .join("target")
-        .join(&profile)
-        .join(bin_name);
+    let bin_path = workspace_root.join("target").join(&profile).join(bin_name);
 
-    println!(
-        "cargo:rustc-env=KRONOSDB_SERVER_BIN={}",
-        bin_path.display()
-    );
+    println!("cargo:rustc-env=KRONOSDB_SERVER_BIN={}", bin_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 
     Ok(())

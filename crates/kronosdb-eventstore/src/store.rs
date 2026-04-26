@@ -562,9 +562,10 @@ impl EventStoreEngine {
             // events are guaranteed not to straddle a segment boundary (see
             // `write_raft_entry` pre-rotate check).
             let (first_position, count) = if let Some(log_id) = applied {
-                let count_u16 = u16::try_from(request.events.len()).map_err(|_| Error::Corrupted {
-                    message: "raft-marked append exceeds u16::MAX events".into(),
-                })?;
+                let count_u16 =
+                    u16::try_from(request.events.len()).map_err(|_| Error::Corrupted {
+                        message: "raft-marked append exceeds u16::MAX events".into(),
+                    })?;
                 let marker = crate::segment::format::RaftMarker::normal(
                     log_id.term,
                     log_id.index,

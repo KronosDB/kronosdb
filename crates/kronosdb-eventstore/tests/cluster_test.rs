@@ -41,8 +41,7 @@ async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
     }
 
     let raft_dir = dir.join("raft");
-    let log_store =
-        LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
+    let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
     let state_machine =
         EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
 

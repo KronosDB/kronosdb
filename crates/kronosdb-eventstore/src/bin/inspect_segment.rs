@@ -106,13 +106,15 @@ fn print_usage() {
 
 fn inspect(opts: &Options) -> Result<(), String> {
     let reader = SegmentReader::open(&opts.path).map_err(|e| format!("{e}"))?;
-    let file_size = std::fs::metadata(&opts.path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = std::fs::metadata(&opts.path).map(|m| m.len()).unwrap_or(0);
 
     println!("SEGMENT: {}", opts.path.display());
     println!("  base_position: {}", reader.base_position());
-    println!("  file_size:     {} ({} bytes)", human_bytes(file_size), file_size);
+    println!(
+        "  file_size:     {} ({} bytes)",
+        human_bytes(file_size),
+        file_size
+    );
     println!();
 
     let mut total: u64 = 0;
@@ -130,15 +132,15 @@ fn inspect(opts: &Options) -> Result<(), String> {
         let event = result.map_err(|e| format!("read error: {e}"))?;
         let pos = event.position.0;
 
-        if let Some(from) = opts.from {
-            if pos < from {
-                continue;
-            }
+        if let Some(from) = opts.from
+            && pos < from
+        {
+            continue;
         }
-        if let Some(to) = opts.to {
-            if pos > to {
-                break;
-            }
+        if let Some(to) = opts.to
+            && pos > to
+        {
+            break;
         }
 
         total += 1;
@@ -199,10 +201,7 @@ fn inspect(opts: &Options) -> Result<(), String> {
     }
     println!("  total_payload:     {total_payload_bytes} bytes");
     if total > 0 {
-        println!(
-            "  avg_payload:       {} bytes",
-            total_payload_bytes / total
-        );
+        println!("  avg_payload:       {} bytes", total_payload_bytes / total);
     }
     println!("  unique_event_types: {}", unique_names.len());
     if !unique_names.is_empty() && total > 0 {

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 /// Generated client stubs — compiled by crates/kronosdb-eventstore/build.rs
 /// (client-only for eventstore.proto). Usable ONLY from this harness module and
 /// its downstream test files; NOT exported from the library.
+#[allow(clippy::enum_variant_names)]
 pub mod pb {
     tonic::include_proto!("kronosdb");
     pub mod eventstore {
@@ -290,7 +291,7 @@ pub fn rand_in(lo: u64, hi: u64) -> u64 {
 pub struct SegmentScanResult {
     pub path: PathBuf,
     pub valid_records: u64,
-    pub torn_tail_bytes: u64, // bytes past the last valid record
+    pub torn_tail_bytes: u64,        // bytes past the last valid record
     pub torn_reason: Option<String>, // short-read | len-zero | bincode-fail | crc-mismatch | None if clean
 }
 

@@ -309,8 +309,7 @@ impl<'a> Iterator for RaftMarkerIterator<'a> {
             }
 
             return Some(
-                format::deserialize_raft_marker(payload)
-                    .map(|(marker, _)| (header_start, marker)),
+                format::deserialize_raft_marker(payload).map(|(marker, _)| (header_start, marker)),
             );
         }
     }
