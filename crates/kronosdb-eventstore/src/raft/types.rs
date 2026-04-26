@@ -3,6 +3,7 @@ use std::io::Cursor;
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Entry;
+use openraft::SnapshotPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::criteria::SourcingCondition;
@@ -58,6 +59,26 @@ pub enum RaftResponse {
     ContextCreated,
     /// No-op / membership change applied.
     Ok,
+    /// Apply-time rejection of an append (e.g. DCB consistency violation).
+    ///
+    /// Returned by the state machine when `apply` cannot honour the
+    /// `RaftRequest` against the current committed state (D-01). Downstream
+    /// (cluster.rs) maps this back to the existing `Error` taxonomy for the
+    /// client-facing surface (D-02) so connector wire contracts stay stable.
+    AppendRejected { reason: RaftRejectReason },
+}
+
+/// Reason an apply-time append was rejected.
+///
+/// Extensible: future rejection classes add variants here rather than
+/// changing `RaftResponse`'s shape (D-01, D-03). `u64` (not `event::Position`)
+/// on the wire keeps this serde surface decoupled from the event-layer type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RaftRejectReason {
+    /// The DCB consistency condition was violated at apply time.
+    /// `conflicting_position` is the `u64` form of `event::Position` of
+    /// the event that caused the rejection.
+    ConsistencyConditionViolated { conflicting_position: u64 },
 }
 
 /// Serializable version of AppendEvent (for Raft log entries).
@@ -152,12 +173,82 @@ impl RaftCriterion {
     }
 }
 
+/// Default cadence for the Raft snapshot policy (D-04): build a snapshot
+/// every N log entries since the last one. At ≥ 1 k ev/s (Phase 7 target)
+/// this is roughly one snapshot per minute. Refine empirically in Phase 7.
+/// Integration tests override this to a much smaller N to exercise install.
+pub const RAFT_SNAPSHOT_LOGS_SINCE_LAST: u64 = 10_000;
+
 /// Helper to build a Raft config with sensible defaults.
 pub fn default_raft_config() -> Config {
     Config {
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(RAFT_SNAPSHOT_LOGS_SINCE_LAST),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_rejected_roundtrip_bincode() {
+        let r = RaftResponse::AppendRejected {
+            reason: RaftRejectReason::ConsistencyConditionViolated {
+                conflicting_position: 42,
+            },
+        };
+        let bytes = bincode::serialize(&r).expect("serialize");
+        let decoded: RaftResponse = bincode::deserialize(&bytes).expect("deserialize");
+        match decoded {
+            RaftResponse::AppendRejected {
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position,
+                    },
+            } => assert_eq!(conflicting_position, 42),
+            other => panic!("expected AppendRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_raft_config_enables_snapshot_policy() {
+        let cfg = default_raft_config();
+        match cfg.snapshot_policy {
+            openraft::SnapshotPolicy::LogsSinceLast(n) => {
+                assert_eq!(n, RAFT_SNAPSHOT_LOGS_SINCE_LAST);
+                assert_eq!(n, 10_000);
+            }
+            other => panic!("expected LogsSinceLast(10_000), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_raft_config_snapshot_policy_is_stable() {
+        let a = default_raft_config().snapshot_policy;
+        let b = default_raft_config().snapshot_policy;
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    #[test]
+    fn existing_variants_still_roundtrip() {
+        let cases = vec![
+            RaftResponse::Append {
+                first_position: 1,
+                count: 2,
+                consistency_marker: 3,
+            },
+            RaftResponse::ContextCreated,
+            RaftResponse::Ok,
+        ];
+        for r in cases {
+            let bytes = bincode::serialize(&r).expect("serialize");
+            let decoded: RaftResponse = bincode::deserialize(&bytes).expect("deserialize");
+            // Debug-string equality is sufficient — no PartialEq on RaftResponse today.
+            assert_eq!(format!("{r:?}"), format!("{decoded:?}"));
+        }
     }
 }

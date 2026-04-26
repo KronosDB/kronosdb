@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -25,14 +25,16 @@ type HandlerSender = mpsc::Sender<Result<pb::QueryHandlerInbound, Status>>;
 
 /// Pending query response collectors: request_id → channel to send results to the caller.
 type QueryResponseSender = mpsc::Sender<pb::QueryResponse>;
-type PendingQueries = Arc<Mutex<HashMap<String, QueryResponseSender>>>;
+type PendingQueries = Arc<DashMap<String, QueryResponseSender>>;
 
 /// gRPC service implementation for the query bus.
 ///
 /// Routes handlers to per-context messaging engines via `kronosdb-context` header.
+/// Both `handler_streams` and `pending_queries` are sharded maps so concurrent
+/// queries and response completions don't contend on a single mutex.
 pub struct QueryServiceImpl {
     messaging: Arc<MessagingManager>,
-    handler_streams: Arc<Mutex<HashMap<String, HandlerSender>>>,
+    handler_streams: Arc<DashMap<String, HandlerSender>>,
     pending_queries: PendingQueries,
     query_timeout: Duration,
 }
@@ -41,8 +43,8 @@ impl QueryServiceImpl {
     pub fn new(messaging: Arc<MessagingManager>, query_timeout: Duration) -> Self {
         Self {
             messaging,
-            handler_streams: Arc::new(Mutex::new(HashMap::new())),
-            pending_queries: Arc::new(Mutex::new(HashMap::new())),
+            handler_streams: Arc::new(DashMap::new()),
+            pending_queries: Arc::new(DashMap::new()),
             query_timeout,
         }
     }
@@ -72,8 +74,9 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let platform = self.messaging.get_platform(&context);
 
         let mut inbound = request.into_inner();
+        // 4096 absorbs dispatch bursts without blocking the send.await path.
         let (handler_tx, handler_rx) =
-            mpsc::channel::<Result<pb::QueryHandlerInbound, Status>>(128);
+            mpsc::channel::<Result<pb::QueryHandlerInbound, Status>>(4096);
 
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending_queries = Arc::clone(&self.pending_queries);
@@ -97,10 +100,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         );
                         client_id = Some(sub.client_id.clone());
 
-                        {
-                            let mut streams = handler_streams.lock();
-                            streams.insert(sub.client_id.clone(), handler_tx.clone());
-                        }
+                        handler_streams.insert(sub.client_id.clone(), handler_tx.clone());
 
                         platform.subscribe_query(
                             sub.query,
@@ -129,17 +129,17 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         platform.grant_query_permits(&ClientId(fc.client_id), fc.permits);
                     }
                     Some(pb::query_handler_outbound::Request::QueryResponse(resp)) => {
-                        // Route the response back to the waiting caller.
+                        // Route the response back to the waiting caller. Sharded
+                        // map so response completions don't contend with
+                        // concurrent dispatches.
                         let request_id = resp.request_identifier.clone();
-                        let pending = pending_queries.lock();
-                        if let Some(tx) = pending.get(&request_id) {
-                            let _ = tx.try_send(resp);
+                        if let Some(entry) = pending_queries.get(&request_id) {
+                            let _ = entry.value().try_send(resp);
                         }
                     }
                     Some(pb::query_handler_outbound::Request::QueryComplete(complete)) => {
                         // All results sent for this query — remove from pending.
-                        let mut pending = pending_queries.lock();
-                        pending.remove(&complete.request_id);
+                        pending_queries.remove(&complete.request_id);
                         // Dropping the sender closes the channel, signaling the caller.
                     }
                     Some(pb::query_handler_outbound::Request::SubscriptionQueryResponse(resp)) => {
@@ -157,7 +157,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
             // Handler disconnected.
             if let Some(cid) = client_id {
                 platform.remove_client(&ClientId(cid.clone()));
-                handler_streams.lock().remove(&cid);
+                handler_streams.remove(&cid);
             }
         });
 
@@ -212,17 +212,15 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let (response_tx, mut response_rx) = mpsc::channel::<pb::QueryResponse>(64);
 
         // Register in pending map so handler responses route here.
-        {
-            let mut pending_map = self.pending_queries.lock();
-            pending_map.insert(message_id.clone(), response_tx);
-        }
+        self.pending_queries
+            .insert(message_id.clone(), response_tx);
 
         // Deliver the query to each target handler.
         for target_client_id in &pending.target_handlers {
-            let handler_tx = {
-                let streams = self.handler_streams.lock();
-                streams.get(&target_client_id.0).cloned()
-            };
+            let handler_tx = self
+                .handler_streams
+                .get(&target_client_id.0)
+                .map(|r| r.value().clone());
 
             if let Some(tx) = handler_tx {
                 let inbound_query = pb::QueryHandlerInbound {
@@ -276,7 +274,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                 }
             }
             // Clean up pending entry.
-            pending_queries.lock().remove(&msg_id);
+            pending_queries.remove(&msg_id);
         });
 
         Ok(Response::new(ReceiverStream::new(caller_rx)))
@@ -356,13 +354,12 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         match platform.subscribe(subscription) {
                             Ok((pending, mut update_rx)) => {
                                 // Deliver the initial query to the handler.
-                                let handler_tx = {
-                                    let streams = handler_streams.lock();
-                                    pending
-                                        .target_handlers
-                                        .first()
-                                        .and_then(|id| streams.get(&id.0).cloned())
-                                };
+                                let handler_tx = pending
+                                    .target_handlers
+                                    .first()
+                                    .and_then(|id| {
+                                        handler_streams.get(&id.0).map(|r| r.value().clone())
+                                    });
 
                                 if let Some(tx) = handler_tx {
                                     // Send as a SubscriptionQueryRequest so the handler

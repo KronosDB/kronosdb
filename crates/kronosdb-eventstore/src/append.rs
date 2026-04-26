@@ -1,6 +1,20 @@
 use crate::criteria::SourcingCondition;
 use crate::event::{AppendEvent, Position};
 
+/// An applied Raft log-entry identifier threaded from the state machine down
+/// into the event-segment writer. Written inline as a `RaftMarker::normal`
+/// record alongside the events it produced, so that on restart the segment
+/// scan recovers `last_applied` without any extra fsync or sidecar file.
+///
+/// Mirrors the fields of `openraft::LogId<NodeId>` that matter at the
+/// storage layer (`leader_id.term` and `index`), but stays crate-local so
+/// `store.rs` does not depend on `raft::types`.
+#[derive(Debug, Clone, Copy)]
+pub struct AppliedLogId {
+    pub term: u64,
+    pub index: u64,
+}
+
 /// The DCB consistency condition for an append.
 ///
 /// "Reject this append if any event matching the criteria exists

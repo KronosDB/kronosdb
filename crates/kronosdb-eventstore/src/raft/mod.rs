@@ -17,6 +17,9 @@ pub mod state_machine;
 pub mod transport;
 pub mod types;
 
+#[cfg(feature = "bench-instrumentation")]
+pub mod bench_instrumentation;
+
 /// Generated protobuf types for Raft transport.
 pub mod proto {
     tonic::include_proto!("kronosdb.raft");

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 parking_lot = "0.12"
+dashmap = "6"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]

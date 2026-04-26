@@ -1,10 +1,20 @@
 /target
 /reference
 /data
+
 *.swp
 *.swo
-.DS_Store
-.env
-DESIGN.md
-kronosdb-spec.md
 admin-prototype.html
+
+# General ban: dotfiles, dot-dirs, and markdown files.
+# Anything we want tracked must be re-included below.
+.*
+*.md
+
+# Re-include allowlist.
+!.gitignore
+!.dockerignore
+!.github
+!.github/**
+!README.md
+!**/README.md
