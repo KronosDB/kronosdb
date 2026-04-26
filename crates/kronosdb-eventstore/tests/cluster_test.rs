@@ -14,7 +14,7 @@ use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
 use kronosdb_eventstore::event::Position;
 use kronosdb_eventstore::raft::cluster::RaftEngine;
-use kronosdb_eventstore::raft::log_store::LogStore;
+use kronosdb_eventstore::raft::log_store::{LogStore, LogStoreConfig};
 use kronosdb_eventstore::raft::network::NetworkFactory;
 use kronosdb_eventstore::raft::state_machine::EventStoreStateMachine;
 use kronosdb_eventstore::raft::transport::RaftTransportService;
@@ -41,8 +41,10 @@ async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
     }
 
     let raft_dir = dir.join("raft");
-    let log_store = LogStore::new(&raft_dir).expect("create log store");
-    let state_machine = EventStoreStateMachine::new(Arc::clone(&contexts));
+    let log_store =
+        LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
+    let state_machine =
+        EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
 
     let config = Config {
         heartbeat_interval: 200,

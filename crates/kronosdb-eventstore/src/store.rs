@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::api::EventStore;
-use crate::append::{AppendRequest, AppendResponse};
+use crate::append::{AppendRequest, AppendResponse, AppliedLogId};
 use crate::cache::IndexCache;
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
@@ -284,8 +284,10 @@ pub struct EventStoreEngine {
     /// The segment writer. Behind Arc<Mutex> — shared with the group commit sync thread.
     writer: Arc<parking_lot::Mutex<SegmentWriter>>,
 
-    /// The tag index for the active segment. Protected by RwLock for concurrent read access.
-    tag_index: Arc<RwLock<TagIndex>>,
+    /// TagIndex is internally sharded (DashMap over tag keys + a brief
+    /// Mutex on all_positions). No outer lock — concurrent writers with
+    /// disjoint tag keys don't contend.
+    tag_index: Arc<TagIndex>,
 
     /// Group commit synchronization.
     sync_state: Arc<SyncState>,
@@ -346,7 +348,7 @@ impl EventStoreEngine {
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
-            tag_index: Arc::new(RwLock::new(TagIndex::new())),
+            tag_index: Arc::new(TagIndex::new()),
             sync_state,
             committed_position: Arc::new(AtomicU64::new(0)),
             commit_tx,
@@ -386,8 +388,8 @@ impl EventStoreEngine {
 
         // Rebuild the active segment's tag index from its events.
         // Sealed segments have their own `.idx` files on disk.
-        let mut tag_index = TagIndex::new();
-        rebuild_active_segment_index(dir, &mut tag_index)?;
+        let tag_index = TagIndex::new();
+        rebuild_active_segment_index(dir, &tag_index)?;
 
         // Build the cached segment list from disk (one-time cost on startup).
         let all_bases = segment::list_segment_files(dir)?;
@@ -411,7 +413,7 @@ impl EventStoreEngine {
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
-            tag_index: Arc::new(RwLock::new(tag_index)),
+            tag_index: Arc::new(tag_index),
             sync_state,
             committed_position: Arc::new(AtomicU64::new(committed)),
             commit_tx,
@@ -450,6 +452,32 @@ impl EventStoreEngine {
     /// 3. Updates the in-memory tag index
     /// 4. Advances the committed position
     pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        self.append_internal(request, None)
+    }
+
+    /// Like `append`, but atomically persists the applied Raft `LogId` alongside
+    /// the events by emitting a `RaftMarker::normal(term, index, count)` record
+    /// in the same segment fsync. Used by the Raft state machine so boot-time
+    /// recovery can reconstruct `last_applied` from segment scan — no sidecar
+    /// file, no extra fsync.
+    ///
+    /// For empty event batches (condition-only or rejected-after-check) this
+    /// method does not emit a marker — `last_applied` will be recovered from
+    /// the next Normal entry that produces events. Membership/Blank entries
+    /// are not persisted here; see `state_machine::apply` for rationale.
+    pub fn append_with_raft(
+        &self,
+        request: AppendRequest,
+        applied: AppliedLogId,
+    ) -> Result<AppendResponse, Error> {
+        self.append_internal(request, Some(applied))
+    }
+
+    fn append_internal(
+        &self,
+        request: AppendRequest,
+        applied: Option<AppliedLogId>,
+    ) -> Result<AppendResponse, Error> {
         let timer = Timer::start();
 
         let target_epoch = if self.sync_state.enabled {
@@ -505,8 +533,8 @@ impl EventStoreEngine {
                 }
 
                 // Check the active segment via in-memory tag index.
-                let index = self.tag_index.read();
-                if let Some(conflicting_pos) = index.check_condition(condition) {
+                // tag_index is internally sharded; no lock needed.
+                if let Some(conflicting_pos) = self.tag_index.check_condition(condition) {
                     return Err(Error::ConsistencyConditionViolated {
                         conflicting_position: conflicting_pos,
                     });
@@ -524,8 +552,32 @@ impl EventStoreEngine {
 
             let old_active_base = writer.active_base_position();
 
-            // Step 2: Write events.
-            let (first_position, count) = if self.sync_state.enabled {
+            // Step 2: Write events (+ Raft marker, if threaded in).
+            //
+            // When `applied` is Some, we route through `SegmentWriter::write_raft_entry`
+            // which emits a `RaftMarker::normal(term, index, count)` record *before* the
+            // event records in the same segment. That marker is the durable witness of
+            // `last_applied` — on restart, scanning raft markers across all segments
+            // reconstructs it without an extra fsync or sidecar file. The marker + its
+            // events are guaranteed not to straddle a segment boundary (see
+            // `write_raft_entry` pre-rotate check).
+            let (first_position, count) = if let Some(log_id) = applied {
+                let count_u16 = u16::try_from(request.events.len()).map_err(|_| Error::Corrupted {
+                    message: "raft-marked append exceeds u16::MAX events".into(),
+                })?;
+                let marker = crate::segment::format::RaftMarker::normal(
+                    log_id.term,
+                    log_id.index,
+                    count_u16,
+                );
+                let result = writer.write_raft_entry(&marker, &request.events)?;
+                if !self.sync_state.enabled {
+                    // Immediate mode: the non-Raft `writer.append` does its own fsync,
+                    // but `write_raft_entry` does not. Preserve strict durability here.
+                    writer.sync()?;
+                }
+                result
+            } else if self.sync_state.enabled {
                 // Group commit: write without fsync. Sync thread handles it.
                 writer.write_events(&request.events)?
             } else {
@@ -543,13 +595,12 @@ impl EventStoreEngine {
             }
 
             // Step 3: Update in-memory tag index.
-            {
-                let mut index = self.tag_index.write();
-                let mut pos = first_position;
-                for event in &request.events {
-                    index.index_event(pos, &event.name, &event.tags);
-                    pos = pos.next();
-                }
+            // TagIndex is internally sharded — concurrent callers indexing events
+            // with different tag keys proceed in parallel.
+            let mut pos = first_position;
+            for event in &request.events {
+                self.tag_index.index_event(pos, &event.name, &event.tags);
+                pos = pos.next();
             }
 
             // Step 4: Advance committed position.
@@ -749,8 +800,11 @@ impl EventStoreEngine {
                 (bm, Some(idx))
             } else {
                 // Active segment — use in-memory index.
-                let index = self.tag_index.read();
-                (index.matching_bitmap(condition, from_position), None)
+                // tag_index is internally sharded; no lock needed.
+                (
+                    self.tag_index.matching_bitmap(condition, from_position),
+                    None,
+                )
             };
 
             let matching_positions = match matching_positions {
@@ -840,8 +894,11 @@ impl EventStoreEngine {
                 let bm = idx.matching(condition);
                 (bm, Some(idx))
             } else {
-                let index = self.tag_index.read();
-                (index.matching_bitmap(condition, from_position), None)
+                // tag_index is internally sharded; no lock needed.
+                (
+                    self.tag_index.matching_bitmap(condition, from_position),
+                    None,
+                )
             };
 
             let matching_positions = match matching_positions {
@@ -887,6 +944,102 @@ impl EventStoreEngine {
             }
         }
 
+        Ok(events)
+    }
+
+    /// Scans all on-disk segments for persisted `RaftMarker` records and
+    /// returns the maximum `(term, index)` seen. Used on boot to reconstruct
+    /// the Raft state-machine's `last_applied` without any sidecar file.
+    ///
+    /// Cheap enough for boot: sealed segments have bounded size (256 MB default)
+    /// and only markers are deserialized; event payloads are skipped by the
+    /// `iter_raft_markers` iterator. Returns `None` if no markers are present
+    /// (fresh store, or legacy data written before this plan).
+    pub fn max_applied_log_id(&self) -> Result<Option<AppliedLogId>, Error> {
+        use crate::segment::format::RaftEntryType;
+
+        let seg_list = self.segments.read().clone();
+        let mut best: Option<(u64, u64)> = None;
+        for &base in &seg_list.bases {
+            let seg_path = segment::segment_path(&self.dir, base);
+            let reader = match SegmentReader::open(&seg_path) {
+                Ok(r) => r,
+                Err(_) => continue, // Missing / unreadable segments don't contribute.
+            };
+            for item in reader.iter_raft_markers() {
+                let (_, marker) = match item {
+                    Ok(m) => m,
+                    Err(_) => break, // Torn tail in this segment — stop scanning it.
+                };
+                // Membership and Blank markers are informational here (we don't
+                // persist them in this plan), but if any appear just honour their
+                // term/index as well — they cannot decrease the max.
+                let _ = RaftEntryType::Normal; // readability
+                let candidate = (marker.term, marker.index);
+                if best.map(|b| candidate > b).unwrap_or(true) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        Ok(best.map(|(term, index)| AppliedLogId { term, index }))
+    }
+
+    /// Returns every stored event with position >= `from_position` up to the
+    /// current committed head, in ascending position order, with tags attached.
+    ///
+    /// Used by the Raft snapshot builder (Phase 4, SNAP-01). Unlike `source` /
+    /// `source_stored`, this applies no criterion filter — every event matches.
+    /// Walks sealed segments (via cached mmap) and the active segment with no
+    /// readdir / stat calls in the hot loop; iteration mirrors the same
+    /// segment-list walk used by `source` / `source_stored`.
+    ///
+    /// Scope note: this is an inherent method on `EventStoreEngine`, not a
+    /// trait method on `EventStore`. The trait is the client-facing contract
+    /// (kept wire-stable per PROJECT.md constraint); snapshot building is
+    /// internal to the Raft state-machine path.
+    pub fn source_all(&self, from_position: Position) -> Result<Vec<StoredEvent>, Error> {
+        let committed = self.committed_position.load(Ordering::Acquire);
+        let seg_list = self.segments.read().clone();
+        if seg_list.bases.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut events = Vec::new();
+        for (i, &base) in seg_list.bases.iter().enumerate() {
+            if base > committed {
+                break;
+            }
+            let seg_path = segment::segment_path(&self.dir, base);
+            let is_last = i + 1 == seg_list.bases.len();
+            let seg_end = if !is_last {
+                seg_list.bases[i + 1] - 1
+            } else {
+                committed
+            };
+            if seg_end < from_position.0 {
+                continue;
+            }
+
+            let reader = if seg_list.is_sealed(i) {
+                let mmap = self.cache.get_mmap(&seg_path, base)?;
+                SegmentReader::from_shared_mmap(mmap)?
+            } else {
+                SegmentReader::open(&seg_path)?
+            };
+
+            // `iter(Some(up_to))` stops once it sees a position >= up_to;
+            // pass committed+1 so every committed event is yielded.
+            for result in reader.iter(Some(Position(committed + 1))) {
+                let stored = result?;
+                if stored.position.0 < from_position.0 {
+                    continue;
+                }
+                if stored.position.0 > committed {
+                    break;
+                }
+                events.push(stored);
+            }
+        }
         Ok(events)
     }
 }
@@ -952,7 +1105,7 @@ fn count_sealed_segments(dir: &Path, bases: &[u64], active_base: u64) -> usize {
 /// Sealed segments have `.idx` companion files on disk and don't need replay.
 /// Only the active segment (the last one without `.idx`) is replayed.
 /// If a sealed segment is missing its `.idx`, it's rebuilt from the segment data.
-fn rebuild_active_segment_index(dir: &Path, index: &mut TagIndex) -> Result<(), Error> {
+fn rebuild_active_segment_index(dir: &Path, index: &TagIndex) -> Result<(), Error> {
     let segments = segment::list_segment_files(dir)?;
 
     for base_pos in segments {
@@ -1255,5 +1408,75 @@ mod tests {
 
             assert!(result.is_ok(), "condition with fresh marker should pass");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // source_all — Phase 4 SNAP-01 (Task 1)
+    // Tag-bearing sequential dump of all events. Used by the Raft
+    // snapshot builder. Unlike `source` / `source_stored`, no criterion
+    // filter is applied — every committed event is emitted in ascending
+    // position order with its original tags.
+    // ------------------------------------------------------------------
+    #[test]
+    fn source_all_returns_all_events_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        for (i, name) in ["A", "B", "C"].iter().enumerate() {
+            engine
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![AppendEvent {
+                        identifier: format!("id-{i}"),
+                        name: (*name).to_string(),
+                        version: "1.0".into(),
+                        timestamp: 1712345678000,
+                        payload: vec![],
+                        metadata: vec![],
+                        tags: vec![Tag::from_str("k", &format!("v{i}"))],
+                    }],
+                })
+                .unwrap();
+        }
+        let all = engine.source_all(Position(1)).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].position, Position(1));
+        assert_eq!(all[1].position, Position(2));
+        assert_eq!(all[2].position, Position(3));
+        assert_eq!(all[0].name, "A");
+        assert_eq!(all[0].tags.len(), 1);
+    }
+
+    #[test]
+    fn source_all_empty_engine_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        let all = engine.source_all(Position(1)).unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn source_all_honours_from_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        for i in 0..3 {
+            engine
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![AppendEvent {
+                        identifier: format!("id-{i}"),
+                        name: "E".into(),
+                        version: "1.0".into(),
+                        timestamp: 0,
+                        payload: vec![],
+                        metadata: vec![],
+                        tags: vec![],
+                    }],
+                })
+                .unwrap();
+        }
+        let tail = engine.source_all(Position(2)).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].position, Position(2));
+        assert_eq!(tail[1].position, Position(3));
     }
 }

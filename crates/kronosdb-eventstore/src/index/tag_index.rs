@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use roaring::RoaringTreemap;
 
 use crate::append::AppendCondition;
@@ -25,68 +25,69 @@ const EVENT_TYPE_TAG_KEY: &[u8] = b"__kronosdb_event_type__";
 /// There is no reverse index (position → tags). GetTags reads the
 /// event from the segment and applies mutations from the WAL.
 ///
-/// This struct is NOT thread-safe on its own. The caller is responsible
-/// for synchronization via RwLock.
+/// **Thread safety**: internally sharded so multiple writers indexing
+/// events with different tag keys don't serialize. `forward` is a
+/// `DashMap` — shard lock only between keys that hash to the same shard.
+/// `all_positions` stays under a single Mutex because every write
+/// inserts into it; the lock scope is just one `RoaringTreemap::insert`
+/// per call so contention is bounded.
+///
+/// All methods take `&self`; no outer RwLock is required.
 pub struct TagIndex {
     /// Forward index: tag(key+value) → roaring bitmap of event positions.
-    forward: HashMap<Vec<u8>, RoaringTreemap>,
+    forward: DashMap<Vec<u8>, RoaringTreemap>,
 
     /// Bitmap of all known event positions. Used when a criterion has
-    /// no tags and no names (matches everything).
-    all_positions: RoaringTreemap,
+    /// no tags and no names (matches everything). Mutex-guarded — each
+    /// lock scope is a single insert, so contention is bounded even
+    /// with N concurrent writers.
+    all_positions: Mutex<RoaringTreemap>,
 }
 
 impl TagIndex {
     pub fn new() -> Self {
         Self {
-            forward: HashMap::new(),
-            all_positions: RoaringTreemap::new(),
+            forward: DashMap::new(),
+            all_positions: Mutex::new(RoaringTreemap::new()),
         }
     }
 
     /// Indexes an event's tags and name. Called on append.
-    pub fn index_event(&mut self, position: Position, event_name: &str, tags: &[Tag]) {
+    pub fn index_event(&self, position: Position, event_name: &str, tags: &[Tag]) {
         let pos = position.0;
 
-        self.all_positions.insert(pos);
+        self.all_positions.lock().insert(pos);
 
         // Index the event type name as a synthetic tag.
         let type_tag_key = make_forward_key(EVENT_TYPE_TAG_KEY, event_name.as_bytes());
-        self.forward
-            .entry(type_tag_key)
-            .or_insert_with(RoaringTreemap::new)
-            .insert(pos);
+        self.forward.entry(type_tag_key).or_default().insert(pos);
 
-        // Index each user-provided tag.
+        // Index each user-provided tag. Different tag keys hash to
+        // different DashMap shards so concurrent writers for distinct
+        // keys proceed in parallel.
         for tag in tags {
             let forward_key = make_forward_key(&tag.key, &tag.value);
-            self.forward
-                .entry(forward_key)
-                .or_insert_with(RoaringTreemap::new)
-                .insert(pos);
+            self.forward.entry(forward_key).or_default().insert(pos);
         }
     }
 
     /// Adds tags to an existing event's index. Used by the AddTags RPC.
-    pub fn add_tags(&mut self, position: Position, tags: &[Tag]) {
+    pub fn add_tags(&self, position: Position, tags: &[Tag]) {
         let pos = position.0;
 
         for tag in tags {
             let forward_key = make_forward_key(&tag.key, &tag.value);
-            self.forward
-                .entry(forward_key)
-                .or_insert_with(RoaringTreemap::new)
-                .insert(pos);
+            self.forward.entry(forward_key).or_default().insert(pos);
         }
     }
 
     /// Removes tags from an existing event's index. Used by the RemoveTags RPC.
-    pub fn remove_tags(&mut self, position: Position, tags: &[Tag]) {
+    pub fn remove_tags(&self, position: Position, tags: &[Tag]) {
         let pos = position.0;
 
         for tag in tags {
             let forward_key = make_forward_key(&tag.key, &tag.value);
-            if let Some(bitmap) = self.forward.get_mut(&forward_key) {
+            if let Some(mut bitmap) = self.forward.get_mut(&forward_key) {
                 bitmap.remove(pos);
             }
         }
@@ -138,6 +139,12 @@ impl TagIndex {
     }
 
     /// Finds the first event matching the condition after the given position.
+    ///
+    /// Semantics: `consistency_marker` is an exclusive lower bound — "I've
+    /// validated everything up to and including `after`; reject if any
+    /// matching event has position > `after`." This matches the
+    /// `segment_index::has_match_after` predicate so the sealed-segment
+    /// and active-segment DCB paths agree.
     fn find_matching_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
         let combined = self.resolve(condition)?;
         combined.iter().find(|&pos| pos > after).map(Position)
@@ -161,23 +168,41 @@ impl TagIndex {
     }
 
     /// Resolves a single criterion into a bitmap.
+    ///
+    /// Builds the result iteratively rather than collecting borrowed
+    /// references: each lookup scopes its own DashMap shard lock briefly,
+    /// AND-s into the running result, and drops the lock. This avoids
+    /// holding multiple shard-lock guards in a Vec (which would be a
+    /// lifetime headache and pointlessly widens the read-lock window).
     fn resolve_criterion(&self, criterion: &Criterion) -> Option<RoaringTreemap> {
-        let mut parts: Vec<&RoaringTreemap> = Vec::new();
+        // Start with None. The first tag/name lookup seeds the result;
+        // subsequent ones AND into it. Any missing key collapses the
+        // criterion to None (AND with empty set = empty set).
+        let mut result: Option<RoaringTreemap> = None;
 
         for tag in &criterion.tags {
             let key = make_forward_key(&tag.key, &tag.value);
             match self.forward.get(&key) {
-                Some(bitmap) => parts.push(bitmap),
+                Some(entry) => {
+                    let bitmap = entry.value();
+                    match &mut result {
+                        Some(existing) => *existing &= bitmap,
+                        None => result = Some(bitmap.clone()),
+                    }
+                }
                 None => return None,
             }
+            // Shard Ref dropped here.
         }
 
-        let name_bitmap;
         if !criterion.names.is_empty() {
+            // The names-list is an OR across event types; build a combined
+            // name bitmap, then AND it into the running result.
             let mut names_combined: Option<RoaringTreemap> = None;
             for name in &criterion.names {
                 let key = make_forward_key(EVENT_TYPE_TAG_KEY, name.as_bytes());
-                if let Some(bitmap) = self.forward.get(&key) {
+                if let Some(entry) = self.forward.get(&key) {
+                    let bitmap = entry.value();
                     match &mut names_combined {
                         Some(existing) => *existing |= bitmap,
                         None => names_combined = Some(bitmap.clone()),
@@ -185,27 +210,24 @@ impl TagIndex {
                 }
             }
             match names_combined {
-                Some(bitmap) => {
-                    name_bitmap = bitmap;
-                    parts.push(&name_bitmap);
-                }
+                Some(names_bitmap) => match &mut result {
+                    Some(existing) => *existing &= &names_bitmap,
+                    None => result = Some(names_bitmap),
+                },
                 None => return None,
             }
         }
 
-        if parts.is_empty() {
-            return Some(self.all_positions.clone());
-        }
+        // If the criterion had no tags and no names, match everything.
+        let final_bitmap = match result {
+            Some(b) => b,
+            None => self.all_positions.lock().clone(),
+        };
 
-        let mut result = parts[0].clone();
-        for part in &parts[1..] {
-            result &= *part;
-        }
-
-        if result.is_empty() {
+        if final_bitmap.is_empty() {
             None
         } else {
-            Some(result)
+            Some(final_bitmap)
         }
     }
 }
@@ -229,7 +251,7 @@ mod tests {
 
     #[test]
     fn index_and_query_by_single_tag() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "OrderPlaced", &[tag("orderId", "B")]);
@@ -248,7 +270,7 @@ mod tests {
 
     #[test]
     fn query_with_and_tags() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(
             Position(1),
@@ -279,7 +301,7 @@ mod tests {
 
     #[test]
     fn query_with_or_criteria() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "OrderPlaced", &[tag("orderId", "B")]);
@@ -304,7 +326,7 @@ mod tests {
 
     #[test]
     fn query_by_event_name() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
@@ -323,7 +345,7 @@ mod tests {
 
     #[test]
     fn dcb_condition_passes_when_no_conflict() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
@@ -343,7 +365,7 @@ mod tests {
 
     #[test]
     fn dcb_condition_fails_when_conflict_exists() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
@@ -365,7 +387,7 @@ mod tests {
 
     #[test]
     fn add_tags_updates_forward_index() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
 
@@ -384,7 +406,7 @@ mod tests {
 
     #[test]
     fn remove_tags_updates_forward_index() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         index.index_event(
             Position(1),
@@ -413,7 +435,7 @@ mod tests {
 
     #[test]
     fn query_from_position() {
-        let mut index = TagIndex::new();
+        let index = TagIndex::new();
 
         for i in 1..=5 {
             index.index_event(Position(i), "Event", &[tag("stream", "main")]);
@@ -428,5 +450,92 @@ mod tests {
 
         let positions = index.matching_positions(&cond, Position(3));
         assert_eq!(positions, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn concurrent_index_and_query() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let index = Arc::new(TagIndex::new());
+
+        // N writer threads each indexing events with distinct tag keys
+        // so DashMap shard contention is low; also one shared tag
+        // ("stream", "main") so writers do contend on that key.
+        const WRITERS: usize = 8;
+        const EVENTS_PER_WRITER: usize = 500;
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|tid| {
+                let idx = Arc::clone(&index);
+                thread::spawn(move || {
+                    for i in 0..EVENTS_PER_WRITER {
+                        // 1-based positions to match this worktree's convention.
+                        let pos = (tid * EVENTS_PER_WRITER + i + 1) as u64;
+                        idx.index_event(
+                            Position(pos),
+                            "Event",
+                            &[
+                                Tag::from_str("stream", "main"),
+                                Tag::from_str("writer", &format!("t{tid}")),
+                            ],
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        // Meanwhile, a reader thread queries continuously and verifies
+        // that matching_positions returns a monotonically growing subset.
+        let index_reader = Arc::clone(&index);
+        let reader = thread::spawn(move || {
+            let cond = SourcingCondition {
+                criteria: vec![Criterion {
+                    names: vec![],
+                    tags: vec![Tag::from_str("stream", "main")],
+                }],
+            };
+            let mut last_len = 0;
+            for _ in 0..100 {
+                let positions = index_reader.matching_positions(&cond, Position(1));
+                assert!(
+                    positions.len() >= last_len,
+                    "tag_index readers must not see regressions"
+                );
+                last_len = positions.len();
+                thread::yield_now();
+            }
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        reader.join().unwrap();
+
+        let cond_all = SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![Tag::from_str("stream", "main")],
+            }],
+        };
+        let positions = index.matching_positions(&cond_all, Position(1));
+        assert_eq!(positions.len(), WRITERS * EVENTS_PER_WRITER);
+
+        // Each writer's tag should yield exactly EVENTS_PER_WRITER positions.
+        for tid in 0..WRITERS {
+            let cond = SourcingCondition {
+                criteria: vec![Criterion {
+                    names: vec![],
+                    tags: vec![Tag::from_str("writer", &format!("t{tid}"))],
+                }],
+            };
+            let positions = index.matching_positions(&cond, Position(1));
+            assert_eq!(
+                positions.len(),
+                EVENTS_PER_WRITER,
+                "writer t{tid} expected {EVENTS_PER_WRITER} positions, got {}",
+                positions.len()
+            );
+        }
     }
 }

@@ -4,12 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Off by default. Enabled by the kronosdb-bench crate for phase-1 baseline measurement.
+# Inserts scoped std::time::Instant timers at four named hotspots plus an fsync syscall
+# counter. Must compile out completely when the feature is off — no runtime cost in release.
+bench-instrumentation = []
+
 [dependencies]
 crc32c = "0.6"
 memmap2 = "0.9"
 libc = "0.2"
 roaring = "0.10"
 parking_lot = "0.12"
+dashmap = "6"
 growable-bloom-filter = "2"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +39,5 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = { version = "0.13", features = ["transport"] }
+prost = "0.13"
+blake3 = "1"

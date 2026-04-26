@@ -22,14 +22,14 @@ use crate::event::{Position, SequencedEvent, Tag};
 use crate::store::EventStoreEngine;
 use crate::stream::EventStream;
 
-use super::log_store::LogStore;
+use super::log_store::{LogStore, LogStoreConfig};
 use super::network::NetworkFactory;
 use super::proto;
 use super::proto::raft_transport_client::RaftTransportClient;
 use super::state_machine::EventStoreStateMachine;
 use super::types::{
-    NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRequest, RaftResponse,
-    TypeConfig,
+    NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRejectReason, RaftRequest,
+    RaftResponse, TypeConfig,
 };
 
 /// Node type determines how a node participates in the cluster.
@@ -104,10 +104,32 @@ impl ClusterManager {
             .data_dir()
             .join(context_name)
             .join("raft");
-        let log_store = LogStore::new(&raft_dir).map_err(Error::Io)?;
+        let log_store =
+            LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
 
-        // Create state machine wrapping the context manager.
-        let state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager));
+        // Create state machine wrapping the context manager. `new` recovers
+        // `last_applied` from segment markers so the post-restart state matches
+        // what the log store will report as committed (Option D).
+        let mut state_machine =
+            EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
+
+        // Reconciliation pass: bring `state_machine.last_applied` and
+        // `log_store.committed` into a consistent shape before handing both
+        // to openraft. Without this pass, `last_applied`'s sentinel
+        // `node_id=0` from marker-only recovery produces two CRASH-02
+        // failure shapes (see `state_machine::reconcile_with_log` for the
+        // full root-cause writeup). This pass is idempotent on a clean
+        // shutdown and is the only new I/O added to the startup path
+        // beyond the pre-fix recovery (no fsync, two in-memory lookups).
+        let log_last = log_store.last_log_id();
+        let log_committed = log_store.committed();
+        let report = state_machine.reconcile_with_log(log_last, log_committed, |idx| {
+            let entry = log_store.entry_at(idx).map_err(Error::Io)?;
+            Ok(entry.map(|e| *openraft::RaftLogId::get_log_id(&e)))
+        })?;
+        if let Some(new_committed) = report.committed_promoted_to {
+            log_store.promote_committed(new_committed);
+        }
 
         // Create Raft node.
         let raft = Raft::new(
@@ -209,9 +231,19 @@ impl ClusterManager {
             match raft.initialize(members).await {
                 Ok(_) => {}
                 Err(e) => {
-                    // Already initialized is not an error.
+                    // Already initialized is not an error. openraft 0.9 surfaces this
+                    // through several phrasings depending on the path hit:
+                    //   - "already initialized"                     (fresh-leader path)
+                    //   - "NotAllowed"                               (older match phrasing)
+                    //   - "not allowed to initialize ... last_log_id" (post-crash restart
+                    //     path: the log already contains entries, so re-initializing
+                    //     the cluster is a no-op we explicitly want to swallow —
+                    //     discovered in Phase 6 kill-mid-append testing)
                     let msg = format!("{e}");
-                    if !msg.contains("already initialized") && !msg.contains("NotAllowed") {
+                    let is_already_initialized = msg.contains("already initialized")
+                        || msg.contains("NotAllowed")
+                        || msg.contains("not allowed to initialize");
+                    if !is_already_initialized {
                         return Err(Error::Corrupted {
                             message: format!("failed to bootstrap cluster: {e}"),
                         });
@@ -419,6 +451,20 @@ impl EventStore for RaftEngine {
                 count,
                 consistency_marker: Position(consistency_marker),
             }),
+            RaftResponse::AppendRejected {
+                reason:
+                    RaftRejectReason::ConsistencyConditionViolated {
+                        conflicting_position,
+                    },
+            } => {
+                // D-02: Apply-time DCB rejection surfaces as the same typed error
+                // the direct (non-Raft) append path in store.rs::EventStoreEngine::append
+                // returns. service.rs::to_status already maps this to Status::aborted
+                // with the position — wire contract unchanged for connectors.
+                Err(Error::ConsistencyConditionViolated {
+                    conflicting_position: Position(conflicting_position),
+                })
+            }
             _ => Err(Error::Corrupted {
                 message: "unexpected raft response type for append".into(),
             }),
@@ -530,5 +576,31 @@ mod tests {
             ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
 
         assert!(cluster.context_manager().context_exists("default"));
+    }
+
+    /// DCB-03 regression guard: `conditional_propose_lock` was the propose-time
+    /// TOCTOU guard added in 04e0cbf. This worktree started from 4dcffcd so the
+    /// identifier is absent. Apply-time authority (Phase 3) makes the lock dead
+    /// weight; reintroducing it would re-install the bug it was defending against.
+    /// This test fails loudly if the identifier ever reappears in this file.
+    #[test]
+    fn dcb_03_guard_no_conditional_propose_lock_in_cluster_rs() {
+        const SOURCE: &str = include_str!("cluster.rs");
+        // We count occurrences of the identifier and require the count to equal
+        // the known-good count for this test's own mentions (docstring, name,
+        // assertion message). Any occurrence outside this test bumps the count
+        // and fails the guard — which is the intended contract.
+        let occurrences = SOURCE.matches("conditional_propose_lock").count();
+        // This constant must be updated ONLY when changing this test's body.
+        // The identifier appears here in the docstring, the function name, the
+        // match-string literal, and the assertion message — total 5 mentions.
+        const EXPECTED_SELF_MENTIONS: usize = 5;
+        assert_eq!(
+            occurrences, EXPECTED_SELF_MENTIONS,
+            "DCB-03 regression: 'conditional_propose_lock' should appear exactly \
+             {EXPECTED_SELF_MENTIONS} times (all inside dcb_03_guard_no_conditional_propose_lock_in_cluster_rs); \
+             found {occurrences}. Apply-time authority makes this lock unnecessary — \
+             do not reintroduce it."
+        );
     }
 }

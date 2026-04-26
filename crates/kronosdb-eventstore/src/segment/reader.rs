@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::event::{Position, StoredEvent};
 
 use crate::segment::{
-    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, format,
+    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format,
 };
 
 /// Reads events from a segment file using memory-mapped I/O.
@@ -67,6 +67,13 @@ impl SegmentReader {
         self.base_position
     }
 
+    /// Returns the raw mmap bytes of this segment — for low-level scanners
+    /// (Raft log recovery) that need to walk records in physical order
+    /// including non-event records that the event iterators skip.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+
     /// Returns an iterator over all valid events in the segment.
     ///
     /// `up_to` limits the read to events with position < up_to.
@@ -79,15 +86,23 @@ impl SegmentReader {
         }
     }
 
+    /// Returns an iterator over Raft entry markers in the segment.
+    /// Event records are skipped — this iterator is for the log-as-state
+    /// Raft log reader which only cares about entries, not their payload events.
+    pub fn iter_raft_markers(&self) -> RaftMarkerIterator<'_> {
+        RaftMarkerIterator {
+            data: &self.mmap,
+            offset: SEGMENT_HEADER_SIZE,
+        }
+    }
+
     /// Returns an iterator that also yields the byte offset of each record.
     /// Used during index building to populate the position→offset table.
     pub fn iter_with_offsets(&self, up_to: Option<Position>) -> OffsetTrackingIterator<'_> {
         OffsetTrackingIterator {
-            inner: SegmentIterator {
-                data: &self.mmap,
-                offset: SEGMENT_HEADER_SIZE,
-                up_to,
-            },
+            data: &self.mmap,
+            offset: SEGMENT_HEADER_SIZE,
+            up_to,
         }
     }
 
@@ -209,6 +224,12 @@ impl<'a> Iterator for SegmentIterator<'a> {
             // Advance past this record.
             self.offset = payload_end;
 
+            // Skip non-event records (Raft markers, future record types).
+            // The loop continues to the next record.
+            if !flags::is_event(flags_byte) {
+                continue;
+            }
+
             // Deserialize the event.
             match format::deserialize_event(payload) {
                 Ok((event, _)) => {
@@ -226,21 +247,152 @@ impl<'a> Iterator for SegmentIterator<'a> {
     }
 }
 
-/// Like SegmentIterator but also yields the byte offset of each record's header.
-/// Used during index building to populate the position→offset table.
+/// Iterates over Raft entry markers in a segment, skipping event records.
+///
+/// Used by the log-as-state Raft log reader. Each item is `(byte_offset, RaftMarker)`
+/// so callers can build a `log_index → offset` map for efficient random access.
+pub struct RaftMarkerIterator<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Iterator for RaftMarkerIterator<'a> {
+    type Item = Result<(usize, format::RaftMarker), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.offset + RECORD_HEADER_SIZE > self.data.len() {
+                return None;
+            }
+
+            let header_start = self.offset;
+            let stored_crc = u32::from_le_bytes(
+                self.data[header_start..header_start + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let record_len = u32::from_le_bytes(
+                self.data[header_start + 4..header_start + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let flags_byte = self.data[header_start + 8];
+
+            if record_len == 0 {
+                return None;
+            }
+
+            let payload_len = record_len - 1;
+            let payload_start = header_start + RECORD_HEADER_SIZE;
+            let payload_end = payload_start + payload_len;
+
+            if payload_end > self.data.len() {
+                return None;
+            }
+
+            let payload = &self.data[payload_start..payload_end];
+
+            let computed_crc = {
+                let digest = crc32c::crc32c(&[flags_byte]);
+                crc32c::crc32c_append(digest, payload)
+            };
+            if computed_crc != stored_crc {
+                return Some(Err(Error::Corrupted {
+                    message: format!("CRC mismatch at offset {header_start}"),
+                }));
+            }
+
+            self.offset = payload_end;
+
+            if !flags::is_raft_marker(flags_byte) {
+                continue;
+            }
+
+            return Some(
+                format::deserialize_raft_marker(payload)
+                    .map(|(marker, _)| (header_start, marker)),
+            );
+        }
+    }
+}
+
+/// Like SegmentIterator but also yields the byte offset of each event record's header.
+/// Non-event records (Raft markers, etc.) are skipped; the offsets returned always
+/// refer to event records specifically. Used during index building.
 pub struct OffsetTrackingIterator<'a> {
-    inner: SegmentIterator<'a>,
+    data: &'a [u8],
+    offset: usize,
+    up_to: Option<Position>,
 }
 
 impl<'a> Iterator for OffsetTrackingIterator<'a> {
-    /// (byte_offset_of_record_header, Result<StoredEvent>)
+    /// (byte_offset_of_event_record_header, Result<StoredEvent>)
     type Item = (usize, Result<StoredEvent, Error>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Capture the offset BEFORE the inner iterator advances past the record.
-        let record_start = self.inner.offset;
-        let result = self.inner.next()?;
-        Some((record_start, result))
+        loop {
+            if self.offset + RECORD_HEADER_SIZE > self.data.len() {
+                return None;
+            }
+
+            let header_start = self.offset;
+            let stored_crc = u32::from_le_bytes(
+                self.data[header_start..header_start + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let record_len = u32::from_le_bytes(
+                self.data[header_start + 4..header_start + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let flags_byte = self.data[header_start + 8];
+
+            if record_len == 0 {
+                return None;
+            }
+
+            let payload_len = record_len - 1;
+            let payload_start = header_start + RECORD_HEADER_SIZE;
+            let payload_end = payload_start + payload_len;
+
+            if payload_end > self.data.len() {
+                return None;
+            }
+
+            let payload = &self.data[payload_start..payload_end];
+
+            let computed_crc = {
+                let digest = crc32c::crc32c(&[flags_byte]);
+                crc32c::crc32c_append(digest, payload)
+            };
+            if computed_crc != stored_crc {
+                return Some((
+                    header_start,
+                    Err(Error::Corrupted {
+                        message: format!("CRC mismatch at offset {header_start}"),
+                    }),
+                ));
+            }
+
+            self.offset = payload_end;
+
+            if !flags::is_event(flags_byte) {
+                continue;
+            }
+
+            match format::deserialize_event(payload) {
+                Ok((event, _)) => {
+                    if let Some(up_to) = self.up_to {
+                        if event.position >= up_to {
+                            return None;
+                        }
+                    }
+                    return Some((header_start, Ok(event)));
+                }
+                Err(e) => return Some((header_start, Err(e))),
+            }
+        }
     }
 }
 
@@ -269,7 +421,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Write events.
-        let mut writer = SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
         let events = vec![
             make_event("OrderPlaced", b"order-data"),
             make_event("PaymentReceived", b"payment-data"),
@@ -283,10 +435,10 @@ mod tests {
         let read_events: Vec<_> = reader.iter(None).collect::<Result<Vec<_>, _>>().unwrap();
 
         assert_eq!(read_events.len(), 2);
-        assert_eq!(read_events[0].position, Position(1));
+        assert_eq!(read_events[0].position, Position(0));
         assert_eq!(read_events[0].name, "OrderPlaced");
         assert_eq!(read_events[0].payload, b"order-data");
-        assert_eq!(read_events[1].position, Position(2));
+        assert_eq!(read_events[1].position, Position(1));
         assert_eq!(read_events[1].name, "PaymentReceived");
         assert_eq!(
             read_events[1].metadata,
@@ -298,7 +450,7 @@ mod tests {
     fn read_with_position_limit() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut writer = SegmentWriter::new(dir.path(), Position(1), DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
         for i in 0..5 {
             let event = make_event(&format!("Event{i}"), b"data");
             writer.append(&[event]).unwrap();
@@ -308,13 +460,13 @@ mod tests {
 
         let reader = SegmentReader::open(&seg_path).unwrap();
 
-        // Read only events with position < 3 (so positions 1 and 2).
+        // Read only events with position < 2 (so positions 0 and 1).
         let read_events: Vec<_> = reader
-            .iter(Some(Position(3)))
+            .iter(Some(Position(2)))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(read_events.len(), 2);
-        assert_eq!(read_events[0].position, Position(1));
-        assert_eq!(read_events[1].position, Position(2));
+        assert_eq!(read_events[0].position, Position(0));
+        assert_eq!(read_events[1].position, Position(1));
     }
 }

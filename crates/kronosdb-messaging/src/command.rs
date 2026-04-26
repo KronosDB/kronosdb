@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use tokio::sync::oneshot;
 
@@ -92,17 +92,21 @@ pub struct PendingCommand {
 
 /// The command bus. Routes commands to registered handlers.
 ///
-/// Thread-safe. The handler registry is behind a RwLock.
-/// Pending commands (waiting for responses) are tracked in a separate map.
+/// Thread-safe. The handler registry stays behind a RwLock (subscribe/
+/// unsubscribe are rare, dispatch reads are frequent and parallel — a
+/// RwLock is the right fit). Pending dispatches and per-type metrics
+/// live in sharded DashMaps so concurrent dispatch/complete paths
+/// don't contend on a single mutex.
 pub struct CommandBus {
     handlers: RwLock<HandlerRegistry>,
     /// Commands that have been dispatched and are awaiting responses.
-    /// Keyed by the command's message_id → (sender, command_name, dispatched_at).
-    pending: RwLock<HashMap<String, (oneshot::Sender<CommandResult>, String, Instant)>>,
+    /// Keyed by message_id → (sender, command_name, dispatched_at).
+    pending: DashMap<String, (oneshot::Sender<CommandResult>, String, Instant)>,
     /// Round-robin counter for load balancing.
     dispatch_counter: AtomicU64,
-    /// Per-command-type dispatch metrics. Lock-free atomics inside.
-    metrics: RwLock<HashMap<String, MessageTypeMetrics>>,
+    /// Per-command-type dispatch metrics. Lock-free atomic counters
+    /// inside the value; DashMap shards the key-level insert contention.
+    metrics: DashMap<String, MessageTypeMetrics>,
 }
 
 impl Default for CommandBus {
@@ -115,9 +119,9 @@ impl CommandBus {
     pub fn new() -> Self {
         Self {
             handlers: RwLock::new(HandlerRegistry::new()),
-            pending: RwLock::new(HashMap::new()),
+            pending: DashMap::new(),
             dispatch_counter: AtomicU64::new(0),
-            metrics: RwLock::new(HashMap::new()),
+            metrics: DashMap::new(),
         }
     }
 
@@ -249,14 +253,14 @@ impl CommandBus {
     pub fn handler_details(&self) -> Vec<MessageTypeDetail> {
         let handlers = self.handlers.read();
         let details = handlers.handler_details();
-        let metrics = self.metrics.read();
 
         details
             .into_iter()
             .map(|(name, handlers)| {
-                let snapshot = metrics
+                let snapshot = self
+                    .metrics
                     .get(&name)
-                    .map(|m| m.snapshot())
+                    .map(|m| m.value().snapshot())
                     .unwrap_or_else(MetricsSnapshot::empty);
                 MessageTypeDetail {
                     name,
@@ -270,12 +274,11 @@ impl CommandBus {
     /// Completes a pending command with a response from the handler.
     /// Called when the handler sends a CommandResult back on its stream.
     pub fn complete(&self, request_id: &str, result: CommandResult) {
-        let mut pending = self.pending.write();
-        if let Some((tx, command_name, dispatched_at)) = pending.remove(request_id) {
+        if let Some((_, (tx, command_name, dispatched_at))) = self.pending.remove(request_id) {
             let duration_us = dispatched_at.elapsed().as_micros() as u64;
             let is_error = result.error_code.is_some();
 
-            if let Some(m) = self.metrics.read().get(&command_name) {
+            if let Some(m) = self.metrics.get(&command_name) {
                 m.total_duration_us
                     .fetch_add(duration_us, Ordering::Relaxed);
                 if is_error {
@@ -293,7 +296,7 @@ impl CommandBus {
     /// Called when a response comes back from a handler.
     pub fn record_completion(&self, command_name: &str, is_error: bool, duration_us: u64) {
         self.get_or_create_metrics(command_name);
-        if let Some(m) = self.metrics.read().get(command_name) {
+        if let Some(m) = self.metrics.get(command_name) {
             m.total_duration_us
                 .fetch_add(duration_us, Ordering::Relaxed);
             if is_error {
@@ -307,31 +310,28 @@ impl CommandBus {
     // ── Metrics helpers (cheap — just atomic increments) ────────────
 
     fn get_or_create_metrics(&self, name: &str) {
-        // Fast path: already exists.
-        if self.metrics.read().contains_key(name) {
-            return;
-        }
-        // Slow path: insert.
-        self.metrics.write().entry(name.to_string()).or_default();
+        // DashMap entry() is shard-level sharded; fast path is just a
+        // hash + one sharded lookup.
+        self.metrics.entry(name.to_string()).or_default();
     }
 
     fn record_dispatched(&self, name: &str) {
         self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.read().get(name) {
+        if let Some(m) = self.metrics.get(name) {
             m.dispatched.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn record_no_handler(&self, name: &str) {
         self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.read().get(name) {
+        if let Some(m) = self.metrics.get(name) {
             m.no_handler.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn record_no_permits(&self, name: &str) {
         self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.read().get(name) {
+        if let Some(m) = self.metrics.get(name) {
             m.no_permits.fetch_add(1, Ordering::Relaxed);
         }
     }
