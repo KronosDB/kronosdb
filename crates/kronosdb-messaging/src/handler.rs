@@ -58,11 +58,7 @@ impl MessageTypeMetrics {
             failed,
             no_handler,
             no_permits,
-            avg_duration_us: if completed > 0 {
-                total_duration_us / completed
-            } else {
-                0
-            },
+            avg_duration_us: total_duration_us.checked_div(completed).unwrap_or(0),
             success_rate: if completed > 0 {
                 (succeeded as f64 / completed as f64) * 100.0
             } else {
