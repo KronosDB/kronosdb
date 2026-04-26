@@ -200,8 +200,8 @@ fn inspect(opts: &Options) -> Result<(), String> {
         println!("  position_range:    [{first}, {last}]");
     }
     println!("  total_payload:     {total_payload_bytes} bytes");
-    if total > 0 {
-        println!("  avg_payload:       {} bytes", total_payload_bytes / total);
+    if let Some(avg) = total_payload_bytes.checked_div(total) {
+        println!("  avg_payload:       {avg} bytes");
     }
     println!("  unique_event_types: {}", unique_names.len());
     if !unique_names.is_empty() && total > 0 {
