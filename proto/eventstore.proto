@@ -12,8 +12,11 @@ service EventStore {
   rpc Source (SourceRequest) returns (stream SourceResponse);
 
   /* Provides an infinite stream of events matching the given criteria.
-     Stays open and pushes new events as they are appended. */
-  rpc Stream (StreamRequest) returns (stream StreamResponse);
+     Stays open and pushes new events as they are appended.
+     Bidirectional with permit-based flow control: the first client message
+     carries the criteria and initial permits. Subsequent messages grant
+     additional permits. The server only sends events when permits > 0. */
+  rpc Stream (stream StreamControl) returns (stream StreamResponse);
 
   /* Gets the current head of the event store (next position to be assigned). */
   rpc GetHead (GetHeadRequest) returns (GetHeadResponse);
@@ -121,18 +124,50 @@ message SourceResponse {
   }
 }
 
-/* Request for an infinite event stream matching criteria. */
-message StreamRequest {
+/* Client-to-server messages on the Stream RPC.
+   The first message MUST be a Subscribe; subsequent messages grant permits. */
+message StreamControl {
+  oneof request {
+    /* Initial subscription — sent once to start the stream. */
+    StreamSubscribe subscribe = 1;
+    /* Grant additional permits — server may send one event per permit. */
+    StreamPermits permits = 2;
+  }
+}
+
+/* Opens the event stream with criteria and initial permits. */
+message StreamSubscribe {
   /* Inclusive starting sequence position. */
   int64 from_sequence = 1;
   /* Criteria to filter events. If empty, all events are streamed. */
   repeated Criterion criteria = 2;
+  /* Initial number of permits. The server will send at most this many events
+     before waiting for more permits. Must be > 0. */
+  int64 initial_permits = 3;
+  /* Optional: event type names to exclude from the stream.
+     Events matching any of these names are silently skipped (payload blacklisting). */
+  repeated string blacklisted_names = 4;
 }
 
-/* A matching event from the infinite stream. */
-message StreamResponse {
-  SequencedEvent event = 1;
+/* Grants additional permits on an active stream. */
+message StreamPermits {
+  /* Number of additional permits to grant. */
+  int64 permits = 1;
 }
+
+/* A message on the event stream — either a matching event or a keep-alive heartbeat. */
+message StreamResponse {
+  oneof result {
+    /* A matching event with its sequence. */
+    SequencedEvent event = 1;
+    /* Server heartbeat — sent periodically to detect slow/dead consumers.
+       Clients should ignore this (no response needed). */
+    StreamHeartbeat heartbeat = 2;
+  }
+}
+
+/* Keep-alive heartbeat on event streams. */
+message StreamHeartbeat {}
 
 message GetHeadRequest {}
 
