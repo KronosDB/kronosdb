@@ -157,41 +157,103 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
     async fn stream(
         &self,
-        request: Request<pb::StreamRequest>,
+        request: Request<Streaming<pb::StreamControl>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
         let context_name = Self::extract_context(&request).to_string();
-        let req = request.into_inner();
-        let from_position = Position(req.from_sequence as u64);
-        let condition = from_proto_criteria(req.criteria);
+        let mut inbound = request.into_inner();
 
+        // First inbound message MUST be a Subscribe; protocol violation otherwise.
+        let first = inbound
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("stream recv: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("stream closed before subscribe"))?;
+        let subscribe = match first.request {
+            Some(pb::stream_control::Request::Subscribe(s)) => s,
+            Some(pb::stream_control::Request::Permits(_)) => {
+                return Err(Status::invalid_argument(
+                    "first stream message must be subscribe, got permits",
+                ));
+            }
+            None => return Err(Status::invalid_argument("empty stream control message")),
+        };
+        if subscribe.initial_permits <= 0 {
+            return Err(Status::invalid_argument("initial_permits must be > 0"));
+        }
+
+        let from_position = Position(subscribe.from_sequence as u64);
+        let condition = from_proto_criteria(subscribe.criteria);
+        let blacklist: std::collections::HashSet<String> =
+            subscribe.blacklisted_names.into_iter().collect();
         let store = self.get_store(&context_name)?;
         let mut event_stream = store.subscribe(from_position, condition.clone());
 
         let (tx, rx) = mpsc::channel(128);
+        let permits = Arc::new(tokio::sync::Semaphore::new(
+            subscribe.initial_permits as usize,
+        ));
 
+        // Task: drain inbound StreamControl messages and add permits.
+        let permits_in = Arc::clone(&permits);
+        let tx_in = tx.clone();
         tokio::spawn(async move {
-            // First: send historical events.
+            loop {
+                match inbound.message().await {
+                    Ok(Some(msg)) => match msg.request {
+                        Some(pb::stream_control::Request::Permits(p)) if p.permits > 0 => {
+                            permits_in.add_permits(p.permits as usize);
+                        }
+                        Some(pb::stream_control::Request::Permits(_)) => {} // <=0 ignored
+                        Some(pb::stream_control::Request::Subscribe(_)) => {
+                            let _ = tx_in
+                                .send(Err(Status::invalid_argument(
+                                    "duplicate subscribe on active stream",
+                                )))
+                                .await;
+                            return;
+                        }
+                        None => {} // unknown oneof variant — ignore
+                    },
+                    Ok(None) => return, // client half-closed
+                    Err(_) => return,   // transport error
+                }
+            }
+        });
+
+        // Task: 15s heartbeat keep-alive. Spurious heartbeats during event flow
+        // are explicitly allowed by the protocol; clients ignore them.
+        let tx_hb = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // first tick fires immediately — skip it
+            loop {
+                tick.tick().await;
+                let response = pb::StreamResponse {
+                    result: Some(pb::stream_response::Result::Heartbeat(
+                        pb::StreamHeartbeat {},
+                    )),
+                };
+                if tx_hb.send(Ok(response)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Task: producer — historical replay, then live tail. Each event acquires
+        // one permit before send. Blacklisted events are silently dropped without
+        // consuming a permit.
+        let permits_p = Arc::clone(&permits);
+        tokio::spawn(async move {
+            // Historical replay.
             let historical = {
                 let store2 = Arc::clone(&store);
                 let condition = condition.clone();
                 let cursor = event_stream.cursor;
                 tokio::task::spawn_blocking(move || store2.source(cursor, &condition)).await
             };
-
-            match historical {
-                Ok(Ok(events)) => {
-                    for event in &events {
-                        let response = pb::StreamResponse {
-                            event: Some(to_proto_sequenced_event(event)),
-                        };
-                        if tx.send(Ok(response)).await.is_err() {
-                            return;
-                        }
-                    }
-                    if let Some(last) = events.last() {
-                        event_stream.advance_cursor(Position(last.position.0 + 1));
-                    }
-                }
+            let events = match historical {
+                Ok(Ok(events)) => events,
                 Ok(Err(e)) => {
                     let _ = tx.send(Err(to_status(e))).await;
                     return;
@@ -202,33 +264,39 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         .await;
                     return;
                 }
+            };
+            for event in &events {
+                if blacklist.contains(&event.name) {
+                    continue;
+                }
+                let Ok(p) = permits_p.acquire().await else {
+                    return;
+                };
+                p.forget();
+                let response = pb::StreamResponse {
+                    result: Some(pb::stream_response::Result::Event(
+                        to_proto_sequenced_event(event),
+                    )),
+                };
+                if tx.send(Ok(response)).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(last) = events.last() {
+                event_stream.advance_cursor(Position(last.position.0 + 1));
             }
 
-            // Then: live tail.
+            // Live tail.
             loop {
                 let _committed = event_stream.wait_for_new_events().await;
-
                 let new_events = {
                     let store2 = Arc::clone(&store);
                     let condition = condition.clone();
                     let cursor = event_stream.cursor;
                     tokio::task::spawn_blocking(move || store2.source(cursor, &condition)).await
                 };
-
-                match new_events {
-                    Ok(Ok(events)) => {
-                        for event in &events {
-                            let response = pb::StreamResponse {
-                                event: Some(to_proto_sequenced_event(event)),
-                            };
-                            if tx.send(Ok(response)).await.is_err() {
-                                return;
-                            }
-                        }
-                        if let Some(last) = events.last() {
-                            event_stream.advance_cursor(Position(last.position.0 + 1));
-                        }
-                    }
+                let events = match new_events {
+                    Ok(Ok(events)) => events,
                     Ok(Err(e)) => {
                         let _ = tx.send(Err(to_status(e))).await;
                         return;
@@ -239,6 +307,26 @@ impl pb::event_store_server::EventStore for EventStoreService {
                             .await;
                         return;
                     }
+                };
+                for event in &events {
+                    if blacklist.contains(&event.name) {
+                        continue;
+                    }
+                    let Ok(p) = permits_p.acquire().await else {
+                        return;
+                    };
+                    p.forget();
+                    let response = pb::StreamResponse {
+                        result: Some(pb::stream_response::Result::Event(
+                            to_proto_sequenced_event(event),
+                        )),
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        return;
+                    }
+                }
+                if let Some(last) = events.last() {
+                    event_stream.advance_cursor(Position(last.position.0 + 1));
                 }
             }
         });
