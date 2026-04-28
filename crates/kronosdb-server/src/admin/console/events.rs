@@ -6,7 +6,7 @@ use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
 use kronosdb_eventstore::event::{Position, StoredEvent, Tag};
 
 use crate::admin::AdminState;
-use crate::admin::layout::{self, format_number, format_timestamp, html_escape, try_utf8_preview};
+use crate::admin::layout::{self, format_number, format_timestamp, html_escape};
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -96,9 +96,10 @@ pub async fn page(
 
 <script>
 var evCurrentPage = 1;
+var evExpandedPositions = {{}};
 
 // Live by default on page 1
-var evLiveInterval = setInterval(function() {{ evQuery(1); }}, 3000);
+var evLiveInterval = setInterval(function() {{ evLiveRefresh(); }}, 3000);
 
 function evBuildUrl(page) {{
   var p = new URLSearchParams();
@@ -112,11 +113,21 @@ function evBuildUrl(page) {{
   return '/fragments/events?' + p.toString();
 }}
 
+function evLiveRefresh() {{
+  // Skip live refresh if any event details are expanded
+  if (Object.keys(evExpandedPositions).length > 0) return;
+  evQuery(evCurrentPage);
+}}
+
 function evQuery(page) {{
   evCurrentPage = page || 1;
   fetch(evBuildUrl(evCurrentPage))
     .then(r => r.text())
-    .then(html => {{ document.getElementById('events-results').innerHTML = html; }});
+    .then(html => {{
+      document.getElementById('events-results').innerHTML = html;
+      evRestoreExpanded();
+      evSetLive(!!evLiveInterval);
+    }});
 }}
 
 function evAddFilter(type, value) {{
@@ -131,6 +142,7 @@ function evAddFilter(type, value) {{
       el.value = value;
     }}
   }}
+  evExpandedPositions = {{}};
   evQuery(1);
 }}
 
@@ -139,14 +151,34 @@ function evToggle(row) {{
   if (detail && detail.classList.contains('ev-detail')) {{
     var hidden = detail.classList.toggle('hidden');
     row.style.background = hidden ? '' : 'var(--c-hover)';
+    // Track expanded state by position
+    var pos = row.querySelector('td')?.textContent?.trim();
+    if (pos) {{
+      if (hidden) {{ delete evExpandedPositions[pos]; }}
+      else {{ evExpandedPositions[pos] = true; }}
+    }}
   }}
+}}
+
+function evRestoreExpanded() {{
+  var rows = document.querySelectorAll('#events-results tbody tr:not(.ev-detail)');
+  rows.forEach(function(row) {{
+    var pos = row.querySelector('td')?.textContent?.trim();
+    if (pos && evExpandedPositions[pos]) {{
+      var detail = row.nextElementSibling;
+      if (detail && detail.classList.contains('ev-detail')) {{
+        detail.classList.remove('hidden');
+        row.style.background = 'var(--c-hover)';
+      }}
+    }}
+  }});
 }}
 
 function evSetLive(on) {{
   var btn = document.getElementById('ev-live-btn');
   if (!btn) return;
   if (on && !evLiveInterval) {{
-    evLiveInterval = setInterval(function() {{ evQuery(1); }}, 3000);
+    evLiveInterval = setInterval(function() {{ evLiveRefresh(); }}, 3000);
   }} else if (!on && evLiveInterval) {{
     clearInterval(evLiveInterval);
     evLiveInterval = null;
@@ -168,6 +200,7 @@ function evToggleLive() {{
 
 // Pause live when navigating away from page 1
 function evPage(page) {{
+  evExpandedPositions = {{}};
   if (page !== 1) evSetLive(false);
   evQuery(page);
 }}
@@ -216,6 +249,8 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
         Err(_) => return events_error_html(&format!("Context '{}' not found", context)),
     };
 
+    // head = next write position (exclusive). Events span [tail, head-1] inclusive
+    // and are contiguous: tail, tail+1, ..., head-1.
     let head = store.head().0;
     let tail = store.tail().0;
     let total_events = if head > tail { head - tail } else { 0 };
@@ -231,21 +266,18 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
     let page = params.page.unwrap_or(1).max(1);
     let condition = build_condition(params);
 
-    // For newest-first: we need to compute the right window.
-    // Fetch from tail, get all matching, then paginate in reverse.
-    // For large stores this would be expensive, so instead we compute
-    // the position window from the end.
     let has_filter = params.name.as_ref().is_some_and(|n| !n.is_empty())
         || params.tag.as_ref().is_some_and(|t| !t.is_empty());
 
     if has_filter {
-        // With filters: fetch forward from tail, reverse for display, paginate.
-        // We fetch more than needed to support pagination.
+        // With filters we can't compute position windows (matching events are sparse).
+        // Fetch page*limit events, paginate the result. This scales to the page depth,
+        // not the total store size — acceptable for filtered browsing.
         let fetch_limit = limit * page as usize;
-        let from = Position(tail.max(1));
+        let from = Position(tail);
         match store.source_stored(from, &condition, fetch_limit) {
             Ok(mut events) => {
-                events.reverse(); // newest first
+                events.reverse();
                 let total_matching = events.len();
                 let skip = (page as usize - 1) * limit;
                 let page_events: Vec<StoredEvent> =
@@ -264,28 +296,34 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
             Err(e) => events_error_html(&format!("Query failed: {e}")),
         }
     } else {
-        // No filter: compute position window from the end for efficient pagination.
+        // No filter: positions are contiguous, so compute an exact window.
+        // Last event = head - 1. Page 1 shows [head-limit, head-1], newest first.
+        let last = head - 1; // last event position (inclusive)
         let skip_from_end = (page - 1) * limit as u64;
-        let from_pos = if head > skip_from_end + limit as u64 {
-            head - skip_from_end - limit as u64
+
+        // Newest event on this page
+        let page_top = if last >= skip_from_end {
+            last - skip_from_end
         } else {
-            tail.max(1)
+            return r#"<div class="text-center text-k-muted py-8 text-xs">No events on this page</div>"#.to_string();
         };
 
-        let fetch_count = if head > skip_from_end {
-            let available = head - from_pos;
-            (available as usize).min(limit)
-        } else {
-            0
-        };
-
-        if fetch_count == 0 {
+        if page_top < tail {
             return r#"<div class="text-center text-k-muted py-8 text-xs">No events on this page</div>"#.to_string();
         }
 
-        match store.source_stored(Position(from_pos), &condition, fetch_count) {
+        // Oldest event on this page, clamped to tail
+        let page_bottom = if page_top + 1 >= limit as u64 {
+            (page_top + 1 - limit as u64).max(tail)
+        } else {
+            tail
+        };
+
+        let fetch_count = (page_top - page_bottom + 1) as usize;
+
+        match store.source_stored(Position(page_bottom), &condition, fetch_count) {
             Ok(mut events) => {
-                events.reverse(); // newest first
+                events.reverse();
                 let total_pages = (total_events as usize + limit - 1) / limit;
                 events_table_html(
                     &events,
@@ -335,15 +373,26 @@ fn events_table_html(
 
         // Detail row (expanded, hidden by default)
         let payload_html = if event.payload.is_empty() {
-            r#"<span class="text-k-muted italic">empty</span>"#.to_string()
+            r#"<span class="text-k-muted italic text-xs">empty</span>"#.to_string()
         } else {
-            let preview = try_utf8_preview(&event.payload, 4096);
-            // Try to pretty-print JSON
-            let formatted = try_pretty_json(&preview);
-            format!(
-                r#"<div class="bg-k-elevated border border-k-subtle rounded-[5px] p-3.5 font-mono text-xs leading-relaxed overflow-auto max-h-[300px] whitespace-pre">{}</div>"#,
-                html_escape(&formatted),
-            )
+            // Parse JSON from raw bytes — NOT from html-escaped preview
+            match serde_json::from_slice::<serde_json::Value>(&event.payload) {
+                Ok(val) => {
+                    let pretty = serde_json::to_string_pretty(&val)
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&event.payload).into_owned());
+                    format!(
+                        r#"<div class="bg-k-elevated border border-k-subtle rounded-[5px] p-3.5 font-mono text-xs leading-relaxed overflow-auto max-h-[400px] whitespace-pre-wrap break-words">{}</div>"#,
+                        html_escape_content(&pretty),
+                    )
+                }
+                Err(_) => {
+                    let size = event.payload.len();
+                    format!(
+                        r#"<span class="text-k-muted italic text-xs">non-JSON payload ({} bytes)</span>"#,
+                        size,
+                    )
+                }
+            }
         };
 
         // Tags
@@ -384,19 +433,15 @@ fn events_table_html(
 
         rows.push_str(&format!(
             r#"<tr class="ev-detail hidden"><td colspan="4" class="!p-0">
-  <div class="flex gap-4 p-4 bg-k-base">
-    <div class="flex-1">
-      <div class="text-[11px] font-semibold uppercase tracking-wider text-k-muted mb-2.5">Payload</div>
-      {payload}
-    </div>
-    <div class="flex-1">
+  <div class="flex flex-wrap gap-4 p-4 bg-k-base">
+    <div class="min-w-[220px]" style="flex: 0 0 280px;">
       <div class="text-[11px] font-semibold uppercase tracking-wider text-k-muted mb-2.5">Event Details</div>
       <div class="flex flex-col gap-1.5 text-xs">
-        <div class="flex justify-between"><span class="text-k-muted font-medium">Position</span><span class="font-mono text-k-text2">{position}</span></div>
-        <div class="flex justify-between"><span class="text-k-muted font-medium">Identifier</span><span class="font-mono text-k-text2">{identifier}</span></div>
-        <div class="flex justify-between"><span class="text-k-muted font-medium">Name</span><span class="font-mono text-k-gold cursor-pointer hover:underline" {name_click}>{name}</span></div>
-        <div class="flex justify-between"><span class="text-k-muted font-medium">Version</span><span class="font-mono text-k-text2">{version}</span></div>
-        <div class="flex justify-between"><span class="text-k-muted font-medium">Timestamp</span><span class="font-mono text-k-text2">{timestamp}</span></div>
+        <div class="flex justify-between gap-3"><span class="text-k-muted font-medium whitespace-nowrap">Position</span><span class="font-mono text-k-text2 text-right break-all">{position}</span></div>
+        <div class="flex justify-between gap-3"><span class="text-k-muted font-medium whitespace-nowrap">Identifier</span><span class="font-mono text-k-text2 text-right break-all">{identifier}</span></div>
+        <div class="flex justify-between gap-3"><span class="text-k-muted font-medium whitespace-nowrap">Name</span><span class="font-mono text-k-gold cursor-pointer hover:underline text-right break-all" {name_click}>{name}</span></div>
+        <div class="flex justify-between gap-3"><span class="text-k-muted font-medium whitespace-nowrap">Version</span><span class="font-mono text-k-text2 text-right break-all">{version}</span></div>
+        <div class="flex justify-between gap-3"><span class="text-k-muted font-medium whitespace-nowrap">Timestamp</span><span class="font-mono text-k-text2 text-right break-all">{timestamp}</span></div>
       </div>
       <div class="mt-3.5">
         <div class="text-[11px] font-semibold uppercase tracking-wider text-k-muted mb-2">Metadata</div>
@@ -406,6 +451,10 @@ fn events_table_html(
         <div class="text-[11px] font-semibold uppercase tracking-wider text-k-muted mb-2">Tags</div>
         <div class="flex gap-1.5 flex-wrap">{tags}</div>
       </div>
+    </div>
+    <div class="flex-1 min-w-0">
+      <div class="text-[11px] font-semibold uppercase tracking-wider text-k-muted mb-2.5">Payload</div>
+      {payload}
     </div>
   </div>
 </td></tr>"#,
@@ -534,10 +583,17 @@ fn events_error_html(message: &str) -> String {
     )
 }
 
-fn try_pretty_json(s: &str) -> String {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(s) {
-        serde_json::to_string_pretty(&val).unwrap_or_else(|_| s.to_string())
-    } else {
-        s.to_string()
+/// Escape only `<`, `>`, and `&` for use inside HTML element content.
+/// Preserves quotes so JSON renders naturally.
+fn html_escape_content(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
     }
+    out
 }
