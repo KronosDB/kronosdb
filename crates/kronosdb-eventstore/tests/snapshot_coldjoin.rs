@@ -233,8 +233,8 @@ async fn snapshot_coldjoin_apply_consistency() {
         .with_context("default", |engine| {
             assert_eq!(
                 engine.head(),
-                Position(1),
-                "node3 starts empty — head is sentinel 1 before any events"
+                Position(0),
+                "node3 starts empty — head is 0 before any events"
             );
             Ok(())
         })

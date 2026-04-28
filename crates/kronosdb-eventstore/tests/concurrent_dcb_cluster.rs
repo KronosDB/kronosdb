@@ -300,11 +300,10 @@ async fn run_three_node_workload() {
     );
 
     // Wait for all nodes to replicate to the expected head.
-    // Head semantics in this crate: `head()` == next position to be written,
-    // so after N successful appends the head is Position(N + 1). See
-    // cluster_test.rs::three_node_cluster_replication for the same convention
-    // (3 appends → head >= 4).
-    let expected_head = Position((AGGREGATES as u64) + 1);
+    // Head semantics in this crate: `head()` == next position to be written
+    // (0-based, next-exclusive), so after N successful single-event appends
+    // the head is Position(N).
+    let expected_head = Position(AGGREGATES as u64);
     for node in [&node1, &node2, &node3] {
         assert!(
             wait_for_head(&node.contexts, expected_head, Duration::from_secs(10)).await,

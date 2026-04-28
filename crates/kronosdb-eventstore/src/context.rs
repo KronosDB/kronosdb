@@ -325,7 +325,7 @@ mod tests {
         // Read from the context.
         manager
             .with_context("orders", |store| {
-                assert_eq!(store.head(), Position(2));
+                assert_eq!(store.head(), Position(1));
                 Ok(())
             })
             .unwrap();
@@ -353,7 +353,7 @@ mod tests {
         // Payments should be empty.
         manager
             .with_context("payments", |store| {
-                assert_eq!(store.head(), Position(1));
+                assert_eq!(store.head(), Position(0));
                 Ok(())
             })
             .unwrap();
@@ -361,7 +361,7 @@ mod tests {
         // Orders should have one event.
         manager
             .with_context("orders", |store| {
-                assert_eq!(store.head(), Position(2));
+                assert_eq!(store.head(), Position(1));
                 Ok(())
             })
             .unwrap();
@@ -432,7 +432,7 @@ mod tests {
 
             manager
                 .with_context("orders", |store| {
-                    assert_eq!(store.head(), Position(2));
+                    assert_eq!(store.head(), Position(1));
                     Ok(())
                 })
                 .unwrap();
