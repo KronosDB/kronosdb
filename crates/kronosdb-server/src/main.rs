@@ -215,7 +215,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
     use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer;
 
-    // Configure TLS if cert and key are provided.
+    // Configure TLS and gRPC keepalive. Aggressive cadence (2.5s ping,
+    // 5s timeout) keeps idle connector streams from being silently dropped
+    // by middleboxes; tonic delegates the actual PING handling to h2.
+    let make_builder = || {
+        Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_millis(2500)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(5)))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .http2_adaptive_window(Some(true))
+    };
+
     let mut server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key)
     {
         let cert = std::fs::read(cert_path)
@@ -234,12 +244,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("mTLS enabled (client certificate verification)");
         }
 
-        Server::builder().tls_config(tls)?
+        make_builder().tls_config(tls)?
     } else {
         if config.tls_cert.is_some() || config.tls_key.is_some() {
             warn!("both --tls-cert and --tls-key must be set for TLS; running without TLS");
         }
-        Server::builder()
+        make_builder()
     };
 
     // Build gRPC router with auth interceptor on client-facing services.
@@ -279,8 +289,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cr.request_reconnect_all().await;
     };
 
+    // Bind with SO_REUSEADDR so restarts don't fail with "address already in use".
+    let listener = {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(config.listen_addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&config.listen_addr.into())?;
+        socket.listen(1024)?;
+        let std_listener: std::net::TcpListener = socket.into();
+        tokio::net::TcpListener::from_std(std_listener)?
+    };
+
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     router
-        .serve_with_shutdown(config.listen_addr, shutdown)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;
 
     info!("KronosDB shut down gracefully");
