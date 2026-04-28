@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{
@@ -93,8 +95,8 @@ impl CommandDispatcher for MessagingEngine {
         self.command_bus.unsubscribe(command_name, client_id);
     }
 
-    fn remove_command_client(&self, client_id: &ClientId) {
-        self.command_bus.remove_client(client_id);
+    fn remove_command_client(&self, client_id: &ClientId) -> Vec<String> {
+        self.command_bus.remove_client(client_id)
     }
 
     fn grant_command_permits(&self, client_id: &ClientId, permits: i64) {
@@ -106,6 +108,22 @@ impl CommandDispatcher for MessagingEngine {
         command: Command,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
         self.command_bus.dispatch(command)
+    }
+
+    fn complete_command(&self, request_id: &str, result: CommandResult) {
+        self.command_bus.complete(request_id, result);
+    }
+
+    fn cancel_in_flight_command(&self, message_id: &str) {
+        self.command_bus.cancel_in_flight(message_id);
+    }
+
+    fn sweep_command_timeouts(&self, timeout: Duration) -> Vec<String> {
+        self.command_bus.sweep_timeouts(timeout)
+    }
+
+    fn in_flight_command_count(&self) -> usize {
+        self.command_bus.in_flight_count()
     }
 }
 
@@ -159,10 +177,11 @@ impl SubscriptionQueryDispatcher for MessagingEngine {
 }
 
 impl MessagingPlatform for MessagingEngine {
-    fn remove_client(&self, client_id: &ClientId) {
-        self.command_bus.remove_client(client_id);
+    fn remove_client(&self, client_id: &ClientId) -> Vec<String> {
+        let cancelled = self.command_bus.remove_client(client_id);
         self.query_bus.remove_client(client_id);
         self.subscriptions.remove_client(client_id);
+        cancelled
     }
 }
 

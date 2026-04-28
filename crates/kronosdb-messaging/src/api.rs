@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::{mpsc, oneshot};
 
 use crate::command::{Command, CommandError, CommandResult, PendingCommand};
@@ -22,8 +24,10 @@ pub trait CommandDispatcher: Send + Sync {
     /// Unregisters a command handler.
     fn unsubscribe_command(&self, command_name: &str, client_id: &ClientId);
 
-    /// Removes all command subscriptions for a disconnected client.
-    fn remove_command_client(&self, client_id: &ClientId);
+    /// Removes all command subscriptions for a disconnected client and
+    /// cancels any in-flight commands routed to it. Returns the cancelled
+    /// command message_ids for logging.
+    fn remove_command_client(&self, client_id: &ClientId) -> Vec<String>;
 
     /// Grants flow control permits to a command handler.
     fn grant_command_permits(&self, client_id: &ClientId, permits: i64);
@@ -34,6 +38,19 @@ pub trait CommandDispatcher: Send + Sync {
         &self,
         command: Command,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError>;
+
+    /// Completes a pending command with a response from the handler.
+    fn complete_command(&self, request_id: &str, result: CommandResult);
+
+    /// Cancels a single in-flight command (caller-side timeout / abandon).
+    fn cancel_in_flight_command(&self, message_id: &str);
+
+    /// Sweeps in-flight commands older than `timeout`. Each receives a
+    /// `KRONOSDB-4005` failure. Returns the swept message_ids.
+    fn sweep_command_timeouts(&self, timeout: Duration) -> Vec<String>;
+
+    /// Returns the number of in-flight commands.
+    fn in_flight_command_count(&self) -> usize;
 }
 
 /// The query bus interface.
@@ -92,6 +109,8 @@ pub trait SubscriptionQueryDispatcher: Send + Sync {
 pub trait MessagingPlatform:
     CommandDispatcher + QueryDispatcher + SubscriptionQueryDispatcher
 {
-    /// Removes all subscriptions for a disconnected client (commands, queries, subscriptions).
-    fn remove_client(&self, client_id: &ClientId);
+    /// Removes all subscriptions for a disconnected client (commands, queries,
+    /// subscriptions) and cancels any in-flight commands routed to it.
+    /// Returns the cancelled command message_ids.
+    fn remove_client(&self, client_id: &ClientId) -> Vec<String>;
 }

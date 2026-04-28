@@ -4,6 +4,7 @@ mod admin;
 mod auth;
 mod config;
 mod eventstore;
+mod handler_registry;
 mod messaging;
 mod platform;
 mod processor;
@@ -127,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_registry = Arc::new(ClientRegistry::new());
     let channel_registry = Arc::new(ClientChannelRegistry::new());
     let processor_registry = Arc::new(processor::ProcessorRegistry::new());
+    let handler_stream_registry = Arc::new(handler_registry::HandlerStreamRegistry::new());
 
     // Build gRPC services.
     let event_store_service = EventStoreService::new(Arc::clone(&cluster));
@@ -134,10 +136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command_service = CommandServiceImpl::new(
         Arc::clone(&messaging),
         Duration::from_secs(config.command_timeout_secs),
+        Arc::clone(&channel_registry),
+        Arc::clone(&handler_stream_registry),
     );
     let query_service = QueryServiceImpl::new(
         Arc::clone(&messaging),
         Duration::from_secs(config.query_timeout_secs),
+        Arc::clone(&channel_registry),
+        Arc::clone(&handler_stream_registry),
     );
 
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
@@ -153,6 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&client_registry),
         Arc::clone(&channel_registry),
         Arc::clone(&processor_registry),
+        Arc::clone(&messaging),
+        Arc::clone(&handler_stream_registry),
         default_platform.clone(),
         context_names,
         config.node_name.clone(),
@@ -166,6 +174,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_platform,
         heartbeat_timeout,
     );
+
+    // Background safety-net sweep: any in-flight command older than 2× the
+    // per-request timeout gets a KRONOSDB-4005 failure. The dispatch RPC
+    // already enforces command_timeout per request, but the sweep catches
+    // any leaks (e.g. caller dropped without timeout firing).
+    let sweep_messaging = Arc::clone(&messaging);
+    let sweep_timeout = Duration::from_secs(config.command_timeout_secs.saturating_mul(2));
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await; // first tick fires immediately — discard.
+        loop {
+            interval.tick().await;
+            for ctx_name in sweep_messaging.list_contexts() {
+                let platform = sweep_messaging.get_platform(&ctx_name);
+                let swept = platform.sweep_command_timeouts(sweep_timeout);
+                if !swept.is_empty() {
+                    warn!(
+                        context = %ctx_name,
+                        swept = swept.len(),
+                        "command sweep: cancelled in-flight commands past deadline"
+                    );
+                }
+            }
+        }
+    });
 
     // Start admin HTTP server in the background.
     let admin_state = admin::AdminState {
