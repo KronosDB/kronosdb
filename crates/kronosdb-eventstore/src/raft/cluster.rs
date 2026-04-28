@@ -536,7 +536,7 @@ mod tests {
         cluster.bootstrap().await.unwrap();
 
         let store = cluster.get_store("default").unwrap();
-        assert_eq!(store.head(), Position(1));
+        assert_eq!(store.head(), Position(0));
     }
 
     #[tokio::test]

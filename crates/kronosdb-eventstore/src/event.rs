@@ -1,6 +1,7 @@
 /// Global position in the event log. Monotonically increasing, gapless.
-/// Position 0 means "no events" / "beginning of log".
-/// First event has position 1.
+/// 0-based, next-exclusive: the first event has position 0; `head` always
+/// equals "the position the next event will be written at" (so on an empty
+/// store, head == 0). A `from_position` of N reads events with position >= N.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position(pub u64);
 

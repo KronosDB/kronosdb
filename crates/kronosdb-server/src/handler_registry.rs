@@ -63,7 +63,8 @@ impl HandlerStreamRegistry {
                 token: CancellationToken::new(),
                 closers: Vec::new(),
             })
-            .token.clone()
+            .token
+            .clone()
     }
 
     /// Registers a handler stream sender for a client.

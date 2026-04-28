@@ -226,9 +226,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                         // Otherwise this may be the initial result for a subscription
                         // query — wrap and forward on the subscription stream.
-                        if !routed
-                            && let Some(entry) = pending_sub_initials.get(&request_id)
-                        {
+                        if !routed && let Some(entry) = pending_sub_initials.get(&request_id) {
                             let initial_result = pb::SubscriptionQueryResponse {
                                 message_identifier: String::new(),
                                 subscription_identifier: request_id.clone(),

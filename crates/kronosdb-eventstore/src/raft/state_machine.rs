@@ -505,7 +505,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
 
         // Rebuild each context by creating it and re-appending its events
         // with no condition. Positions align because disk was wiped: a fresh
-        // engine assigns Position(1) to its first append, matching what the
+        // engine assigns Position(0) to its first append, matching what the
         // leader's snapshot records.
         for ctx in &sm_snapshot.contexts {
             self.contexts.create_context(&ctx.name).map_err(|e| {
@@ -576,7 +576,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
 
             // Sanity: the first position assigned must match what the leader
             // recorded for this event. If disk wipe + fresh create_context
-            // did not produce Position(1), something is very wrong and we
+            // did not produce Position(0), something is very wrong and we
             // must halt rather than apply on a divergent base.
             if let Some(expected) = expected_first_pos {
                 if resp.first_position.0 != expected {
@@ -661,7 +661,7 @@ impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
                     ),
                 )
             })?;
-            let stored = engine.source_all(crate::event::Position(1)).map_err(|e| {
+            let stored = engine.source_all(crate::event::Position(0)).map_err(|e| {
                 StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
@@ -801,7 +801,7 @@ mod tests {
                 count,
                 ..
             } => {
-                assert_eq!(*first_position, 1);
+                assert_eq!(*first_position, 0);
                 assert_eq!(*count, 1);
             }
             other => panic!("expected Append, got {:?}", other),
@@ -813,15 +813,15 @@ mod tests {
                 count,
                 ..
             } => {
-                assert_eq!(*first_position, 2);
+                assert_eq!(*first_position, 1);
                 assert_eq!(*count, 1);
             }
             other => panic!("expected Append, got {:?}", other),
         }
 
-        // Verify events in the store.
+        // Verify events in the store: 2 events committed → head = 2 (next slot).
         let store = contexts.get_context("default").unwrap();
-        assert_eq!(store.head(), Position(3));
+        assert_eq!(store.head(), Position(2));
     }
 
     #[tokio::test]
@@ -936,7 +936,7 @@ mod tests {
     async fn apply_returns_append_rejected_on_dcb_violation() {
         let (mut sm, contexts) = create_sm();
 
-        // First entry: unconditional append, tags id=1, lands at position 1.
+        // First entry: unconditional append, tags id=1, lands at position 0.
         let e1 = make_append_entry(1, 1, "default", "OrderPlaced");
         sm.apply(vec![e1]).await.unwrap();
         let store = contexts.get_context("default").unwrap();
@@ -944,7 +944,7 @@ mod tests {
 
         // Second entry: conditional append with consistency_marker=0 and
         // criterion matching id=1 — should be rejected because the first
-        // event already matches.
+        // event already matches at position 0 (>= marker).
         let e2 = make_conditional_append_entry(1, 2, "default", "OrderPlaced", 0);
         let responses = sm.apply(vec![e2]).await.unwrap();
         assert_eq!(responses.len(), 1);
@@ -955,7 +955,7 @@ mod tests {
                         conflicting_position,
                     },
             } => {
-                assert_eq!(*conflicting_position, 1);
+                assert_eq!(*conflicting_position, 0);
             }
             other => panic!("expected AppendRejected, got {other:?}"),
         }
@@ -1080,12 +1080,12 @@ mod tests {
             .unwrap();
         assert_eq!(orders.events.len(), 3);
         assert_eq!(payments.events.len(), 2);
-        assert_eq!(orders.events[0].position, 1);
-        assert_eq!(orders.events[1].position, 2);
-        assert_eq!(orders.events[2].position, 3);
+        assert_eq!(orders.events[0].position, 0);
+        assert_eq!(orders.events[1].position, 1);
+        assert_eq!(orders.events[2].position, 2);
         assert_eq!(orders.events[0].name, "OrderPlaced");
-        assert_eq!(payments.events[0].position, 1);
-        assert_eq!(payments.events[1].position, 2);
+        assert_eq!(payments.events[0].position, 0);
+        assert_eq!(payments.events[1].position, 1);
         // "default" context from create_sm() is present but empty:
         let default = decoded
             .contexts
@@ -1122,11 +1122,11 @@ mod tests {
             .unwrap();
 
         let engine = follower_ctx.get_context("default").unwrap();
-        let all = engine.source_all(crate::event::Position(1)).unwrap();
+        let all = engine.source_all(crate::event::Position(0)).unwrap();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].position.0, 1);
-        assert_eq!(all[1].position.0, 2);
-        assert_eq!(all[2].position.0, 3);
+        assert_eq!(all[0].position.0, 0);
+        assert_eq!(all[1].position.0, 1);
+        assert_eq!(all[2].position.0, 2);
         assert_eq!(all[0].name, "A");
         let (applied, _) = follower_sm.applied_state().await.unwrap();
         assert_eq!(applied.unwrap().index, 3);
@@ -1171,7 +1171,7 @@ mod tests {
         );
         assert!(follower_ctx.context_exists("default"));
         let engine = follower_ctx.get_context("default").unwrap();
-        let all = engine.source_all(crate::event::Position(1)).unwrap();
+        let all = engine.source_all(crate::event::Position(0)).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "A", "follower's divergent event was wiped");
     }
@@ -1239,7 +1239,7 @@ mod tests {
         assert!(follower_ctx.context_exists("orders"));
         let engine = follower_ctx.get_context("orders").unwrap();
         assert_eq!(
-            engine.source_all(crate::event::Position(1)).unwrap().len(),
+            engine.source_all(crate::event::Position(0)).unwrap().len(),
             1
         );
     }
@@ -1271,22 +1271,22 @@ mod tests {
         let orders = follower_ctx.get_context("orders").unwrap();
         let payments = follower_ctx.get_context("payments").unwrap();
         assert_eq!(
-            orders.source_all(crate::event::Position(1)).unwrap().len(),
+            orders.source_all(crate::event::Position(0)).unwrap().len(),
             3
         );
         assert_eq!(
             payments
-                .source_all(crate::event::Position(1))
+                .source_all(crate::event::Position(0))
                 .unwrap()
                 .len(),
             2
         );
         assert_eq!(
-            orders.source_all(crate::event::Position(1)).unwrap()[0].name,
+            orders.source_all(crate::event::Position(0)).unwrap()[0].name,
             "O1"
         );
         assert_eq!(
-            payments.source_all(crate::event::Position(1)).unwrap()[0].name,
+            payments.source_all(crate::event::Position(0)).unwrap()[0].name,
             "P1"
         );
     }

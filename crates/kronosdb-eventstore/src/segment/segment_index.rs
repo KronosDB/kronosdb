@@ -130,10 +130,11 @@ impl SegmentIndex {
         result
     }
 
-    /// Checks if any event matching the query exists after the given position.
+    /// Checks if any event matching the query exists at or after the given position.
+    /// `after` is the next-exclusive head the caller validated against (DCB marker).
     pub fn has_match_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
         let bitmap = self.matching(condition)?;
-        bitmap.iter().find(|&pos| pos > after).map(Position)
+        bitmap.iter().find(|&pos| pos >= after).map(Position)
     }
 
     fn resolve_criterion(&self, criterion: &Criterion) -> Option<RoaringTreemap> {
@@ -549,9 +550,12 @@ mod tests {
             }],
         };
 
+        // `after` is the next-exclusive marker: returns first matching pos >= after.
         assert_eq!(index.has_match_after(&cond, 0), Some(Position(1)));
-        assert_eq!(index.has_match_after(&cond, 1), Some(Position(3)));
-        assert_eq!(index.has_match_after(&cond, 3), None);
+        assert_eq!(index.has_match_after(&cond, 1), Some(Position(1)));
+        assert_eq!(index.has_match_after(&cond, 2), Some(Position(3)));
+        assert_eq!(index.has_match_after(&cond, 3), Some(Position(3)));
+        assert_eq!(index.has_match_after(&cond, 4), None);
     }
 
     #[test]

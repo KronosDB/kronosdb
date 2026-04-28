@@ -138,16 +138,16 @@ impl TagIndex {
         }
     }
 
-    /// Finds the first event matching the condition after the given position.
+    /// Finds the first event matching the condition at or after the given position.
     ///
-    /// Semantics: `consistency_marker` is an exclusive lower bound — "I've
-    /// validated everything up to and including `after`; reject if any
-    /// matching event has position > `after`." This matches the
-    /// `segment_index::has_match_after` predicate so the sealed-segment
-    /// and active-segment DCB paths agree.
+    /// Semantics: `consistency_marker` is the next-exclusive head the caller
+    /// validated against — "I've seen every event with position < `after`;
+    /// reject if any matching event has position >= `after`." This matches
+    /// `segment_index::has_match_after` so the sealed-segment and
+    /// active-segment DCB paths agree.
     fn find_matching_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
         let combined = self.resolve(condition)?;
-        combined.iter().find(|&pos| pos > after).map(Position)
+        combined.iter().find(|&pos| pos >= after).map(Position)
     }
 
     /// Resolves a sourcing condition into a single bitmap of matching positions.
@@ -350,8 +350,9 @@ mod tests {
         index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
 
+        // marker=3 = "I've validated through position 2; reject anything at >=3".
         let condition = AppendCondition {
-            consistency_marker: Position(2),
+            consistency_marker: Position(3),
             criteria: SourcingCondition {
                 criteria: vec![Criterion {
                     names: vec![],
@@ -371,8 +372,9 @@ mod tests {
         index.index_event(Position(2), "PaymentReceived", &[tag("orderId", "A")]);
         index.index_event(Position(3), "OrderCancelled", &[tag("orderId", "A")]);
 
+        // marker=2 = "I've validated through position 1; reject anything at >=2".
         let condition = AppendCondition {
-            consistency_marker: Position(1),
+            consistency_marker: Position(2),
             criteria: SourcingCondition {
                 criteria: vec![Criterion {
                     names: vec![],

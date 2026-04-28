@@ -17,7 +17,7 @@
 //!   - Exactly 10 winners.
 //!   - Exactly 30 rejections.
 //!   - Every rejection matches `Error::ConsistencyConditionViolated`.
-//!   - Node head converges to Position(11).
+//!   - Node head converges to Position(10).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -247,8 +247,9 @@ async fn run_single_node_workload() {
         AGGREGATES * (ACTORS_PER_AGGREGATE - 1)
     );
 
-    // Head convention: head() == next position to write, so after N appends head is Position(N+1).
-    let expected_head = Position((AGGREGATES as u64) + 1);
+    // Head convention: head() == next position to write (0-based, next-exclusive),
+    // so after N successful single-event appends head is Position(N).
+    let expected_head = Position(AGGREGATES as u64);
     assert!(
         wait_for_head(&node.contexts, expected_head, Duration::from_secs(5)).await,
         "node did not reach head {}",

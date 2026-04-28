@@ -292,8 +292,9 @@ pub struct EventStoreEngine {
     /// Group commit synchronization.
     sync_state: Arc<SyncState>,
 
-    /// The committed position — the position of the last event visible to readers.
-    committed_position: Arc<AtomicU64>,
+    /// The head position — next-exclusive: the position the next event will
+    /// be written at, equivalently the count of events committed.
+    head_position: Arc<AtomicU64>,
 
     /// Broadcast channel for notifying stream subscribers of new commits.
     commit_tx: broadcast::Sender<CommitNotification>,
@@ -329,7 +330,7 @@ impl EventStoreEngine {
     /// Creates a new event store with full options.
     pub fn create_with_store_options(dir: &Path, opts: &StoreOptions) -> Result<Self, Error> {
         std::fs::create_dir_all(dir)?;
-        let seg_writer = SegmentWriter::new(dir, Position(1), opts.max_segment_size)?;
+        let seg_writer = SegmentWriter::new(dir, Position(0), opts.max_segment_size)?;
         let active_base = seg_writer.active_base_position();
         let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
@@ -350,7 +351,7 @@ impl EventStoreEngine {
             writer,
             tag_index: Arc::new(TagIndex::new()),
             sync_state,
-            committed_position: Arc::new(AtomicU64::new(0)),
+            head_position: Arc::new(AtomicU64::new(0)),
             commit_tx,
             cache: Arc::new(IndexCache::new(
                 opts.index_cache_size,
@@ -395,7 +396,9 @@ impl EventStoreEngine {
         let all_bases = segment::list_segment_files(dir)?;
         let sealed_count = count_sealed_segments(dir, &all_bases, active_base);
 
-        let committed = if head.0 > 0 { head.0 - 1 } else { 0 };
+        // Writer's head() already returns the next-exclusive position, which
+        // is exactly our head_position semantics — no adjustment.
+        let head_pos = head.0;
         let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
         let gc_enabled = opts.group_commit_interval_ms > 0;
@@ -415,7 +418,7 @@ impl EventStoreEngine {
             writer,
             tag_index: Arc::new(tag_index),
             sync_state,
-            committed_position: Arc::new(AtomicU64::new(committed)),
+            head_position: Arc::new(AtomicU64::new(head_pos)),
             commit_tx,
             cache: Arc::new(IndexCache::new(
                 opts.index_cache_size,
@@ -450,7 +453,7 @@ impl EventStoreEngine {
     /// 1. Checks DCB condition against the tag index
     /// 2. Writes events to the active segment (tags included on disk)
     /// 3. Updates the in-memory tag index
-    /// 4. Advances the committed position
+    /// 4. Advances the head position (next-exclusive)
     pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
         self.append_internal(request, None)
     }
@@ -501,13 +504,15 @@ impl EventStoreEngine {
                     if !seg_list.is_sealed(i) {
                         break; // Active segment checked below via tag index.
                     }
-                    // Segment ends before the marker — all its events are older, skip.
+                    // Segment ends below the marker — all its events were
+                    // already validated by the caller, skip. seg_end is the
+                    // last position in the segment (next base - 1).
                     let seg_end = if i + 1 < seg_list.bases.len() {
                         seg_list.bases[i + 1] - 1
                     } else {
                         continue;
                     };
-                    if seg_end <= marker {
+                    if seg_end < marker {
                         continue;
                     }
 
@@ -546,7 +551,7 @@ impl EventStoreEngine {
                 return Ok(AppendResponse {
                     first_position: head,
                     count: 0,
-                    consistency_marker: Position(self.committed_position.load(Ordering::Acquire)),
+                    consistency_marker: Position(self.head_position.load(Ordering::Acquire)),
                 });
             }
 
@@ -604,20 +609,20 @@ impl EventStoreEngine {
                 pos = pos.next();
             }
 
-            // Step 4: Advance committed position.
-            let last_position = Position(first_position.0 + count as u64 - 1);
-            self.committed_position
-                .store(last_position.0, Ordering::Release);
+            // Step 4: Advance head position (next-exclusive: first event's
+            // position + count = position the next event will land at).
+            let new_head = first_position.0 + count as u64;
+            self.head_position.store(new_head, Ordering::Release);
 
             // Step 5: Notify stream subscribers.
             let _ = self.commit_tx.send(CommitNotification {
-                committed_position: last_position.0,
+                head_position: new_head,
             });
 
             AppendResponse {
                 first_position,
                 count,
-                consistency_marker: last_position,
+                consistency_marker: Position(new_head),
             }
             // Writer lock released here — other appends can proceed
             // and batch into the same upcoming fsync.
@@ -635,8 +640,8 @@ impl EventStoreEngine {
 
     /// Gets tags for an event at the given position by reading from the segment.
     pub fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error> {
-        let committed = self.committed_position.load(Ordering::Acquire);
-        if position.0 > committed || position.0 == 0 {
+        let head = self.head_position.load(Ordering::Acquire);
+        if position.0 >= head {
             return Err(Error::Corrupted {
                 message: format!("position {} does not exist", position.0),
             });
@@ -685,8 +690,8 @@ impl EventStoreEngine {
     /// Scans segments from oldest to newest, reading events linearly within each segment.
     /// This is an infrequently-called operation so a linear scan is acceptable.
     pub fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
-        let committed = self.committed_position.load(Ordering::Acquire);
-        if committed == 0 {
+        let head = self.head_position.load(Ordering::Acquire);
+        if head == 0 {
             return Ok(None);
         }
 
@@ -696,7 +701,7 @@ impl EventStoreEngine {
         }
 
         for (i, &base) in seg_list.bases.iter().enumerate() {
-            if base > committed {
+            if base >= head {
                 break;
             }
 
@@ -709,7 +714,7 @@ impl EventStoreEngine {
                 SegmentReader::open(&seg_path)?
             };
 
-            for result in reader.iter(Some(Position(committed + 1))) {
+            for result in reader.iter(Some(Position(head))) {
                 let event = result?;
                 if event.timestamp >= timestamp_millis {
                     return Ok(Some(event.position));
@@ -726,25 +731,27 @@ impl EventStoreEngine {
             condition,
             from_position,
             self.commit_tx.subscribe(),
-            Arc::clone(&self.committed_position),
+            Arc::clone(&self.head_position),
         )
     }
 
-    /// Returns the current head position (next position to be assigned).
+    /// Returns the current head position (next position to be assigned;
+    /// equivalently, the count of events committed).
     pub fn head(&self) -> Position {
         self.writer.lock().head()
     }
 
-    /// Returns the tail position (first event in the store).
+    /// Returns the tail position (first available event position).
     ///
     /// For an empty store, returns the same as `head()` so that `head - tail == 0`.
-    /// For a non-empty, non-truncated store, returns `Position(1)` (events are 1-based).
+    /// For a non-empty, non-truncated store, returns `Position(0)` — the
+    /// position of the first event, since the log is 0-based.
     pub fn tail(&self) -> Position {
-        let committed = self.committed_position.load(Ordering::Acquire);
-        if committed == 0 {
-            self.writer.lock().head() // Empty: tail == head → 0 events.
+        let head = self.head_position.load(Ordering::Acquire);
+        if head == 0 {
+            Position(0) // Empty: tail == head == 0.
         } else {
-            Position(1) // TODO: Track actual tail for truncated stores.
+            Position(0) // TODO: Track actual tail for truncated stores.
         }
     }
 
@@ -761,11 +768,11 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
     ) -> Result<Vec<SequencedEvent>, Error> {
         let timer = Timer::start();
-        let committed = self.committed_position.load(Ordering::Acquire);
+        let head = self.head_position.load(Ordering::Acquire);
 
         // Read cached segment list — no readdir syscall.
         let seg_list = self.segments.read().clone();
-        if seg_list.bases.is_empty() {
+        if seg_list.bases.is_empty() || head == 0 {
             return Ok(vec![]);
         }
 
@@ -774,13 +781,14 @@ impl EventStoreEngine {
         for (i, &base) in seg_list.bases.iter().enumerate() {
             let seg_path = segment::segment_path(&self.dir, base);
             let is_last = i + 1 == seg_list.bases.len();
+            // seg_end is the last position present in this segment.
             let seg_end = if !is_last {
                 seg_list.bases[i + 1] - 1
             } else {
-                committed
+                head - 1
             };
 
-            if base > committed {
+            if base >= head {
                 break;
             }
             if seg_end < from_position.0 {
@@ -826,7 +834,7 @@ impl EventStoreEngine {
             if let Some(idx) = &seg_index {
                 self.metrics.record_direct_seek();
                 for pos in matching_positions.iter() {
-                    if pos < from_position.0 || pos > committed {
+                    if pos < from_position.0 || pos >= head {
                         continue;
                     }
                     if let Some(offset) = idx.get_offset(pos) {
@@ -836,7 +844,7 @@ impl EventStoreEngine {
                 }
             } else {
                 self.metrics.record_sequential_scan();
-                for result in reader.iter(Some(Position(committed + 1))) {
+                for result in reader.iter(Some(Position(head))) {
                     let stored = result?;
 
                     if stored.position.0 < from_position.0 {
@@ -862,10 +870,10 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, Error> {
-        let committed = self.committed_position.load(Ordering::Acquire);
+        let head = self.head_position.load(Ordering::Acquire);
 
         let seg_list = self.segments.read().clone();
-        if seg_list.bases.is_empty() {
+        if seg_list.bases.is_empty() || head == 0 {
             return Ok(vec![]);
         }
 
@@ -877,10 +885,10 @@ impl EventStoreEngine {
             let seg_end = if !is_last {
                 seg_list.bases[i + 1] - 1
             } else {
-                committed
+                head - 1
             };
 
-            if base > committed {
+            if base >= head {
                 break;
             }
             if seg_end < from_position.0 {
@@ -916,7 +924,7 @@ impl EventStoreEngine {
 
             if let Some(idx) = &seg_index {
                 for pos in matching_positions.iter() {
-                    if pos < from_position.0 || pos > committed {
+                    if pos < from_position.0 || pos >= head {
                         continue;
                     }
                     if let Some(offset) = idx.get_offset(pos) {
@@ -928,7 +936,7 @@ impl EventStoreEngine {
                     }
                 }
             } else {
-                for result in reader.iter(Some(Position(committed + 1))) {
+                for result in reader.iter(Some(Position(head))) {
                     let stored = result?;
 
                     if stored.position.0 < from_position.0 {
@@ -999,15 +1007,15 @@ impl EventStoreEngine {
     /// (kept wire-stable per PROJECT.md constraint); snapshot building is
     /// internal to the Raft state-machine path.
     pub fn source_all(&self, from_position: Position) -> Result<Vec<StoredEvent>, Error> {
-        let committed = self.committed_position.load(Ordering::Acquire);
+        let head = self.head_position.load(Ordering::Acquire);
         let seg_list = self.segments.read().clone();
-        if seg_list.bases.is_empty() {
+        if seg_list.bases.is_empty() || head == 0 {
             return Ok(vec![]);
         }
 
         let mut events = Vec::new();
         for (i, &base) in seg_list.bases.iter().enumerate() {
-            if base > committed {
+            if base >= head {
                 break;
             }
             let seg_path = segment::segment_path(&self.dir, base);
@@ -1015,7 +1023,7 @@ impl EventStoreEngine {
             let seg_end = if !is_last {
                 seg_list.bases[i + 1] - 1
             } else {
-                committed
+                head - 1
             };
             if seg_end < from_position.0 {
                 continue;
@@ -1029,13 +1037,13 @@ impl EventStoreEngine {
             };
 
             // `iter(Some(up_to))` stops once it sees a position >= up_to;
-            // pass committed+1 so every committed event is yielded.
-            for result in reader.iter(Some(Position(committed + 1))) {
+            // pass head so every committed event (positions 0..head) is yielded.
+            for result in reader.iter(Some(Position(head))) {
                 let stored = result?;
                 if stored.position.0 < from_position.0 {
                     continue;
                 }
-                if stored.position.0 > committed {
+                if stored.position.0 >= head {
                     break;
                 }
                 events.push(stored);
@@ -1168,10 +1176,11 @@ mod tests {
         };
 
         let response = store.append(request).unwrap();
-        assert_eq!(response.first_position, Position(1));
+        assert_eq!(response.first_position, Position(0));
         assert_eq!(response.count, 2);
+        // marker is the new head after the append (next-exclusive).
         assert_eq!(response.consistency_marker, Position(2));
-        assert_eq!(store.head(), Position(3));
+        assert_eq!(store.head(), Position(2));
     }
 
     #[test]
@@ -1259,7 +1268,7 @@ mod tests {
             }],
         };
 
-        let events = store.source(Position(1), &cond).unwrap();
+        let events = store.source(Position(0), &cond).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name, "OrderPlaced");
         assert_eq!(events[1].name, "PaymentReceived");
@@ -1280,7 +1289,7 @@ mod tests {
             })
             .unwrap();
 
-        let tags = store.get_tags(Position(1)).unwrap();
+        let tags = store.get_tags(Position(0)).unwrap();
         assert_eq!(tags.len(), 2);
         assert!(tags.contains(&tag("orderId", "A")));
         assert!(tags.contains(&tag("region", "EU")));
@@ -1308,7 +1317,7 @@ mod tests {
 
         {
             let store = EventStoreEngine::open(dir.path()).unwrap();
-            assert_eq!(store.head(), Position(3));
+            assert_eq!(store.head(), Position(2));
 
             let cond = SourcingCondition {
                 criteria: vec![Criterion {
@@ -1316,7 +1325,7 @@ mod tests {
                     tags: vec![tag("orderId", "A")],
                 }],
             };
-            let events = store.source(Position(1), &cond).unwrap();
+            let events = store.source(Position(0), &cond).unwrap();
             assert_eq!(events.len(), 2);
 
             let cond = SourcingCondition {
@@ -1325,12 +1334,12 @@ mod tests {
                     tags: vec![tag("paymentId", "P1")],
                 }],
             };
-            let events = store.source(Position(1), &cond).unwrap();
+            let events = store.source(Position(0), &cond).unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].name, "PaymentReceived");
 
             // Tags readable from segment.
-            let tags = store.get_tags(Position(1)).unwrap();
+            let tags = store.get_tags(Position(0)).unwrap();
             assert!(tags.contains(&tag("orderId", "A")));
         }
     }
@@ -1340,8 +1349,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EventStoreEngine::create(dir.path()).unwrap();
 
-        assert_eq!(store.head(), Position(1));
-        assert_eq!(store.tail(), Position(1)); // Empty: tail == head → 0 events.
+        assert_eq!(store.head(), Position(0));
+        assert_eq!(store.tail(), Position(0)); // Empty: tail == head == 0.
     }
 
     #[test]
@@ -1438,11 +1447,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        let all = engine.source_all(Position(1)).unwrap();
+        let all = engine.source_all(Position(0)).unwrap();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].position, Position(1));
-        assert_eq!(all[1].position, Position(2));
-        assert_eq!(all[2].position, Position(3));
+        assert_eq!(all[0].position, Position(0));
+        assert_eq!(all[1].position, Position(1));
+        assert_eq!(all[2].position, Position(2));
         assert_eq!(all[0].name, "A");
         assert_eq!(all[0].tags.len(), 1);
     }
@@ -1451,7 +1460,7 @@ mod tests {
     fn source_all_empty_engine_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EventStoreEngine::create(dir.path()).unwrap();
-        let all = engine.source_all(Position(1)).unwrap();
+        let all = engine.source_all(Position(0)).unwrap();
         assert!(all.is_empty());
     }
 
@@ -1475,9 +1484,9 @@ mod tests {
                 })
                 .unwrap();
         }
-        let tail = engine.source_all(Position(2)).unwrap();
+        let tail = engine.source_all(Position(1)).unwrap();
         assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].position, Position(2));
-        assert_eq!(tail[1].position, Position(3));
+        assert_eq!(tail[0].position, Position(1));
+        assert_eq!(tail[1].position, Position(2));
     }
 }

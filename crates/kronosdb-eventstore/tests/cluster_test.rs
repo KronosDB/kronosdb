@@ -209,28 +209,28 @@ async fn three_node_cluster_replication() {
             count,
             ..
         } => {
-            assert_eq!(*first_position, 1);
+            assert_eq!(*first_position, 0);
             assert_eq!(*count, 3);
-            println!("Appended 3 events on leader (positions 1-3)");
+            println!("Appended 3 events on leader (positions 0-2)");
         }
         other => panic!("unexpected response: {:?}", other),
     }
 
     // Wait for all nodes to replicate.
-    let expected_head = Position(4); // 3 events → head at 4
+    let expected_head = Position(3); // 3 events → next slot is 3 (0-based)
     let timeout = Duration::from_secs(10);
 
     assert!(
         wait_for_head(&node1.contexts, "default", expected_head, timeout).await,
-        "node 1 should have head >= 4"
+        "node 1 should have head >= 3"
     );
     assert!(
         wait_for_head(&node2.contexts, "default", expected_head, timeout).await,
-        "node 2 should have head >= 4"
+        "node 2 should have head >= 3"
     );
     assert!(
         wait_for_head(&node3.contexts, "default", expected_head, timeout).await,
-        "node 3 should have head >= 4"
+        "node 3 should have head >= 3"
     );
 
     println!("All 3 nodes replicated to head >= {}", expected_head.0);
@@ -245,7 +245,7 @@ async fn three_node_cluster_replication() {
 
     for (name, node) in [("node1", &node1), ("node2", &node2), ("node3", &node3)] {
         let store = node.contexts.get_context("default").unwrap();
-        let events = store.source(Position(1), &condition).unwrap();
+        let events = store.source(Position(0), &condition).unwrap();
         assert_eq!(events.len(), 3, "{name} should have 3 events");
         assert_eq!(events[0].name, "OrderPlaced");
         assert_eq!(events[1].name, "OrderPlaced");
@@ -269,15 +269,15 @@ async fn three_node_cluster_replication() {
         .await
         .expect("append more events");
 
-    let expected_head2 = Position(6);
+    let expected_head2 = Position(5); // 5 events total → next slot is 5
     for (name, node) in [("node1", &node1), ("node2", &node2), ("node3", &node3)] {
         assert!(
             wait_for_head(&node.contexts, "default", expected_head2, timeout).await,
-            "{name} should replicate to head >= 6"
+            "{name} should replicate to head >= 5"
         );
     }
 
-    println!("Second batch replicated. All nodes at head >= 6.");
+    println!("Second batch replicated. All nodes at head >= 5.");
 
     let _ = node1.raft.shutdown().await;
     let _ = node2.raft.shutdown().await;
@@ -350,7 +350,7 @@ async fn passive_backup_receives_replicated_events() {
 
     // Wait for all nodes (including backup) to receive events.
     let timeout = Duration::from_secs(10);
-    let expected = Position(4);
+    let expected = Position(3);
 
     assert!(
         wait_for_head(&voter1.contexts, "default", expected, timeout).await,
@@ -378,7 +378,7 @@ async fn passive_backup_receives_replicated_events() {
         }],
     };
     let backup_store = backup.contexts.get_context("default").unwrap();
-    let events = backup_store.source(Position(1), &condition).unwrap();
+    let events = backup_store.source(Position(0), &condition).unwrap();
     assert_eq!(events.len(), 3);
     println!("Backup serving reads: {} events", events.len());
 
@@ -464,7 +464,7 @@ async fn follower_forwards_writes_to_leader() {
     );
 
     let resp = result.unwrap();
-    assert_eq!(resp.first_position, Position(1));
+    assert_eq!(resp.first_position, Position(0));
     assert_eq!(resp.count, 1);
     println!(
         "Follower write forwarded to leader, got position {}",
@@ -473,11 +473,11 @@ async fn follower_forwards_writes_to_leader() {
 
     // Verify all nodes have the event.
     let timeout = Duration::from_secs(10);
-    let expected = Position(2);
+    let expected = Position(1);
     for (name, node) in [("node1", &node1), ("node2", &node2), ("node3", &node3)] {
         assert!(
             wait_for_head(&node.contexts, "default", expected, timeout).await,
-            "{name} should have head >= 2"
+            "{name} should have head >= 1"
         );
         println!("{name}: replicated");
     }

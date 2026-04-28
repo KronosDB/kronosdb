@@ -223,10 +223,10 @@ async fn run_one_iteration(iter: usize) {
         .sequence;
     assert_eq!(
         events_by_seq.len() as i64,
-        head - 1,
-        "iter {iter}: phantom check FAILED — Source returned {} events but head-1 = {} (CRASH-02 VIOLATION)",
+        head,
+        "iter {iter}: phantom check FAILED — Source returned {} events but head = {} (CRASH-02 VIOLATION)",
         events_by_seq.len(),
-        head - 1
+        head
     );
     assert!(
         events_by_seq.len() >= acked.len(),

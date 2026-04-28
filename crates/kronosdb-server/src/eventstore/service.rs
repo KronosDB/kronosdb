@@ -121,11 +121,13 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
         let store = self.get_store(&context_name)?;
         let condition_clone = condition.clone();
-        let (events, committed) = tokio::task::spawn_blocking(move || {
+        let (events, marker) = tokio::task::spawn_blocking(move || {
             let events = store.source(from_position, &condition_clone)?;
-            let head = store.head();
-            let committed = if head.0 > 0 { head.0 - 1 } else { 0 };
-            Ok::<_, Error>((events, committed))
+            // head is next-exclusive: the position the next event would be
+            // written at, which is exactly the consistency marker the
+            // client should use for a subsequent DCB-conditioned append.
+            let marker = store.head().0;
+            Ok::<_, Error>((events, marker))
         })
         .await
         .map_err(|e| Status::internal(format!("task join error: {e}")))?
@@ -146,7 +148,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
             }
             let response = pb::SourceResponse {
                 result: Some(pb::source_response::Result::ConsistencyMarker(
-                    committed as i64,
+                    marker as i64,
                 )),
             };
             let _ = tx.send(Ok(response)).await;
