@@ -15,6 +15,9 @@ use kronosdb_messaging::types::{
     ProcessingKey,
 };
 
+use crate::handler_registry::HandlerStreamRegistry;
+use crate::platform::service::ClientChannelRegistry;
+use crate::proto::kronosdb::platform as platform_pb;
 use crate::proto::kronosdb::query as pb;
 use crate::proto::kronosdb::query::query_service_server::QueryServiceServer as GrpcQueryServiceServer;
 
@@ -27,25 +30,43 @@ type HandlerSender = mpsc::Sender<Result<pb::QueryHandlerInbound, Status>>;
 type QueryResponseSender = mpsc::Sender<pb::QueryResponse>;
 type PendingQueries = Arc<DashMap<String, QueryResponseSender>>;
 
+/// Pending subscription-query initial results: subscription_id → sender on the
+/// subscription stream. Routed when a regular QueryResponse comes back tagged
+/// with a subscription's id, so the caller receives it as
+/// `SubscriptionQueryResponse::InitialResult` on the same stream as updates.
+type SubscriptionInitialSender = mpsc::Sender<Result<pb::SubscriptionQueryResponse, Status>>;
+type PendingSubscriptionInitials = Arc<DashMap<String, SubscriptionInitialSender>>;
+
 /// gRPC service implementation for the query bus.
 ///
 /// Routes handlers to per-context messaging engines via `kronosdb-context` header.
-/// Both `handler_streams` and `pending_queries` are sharded maps so concurrent
+/// `handler_streams` and `pending_queries` are sharded maps so concurrent
 /// queries and response completions don't contend on a single mutex.
 pub struct QueryServiceImpl {
     messaging: Arc<MessagingManager>,
     handler_streams: Arc<DashMap<String, HandlerSender>>,
     pending_queries: PendingQueries,
+    pending_sub_initials: PendingSubscriptionInitials,
     query_timeout: Duration,
+    channel_registry: Arc<ClientChannelRegistry>,
+    handler_stream_registry: Arc<HandlerStreamRegistry>,
 }
 
 impl QueryServiceImpl {
-    pub fn new(messaging: Arc<MessagingManager>, query_timeout: Duration) -> Self {
+    pub fn new(
+        messaging: Arc<MessagingManager>,
+        query_timeout: Duration,
+        channel_registry: Arc<ClientChannelRegistry>,
+        handler_stream_registry: Arc<HandlerStreamRegistry>,
+    ) -> Self {
         Self {
             messaging,
             handler_streams: Arc::new(DashMap::new()),
             pending_queries: Arc::new(DashMap::new()),
+            pending_sub_initials: Arc::new(DashMap::new()),
             query_timeout,
+            channel_registry,
+            handler_stream_registry,
         }
     }
 
@@ -80,10 +101,41 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending_queries = Arc::clone(&self.pending_queries);
+        let pending_sub_initials = Arc::clone(&self.pending_sub_initials);
+        let channel_registry = Arc::clone(&self.channel_registry);
+        let handler_stream_registry = Arc::clone(&self.handler_stream_registry);
         let mut client_id: Option<String> = None;
 
         tokio::spawn(async move {
-            while let Ok(Some(msg)) = inbound.message().await {
+            let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
+            let mut subscribed_queries: Vec<String> = Vec::new();
+
+            loop {
+                let msg_result = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            tracing::info!(client_id = ?client_id, "query handler: cancelled by platform disconnect");
+                            break;
+                        }
+                        result = inbound.message() => result,
+                    }
+                } else {
+                    inbound.message().await
+                };
+
+                let msg = match msg_result {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        tracing::info!(client_id = ?client_id, "query handler stream: client closed send-side");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(client_id = ?client_id, error = %e, "query handler stream: transport error");
+                        break;
+                    }
+                };
+
                 let instruction_id = if msg.instruction_id.is_empty() {
                     None
                 } else {
@@ -98,15 +150,36 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                             component = %sub.component_name,
                             "Query handler subscribing"
                         );
+                        let query_name = sub.query.clone();
+                        let sub_client_id = sub.client_id.clone();
+                        let sub_component = sub.component_name.clone();
                         client_id = Some(sub.client_id.clone());
+                        subscribed_queries.push(sub.query.clone());
+
+                        if cancel_token.is_none() {
+                            cancel_token = Some(
+                                handler_stream_registry.get_cancellation_token(&sub.client_id),
+                            );
+                        }
 
                         handler_streams.insert(sub.client_id.clone(), handler_tx.clone());
+                        handler_stream_registry.register(&sub.client_id, handler_tx.clone());
 
                         platform.subscribe_query(
                             sub.query,
                             ClientId(sub.client_id),
                             ComponentName(sub.component_name),
                         );
+
+                        channel_registry
+                            .broadcast_topology_notification(platform_pb::TopologyNotification {
+                                change_type: "handler_registered".to_string(),
+                                message_type: query_name,
+                                handler_kind: "query".to_string(),
+                                client_id: sub_client_id,
+                                component_name: sub_component,
+                            })
+                            .await;
 
                         if let Some(id) = instruction_id {
                             let ack = pb::QueryHandlerInbound {
@@ -123,28 +196,65 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         }
                     }
                     Some(pb::query_handler_outbound::Request::Unsubscribe(sub)) => {
+                        let query_name = sub.query.clone();
+                        let unsub_client_id = sub.client_id.clone();
                         platform.unsubscribe_query(&sub.query, &ClientId(sub.client_id));
+
+                        channel_registry
+                            .broadcast_topology_notification(platform_pb::TopologyNotification {
+                                change_type: "handler_deregistered".to_string(),
+                                message_type: query_name,
+                                handler_kind: "query".to_string(),
+                                client_id: unsub_client_id,
+                                component_name: String::new(),
+                            })
+                            .await;
                     }
                     Some(pb::query_handler_outbound::Request::FlowControl(fc)) => {
                         platform.grant_query_permits(&ClientId(fc.client_id), fc.permits);
                     }
                     Some(pb::query_handler_outbound::Request::QueryResponse(resp)) => {
-                        // Route the response back to the waiting caller. Sharded
-                        // map so response completions don't contend with
-                        // concurrent dispatches.
                         let request_id = resp.request_identifier.clone();
-                        if let Some(entry) = pending_queries.get(&request_id) {
-                            let _ = entry.value().try_send(resp);
+
+                        // First try regular pending queries.
+                        let routed = if let Some(entry) = pending_queries.get(&request_id) {
+                            let _ = entry.value().try_send(resp.clone());
+                            true
+                        } else {
+                            false
+                        };
+
+                        // Otherwise this may be the initial result for a subscription
+                        // query — wrap and forward on the subscription stream.
+                        if !routed
+                            && let Some(entry) = pending_sub_initials.get(&request_id)
+                        {
+                            let initial_result = pb::SubscriptionQueryResponse {
+                                message_identifier: String::new(),
+                                subscription_identifier: request_id.clone(),
+                                response: Some(
+                                    pb::subscription_query_response::Response::InitialResult(
+                                        pb::QueryResponse {
+                                            message_identifier: resp.message_identifier,
+                                            error_code: resp.error_code,
+                                            error_message: resp.error_message,
+                                            payload: resp.payload,
+                                            metadata: resp.metadata,
+                                            processing_instructions: resp.processing_instructions,
+                                            request_identifier: resp.request_identifier,
+                                        },
+                                    ),
+                                ),
+                            };
+                            let _ = entry.value().try_send(Ok(initial_result));
                         }
                     }
                     Some(pb::query_handler_outbound::Request::QueryComplete(complete)) => {
-                        // All results sent for this query — remove from pending.
                         pending_queries.remove(&complete.request_id);
-                        // Dropping the sender closes the channel, signaling the caller.
+                        // Initial result delivered (or never coming); drop the subscriber sender.
+                        pending_sub_initials.remove(&complete.request_id);
                     }
                     Some(pb::query_handler_outbound::Request::SubscriptionQueryResponse(resp)) => {
-                        // Route subscription update through the registry so it
-                        // reaches the subscriber's update receiver.
                         let sub_id = resp.subscription_identifier.clone();
                         let update = proto_subscription_response_to_update(resp);
                         platform.send_update(&sub_id, update);
@@ -154,10 +264,39 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                 }
             }
 
-            // Handler disconnected.
+            // Handler disconnected. Skip cleanup if the platform stream already
+            // cascaded the disconnect — it's responsible for remove_client.
+            let was_cancelled = cancel_token.as_ref().is_some_and(|t| t.is_cancelled());
+
             if let Some(cid) = client_id {
-                platform.remove_client(&ClientId(cid.clone()));
                 handler_streams.remove(&cid);
+
+                if !was_cancelled {
+                    let client = ClientId(cid.clone());
+                    for query in &subscribed_queries {
+                        platform.unsubscribe_query(query, &client);
+                    }
+                    tracing::info!(
+                        client_id = %cid,
+                        queries = subscribed_queries.len(),
+                        "query handler: unsubscribed queries for this stream"
+                    );
+
+                    channel_registry
+                        .broadcast_topology_notification(platform_pb::TopologyNotification {
+                            change_type: "handler_deregistered".to_string(),
+                            message_type: String::new(),
+                            handler_kind: "query".to_string(),
+                            client_id: cid.clone(),
+                            component_name: String::new(),
+                        })
+                        .await;
+                } else {
+                    tracing::info!(
+                        client_id = %cid,
+                        "query handler: skipping cleanup (platform stream cascaded)"
+                    );
+                }
             }
         });
 
@@ -294,6 +433,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let mut inbound = request.into_inner();
         let (sub_tx, sub_rx) = mpsc::channel::<Result<pb::SubscriptionQueryResponse, Status>>(64);
         let handler_streams = Arc::clone(&self.handler_streams);
+        let pending_sub_initials = Arc::clone(&self.pending_sub_initials);
 
         tokio::spawn(async move {
             while let Ok(Some(msg)) = inbound.message().await {
@@ -352,6 +492,11 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                         match platform.subscribe(subscription) {
                             Ok((pending, mut update_rx)) => {
+                                // Register so the initial QueryResponse from the handler
+                                // can be re-routed onto this subscription stream as
+                                // SubscriptionQueryResponse::InitialResult.
+                                pending_sub_initials.insert(sub_id.clone(), sub_tx.clone());
+
                                 // Deliver the initial query to the handler.
                                 let handler_tx = pending.target_handlers.first().and_then(|id| {
                                     handler_streams.get(&id.0).map(|r| r.value().clone())

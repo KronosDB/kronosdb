@@ -28,6 +28,15 @@ pub const CONCURRENCY_EXCEPTION: &str = "KRONOSDB-4004";
 /// Command dispatch timed out waiting for a handler response.
 pub const COMMAND_TIMEOUT: &str = "KRONOSDB-4005";
 
+/// The handler the command was routed to disconnected before responding.
+pub const CONNECTION_TO_HANDLER_LOST: &str = "KRONOSDB-4006";
+
+/// A command with the same message_id is already in-flight.
+pub const COMMAND_DUPLICATED: &str = "KRONOSDB-4007";
+
+/// The in-flight command buffer is full — server is shedding load.
+pub const COMMAND_CAPACITY_EXCEEDED: &str = "KRONOSDB-4008";
+
 // ── Query errors ───────────────────────────────────────────────────
 
 /// No handler is registered for the given query type.

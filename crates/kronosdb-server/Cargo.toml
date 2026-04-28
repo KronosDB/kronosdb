@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
 dashmap = "6"
 tokio-stream = "0.1"
+tokio-util = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

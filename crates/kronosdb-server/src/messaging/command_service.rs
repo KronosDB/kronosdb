@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -14,35 +14,45 @@ use kronosdb_messaging::types::{
     RoutingKey,
 };
 
+use crate::handler_registry::HandlerStreamRegistry;
+use crate::platform::service::ClientChannelRegistry;
 use crate::proto::kronosdb::command as pb;
 use crate::proto::kronosdb::command::command_service_server::CommandServiceServer as GrpcCommandServiceServer;
+use crate::proto::kronosdb::platform as platform_pb;
 
 /// gRPC metadata header for context routing.
 const CONTEXT_HEADER: &str = "kronosdb-context";
 const DEFAULT_CONTEXT: &str = "default";
 
 type HandlerSender = mpsc::Sender<Result<pb::CommandHandlerInbound, Status>>;
-type PendingResponses = Arc<DashMap<String, oneshot::Sender<CommandResult>>>;
 
 /// gRPC service implementation for the command bus.
 ///
 /// Routes handlers to per-context messaging engines via `kronosdb-context` header.
-/// Both `handler_streams` and `pending` are sharded maps so concurrent
-/// dispatches and response completions don't contend on a single mutex.
+/// `handler_streams` is sharded so concurrent dispatches don't contend; the
+/// caller-side response channel lives in the messaging engine's in-flight map
+/// rather than a parallel gRPC-side map.
 pub struct CommandServiceImpl {
     messaging: Arc<MessagingManager>,
     handler_streams: Arc<DashMap<String, HandlerSender>>,
-    pending: PendingResponses,
     command_timeout: Duration,
+    channel_registry: Arc<ClientChannelRegistry>,
+    handler_stream_registry: Arc<HandlerStreamRegistry>,
 }
 
 impl CommandServiceImpl {
-    pub fn new(messaging: Arc<MessagingManager>, command_timeout: Duration) -> Self {
+    pub fn new(
+        messaging: Arc<MessagingManager>,
+        command_timeout: Duration,
+        channel_registry: Arc<ClientChannelRegistry>,
+        handler_stream_registry: Arc<HandlerStreamRegistry>,
+    ) -> Self {
         Self {
             messaging,
             handler_streams: Arc::new(DashMap::new()),
-            pending: Arc::new(DashMap::new()),
             command_timeout,
+            channel_registry,
+            handler_stream_registry,
         }
     }
 
@@ -65,21 +75,49 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             .and_then(|v| v.to_str().ok())
             .unwrap_or(DEFAULT_CONTEXT)
             .to_string();
+        tracing::info!(context = %context, "Command OpenStream opened");
         let platform = self.messaging.get_platform(&context);
 
         let mut inbound = request.into_inner();
-        // 4096 absorbs dispatch bursts without blocking the send.await
-        // path; each queued entry is a small proto so worst-case memory
-        // stays bounded.
+        // 4096 absorbs dispatch bursts without blocking the send.await path.
         let (handler_tx, handler_rx) =
             mpsc::channel::<Result<pb::CommandHandlerInbound, Status>>(4096);
 
         let handler_streams = Arc::clone(&self.handler_streams);
-        let pending = Arc::clone(&self.pending);
+        let channel_registry = Arc::clone(&self.channel_registry);
+        let handler_stream_registry = Arc::clone(&self.handler_stream_registry);
         let mut client_id: Option<String> = None;
 
         tokio::spawn(async move {
-            while let Ok(Some(msg)) = inbound.message().await {
+            let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
+            let mut subscribed_commands: Vec<String> = Vec::new();
+
+            loop {
+                let msg_result = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            tracing::info!(client_id = ?client_id, "command handler: cancelled by platform disconnect");
+                            break;
+                        }
+                        result = inbound.message() => result,
+                    }
+                } else {
+                    inbound.message().await
+                };
+
+                let msg = match msg_result {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        tracing::info!(client_id = ?client_id, "command handler stream: client closed send-side");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(client_id = ?client_id, error = %e, "command handler stream: transport error");
+                        break;
+                    }
+                };
+
                 let instruction_id = if msg.instruction_id.is_empty() {
                     None
                 } else {
@@ -94,9 +132,20 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                             component = %sub.component_name,
                             "Command handler subscribing"
                         );
+                        let command_name = sub.command.clone();
+                        let sub_client_id = sub.client_id.clone();
+                        let sub_component = sub.component_name.clone();
                         client_id = Some(sub.client_id.clone());
+                        subscribed_commands.push(sub.command.clone());
+
+                        if cancel_token.is_none() {
+                            cancel_token = Some(
+                                handler_stream_registry.get_cancellation_token(&sub.client_id),
+                            );
+                        }
 
                         handler_streams.insert(sub.client_id.clone(), handler_tx.clone());
+                        handler_stream_registry.register(&sub.client_id, handler_tx.clone());
 
                         platform.subscribe_command(
                             sub.command,
@@ -104,6 +153,16 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                             ComponentName(sub.component_name),
                             sub.load_factor,
                         );
+
+                        channel_registry
+                            .broadcast_topology_notification(platform_pb::TopologyNotification {
+                                change_type: "handler_registered".to_string(),
+                                message_type: command_name,
+                                handler_kind: "command".to_string(),
+                                client_id: sub_client_id,
+                                component_name: sub_component,
+                            })
+                            .await;
 
                         if let Some(id) = instruction_id {
                             let ack = pb::CommandHandlerInbound {
@@ -120,7 +179,19 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                         }
                     }
                     Some(pb::command_handler_outbound::Request::Unsubscribe(sub)) => {
+                        let command_name = sub.command.clone();
+                        let unsub_client_id = sub.client_id.clone();
                         platform.unsubscribe_command(&sub.command, &ClientId(sub.client_id));
+
+                        channel_registry
+                            .broadcast_topology_notification(platform_pb::TopologyNotification {
+                                change_type: "handler_deregistered".to_string(),
+                                message_type: command_name,
+                                handler_kind: "command".to_string(),
+                                client_id: unsub_client_id,
+                                component_name: String::new(),
+                            })
+                            .await;
                     }
                     Some(pb::command_handler_outbound::Request::FlowControl(fc)) => {
                         platform.grant_command_permits(&ClientId(fc.client_id), fc.permits);
@@ -128,27 +199,49 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                     Some(pb::command_handler_outbound::Request::CommandResponse(resp)) => {
                         let result = from_proto_command_response(resp);
                         let request_id = result.request_id.clone();
-
-                        // Complete the pending dispatch call. Sharded map
-                        // so we don't contend with concurrent dispatches.
-                        if let Some((_, tx)) = pending.remove(&request_id) {
-                            let _ = tx.send(result);
-                        }
+                        // The bus owns the response sender (in its in-flight map);
+                        // complete_command extracts the entry, sends, and updates metrics.
+                        platform.complete_command(&request_id, result);
                     }
                     Some(pb::command_handler_outbound::Request::Ack(_)) => {}
                     None => {}
                 }
             }
 
-            // Handler disconnected — clean up.
+            // Handler disconnected. Skip cleanup if the platform stream already
+            // cascaded the disconnect — it's responsible for remove_client.
+            let was_cancelled = cancel_token.as_ref().is_some_and(|t| t.is_cancelled());
+
             if let Some(cid) = client_id {
-                platform.remove_client(&ClientId(cid.clone()));
                 handler_streams.remove(&cid);
 
-                // Fail all pending commands for this handler.
-                // (In practice, the oneshot receivers will get a RecvError
-                // when the handler_streams entry is removed and the dispatch
-                // path can't send the command.)
+                if !was_cancelled {
+                    let client = ClientId(cid.clone());
+                    // Removes all subscriptions and cancels in-flight commands
+                    // (each receives a KRONOSDB-4006 failure on its caller).
+                    let cancelled = platform.remove_command_client(&client);
+                    tracing::info!(
+                        client_id = %cid,
+                        commands = subscribed_commands.len(),
+                        cancelled_in_flight = cancelled.len(),
+                        "command handler: unsubscribed and cancelled in-flight commands"
+                    );
+
+                    channel_registry
+                        .broadcast_topology_notification(platform_pb::TopologyNotification {
+                            change_type: "handler_deregistered".to_string(),
+                            message_type: String::new(),
+                            handler_kind: "command".to_string(),
+                            client_id: cid.clone(),
+                            component_name: String::new(),
+                        })
+                        .await;
+                } else {
+                    tracing::info!(
+                        client_id = %cid,
+                        "command handler: skipping cleanup (platform stream cascaded)"
+                    );
+                }
             }
         });
 
@@ -171,14 +264,11 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         let command = from_proto_command(cmd);
         let message_id = command.message_id.clone();
 
-        // Dispatch — selects a handler and acquires a permit.
+        // Dispatch — selects a handler, acquires a permit, and registers the
+        // in-flight tracking entry holding the response sender.
         let (pending_cmd, response_rx) = platform
             .dispatch_command(command)
             .map_err(|e| Status::unavailable(e.to_string()))?;
-
-        // Store the response channel so the handler stream can complete it.
-        self.pending
-            .insert(message_id.clone(), pending_cmd.response_tx);
 
         // Find the selected handler's stream and deliver the command.
         let target_id = &pending_cmd.target_handler.0;
@@ -187,32 +277,40 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             .get(target_id)
             .map(|r| r.value().clone());
 
-        let handler_tx = handler_tx.ok_or_else(|| {
-            Status::unavailable(format!("handler '{}' stream not found", target_id))
-        })?;
-
-        let inbound_cmd = to_proto_command_inbound(&pending_cmd.command);
-        handler_tx
-            .send(Ok(inbound_cmd))
-            .await
-            .map_err(|_| Status::unavailable("handler disconnected"))?;
-
-        // Wait for the handler's response with timeout.
-        let result = match tokio::time::timeout(self.command_timeout, response_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => {
-                self.pending.remove(&message_id);
-                return Err(Status::unavailable(
-                    "handler disconnected before responding",
-                ));
-            }
-            Err(_) => {
-                self.pending.remove(&message_id);
-                return Err(Status::deadline_exceeded("command dispatch timed out"));
+        let handler_tx = match handler_tx {
+            Some(tx) => tx,
+            None => {
+                platform.cancel_in_flight_command(&message_id);
+                return Err(Status::unavailable(format!(
+                    "handler '{target_id}' stream not found"
+                )));
             }
         };
 
-        Ok(Response::new(to_proto_command_response(result)))
+        let inbound_cmd = to_proto_command_inbound(&pending_cmd.command);
+        if handler_tx.send(Ok(inbound_cmd)).await.is_err() {
+            platform.cancel_in_flight_command(&message_id);
+            return Err(Status::unavailable("handler disconnected"));
+        }
+
+        // Wait for the handler's response, with a per-request timeout. The
+        // bus also runs a background sweep as a safety net, but the per-
+        // request deadline is enforced here so callers see deadline_exceeded.
+        match tokio::time::timeout(self.command_timeout, response_rx).await {
+            Ok(Ok(result)) => Ok(Response::new(to_proto_command_response(result))),
+            Ok(Err(_)) => {
+                // Sender dropped without sending — the bus extracted the entry
+                // (e.g. handler disconnect cascade dropped the entry before
+                // sending). Treat as unavailable.
+                Err(Status::unavailable(
+                    "handler disconnected before responding",
+                ))
+            }
+            Err(_) => {
+                platform.cancel_in_flight_command(&message_id);
+                Err(Status::deadline_exceeded("command dispatch timed out"))
+            }
+        }
     }
 }
 

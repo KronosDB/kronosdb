@@ -80,9 +80,25 @@ message PlatformOutbound {
     EventProcessorSegmentReference split_event_processor_segment = 8;
     /* Instruction to merge two segments in a streaming event processor. */
     EventProcessorSegmentReference merge_event_processor_segment = 9;
+    /* Notification that the handler topology has changed (handlers registered/deregistered). */
+    TopologyNotification topology_notification = 11;
   }
   /* If set, the client must acknowledge this instruction. */
   string instruction_id = 10;
+}
+
+/* Notification sent to connected platform clients when the handler topology changes. */
+message TopologyNotification {
+  /* Type of change: "handler_registered" or "handler_deregistered". */
+  string change_type = 1;
+  /* The message type (command or query name) affected. */
+  string message_type = 2;
+  /* Whether this is a command or query handler. */
+  string handler_kind = 3;
+  /* The client that registered/deregistered. */
+  string client_id = 4;
+  /* The component name. */
+  string component_name = 5;
 }
 
 /* Heartbeat message for liveness detection. */
