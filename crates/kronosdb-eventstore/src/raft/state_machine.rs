@@ -12,6 +12,7 @@ use crate::append::{AppendRequest, AppliedLogId};
 use crate::context::ContextManager;
 use crate::error::Error;
 
+use super::snapshot_store::{PersistedSnapshot, SnapshotStore};
 use super::types::{NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConfig};
 
 #[cfg(feature = "bench-instrumentation")]
@@ -84,6 +85,7 @@ pub struct Reconciliation {
 /// This is the bridge between Raft consensus and the event store.
 pub struct EventStoreStateMachine {
     contexts: Arc<ContextManager>,
+    snapshot_store: Arc<SnapshotStore>,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
 }
@@ -103,20 +105,63 @@ impl EventStoreStateMachine {
     /// `applied_state()` as "something at least this high is applied".
     /// Subsequent `apply()` calls overwrite `last_applied` with the full
     /// real `LogId` carried on each entry.
-    pub fn new(contexts: Arc<ContextManager>) -> Result<Self, Error> {
-        let last_applied = contexts.max_applied_log_id()?.map(|applied| LogId {
+    ///
+    /// `last_membership` is hydrated from the latest on-disk snapshot. This
+    /// is the load-bearing path for surviving restart-after-purge: once the
+    /// cluster-init `Membership` log entry is purged, the snapshot's meta
+    /// is the only durable carrier of voter set. Without it, `applied_state`
+    /// would return `StoredMembership::default()` and openraft's startup
+    /// would default the node to Learner — see `raft/snapshot_store.rs`
+    /// for the full failure-mode writeup.
+    ///
+    /// When a snapshot exists, its `last_log_id` provides a real (non-
+    /// sentinel) `LogId` for `last_applied`. The marker recovery is only
+    /// authoritative when it is strictly ahead of the snapshot (a Normal
+    /// entry was applied after the last snapshot was built); in that case
+    /// `reconcile_with_log` rewrites the sentinel `node_id` once it can
+    /// see the real entry in the log.
+    pub fn new(
+        contexts: Arc<ContextManager>,
+        snapshot_store: Arc<SnapshotStore>,
+    ) -> Result<Self, Error> {
+        let snap_meta = snapshot_store.load_latest_meta().map_err(Error::Io)?;
+
+        let marker_applied = contexts.max_applied_log_id()?.map(|applied| LogId {
             leader_id: CommittedLeaderId::new(applied.term, 0),
             index: applied.index,
         });
+
+        // Highest applied across the two recovery sources. The snapshot
+        // gives a real `node_id`; the marker provides a sentinel. We
+        // prefer the snapshot's LogId when their indices tie so subsequent
+        // openraft invariants (which compare full `LogId` lexicographically)
+        // see real `node_id`s instead of the marker sentinel.
+        let snap_applied = snap_meta.as_ref().and_then(|m| m.last_log_id);
+        let last_applied = match (snap_applied, marker_applied) {
+            (Some(s), Some(m)) if m.index > s.index => Some(m),
+            (Some(s), _) => Some(s),
+            (None, m) => m,
+        };
+
+        let last_membership = snap_meta
+            .as_ref()
+            .map(|m| m.last_membership.clone())
+            .unwrap_or_default();
+
         tracing::info!(
             target: "raft.recovery",
-            last_applied = ?last_applied,
-            "state machine recovered from on-disk markers"
+            snap_applied = ?snap_applied,
+            marker_applied = ?marker_applied,
+            chosen_last_applied = ?last_applied,
+            voter_count = last_membership.membership().voter_ids().count(),
+            "state machine recovered (snapshot meta + on-disk markers)"
         );
+
         Ok(Self {
             contexts,
+            snapshot_store,
             last_applied,
-            last_membership: StoredMembership::default(),
+            last_membership,
         })
     }
 
@@ -451,6 +496,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
             contexts: Arc::clone(&self.contexts),
+            snapshot_store: Arc::clone(&self.snapshot_store),
         }
     }
 
@@ -462,7 +508,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        _meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
@@ -602,35 +648,48 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         self.last_applied = sm_snapshot.last_applied;
         self.last_membership = sm_snapshot.last_membership;
 
-        // TODO(06-02): persist `last_applied` after install_snapshot so a
-        // subsequent restart does NOT rediscover `last_applied = None` from
-        // marker scan and force openraft to re-apply every committed entry
-        // past the snapshot. The rebuild appends above go through the plain
-        // `engine.append(...)` path, which writes no RaftMarker. Current
-        // tests don't exercise install-then-restart, so this is DEFERRED.
-        // Preferred fix: thread `sm_snapshot.last_applied` into the first
-        // rebuild-append via `append_with_raft` (Option 3 in plan 06-01
-        // remaining_work). Requires extending the rebuild loop to emit ONE
-        // synthetic marker even when the snapshot has no events.
+        // Persist the installed snapshot to disk. Without this, a restart
+        // after install would lose `last_membership` (since markers don't
+        // carry membership) and the node would default to Learner — exactly
+        // the bug we're fixing for the locally-built snapshot path. The
+        // disk write happens AFTER the in-memory restore so a crash here
+        // leaves us in a recoverable state: SM has new state in memory,
+        // disk still has the old snapshot, next restart re-applies the
+        // committed log range to catch up.
+        self.snapshot_store
+            .write(&PersistedSnapshot {
+                meta: meta.clone(),
+                data,
+            })
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
+
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        // openraft contract: return None iff there is no snapshot to offer.
-        // Before any apply there is nothing to snapshot; after the first
-        // apply we can always materialize a fresh snapshot on demand from
-        // the authoritative segment state.
-        if self.last_applied.is_none() {
-            return Ok(None);
+        // openraft contract: return the latest persisted snapshot if one
+        // exists, else None. openraft's startup helper rebuilds via
+        // `get_snapshot_builder` when this returns None and logs have been
+        // purged (helper.rs:132-143), so we don't need to materialize on
+        // demand here — that would just duplicate work and produce a
+        // snapshot whose meta doesn't match anything on disk.
+        match self.snapshot_store.load_latest().map_err(|e| {
+            StorageError::from_io_error(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
+        })? {
+            Some(persisted) => Ok(Some(Snapshot {
+                meta: persisted.meta,
+                snapshot: Box::new(Cursor::new(persisted.data)),
+            })),
+            None => Ok(None),
         }
-        let mut builder = EventStoreSnapshotBuilder {
-            last_applied: self.last_applied,
-            last_membership: self.last_membership.clone(),
-            contexts: Arc::clone(&self.contexts),
-        };
-        Ok(Some(builder.build_snapshot().await?))
     }
 }
 
@@ -639,11 +698,15 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
 /// Holds a cloned `Arc<ContextManager>` so `build_snapshot` can walk every
 /// context via `list_contexts` + `get_context`, calling the new
 /// `EventStoreEngine::source_all` helper for each to materialize the
-/// per-context event stream (Phase 4, SNAP-01).
+/// per-context event stream (Phase 4, SNAP-01). Also carries an
+/// `Arc<SnapshotStore>` so the built snapshot is persisted to disk before
+/// it is handed back to openraft — without that, restart loses
+/// `last_membership` and the node refuses to elect.
 pub struct EventStoreSnapshotBuilder {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
     contexts: Arc<ContextManager>,
+    snapshot_store: Arc<SnapshotStore>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
@@ -713,11 +776,98 @@ impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
             snapshot_id,
         };
 
+        // Persist before handing back to openraft. If this fails, openraft
+        // sees the build as failed and won't purge logs against this
+        // snapshot — preserving the invariant that purge is only safe once
+        // a snapshot covering those entries is durable.
+        self.snapshot_store
+            .write(&PersistedSnapshot {
+                meta: meta.clone(),
+                data: data.clone(),
+            })
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
+
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
         })
     }
+}
+
+/// Synthesize and persist a rescue snapshot for a data dir that was created
+/// by a pre-fix server: openraft built and purged in-memory snapshots, but
+/// nothing was ever written to disk. The cluster-init `Membership` log entry
+/// at index 1 is gone, no other Membership entries survive, and the only
+/// durable carrier of the voter set was the snapshot's `meta.last_membership`
+/// — which doesn't exist. On the next restart `applied_state()` returns
+/// `StoredMembership::default()`, openraft defaults the node to Learner, and
+/// writes hang forever (see `restart_after_snapshot_single_node.rs`).
+///
+/// This helper rebuilds the snapshot bytes from the live event segments
+/// (the only authoritative state we still have) and pairs them with a
+/// membership reconstructed from `cluster_config`. Caller MUST verify that
+/// the rescue is safe before invoking — specifically, that the running node
+/// is one of the synthesized voters, otherwise the membership we write would
+/// silently exclude this node from its own cluster.
+pub fn synthesize_rescue_snapshot(
+    contexts: &Arc<ContextManager>,
+    snapshot_store: &SnapshotStore,
+    last_applied: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, openraft::BasicNode>,
+) -> Result<(), Error> {
+    let names = contexts.list_contexts();
+    let mut context_snaps = Vec::with_capacity(names.len());
+    for name in names {
+        let engine = contexts.get_context(&name)?;
+        let stored = engine.source_all(crate::event::Position(0))?;
+        let events = stored
+            .into_iter()
+            .map(|s| SnapshotEvent {
+                position: s.position.0,
+                identifier: s.identifier,
+                name: s.name,
+                version: s.version,
+                timestamp: s.timestamp,
+                payload: s.payload,
+                metadata: s.metadata,
+                tags: s.tags.into_iter().map(|t| (t.key, t.value)).collect(),
+            })
+            .collect();
+        context_snaps.push(ContextSnapshot { name, events });
+    }
+
+    let sm_snapshot = StateMachineSnapshot {
+        version: SNAPSHOT_VERSION,
+        last_applied,
+        last_membership: last_membership.clone(),
+        contexts: context_snaps,
+    };
+
+    let data = bincode::serialize(&sm_snapshot).map_err(|e| Error::Corrupted {
+        message: format!("rescue snapshot serialize: {e}"),
+    })?;
+
+    let snapshot_id = last_applied
+        .map(|id| format!("rescue-{}-{}", id.leader_id, id.index))
+        .unwrap_or_else(|| "rescue-empty".to_string());
+
+    let meta = SnapshotMeta {
+        last_log_id: last_applied,
+        last_membership,
+        snapshot_id,
+    };
+
+    snapshot_store
+        .write(&PersistedSnapshot { meta, data })
+        .map_err(Error::Io)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -771,7 +921,8 @@ mod tests {
         let dir = Box::leak(Box::new(dir));
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         (sm, contexts)
     }
 
@@ -1034,16 +1185,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_current_snapshot_some_after_apply() {
+    async fn get_current_snapshot_some_after_build() {
+        // openraft's contract: `get_current_snapshot` returns the latest
+        // *persisted* snapshot, not one synthesized on demand. A snapshot
+        // becomes available only after the snapshot builder runs (either
+        // openraft's policy fires or a caller drives the builder
+        // explicitly). This test exercises the post-build path.
         let (mut sm, _ctx) = create_sm();
         sm.apply(vec![make_append_entry(1, 1, "default", "A")])
             .await
             .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let _ = builder.build_snapshot().await.unwrap();
         let snap = sm
             .get_current_snapshot()
             .await
             .unwrap()
-            .expect("expected Some snapshot after apply");
+            .expect("expected Some snapshot after build_snapshot");
         assert_eq!(snap.meta.last_log_id.unwrap().index, 1);
     }
 
@@ -1323,7 +1481,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         sm.last_applied = Some(LogId {
             leader_id: CommittedLeaderId::new(1, 0),
             index: 12,
@@ -1366,7 +1525,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         sm.last_applied = Some(LogId {
             leader_id: CommittedLeaderId::new(1, 0),
             index: 12,
@@ -1404,7 +1564,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         let real_at_10 = LogId {
             leader_id: CommittedLeaderId::new(1, 1),
             index: 10,
@@ -1436,7 +1597,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         assert!(sm.last_applied.is_none());
 
         let report = sm
@@ -1459,7 +1621,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         let sentinel = LogId {
             leader_id: CommittedLeaderId::new(5, 0),
             index: 20,
@@ -1489,7 +1652,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contexts = Arc::new(ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap());
         contexts.create_context("default").unwrap();
-        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts)).unwrap();
+        let snap_store = Arc::new(SnapshotStore::new(dir.path().join("snapshots")).unwrap());
+        let mut sm = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store).unwrap();
         sm.last_applied = Some(LogId {
             leader_id: CommittedLeaderId::new(1, 0),
             index: 50,
