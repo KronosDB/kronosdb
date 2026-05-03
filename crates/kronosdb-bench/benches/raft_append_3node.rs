@@ -45,6 +45,7 @@ use kronosdb_eventstore::event::{Position, Tag};
 use kronosdb_eventstore::raft::bench_instrumentation::{self as bi, Region, VecSink};
 use kronosdb_eventstore::raft::log_store::{LogStore, LogStoreConfig};
 use kronosdb_eventstore::raft::network::NetworkFactory;
+use kronosdb_eventstore::raft::snapshot_store::SnapshotStore;
 use kronosdb_eventstore::raft::state_machine::EventStoreStateMachine;
 use kronosdb_eventstore::raft::transport::RaftTransportService;
 use kronosdb_eventstore::raft::types::{
@@ -113,8 +114,10 @@ async fn start_node(id: NodeId, port: u16, dir: &Path) -> BenchNode {
 
     let raft_dir = dir.join("raft");
     let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
-    let state_machine =
-        EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
+    let snap_store =
+        Arc::new(SnapshotStore::new(raft_dir.join("snapshots")).expect("create snapshot store"));
+    let state_machine = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store)
+        .expect("recover state machine");
 
     // Short election/heartbeat windows to keep bench boot latency low. These
     // mirror the values used in `cluster_test.rs`; the stock

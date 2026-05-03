@@ -23,6 +23,7 @@ use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::event::Position;
 use kronosdb_eventstore::raft::log_store::{LogStore, LogStoreConfig};
 use kronosdb_eventstore::raft::network::NetworkFactory;
+use kronosdb_eventstore::raft::snapshot_store::SnapshotStore;
 use kronosdb_eventstore::raft::state_machine::EventStoreStateMachine;
 use kronosdb_eventstore::raft::transport::RaftTransportService;
 use kronosdb_eventstore::raft::types::{
@@ -50,8 +51,10 @@ async fn start_node(id: NodeId, port: u16, dir: &std::path::Path) -> TestNode {
 
     let raft_dir = dir.join("raft");
     let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
-    let state_machine =
-        EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
+    let snap_store =
+        Arc::new(SnapshotStore::new(raft_dir.join("snapshots")).expect("create snapshot store"));
+    let state_machine = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store)
+        .expect("recover state machine");
 
     // Aggressive snapshot threshold to force install on the learner.
     let config = Config {
@@ -283,10 +286,22 @@ async fn snapshot_coldjoin_apply_consistency() {
     // Build sibling state machines sharing each node's live ContextManager.
     // These siblings are NOT wired into openraft — they're a direct handle
     // into the apply() path for deterministic side-by-side comparison.
-    let mut leader_sibling =
-        EventStoreStateMachine::new(Arc::clone(&leader_contexts)).expect("recover leader sibling");
-    let mut follower_sibling =
-        EventStoreStateMachine::new(Arc::clone(&node3.contexts)).expect("recover follower sibling");
+    // Throwaway snapshot stores — these sibling SMs are not wired into
+    // openraft, they're just direct apply()-path probes for side-by-side
+    // determinism comparison. A scratch dir per sibling keeps them
+    // independent of the live raft snapshot dirs.
+    let leader_snap_scratch = tempfile::tempdir().expect("scratch dir");
+    let follower_snap_scratch = tempfile::tempdir().expect("scratch dir");
+    let mut leader_sibling = EventStoreStateMachine::new(
+        Arc::clone(&leader_contexts),
+        Arc::new(SnapshotStore::new(leader_snap_scratch.path()).unwrap()),
+    )
+    .expect("recover leader sibling");
+    let mut follower_sibling = EventStoreStateMachine::new(
+        Arc::clone(&node3.contexts),
+        Arc::new(SnapshotStore::new(follower_snap_scratch.path()).unwrap()),
+    )
+    .expect("recover follower sibling");
 
     // Craft a conditional append that MUST be rejected: criterion matches
     // tag orderId=order-1 which was appended in the loop above, with

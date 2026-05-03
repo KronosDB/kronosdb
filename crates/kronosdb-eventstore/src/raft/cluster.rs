@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use openraft::{BasicNode, Config, Raft};
+use openraft::{BasicNode, Config, Membership, Raft, StoredMembership};
 use parking_lot::RwLock;
 use tonic::transport::Channel;
 
@@ -26,7 +26,8 @@ use super::log_store::{LogStore, LogStoreConfig};
 use super::network::NetworkFactory;
 use super::proto;
 use super::proto::raft_transport_client::RaftTransportClient;
-use super::state_machine::EventStoreStateMachine;
+use super::snapshot_store::SnapshotStore;
+use super::state_machine::{EventStoreStateMachine, synthesize_rescue_snapshot};
 use super::types::{
     NodeId, RaftAppendCondition, RaftAppendEvent, RaftCriterion, RaftRejectReason, RaftRequest,
     RaftResponse, TypeConfig,
@@ -106,10 +107,115 @@ impl ClusterManager {
             .join("raft");
         let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
 
+        // On-disk snapshot store. Lives in `<raft_dir>/snapshots`. Used to
+        // persist `last_membership` across restart — without this, the
+        // cluster-init Membership log entry being purged leaves no durable
+        // carrier of voter set and the node defaults to Learner on restart.
+        let snapshot_store =
+            Arc::new(SnapshotStore::new(raft_dir.join("snapshots")).map_err(Error::Io)?);
+
+        // Rescue shim for pre-fix data dirs. Trigger conditions:
+        //   1. No on-disk snapshot exists (`load_latest_meta` is None)
+        //   2. The Raft log was purged at some point (`last_purged` is Some)
+        //
+        // Together these imply the node ran a server build that built
+        // snapshots only in memory. The cluster-init Membership entry at
+        // index 1 was purged but never persisted into a snapshot, so on
+        // restart `applied_state()` would return an empty `last_membership`
+        // and openraft would default the node to Learner — writes hang
+        // forever (see `restart_after_snapshot_single_node.rs`).
+        //
+        // We refuse to rescue if this node isn't in `cluster_config.voters`
+        // — silently writing a membership that excludes us would corrupt
+        // the cluster's voter set in a way that's much harder to recover
+        // from than the original bug.
+        let needs_rescue = snapshot_store
+            .load_latest_meta()
+            .map_err(Error::Io)?
+            .is_none()
+            && log_store.last_purged().is_some();
+        if needs_rescue {
+            let cfg = &self.cluster_config;
+            let self_in_voters = cfg.voters.iter().any(|p| p.id == cfg.node_id);
+            if !self_in_voters {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "rescue refused: node {} is not in cluster_config.voters {:?}; \
+                         cannot synthesize a snapshot whose membership excludes the running node. \
+                         This data dir was created by a pre-fix server (snapshots in-memory only) \
+                         and the cluster-init Membership log entry has been purged. Either start \
+                         this node under its original voter id or restore from backup.",
+                        cfg.node_id,
+                        cfg.voters.iter().map(|p| p.id).collect::<Vec<_>>(),
+                    ),
+                });
+            }
+
+            let mut nodes: BTreeMap<NodeId, BasicNode> = BTreeMap::new();
+            for p in &cfg.voters {
+                nodes.insert(
+                    p.id,
+                    BasicNode {
+                        addr: p.addr.clone(),
+                    },
+                );
+            }
+            let voter_ids: std::collections::BTreeSet<NodeId> =
+                cfg.voters.iter().map(|p| p.id).collect();
+            let membership = Membership::new(vec![voter_ids], nodes);
+            let stored_membership = StoredMembership::new(None, membership);
+
+            // Use the marker-recovered last_applied. The sentinel `node_id=0`
+            // would normally be fine inside the state machine (reconcile
+            // rewrites it from the real log entry), but the snapshot meta is
+            // checked against `last_purged` by openraft's startup with a
+            // strict lexicographic `(term, node_id, index)` comparison —
+            // a sentinel `node_id=0` here would fail the
+            // `purge_upto <= snapshot_last_log_id` invariant when
+            // `last_purged` carries the real `node_id`. Read the actual log
+            // entry at the marker's index and use its real `LogId` for the
+            // snapshot meta. If the log has no entry there (impossible in
+            // this rescue path because `last_purged.is_some()` implies log
+            // entries exist below that index, and markers are only written
+            // alongside log entries), fall back to the log's own
+            // `last_log_id` so the comparison still succeeds.
+            let marker_applied_index = self
+                .context_manager
+                .max_applied_log_id()?
+                .map(|applied| applied.index);
+            let rescue_last_log_id = match marker_applied_index {
+                Some(idx) => match log_store.entry_at(idx).map_err(Error::Io)? {
+                    Some(entry) => Some(*openraft::RaftLogId::get_log_id(&entry)),
+                    None => log_store.last_log_id(),
+                },
+                None => None,
+            };
+
+            tracing::warn!(
+                target: "raft.recovery",
+                node_id = cfg.node_id,
+                voter_count = cfg.voters.len(),
+                rescue_last_log_id = ?rescue_last_log_id,
+                last_purged = ?log_store.last_purged(),
+                "rescuing pre-fix data dir: synthesizing membership snapshot from cluster_config \
+                 (no on-disk snapshot, but log was purged — cluster-init Membership entry is gone)"
+            );
+
+            synthesize_rescue_snapshot(
+                &self.context_manager,
+                &snapshot_store,
+                rescue_last_log_id,
+                stored_membership,
+            )?;
+        }
+
         // Create state machine wrapping the context manager. `new` recovers
         // `last_applied` from segment markers so the post-restart state matches
-        // what the log store will report as committed (Option D).
-        let mut state_machine = EventStoreStateMachine::new(Arc::clone(&self.context_manager))?;
+        // what the log store will report as committed (Option D), and hydrates
+        // `last_membership` from the latest on-disk snapshot (or the rescue
+        // snapshot we just synthesized above).
+        let mut state_machine =
+            EventStoreStateMachine::new(Arc::clone(&self.context_manager), snapshot_store)?;
 
         // Reconciliation pass: bring `state_machine.last_applied` and
         // `log_store.committed` into a consistent shape before handing both

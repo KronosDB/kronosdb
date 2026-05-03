@@ -36,6 +36,7 @@ use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
 use kronosdb_eventstore::raft::cluster::RaftEngine;
 use kronosdb_eventstore::raft::log_store::{LogStore, LogStoreConfig};
 use kronosdb_eventstore::raft::network::NetworkFactory;
+use kronosdb_eventstore::raft::snapshot_store::SnapshotStore;
 use kronosdb_eventstore::raft::state_machine::EventStoreStateMachine;
 use kronosdb_eventstore::raft::types::{NodeId, TypeConfig};
 use kronosdb_eventstore::segment::DEFAULT_SEGMENT_SIZE;
@@ -61,8 +62,10 @@ async fn start_single_node(id: NodeId, dir: &Path) -> TestNode {
 
     let raft_dir = dir.join("raft");
     let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).expect("create log store");
-    let state_machine =
-        EventStoreStateMachine::new(Arc::clone(&contexts)).expect("recover state machine");
+    let snap_store =
+        Arc::new(SnapshotStore::new(raft_dir.join("snapshots")).expect("create snapshot store"));
+    let state_machine = EventStoreStateMachine::new(Arc::clone(&contexts), snap_store)
+        .expect("recover state machine");
 
     let config = Config {
         heartbeat_interval: 200,

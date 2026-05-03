@@ -793,6 +793,16 @@ impl LogStore {
         self.inner.lock().committed
     }
 
+    /// Returns the recovered `last_purged` without going through the async
+    /// `RaftLogStorage` trait. Used by `cluster::init_context`'s rescue
+    /// pre-check: if entries have been purged but no on-disk snapshot exists,
+    /// the cluster-init `Membership` log entry has been silently dropped and
+    /// startup must synthesize a rescue snapshot from `cluster_config` before
+    /// constructing the state machine.
+    pub fn last_purged(&self) -> Option<LogId<NodeId>> {
+        self.inner.lock().last_purged
+    }
+
     /// Reads the log entry at `log_index`, if present. Synchronous
     /// counterpart to `try_get_log_entries(index..=index)` for the
     /// reconciliation pass.

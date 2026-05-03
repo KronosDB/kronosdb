@@ -13,6 +13,7 @@
 pub mod cluster;
 pub mod log_store;
 pub mod network;
+pub mod snapshot_store;
 pub mod state_machine;
 pub mod transport;
 pub mod types;
