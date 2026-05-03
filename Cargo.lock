@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "kronosdb-bench"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "kronosdb-eventstore"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "kronosdb-messaging"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dashmap",
  "parking_lot",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "kronosdb-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "clap",
