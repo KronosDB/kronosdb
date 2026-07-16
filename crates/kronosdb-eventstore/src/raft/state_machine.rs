@@ -143,10 +143,25 @@ impl EventStoreStateMachine {
             (None, m) => m,
         };
 
-        let last_membership = snap_meta
-            .as_ref()
-            .map(|m| m.last_membership.clone())
-            .unwrap_or_default();
+        // Membership hydration priority: membership.bin (written on every
+        // membership apply — survives restarts that happen before the first
+        // snapshot) > latest snapshot meta > empty. When only the snapshot
+        // carries it, heal forward by writing membership.bin now.
+        let last_membership = match snapshot_store.load_membership().map_err(Error::Io)? {
+            Some(m) => m,
+            None => {
+                let from_snap = snap_meta
+                    .as_ref()
+                    .map(|m| m.last_membership.clone())
+                    .unwrap_or_default();
+                if from_snap.membership().voter_ids().count() > 0 {
+                    snapshot_store
+                        .save_membership(&from_snap)
+                        .map_err(Error::Io)?;
+                }
+                from_snap
+            }
+        };
 
         tracing::info!(
             target: "raft.recovery",
@@ -480,6 +495,18 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
                 }
                 EntryPayload::Membership(ref membership) => {
                     self.last_membership = StoredMembership::new(Some(log_id), membership.clone());
+                    // Durable immediately — the log entry alone is not enough:
+                    // once applied it leaves openraft's startup rescan window,
+                    // and the next snapshot may be thousands of entries away.
+                    self.snapshot_store
+                        .save_membership(&self.last_membership)
+                        .map_err(|e| {
+                            StorageError::from_io_error(
+                                openraft::ErrorSubject::StateMachine,
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Blank => {
@@ -647,6 +674,19 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         // rewinds all the way.
         self.last_applied = sm_snapshot.last_applied;
         self.last_membership = sm_snapshot.last_membership;
+
+        // Keep membership.bin in sync with the installed snapshot so the
+        // startup hydration priority (membership.bin first) never resurrects
+        // a pre-install voter set.
+        self.snapshot_store
+            .save_membership(&self.last_membership)
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
 
         // Persist the installed snapshot to disk. Without this, a restart
         // after install would lose `last_membership` (since markers don't
