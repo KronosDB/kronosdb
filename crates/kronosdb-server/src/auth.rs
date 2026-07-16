@@ -1,3 +1,4 @@
+use subtle::ConstantTimeEq;
 use tonic::{Request, Status};
 
 /// Creates a tonic interceptor that validates the `kronosdb-token` metadata header.
@@ -15,7 +16,10 @@ pub fn make_auth_interceptor(
 
         match req.metadata().get("kronosdb-token") {
             Some(t) => {
-                if t.to_str().unwrap_or("") == expected.as_str() {
+                // Constant-time compare: a plain `==` short-circuits on the
+                // first differing byte, leaking prefix length via timing.
+                let presented = t.to_str().unwrap_or("").as_bytes();
+                if bool::from(presented.ct_eq(expected.as_bytes())) {
                     Ok(req)
                 } else {
                     Err(Status::unauthenticated("invalid access token"))

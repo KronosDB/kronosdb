@@ -112,7 +112,9 @@ pub async fn create_context_fragment(
     State(state): State<AdminState>,
     axum::Form(req): axum::Form<CreateContextRequest>,
 ) -> Response {
-    match state.contexts.create_context(&req.name) {
+    // Through Raft consensus: replicated to every node and immediately
+    // servable (the event store layer registers the context lazily).
+    match state.cluster.create_context_replicated(&req.name).await {
         Ok(()) => (
             StatusCode::OK,
             [("HX-Trigger", "refreshContexts")],
@@ -140,8 +142,9 @@ pub async fn api_create_context(
     Json(req): Json<CreateContextRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
-        .contexts
-        .create_context(&req.name)
+        .cluster
+        .create_context_replicated(&req.name)
+        .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(
         serde_json::json!({"status": "ok", "context": req.name}),

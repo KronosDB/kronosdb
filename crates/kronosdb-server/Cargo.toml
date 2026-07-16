@@ -19,12 +19,23 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = "0.8"
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 uuid = { version = "1", features = ["v4"] }
 socket2 = "0.5"
+tonic-health = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+jsonwebtoken = "9"
+axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
+subtle = "2"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
