@@ -103,7 +103,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let context_name = Self::extract_context(&request).to_string();
         let req = request.into_inner();
         let from_position = Position(req.from_sequence as u64);
-        let condition = from_proto_criteria(req.criteria);
+        let condition = from_proto_read_criteria(req.criteria);
         tracing::info!(
             from = from_position.0,
             criteria_count = condition.criteria.len(),
@@ -184,7 +184,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         }
 
         let from_position = Position(subscribe.from_sequence as u64);
-        let condition = from_proto_criteria(subscribe.criteria);
+        let condition = from_proto_read_criteria(subscribe.criteria);
         let blacklist: std::collections::HashSet<String> =
             subscribe.blacklisted_names.into_iter().collect();
         let store = self.get_store(&context_name)?;
@@ -420,6 +420,24 @@ fn from_proto_criteria(criteria: Vec<pb::Criterion>) -> SourcingCondition {
     }
 }
 
+/// Criteria conversion for reads (Source/Stream), where the proto contract is
+/// "if empty, all events are returned". The engine resolves an empty criteria
+/// list to no matches, so an empty read filter is normalized to a single empty
+/// criterion (no names, no tags), which every index path treats as match-all.
+/// Append conditions must NOT use this: an absent/empty condition there means
+/// "no conflict check", which the unnormalized conversion already provides.
+fn from_proto_read_criteria(criteria: Vec<pb::Criterion>) -> SourcingCondition {
+    if criteria.is_empty() {
+        return SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![],
+            }],
+        };
+    }
+    from_proto_criteria(criteria)
+}
+
 fn from_proto_criterion(c: pb::Criterion) -> Criterion {
     Criterion {
         names: c.names,
@@ -490,5 +508,43 @@ fn to_status(e: Error) -> Status {
             Status::invalid_argument(format!("invalid context name '{name}': {reason}"))
         }
         Error::SnapshotNotFound { key } => Status::not_found(format!("snapshot not found: {key}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Source/Stream proto contract says "if criteria is empty, all events
+    /// are returned", but the engine resolves an empty criteria list to zero
+    /// matches. Reads must normalize to a single match-all criterion.
+    #[test]
+    fn empty_read_criteria_normalizes_to_match_all() {
+        let cond = from_proto_read_criteria(vec![]);
+        assert_eq!(cond.criteria.len(), 1);
+        assert!(cond.criteria[0].names.is_empty());
+        assert!(cond.criteria[0].tags.is_empty());
+    }
+
+    /// Append conditions keep the unnormalized conversion: empty criteria
+    /// means "no conflict check", not "conflict with everything".
+    #[test]
+    fn empty_append_condition_criteria_stays_empty() {
+        let cond = from_proto_condition(pb::ConsistencyCondition {
+            consistency_marker: 7,
+            criteria: vec![],
+        });
+        assert!(cond.criteria.criteria.is_empty());
+        assert_eq!(cond.consistency_marker.0, 7);
+    }
+
+    #[test]
+    fn non_empty_read_criteria_passes_through() {
+        let cond = from_proto_read_criteria(vec![pb::Criterion {
+            names: vec!["OrderPlaced".into()],
+            tags: vec![],
+        }]);
+        assert_eq!(cond.criteria.len(), 1);
+        assert_eq!(cond.criteria[0].names, vec!["OrderPlaced".to_string()]);
     }
 }
