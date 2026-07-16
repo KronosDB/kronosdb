@@ -1,3 +1,4 @@
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -63,6 +64,14 @@ struct SyncState {
     pending_writes: AtomicU64,
     enabled: bool,
     shutdown: AtomicBool,
+    /// Latches when an fsync fails. A failed fsync means the dirty pages may
+    /// already have been dropped by the kernel (fsyncgate semantics) — no
+    /// retry can make those writes durable, so the engine is poisoned: every
+    /// waiting writer gets an error instead of a durability ack, and all
+    /// subsequent appends fail fast until the process restarts and recovers
+    /// from what actually reached disk.
+    failed: AtomicBool,
+    failure_msg: StdMutex<Option<String>>,
 }
 
 impl SyncState {
@@ -73,6 +82,8 @@ impl SyncState {
             pending_writes: AtomicU64::new(0),
             enabled,
             shutdown: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            failure_msg: StdMutex::new(None),
         }
     }
 
@@ -81,11 +92,20 @@ impl SyncState {
         *self.epoch.lock().unwrap() + 1
     }
 
-    fn wait_for_sync(&self, target_epoch: u64) {
+    /// Blocks until the sync thread has fsynced past `target_epoch`.
+    /// Returns an error — the write is NOT durable — if the fsync failed.
+    fn wait_for_sync(&self, target_epoch: u64) -> Result<(), Error> {
         let mut epoch = self.epoch.lock().unwrap();
         while *epoch < target_epoch {
+            if self.failed.load(Ordering::Acquire) {
+                return Err(self.failure_error());
+            }
             epoch = self.synced.wait(epoch).unwrap();
         }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(self.failure_error());
+        }
+        Ok(())
     }
 
     fn complete_sync(&self) {
@@ -93,6 +113,33 @@ impl SyncState {
         let mut epoch = self.epoch.lock().unwrap();
         *epoch += 1;
         self.synced.notify_all();
+    }
+
+    /// Poisons the engine after an fsync failure and wakes every waiter so
+    /// they observe the failure instead of blocking forever.
+    fn fail_sync(&self, err: &Error) {
+        *self.failure_msg.lock().unwrap() = Some(err.to_string());
+        self.failed.store(true, Ordering::Release);
+        // Grab the epoch lock so the store/notify pair cannot interleave
+        // between a waiter's predicate check and its wait().
+        let _epoch = self.epoch.lock().unwrap();
+        self.synced.notify_all();
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn failure_error(&self) -> Error {
+        let msg = self
+            .failure_msg
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "unknown fsync failure".to_string());
+        Error::Io(io::Error::other(format!(
+            "event store poisoned by fsync failure (writes are NOT durable): {msg}; restart required"
+        )))
     }
 
     fn has_pending(&self) -> bool {
@@ -108,13 +155,34 @@ fn spawn_sync_thread(
     std::thread::Builder::new()
         .name("kronosdb-sync".into())
         .spawn(move || {
-            while !sync_state.shutdown.load(Ordering::Relaxed) {
+            loop {
                 std::thread::sleep(interval);
+                // Read the flag BEFORE the final sync pass: writers that
+                // marked pending before shutdown still get their fsync (and
+                // their wakeup) instead of hanging on a dead thread.
+                let shutting_down = sync_state.shutdown.load(Ordering::Relaxed);
                 if sync_state.has_pending() {
                     let mut w = writer.lock();
-                    let _ = w.sync();
+                    let result = w.sync();
                     drop(w);
-                    sync_state.complete_sync();
+                    match result {
+                        Ok(()) => sync_state.complete_sync(),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "group-commit fsync FAILED — poisoning event store; \
+                                 pending writes are not durable and new appends will be rejected"
+                            );
+                            sync_state.fail_sync(&e);
+                            // No retry: a post-failure fsync "success" would
+                            // not cover the dropped pages. The thread exits;
+                            // the poisoned flag gates all further appends.
+                            return;
+                        }
+                    }
+                }
+                if shutting_down {
+                    return;
                 }
             }
         })
@@ -433,6 +501,13 @@ impl EventStoreEngine {
     }
 
     /// Returns a shared reference to this engine's metrics counters.
+    /// Initiates engine shutdown: new appends are rejected, and the group
+    /// commit sync thread performs one final fsync pass (releasing any
+    /// in-flight writers) before exiting. Idempotent.
+    pub fn shutdown(&self) {
+        self.sync_state.shutdown.store(true, Ordering::Release);
+    }
+
     pub fn metrics(&self) -> &Arc<StoreMetrics> {
         &self.metrics
     }
@@ -482,6 +557,20 @@ impl EventStoreEngine {
         applied: Option<AppliedLogId>,
     ) -> Result<AppendResponse, Error> {
         let timer = Timer::start();
+
+        // Fail fast once poisoned: after an fsync failure nothing written
+        // here can be made durable, so accepting the write would lie.
+        if self.sync_state.is_failed() {
+            return Err(self.sync_state.failure_error());
+        }
+        // Reject writes during shutdown — the sync thread is doing its final
+        // pass and a write marked after it would wait for an fsync that
+        // never comes.
+        if self.sync_state.shutdown.load(Ordering::Relaxed) {
+            return Err(Error::Io(io::Error::other(
+                "event store is shutting down; append rejected",
+            )));
+        }
 
         let target_epoch = if self.sync_state.enabled {
             Some(self.sync_state.mark_pending())
@@ -628,9 +717,10 @@ impl EventStoreEngine {
             // and batch into the same upcoming fsync.
         };
 
-        // Step 6: Wait for fsync (group commit only).
+        // Step 6: Wait for fsync (group commit only). A failed fsync surfaces
+        // here as an error — the caller must NOT treat the write as durable.
         if let Some(epoch) = target_epoch {
-            self.sync_state.wait_for_sync(epoch);
+            self.sync_state.wait_for_sync(epoch)?;
         }
 
         self.metrics
@@ -1160,6 +1250,45 @@ mod tests {
             metadata: vec![],
             tags,
         }
+    }
+
+    /// A failed fsync must surface as an error to every waiting writer —
+    /// never as a silent durability ack — and must poison future appends.
+    #[test]
+    fn sync_failure_propagates_to_waiters_and_poisons() {
+        let state = Arc::new(SyncState::new(true));
+
+        let target = state.mark_pending();
+        let waiter = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.wait_for_sync(target))
+        };
+
+        // Give the waiter time to block, then fail the sync.
+        std::thread::sleep(Duration::from_millis(50));
+        state.fail_sync(&Error::Io(io::Error::other("simulated ENOSPC")));
+
+        let result = waiter.join().unwrap();
+        let err = result.expect_err("waiter must NOT be told the write is durable");
+        assert!(err.to_string().contains("fsync failure"), "got: {err}");
+
+        // Poisoned: subsequent waits fail immediately too.
+        assert!(state.is_failed());
+        assert!(state.wait_for_sync(state.mark_pending()).is_err());
+    }
+
+    /// The happy path is unchanged: complete_sync releases waiters with Ok.
+    #[test]
+    fn sync_success_releases_waiters_ok() {
+        let state = Arc::new(SyncState::new(true));
+        let target = state.mark_pending();
+        let waiter = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.wait_for_sync(target))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        state.complete_sync();
+        assert!(waiter.join().unwrap().is_ok());
     }
 
     #[test]

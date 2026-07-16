@@ -30,6 +30,7 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 tonic = "0.13"
 prost = "0.13"
 tracing = "0.1"
+fs2 = "0.4"
 
 [build-dependencies]
 tonic-build = "0.13"
