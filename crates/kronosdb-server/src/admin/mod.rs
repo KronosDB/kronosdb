@@ -1,5 +1,7 @@
+pub mod auth;
 mod console;
 pub mod layout;
+mod metrics;
 
 use std::sync::Arc;
 
@@ -34,6 +36,7 @@ pub struct AdminState {
     pub processor_registry: Arc<ProcessorRegistry>,
     pub channel_registry: Arc<ClientChannelRegistry>,
     pub started_at: std::time::Instant,
+    pub auth: Arc<auth::AuthRuntime>,
 }
 
 /// Starts the admin HTTP server on the configured address.
@@ -56,6 +59,8 @@ pub async fn start_admin_server(
         .route("/cluster", get(console::cluster::page))
         .route("/settings", get(console::settings::page))
         .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics::metrics))
         // Cluster membership API
         .route(
             "/api/cluster/add-learner",
@@ -71,6 +76,8 @@ pub async fn start_admin_server(
         )
         // Context API
         .route("/api/contexts", post(console::contexts::api_create_context))
+        // Auth routes (login/callback/logout) — public by design
+        .merge(auth::routes())
         // HTMX fragment endpoints
         .route("/fragments/stats", get(console::overview::stats_fragment))
         .route(
@@ -117,15 +124,45 @@ pub async fn start_admin_server(
         .route("/api/processors/{name}/split", post(processor_action_split))
         .route("/api/processors/{name}/merge", post(processor_action_merge))
         .route("/static/{*path}", get(static_handler))
+        // Auth gate for everything above except /health, /ready, /metrics,
+        // and /auth/* (see auth::is_public). Mode comes from [admin.auth].
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            crate::shutdown_signal().await;
+        })
+        .await?;
     Ok(())
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Readiness probe: 200 only when this node can serve. Liveness (`/health`)
+/// answers "is the process up"; this answers "should traffic be routed here"
+/// — contexts are open (implied by the server being wired) and the Raft
+/// group knows a leader, so writes can be accepted or forwarded.
+async fn ready(State(state): State<AdminState>) -> (StatusCode, &'static str) {
+    let leader_known = state
+        .cluster
+        .raft_node()
+        .map(|raft| raft.metrics().borrow().current_leader.is_some())
+        .unwrap_or(false);
+    if leader_known {
+        (StatusCode::OK, "ready")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: no raft leader known",
+        )
+    }
 }
 
 // Context chart fragment — returns bar chart HTML for the overview

@@ -57,9 +57,20 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_HEARTBEAT_TIMEOUT")]
     heartbeat_timeout: Option<u64>,
 
+    /// Graceful-shutdown drain deadline in seconds. After SIGTERM the server
+    /// waits at most this long for open connections to close before exiting.
+    /// Set terminationGracePeriodSeconds slightly above this on Kubernetes.
+    #[arg(long, default_value = "20", env = "KRONOSDB_DRAIN_DEADLINE")]
+    drain_deadline_secs: u64,
+
     /// Path to config file (TOML).
     #[arg(long, short, env = "KRONOSDB_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Path to a declarative manifest (TOML) whose resources — e.g. event
+    /// store contexts — are ensured to exist at startup.
+    #[arg(long, env = "KRONOSDB_MANIFEST")]
+    manifest: Option<PathBuf>,
 
     // --- Cluster options ---
     /// Enable clustering with this node ID (u64).
@@ -69,6 +80,13 @@ struct Cli {
     /// Node type: "standard" (voter) or "passive-backup" (learner).
     #[arg(long, default_value = "standard", env = "KRONOSDB_CLUSTER_NODE_TYPE")]
     cluster_node_type: String,
+
+    /// Append write path: "auto" (default) bypasses Raft consensus on
+    /// standalone single-voter deployments — one fsync per append instead of
+    /// two; "raft" forces every append through consensus even single-node.
+    /// Any configured peer or learner always forces the consensus path.
+    #[arg(long, default_value = "auto", env = "KRONOSDB_WRITE_PATH")]
+    write_path: String,
 
     /// Cluster voter peers as "id=addr" pairs (e.g. "1=127.0.0.1:50051,2=127.0.0.1:50052").
     #[arg(long, env = "KRONOSDB_CLUSTER_PEERS", value_delimiter = ',')]
@@ -95,6 +113,47 @@ struct Cli {
     /// Path to TLS CA certificate for client verification (mTLS).
     #[arg(long, env = "KRONOSDB_TLS_CA")]
     tls_ca: Option<PathBuf>,
+
+    // --- Admin auth options (see also [admin.auth] / [admin.oidc] in TOML) ---
+    /// Admin console/API auth mode: "none", "token", or "oidc".
+    #[arg(long, env = "KRONOSDB_ADMIN_AUTH_MODE")]
+    admin_auth_mode: Option<String>,
+
+    /// Static bearer token for admin auth mode "token".
+    #[arg(long, env = "KRONOSDB_ADMIN_TOKEN")]
+    admin_token: Option<String>,
+
+    /// OIDC issuer URL (e.g. https://keycloak.example.com/realms/platform).
+    #[arg(long, env = "KRONOSDB_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// OIDC client id.
+    #[arg(long, env = "KRONOSDB_OIDC_CLIENT_ID")]
+    oidc_client_id: Option<String>,
+
+    /// OIDC client secret (omit for public clients; PKCE is always used).
+    #[arg(long, env = "KRONOSDB_OIDC_CLIENT_SECRET")]
+    oidc_client_secret: Option<String>,
+
+    /// OIDC redirect URL registered at the IdP (default: derived from Host).
+    #[arg(long, env = "KRONOSDB_OIDC_REDIRECT_URL")]
+    oidc_redirect_url: Option<String>,
+
+    /// Dotted path to the roles claim (e.g. "realm_access.roles").
+    #[arg(long, env = "KRONOSDB_OIDC_ROLE_CLAIM")]
+    oidc_role_claim: Option<String>,
+
+    /// Role required for admin access.
+    #[arg(long, env = "KRONOSDB_OIDC_REQUIRED_ROLE")]
+    oidc_required_role: Option<String>,
+
+    /// Expected `aud` claim for bearer tokens (unset = not enforced).
+    #[arg(long, env = "KRONOSDB_OIDC_AUDIENCE")]
+    oidc_audience: Option<String>,
+
+    /// HMAC secret for admin session cookies (unset = random per boot).
+    #[arg(long, env = "KRONOSDB_OIDC_COOKIE_SECRET")]
+    oidc_cookie_secret: Option<String>,
 }
 
 /// TOML config file structure.
@@ -106,6 +165,7 @@ struct ConfigFile {
     data_dir: Option<String>,
     #[serde(rename = "node-name")]
     node_name: Option<String>,
+    manifest: Option<String>,
 
     #[serde(default)]
     storage: StorageConfig,
@@ -146,6 +206,88 @@ struct TimeoutConfig {
 #[allow(dead_code)]
 struct AdminConfig {
     listen: Option<String>,
+    #[serde(default)]
+    auth: AdminAuthFile,
+    #[serde(default)]
+    oidc: OidcFile,
+}
+
+#[derive(Deserialize, Default, Debug)]
+struct AdminAuthFile {
+    /// "none" (default), "token", or "oidc".
+    mode: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Deserialize, Default, Debug)]
+struct OidcFile {
+    issuer: Option<String>,
+    #[serde(rename = "client-id")]
+    client_id: Option<String>,
+    #[serde(rename = "client-secret")]
+    client_secret: Option<String>,
+    #[serde(rename = "redirect-url")]
+    redirect_url: Option<String>,
+    scopes: Option<Vec<String>>,
+    #[serde(rename = "role-claim")]
+    role_claim: Option<String>,
+    #[serde(rename = "required-role")]
+    required_role: Option<String>,
+    audience: Option<String>,
+    #[serde(rename = "cookie-secret")]
+    cookie_secret: Option<String>,
+    #[serde(rename = "session-ttl-minutes")]
+    session_ttl_minutes: Option<u64>,
+}
+
+/// How the admin console + admin API authenticate callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuthMode {
+    /// No authentication (default). The server logs a prominent warning —
+    /// only acceptable when the admin port is unreachable from untrusted
+    /// networks (localhost, strict NetworkPolicy).
+    None,
+    /// Static bearer token (constant-time compared).
+    Token,
+    /// OpenID Connect: authorization-code + PKCE for the console (session
+    /// cookie), JWT bearer validation against the IdP's JWKS for the API.
+    Oidc,
+}
+
+/// Resolved admin auth configuration.
+#[derive(Debug, Clone)]
+pub struct AdminAuthConfig {
+    pub mode: AdminAuthMode,
+    /// Static token for `mode = token`.
+    pub token: Option<String>,
+    /// OIDC settings for `mode = oidc`.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// OIDC provider settings ("admin realm" — e.g. a Keycloak realm).
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    /// Issuer URL; discovery is fetched from
+    /// `{issuer}/.well-known/openid-configuration`.
+    pub issuer: String,
+    pub client_id: String,
+    /// Optional for public clients (PKCE is always used).
+    pub client_secret: Option<String>,
+    /// Callback URL registered at the IdP. Derived from the request's Host
+    /// (and X-Forwarded-Proto) when unset.
+    pub redirect_url: Option<String>,
+    pub scopes: Vec<String>,
+    /// Dotted path to the roles claim, e.g. "realm_access.roles" (Keycloak).
+    pub role_claim: Option<String>,
+    /// Role required to access the console/API. Unset = any authenticated
+    /// user of the realm.
+    pub required_role: Option<String>,
+    /// Expected `aud` for bearer tokens. Unset = audience not enforced.
+    pub audience: Option<String>,
+    /// HMAC key for session cookies. Random per boot when unset (sessions
+    /// don't survive restarts).
+    pub cookie_secret: Option<String>,
+    pub session_ttl_minutes: u64,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -182,9 +324,13 @@ pub struct ServerConfig {
     pub query_timeout_secs: u64,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_timeout_secs: u64,
+    /// Max seconds to wait for connections to drain after SIGTERM.
+    pub drain_deadline_secs: u64,
     /// If set, clustering is enabled.
     pub cluster_node_id: Option<u64>,
     pub cluster_node_type: String,
+    /// "auto" (single-node fast path allowed) or "raft" (always consensus).
+    pub write_path: String,
     pub cluster_peers: Vec<PeerEntry>,
     pub cluster_learners: Vec<PeerEntry>,
     /// Access token for gRPC auth. None = open access.
@@ -195,6 +341,10 @@ pub struct ServerConfig {
     pub tls_key: Option<PathBuf>,
     /// TLS CA certificate for client verification (mTLS).
     pub tls_ca: Option<PathBuf>,
+    /// Declarative manifest applied at startup, if any.
+    pub manifest: Option<PathBuf>,
+    /// Admin console/API authentication.
+    pub admin_auth: AdminAuthConfig,
 }
 
 impl ServerConfig {
@@ -233,6 +383,7 @@ impl ServerConfig {
 
         let cluster_peers = parse_peer_list(&cli.cluster_peers)?;
         let cluster_learners = parse_peer_list(&cli.cluster_learners)?;
+        let admin_auth = resolve_admin_auth(&cli, &file_config)?;
 
         Ok(Self {
             listen_addr: cli.listen,
@@ -268,8 +419,18 @@ impl ServerConfig {
                 .heartbeat_timeout
                 .or(file_config.timeouts.heartbeat_timeout)
                 .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT),
+            drain_deadline_secs: cli.drain_deadline_secs,
             cluster_node_id: cli.cluster_node_id,
             cluster_node_type: cli.cluster_node_type,
+            write_path: match cli.write_path.as_str() {
+                "auto" | "raft" => cli.write_path,
+                other => {
+                    return Err(format!(
+                        "invalid --write-path '{other}': expected 'auto' or 'raft'"
+                    )
+                    .into());
+                }
+            },
             cluster_peers,
             cluster_learners,
             access_token: cli.access_token.or(file_config.security.access_token),
@@ -282,6 +443,15 @@ impl ServerConfig {
             tls_ca: cli
                 .tls_ca
                 .or(file_config.security.tls_ca.map(PathBuf::from)),
+            // CLI/env > config file > default discovery of ./kronosdb-manifest.toml.
+            manifest: cli
+                .manifest
+                .or(file_config.manifest.map(PathBuf::from))
+                .or_else(|| {
+                    let default = PathBuf::from("kronosdb-manifest.toml");
+                    default.exists().then_some(default)
+                }),
+            admin_auth,
         })
     }
 
@@ -289,6 +459,92 @@ impl ServerConfig {
     pub fn is_clustered(&self) -> bool {
         self.cluster_node_id.is_some()
     }
+}
+
+/// Resolves admin auth from CLI/env (priority) and the TOML file.
+fn resolve_admin_auth(
+    cli: &Cli,
+    file: &ConfigFile,
+) -> Result<AdminAuthConfig, Box<dyn std::error::Error>> {
+    let mode_str = cli
+        .admin_auth_mode
+        .clone()
+        .or_else(|| file.admin.auth.mode.clone())
+        .unwrap_or_else(|| "none".to_string());
+    let mode = match mode_str.as_str() {
+        "none" => AdminAuthMode::None,
+        "token" => AdminAuthMode::Token,
+        "oidc" => AdminAuthMode::Oidc,
+        other => {
+            return Err(format!(
+                "invalid admin auth mode '{other}': expected 'none', 'token', or 'oidc'"
+            )
+            .into());
+        }
+    };
+
+    let token = cli
+        .admin_token
+        .clone()
+        .or_else(|| file.admin.auth.token.clone());
+    if mode == AdminAuthMode::Token && token.is_none() {
+        return Err(
+            "admin auth mode 'token' requires --admin-token / KRONOSDB_ADMIN_TOKEN / [admin.auth] token"
+                .into(),
+        );
+    }
+
+    let oidc = if mode == AdminAuthMode::Oidc {
+        let issuer = cli
+            .oidc_issuer
+            .clone()
+            .or_else(|| file.admin.oidc.issuer.clone())
+            .ok_or("admin auth mode 'oidc' requires --oidc-issuer / [admin.oidc] issuer")?;
+        let client_id = cli
+            .oidc_client_id
+            .clone()
+            .or_else(|| file.admin.oidc.client_id.clone())
+            .ok_or("admin auth mode 'oidc' requires --oidc-client-id / [admin.oidc] client-id")?;
+        Some(OidcConfig {
+            issuer: issuer.trim_end_matches('/').to_string(),
+            client_id,
+            client_secret: cli
+                .oidc_client_secret
+                .clone()
+                .or_else(|| file.admin.oidc.client_secret.clone()),
+            redirect_url: cli
+                .oidc_redirect_url
+                .clone()
+                .or_else(|| file.admin.oidc.redirect_url.clone()),
+            scopes: file
+                .admin
+                .oidc
+                .scopes
+                .clone()
+                .unwrap_or_else(|| vec!["openid".into(), "profile".into(), "email".into()]),
+            role_claim: cli
+                .oidc_role_claim
+                .clone()
+                .or_else(|| file.admin.oidc.role_claim.clone()),
+            required_role: cli
+                .oidc_required_role
+                .clone()
+                .or_else(|| file.admin.oidc.required_role.clone()),
+            audience: cli
+                .oidc_audience
+                .clone()
+                .or_else(|| file.admin.oidc.audience.clone()),
+            cookie_secret: cli
+                .oidc_cookie_secret
+                .clone()
+                .or_else(|| file.admin.oidc.cookie_secret.clone()),
+            session_ttl_minutes: file.admin.oidc.session_ttl_minutes.unwrap_or(480),
+        })
+    } else {
+        None
+    };
+
+    Ok(AdminAuthConfig { mode, token, oidc })
 }
 
 /// Parses "id=addr" peer entries from CLI/config.
@@ -433,6 +689,7 @@ tls-ca = "/etc/kronosdb/ca.pem"
             query_timeout_secs: 30,
             heartbeat_interval_secs: 5,
             heartbeat_timeout_secs: 15,
+            drain_deadline_secs: 20,
             cluster_node_id: Some(1),
             cluster_node_type: "standard".into(),
             cluster_peers: vec![],
@@ -441,6 +698,13 @@ tls-ca = "/etc/kronosdb/ca.pem"
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            manifest: None,
+            admin_auth: AdminAuthConfig {
+                mode: AdminAuthMode::None,
+                token: None,
+                oidc: None,
+            },
+            write_path: "auto".into(),
         };
         assert!(config.is_clustered());
     }
@@ -460,6 +724,7 @@ tls-ca = "/etc/kronosdb/ca.pem"
             query_timeout_secs: 30,
             heartbeat_interval_secs: 5,
             heartbeat_timeout_secs: 15,
+            drain_deadline_secs: 20,
             cluster_node_id: None,
             cluster_node_type: "standard".into(),
             cluster_peers: vec![],
@@ -468,6 +733,13 @@ tls-ca = "/etc/kronosdb/ca.pem"
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            manifest: None,
+            admin_auth: AdminAuthConfig {
+                mode: AdminAuthMode::None,
+                token: None,
+                oidc: None,
+            },
+            write_path: "auto".into(),
         };
         assert!(!config.is_clustered());
     }

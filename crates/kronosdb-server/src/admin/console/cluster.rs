@@ -189,19 +189,11 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 pub struct AddNodeRequest {
     id: u64,
     addr: String,
-    #[serde(default = "default_context")]
-    context: String,
-}
-
-fn default_context() -> String {
-    "default".to_string()
 }
 
 #[derive(Deserialize)]
 pub struct RemoveNodeRequest {
     id: u64,
-    #[serde(default = "default_context")]
-    context: String,
 }
 
 pub async fn api_add_learner(
@@ -210,7 +202,7 @@ pub async fn api_add_learner(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .cluster
-        .add_learner(&req.context, req.id, req.addr.clone())
+        .add_learner(req.id, req.addr.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -229,15 +221,15 @@ pub async fn api_add_voter(
     // First add as learner, then promote to voter.
     state
         .cluster
-        .add_learner(&req.context, req.id, req.addr.clone())
+        .add_learner(req.id, req.addr.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Get current voter IDs and add the new one.
     let raft = state
         .cluster
-        .get_raft_node(&req.context)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "context not found".to_string()))?;
+        .raft_node()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "raft not initialized".to_string()))?;
 
     let metrics = raft.metrics().borrow().clone();
     let mut voter_ids: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
@@ -247,7 +239,7 @@ pub async fn api_add_voter(
 
     state
         .cluster
-        .change_membership(&req.context, voter_ids)
+        .change_membership(voter_ids)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -265,8 +257,8 @@ pub async fn api_remove_node(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let raft = state
         .cluster
-        .get_raft_node(&req.context)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "context not found".to_string()))?;
+        .raft_node()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "raft not initialized".to_string()))?;
 
     let metrics = raft.metrics().borrow().clone();
     let voter_ids: Vec<u64> = metrics
@@ -278,7 +270,7 @@ pub async fn api_remove_node(
 
     state
         .cluster
-        .change_membership(&req.context, voter_ids)
+        .change_membership(voter_ids)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

@@ -5,6 +5,7 @@ mod auth;
 mod config;
 mod eventstore;
 mod handler_registry;
+mod manifest;
 mod messaging;
 mod platform;
 mod processor;
@@ -34,13 +35,22 @@ use crate::platform::service::{ClientChannelRegistry, PlatformServiceImpl, spawn
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "kronosdb=info,warn".into()),
-        )
-        .init();
+    // Initialize structured logging. KRONOSDB_LOG_FORMAT=json switches to
+    // newline-delimited JSON for log aggregation (Loki, CloudWatch, etc.).
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "kronosdb=info,warn".into())
+    };
+    if std::env::var("KRONOSDB_LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .init();
+    }
 
     let config = ServerConfig::parse()?;
 
@@ -58,6 +68,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     if !contexts.context_exists("default") {
         contexts.create_context("default")?;
+    }
+
+    // Apply the declarative manifest (if configured) BEFORE Raft init, the
+    // same way the default context is bootstrapped. Idempotent: existing
+    // contexts are untouched, nothing is ever deleted. In a cluster, every
+    // node must be given the same manifest.
+    if let Some(ref manifest_path) = config.manifest {
+        let manifest = manifest::load(manifest_path)?;
+        let created = manifest::apply(&manifest, &contexts)?;
+        tracing::info!(
+            manifest = %manifest_path.display(),
+            declared = manifest.contexts.len(),
+            created = ?created,
+            "applied declarative manifest"
+        );
     }
 
     // Create the cluster manager — every node is always a Raft node.
@@ -101,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         voters,
         learners,
         raft_config: default_raft_config(),
+        single_node_fast_path: config.write_path == "auto",
     };
 
     // Log what the durability configuration means for this node. This is the
@@ -111,16 +137,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cluster = Arc::new(ClusterManager::new(Arc::clone(&contexts), cluster_config));
 
+    if cluster.is_fast_path() {
+        tracing::info!(
+            "single-node fast path ACTIVE: appends go directly to the local engine \
+             (one fsync per append, no consensus round-trip); configure cluster peers \
+             or --write-path raft to force consensus"
+        );
+    }
+
+    // One shared Raft group per node; every context registers against it.
+    cluster.init_raft().await?;
     for ctx_name in contexts.list_contexts() {
-        cluster.init_context(&ctx_name).await?;
+        cluster.register_context(&ctx_name)?;
     }
 
     cluster.bootstrap().await?;
 
     for learner in &config.cluster_learners {
-        let _ = cluster
-            .add_learner("default", learner.id, learner.addr.clone())
-            .await;
+        let _ = cluster.add_learner(learner.id, learner.addr.clone()).await;
     }
 
     // Create the messaging manager (per-context) and client registries.
@@ -201,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start admin HTTP server in the background.
+    let admin_auth = Arc::new(admin::auth::AuthRuntime::new(&config.admin_auth));
     let admin_state = admin::AdminState {
         config: config.clone(),
         contexts: Arc::clone(&contexts),
@@ -210,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         processor_registry: Arc::clone(&processor_registry),
         channel_registry: Arc::clone(&channel_registry),
         started_at: std::time::Instant::now(),
+        auth: admin_auth,
     };
     tokio::spawn(async move {
         if let Err(e) = admin::start_admin_server(admin_state).await {
@@ -310,16 +346,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Raft transport — always enabled (every node is a Raft node).
     let raft_node = cluster
-        .get_raft_node("default")
-        .expect("default context Raft node must be initialized");
-    let raft_transport = RaftTransportService::new(raft_node);
+        .raft_node()
+        .expect("shared Raft node must be initialized");
+    let raft_transport = RaftTransportService::new(Arc::clone(&raft_node));
     router = router.add_service(raft_transport.into_server());
 
+    // grpc.health.v1 — unauthenticated by design (kubelet probes and gRPC
+    // client-side health checking). Overall status tracks Raft leadership:
+    // SERVING only while a leader is known, mirroring the admin `/ready`.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    router = router.add_service(health_service);
+    {
+        let raft = Arc::clone(&raft_node);
+        let reporter = health_reporter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let serving = raft.metrics().borrow().current_leader.is_some();
+                if serving {
+                    reporter
+                        .set_service_status("", tonic_health::ServingStatus::Serving)
+                        .await;
+                } else {
+                    reporter
+                        .set_service_status("", tonic_health::ServingStatus::NotServing)
+                        .await;
+                }
+            }
+        });
+    }
+
     let cr = Arc::clone(&channel_registry);
+    let raft_for_shutdown = Arc::clone(&raft_node);
+    let contexts_for_shutdown = Arc::clone(&contexts);
+    let drain_deadline = Duration::from_secs(config.drain_deadline_secs);
     let shutdown = async move {
         shutdown_signal().await;
-        // Ask all connected clients to reconnect before shutting down.
+        info!(
+            deadline_secs = drain_deadline.as_secs(),
+            "shutdown signal received: draining"
+        );
+        // 1. Ask all connected clients to reconnect elsewhere.
         cr.request_reconnect_all().await;
+        // 2. Shut the Raft core down cleanly — on multi-node clusters the
+        //    peers detect the departure at the next election timeout instead
+        //    of waiting on a dead TCP peer.
+        let _ = raft_for_shutdown.shutdown().await;
+        // 3. Stop the engines: new appends are rejected, sync threads do a
+        //    final fsync pass releasing in-flight writers.
+        contexts_for_shutdown.shutdown_all();
+        // 4. Watchdog: tonic's drain waits for open connections, and the
+        //    platform/command/query streams are indefinitely long-lived. If
+        //    they don't close within the deadline, exit anyway — acked
+        //    writes are already durable, and kubelet's SIGKILL would be
+        //    less orderly than this.
+        tokio::spawn(async move {
+            tokio::time::sleep(drain_deadline).await;
+            tracing::warn!("drain deadline exceeded with connections still open; exiting now");
+            std::process::exit(0);
+        });
     };
 
     // Bind with SO_REUSEADDR so restarts don't fail with "address already in use".
@@ -346,7 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
