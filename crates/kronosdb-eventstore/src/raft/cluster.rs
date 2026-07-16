@@ -64,6 +64,13 @@ pub struct ClusterConfig {
     pub learners: Vec<PeerConfig>,
     /// Raft configuration.
     pub raft_config: Config,
+    /// Serve appends directly from the local engine when this node is a
+    /// standalone single-voter deployment (one voter, no learners). Skips the
+    /// consensus round-trip — and its extra Raft-log fsync — per append. The
+    /// write path is fixed for the process lifetime, so exactly one append
+    /// path is ever active (the invariant that prevents dual-write bugs).
+    /// Ignored whenever peers or learners are configured.
+    pub single_node_fast_path: bool,
 }
 
 /// Manages event store access — always backed by Raft consensus.
@@ -72,10 +79,14 @@ pub struct ClusterConfig {
 /// one-voter cluster that instantly self-elects as leader.
 pub struct ClusterManager {
     context_manager: Arc<ContextManager>,
-    /// Per-context Raft-backed stores.
-    raft_stores: RwLock<HashMap<String, Arc<RaftEngine>>>,
-    /// Per-context Raft nodes (for the transport service).
-    raft_nodes: RwLock<HashMap<String, Arc<Raft<TypeConfig>>>>,
+    /// Per-context store facades. On the consensus path each wraps the
+    /// node's single shared Raft group (the target context travels inside
+    /// `RaftRequest::Append`); on the single-node fast path this is the
+    /// local engine directly.
+    raft_stores: RwLock<HashMap<String, Arc<dyn EventStore>>>,
+    /// The node's single Raft node. One consensus group per node governs all
+    /// contexts — the state machine routes each applied entry to its context.
+    raft: RwLock<Option<Arc<Raft<TypeConfig>>>>,
     cluster_config: ClusterConfig,
 }
 
@@ -85,7 +96,7 @@ impl ClusterManager {
         Self {
             context_manager,
             raft_stores: RwLock::new(HashMap::new()),
-            raft_nodes: RwLock::new(HashMap::new()),
+            raft: RwLock::new(None),
             cluster_config,
         }
     }
@@ -95,16 +106,31 @@ impl ClusterManager {
         self.cluster_config.voters.len() > 1
     }
 
-    /// Initializes Raft for a context.
-    pub async fn init_context(&self, context_name: &str) -> Result<(), Error> {
-        let local_engine = self.context_manager.get_context(context_name)?;
+    /// Returns true when appends bypass Raft: fast path requested AND the
+    /// deployment is genuinely standalone (one voter, no learners). Any
+    /// configured peer disables it regardless of the flag.
+    pub fn is_fast_path(&self) -> bool {
+        self.cluster_config.single_node_fast_path
+            && self.cluster_config.voters.len() <= 1
+            && self.cluster_config.learners.is_empty()
+    }
 
-        // Create Raft log store in a subdirectory of the context.
-        let raft_dir = self
-            .context_manager
-            .data_dir()
-            .join(context_name)
-            .join("raft");
+    /// Initializes the node's single Raft group. Idempotent — subsequent
+    /// calls are no-ops.
+    ///
+    /// The Raft log store lives under `<data_dir>/default/raft` — the same
+    /// location it historically occupied when it was the default context's
+    /// per-context log — so existing data directories keep working without
+    /// migration. The log is node-wide: entries for every context flow
+    /// through it, and the state machine (which wraps the whole
+    /// `ContextManager`) routes each entry to its target context.
+    pub async fn init_raft(&self) -> Result<(), Error> {
+        if self.raft.read().is_some() {
+            return Ok(());
+        }
+
+        // Node-wide Raft log store (kept under default/ for back-compat).
+        let raft_dir = self.context_manager.data_dir().join("default").join("raft");
         let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
 
         // On-disk snapshot store. Lives in `<raft_dir>/snapshots`. Used to
@@ -113,6 +139,45 @@ impl ClusterManager {
         // carrier of voter set and the node defaults to Learner on restart.
         let snapshot_store =
             Arc::new(SnapshotStore::new(raft_dir.join("snapshots")).map_err(Error::Io)?);
+
+        // Legacy recovery for data dirs written before membership.bin
+        // existed: a node that restarted cleanly pre-first-snapshot has its
+        // Membership entry inside the applied log region, which openraft
+        // never rescans — the state machine would hydrate an empty voter set
+        // and the node could never elect a leader again. If the entry is
+        // still in the (unpurged) log, recover it from there and persist it.
+        if snapshot_store
+            .load_membership()
+            .map_err(Error::Io)?
+            .is_none()
+            && snapshot_store
+                .load_latest_meta()
+                .map_err(Error::Io)?
+                .is_none()
+        {
+            if let Some(last) = log_store.last_log_id() {
+                let first = log_store.last_purged().map(|p| p.index + 1).unwrap_or(0);
+                let mut found: Option<StoredMembership<NodeId, BasicNode>> = None;
+                for idx in first..=last.index {
+                    if let Some(entry) = log_store.entry_at(idx).map_err(Error::Io)? {
+                        if let openraft::EntryPayload::Membership(m) = &entry.payload {
+                            found = Some(StoredMembership::new(
+                                Some(*openraft::RaftLogId::get_log_id(&entry)),
+                                m.clone(),
+                            ));
+                        }
+                    }
+                }
+                if let Some(m) = found {
+                    tracing::info!(
+                        target: "raft.recovery",
+                        voter_count = m.membership().voter_ids().count(),
+                        "recovered membership from log scan (legacy data dir without membership.bin)"
+                    );
+                    snapshot_store.save_membership(&m).map_err(Error::Io)?;
+                }
+            }
+        }
 
         // Rescue shim for pre-fix data dirs. Trigger conditions:
         //   1. No on-disk snapshot exists (`load_latest_meta` is None)
@@ -248,35 +313,111 @@ impl ClusterManager {
             message: format!("failed to create raft node: {e}"),
         })?;
 
-        let raft = Arc::new(raft);
-
-        // Wrap in RaftEngine.
-        let raft_store = Arc::new(RaftEngine::new(
-            Arc::clone(&raft),
-            local_engine,
-            context_name.to_string(),
-        ));
-
-        self.raft_stores
-            .write()
-            .insert(context_name.to_string(), raft_store);
-        self.raft_nodes
-            .write()
-            .insert(context_name.to_string(), raft);
+        *self.raft.write() = Some(Arc::new(raft));
 
         Ok(())
     }
 
+    /// Registers a context's store facade. Idempotent. On the consensus path
+    /// this wraps the shared Raft group (requires `init_raft()`); on the
+    /// single-node fast path the local engine is served directly.
+    pub fn register_context(&self, context_name: &str) -> Result<(), Error> {
+        if self.raft_stores.read().contains_key(context_name) {
+            return Ok(());
+        }
+        let local_engine = self.context_manager.get_context(context_name)?;
+        let store: Arc<dyn EventStore> = if self.is_fast_path() {
+            local_engine
+        } else {
+            let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+                message: "register_context called before init_raft".into(),
+            })?;
+            Arc::new(RaftEngine::new(
+                raft,
+                local_engine,
+                context_name.to_string(),
+            ))
+        };
+        self.raft_stores
+            .write()
+            .insert(context_name.to_string(), store);
+        Ok(())
+    }
+
+    /// Initializes the shared Raft group (if needed) and registers a context.
+    pub async fn init_context(&self, context_name: &str) -> Result<(), Error> {
+        self.init_raft().await?;
+        self.register_context(context_name)
+    }
+
+    /// Creates a context through Raft consensus so every node in the cluster
+    /// applies it. Idempotent (replayed/duplicate creates succeed). Forwards
+    /// to the leader when called on a follower.
+    ///
+    /// The name is validated BEFORE proposing: `apply` treats an invalid name
+    /// as a fatal state-machine error, so it must never reach the log.
+    pub async fn create_context_replicated(&self, name: &str) -> Result<(), Error> {
+        crate::context::validate_context_name(name)?;
+
+        // Fast path: no peers to replicate to — create locally, with the
+        // same idempotent semantics as a replicated CreateContext.
+        if self.is_fast_path() {
+            return match self.context_manager.create_context(name) {
+                Ok(()) | Err(Error::ContextAlreadyExists { .. }) => Ok(()),
+                Err(e) => Err(e),
+            };
+        }
+
+        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+            message: "create_context_replicated called before init_raft".into(),
+        })?;
+
+        let raft_req = RaftRequest::CreateContext {
+            name: name.to_string(),
+        };
+        let response = match raft.client_write(raft_req.clone()).await {
+            Ok(resp) => resp.data,
+            Err(e) => {
+                let err_str = format!("{e}");
+                if err_str.contains("forward request to") || err_str.contains("ForwardToLeader") {
+                    forward_write_to_leader(&raft, &raft_req).await?
+                } else {
+                    return Err(Error::Corrupted {
+                        message: format!("raft create_context failed: {e}"),
+                    });
+                }
+            }
+        };
+
+        match response {
+            RaftResponse::ContextCreated => Ok(()),
+            other => Err(Error::Corrupted {
+                message: format!("unexpected raft response for create_context: {other:?}"),
+            }),
+        }
+    }
+
     /// Gets an event store for a context (always Raft-backed).
+    ///
+    /// Registers the facade lazily when the context exists in the
+    /// `ContextManager` but no `RaftEngine` has been built yet — this is how
+    /// contexts created at runtime (via a replicated `CreateContext` applied
+    /// on this node) become servable without a restart.
     pub fn get_store(&self, context_name: &str) -> Result<Arc<dyn EventStore>, Error> {
-        let stores = self.raft_stores.read();
-        stores
-            .get(context_name)
-            .cloned()
-            .map(|s| s as Arc<dyn EventStore>)
-            .ok_or_else(|| Error::ContextNotFound {
-                name: context_name.to_string(),
-            })
+        if let Some(store) = self.raft_stores.read().get(context_name) {
+            return Ok(Arc::clone(store));
+        }
+        if self.context_manager.context_exists(context_name)
+            && (self.raft_node().is_some() || self.is_fast_path())
+        {
+            self.register_context(context_name)?;
+            if let Some(store) = self.raft_stores.read().get(context_name) {
+                return Ok(Arc::clone(store));
+            }
+        }
+        Err(Error::ContextNotFound {
+            name: context_name.to_string(),
+        })
     }
 
     /// Gets the underlying ContextManager (for admin, snapshot store access, etc.).
@@ -284,14 +425,10 @@ impl ClusterManager {
         &self.context_manager
     }
 
-    /// Gets a Raft node for a context (for building the transport service).
-    pub fn get_raft_node(&self, context_name: &str) -> Option<Arc<Raft<TypeConfig>>> {
-        self.raft_nodes.read().get(context_name).cloned()
-    }
-
-    /// Gets all Raft nodes (for building the transport service).
-    pub fn get_all_raft_nodes(&self) -> HashMap<String, Arc<Raft<TypeConfig>>> {
-        self.raft_nodes.read().clone()
+    /// Gets the node's shared Raft node (for the transport service and
+    /// membership operations). `None` before `init_raft()`.
+    pub fn raft_node(&self) -> Option<Arc<Raft<TypeConfig>>> {
+        self.raft.read().clone()
     }
 
     /// Returns the cluster config.
@@ -330,24 +467,22 @@ impl ClusterManager {
             );
         }
 
-        // Try to initialize on the default context's Raft node.
-        if let Some(raft) = self.get_raft_node("default") {
+        // Initialize the node's shared Raft group.
+        if let Some(raft) = self.raft_node() {
             match raft.initialize(members).await {
                 Ok(_) => {}
                 Err(e) => {
-                    // Already initialized is not an error. openraft 0.9 surfaces this
-                    // through several phrasings depending on the path hit:
-                    //   - "already initialized"                     (fresh-leader path)
-                    //   - "NotAllowed"                               (older match phrasing)
-                    //   - "not allowed to initialize ... last_log_id" (post-crash restart
-                    //     path: the log already contains entries, so re-initializing
-                    //     the cluster is a no-op we explicitly want to swallow —
-                    //     discovered in Phase 6 kill-mid-append testing)
-                    let msg = format!("{e}");
-                    let is_already_initialized = msg.contains("already initialized")
-                        || msg.contains("NotAllowed")
-                        || msg.contains("not allowed to initialize");
-                    if !is_already_initialized {
+                    // Already initialized is not an error: openraft raises a
+                    // typed `InitializeError::NotAllowed` whenever the log or
+                    // vote is non-empty (fresh-leader re-init AND post-crash
+                    // restart both land here). Matching the typed variant —
+                    // instead of the error's display string — survives
+                    // openraft upgrades that rephrase the message.
+                    let already_initialized = matches!(
+                        e.api_error(),
+                        Some(openraft::error::InitializeError::NotAllowed(_))
+                    );
+                    if !already_initialized {
                         return Err(Error::Corrupted {
                             message: format!("failed to bootstrap cluster: {e}"),
                         });
@@ -360,12 +495,10 @@ impl ClusterManager {
     }
 
     /// Adds a learner to the cluster (for passive backup nodes).
-    pub async fn add_learner(&self, context: &str, id: NodeId, addr: String) -> Result<(), Error> {
-        let raft = self
-            .get_raft_node(context)
-            .ok_or_else(|| Error::ContextNotFound {
-                name: context.to_string(),
-            })?;
+    pub async fn add_learner(&self, id: NodeId, addr: String) -> Result<(), Error> {
+        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+            message: "add_learner called before init_raft".into(),
+        })?;
 
         raft.add_learner(id, BasicNode { addr }, true)
             .await
@@ -377,16 +510,10 @@ impl ClusterManager {
     }
 
     /// Changes the voter membership (for dynamic membership changes).
-    pub async fn change_membership(
-        &self,
-        context: &str,
-        voter_ids: Vec<NodeId>,
-    ) -> Result<(), Error> {
-        let raft = self
-            .get_raft_node(context)
-            .ok_or_else(|| Error::ContextNotFound {
-                name: context.to_string(),
-            })?;
+    pub async fn change_membership(&self, voter_ids: Vec<NodeId>) -> Result<(), Error> {
+        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+            message: "change_membership called before init_raft".into(),
+        })?;
 
         let members: BTreeMap<NodeId, BasicNode> = voter_ids
             .into_iter()
@@ -480,50 +607,59 @@ impl RaftEngine {
 
     /// Forwards a write to the current leader via the ForwardWrite RPC.
     async fn forward_to_leader(&self, raft_req: &RaftRequest) -> Result<RaftResponse, Error> {
-        let metrics = self.raft.metrics().borrow().clone();
-        let leader_id = metrics.current_leader.ok_or_else(|| Error::Corrupted {
-            message: "no leader available, try again later".into(),
-        })?;
-
-        let leader_node = metrics
-            .membership_config
-            .membership()
-            .get_node(&leader_id)
-            .ok_or_else(|| Error::Corrupted {
-                message: format!("leader {leader_id} address not found in membership"),
-            })?;
-
-        let endpoint = format!("http://{}", leader_node.addr);
-        let channel = Channel::from_shared(endpoint.clone())
-            .map_err(|e| Error::Corrupted {
-                message: format!("invalid leader endpoint: {e}"),
-            })?
-            .connect()
-            .await
-            .map_err(|e| Error::Corrupted {
-                message: format!("connect to leader at {endpoint}: {e}"),
-            })?;
-
-        let mut client = RaftTransportClient::new(channel);
-
-        let data = bincode::serialize(raft_req).map_err(|e| Error::Corrupted {
-            message: format!("serialize forward request: {e}"),
-        })?;
-
-        let resp = client
-            .forward_write(proto::ForwardWriteRequest { data })
-            .await
-            .map_err(|e| Error::Corrupted {
-                message: format!("forward write to leader: {e}"),
-            })?;
-
-        let raft_resp: RaftResponse =
-            bincode::deserialize(&resp.into_inner().data).map_err(|e| Error::Corrupted {
-                message: format!("deserialize leader response: {e}"),
-            })?;
-
-        Ok(raft_resp)
+        forward_write_to_leader(&self.raft, raft_req).await
     }
+}
+
+/// Forwards a write to the current leader via the ForwardWrite RPC. Shared by
+/// `RaftEngine::append` and `ClusterManager::create_context_replicated`.
+async fn forward_write_to_leader(
+    raft: &Raft<TypeConfig>,
+    raft_req: &RaftRequest,
+) -> Result<RaftResponse, Error> {
+    let metrics = raft.metrics().borrow().clone();
+    let leader_id = metrics.current_leader.ok_or_else(|| Error::Corrupted {
+        message: "no leader available, try again later".into(),
+    })?;
+
+    let leader_node = metrics
+        .membership_config
+        .membership()
+        .get_node(&leader_id)
+        .ok_or_else(|| Error::Corrupted {
+            message: format!("leader {leader_id} address not found in membership"),
+        })?;
+
+    let endpoint = format!("http://{}", leader_node.addr);
+    let channel = Channel::from_shared(endpoint.clone())
+        .map_err(|e| Error::Corrupted {
+            message: format!("invalid leader endpoint: {e}"),
+        })?
+        .connect()
+        .await
+        .map_err(|e| Error::Corrupted {
+            message: format!("connect to leader at {endpoint}: {e}"),
+        })?;
+
+    let mut client = RaftTransportClient::new(channel);
+
+    let data = bincode::serialize(raft_req).map_err(|e| Error::Corrupted {
+        message: format!("serialize forward request: {e}"),
+    })?;
+
+    let resp = client
+        .forward_write(proto::ForwardWriteRequest { data })
+        .await
+        .map_err(|e| Error::Corrupted {
+            message: format!("forward write to leader: {e}"),
+        })?;
+
+    let raft_resp: RaftResponse =
+        bincode::deserialize(&resp.into_inner().data).map_err(|e| Error::Corrupted {
+            message: format!("deserialize leader response: {e}"),
+        })?;
+
+    Ok(raft_resp)
 }
 
 #[async_trait::async_trait]
@@ -616,6 +752,7 @@ mod tests {
     }
 
     fn single_node_config(addr: &str) -> ClusterConfig {
+        // fast path OFF so these tests keep exercising the consensus path.
         ClusterConfig {
             node_id: 1,
             node_type: NodeType::Standard,
@@ -626,6 +763,14 @@ mod tests {
             }],
             learners: vec![],
             raft_config: super::super::types::default_raft_config(),
+            single_node_fast_path: false,
+        }
+    }
+
+    fn fast_path_config(addr: &str) -> ClusterConfig {
+        ClusterConfig {
+            single_node_fast_path: true,
+            ..single_node_config(addr)
         }
     }
 
@@ -658,18 +803,382 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_raft_node_returns_node_after_init() {
+    async fn raft_node_returns_node_after_init() {
         let dir = tempfile::tempdir().unwrap();
         let contexts = make_contexts(dir.path());
 
         let cluster =
             ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
 
-        assert!(cluster.get_raft_node("default").is_none());
+        assert!(cluster.raft_node().is_none());
 
         cluster.init_context("default").await.unwrap();
 
-        assert!(cluster.get_raft_node("default").is_some());
+        assert!(cluster.raft_node().is_some());
+    }
+
+    #[tokio::test]
+    async fn non_default_context_append_goes_through_shared_raft() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = make_contexts(dir.path());
+        contexts.create_context("orders").unwrap();
+
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.init_context("orders").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+
+        let store = cluster.get_store("orders").unwrap();
+        let resp = store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![crate::event::AppendEvent {
+                    identifier: "e1".into(),
+                    timestamp: 1,
+                    name: "TestEvent".into(),
+                    version: "1.0".into(),
+                    payload: vec![1],
+                    metadata: Default::default(),
+                    tags: vec![Tag {
+                        key: b"orderId".to_vec(),
+                        value: b"o1".to_vec(),
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1);
+
+        // The default context is untouched by the orders append.
+        let default_store = cluster.get_store("default").unwrap();
+        assert_eq!(default_store.head(), Position(0));
+    }
+
+    #[tokio::test]
+    async fn runtime_created_context_is_writable_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = make_contexts(dir.path());
+
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+
+        // Created AFTER bootstrap, through consensus — like the admin API.
+        cluster.create_context_replicated("late-ctx").await.unwrap();
+
+        // get_store lazily registers the facade; the append must succeed.
+        let store = cluster.get_store("late-ctx").unwrap();
+        let resp = store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![crate::event::AppendEvent {
+                    identifier: "e1".into(),
+                    timestamp: 1,
+                    name: "TestEvent".into(),
+                    version: "1.0".into(),
+                    payload: vec![1],
+                    metadata: Default::default(),
+                    tags: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1);
+    }
+
+    /// Reopens a data dir after a "restart", waiting for the previous
+    /// instance's fencing lock to release (the Raft core task drops its
+    /// ContextManager Arc asynchronously after shutdown).
+    async fn reopen_contexts(dir: &std::path::Path) -> Arc<ContextManager> {
+        for _ in 0..100 {
+            match ContextManager::new(dir, crate::segment::DEFAULT_SEGMENT_SIZE) {
+                Ok(c) => return Arc::new(c),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        panic!("data dir fencing lock not released within 5s");
+    }
+
+    async fn wait_for_leader(cluster: &ClusterManager) {
+        let raft = cluster.raft_node().expect("raft initialized");
+        for _ in 0..100 {
+            if raft.metrics().borrow().current_leader.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("no leader elected within 10s");
+    }
+
+    fn test_append() -> AppendRequest {
+        AppendRequest {
+            condition: None,
+            events: vec![crate::event::AppendEvent {
+                identifier: "e1".into(),
+                timestamp: 1,
+                name: "TestEvent".into(),
+                version: "1.0".into(),
+                payload: vec![1],
+                metadata: Default::default(),
+                tags: vec![],
+            }],
+        }
+    }
+
+    /// Regression: a clean restart BEFORE the first Raft snapshot must not
+    /// lose the voter set. Without membership.bin, the cluster-init
+    /// Membership entry sits in the applied log region (never rescanned by
+    /// openraft), the state machine hydrates an empty membership, and the
+    /// node comes back as a Learner that can never elect — writes fail with
+    /// "no leader available" forever.
+    #[tokio::test]
+    async fn clean_restart_before_first_snapshot_keeps_write_availability() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let contexts = make_contexts(dir.path());
+            let cluster =
+                ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+            cluster.init_context("default").await.unwrap();
+            cluster.bootstrap().await.unwrap();
+            wait_for_leader(&cluster).await;
+            let store = cluster.get_store("default").unwrap();
+            store.append(test_append()).await.unwrap();
+            let _ = cluster.raft_node().unwrap().shutdown().await;
+        }
+
+        // Restart: rediscover contexts from disk (no create_context).
+        let contexts = reopen_contexts(dir.path()).await;
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+        wait_for_leader(&cluster).await;
+
+        let store = cluster.get_store("default").unwrap();
+        let resp = store.append(test_append()).await.unwrap();
+        assert_eq!(resp.count, 1);
+    }
+
+    /// Same as above but for legacy data dirs written before membership.bin
+    /// existed: the voter set must be recovered by scanning the unpurged log
+    /// for the last Membership entry.
+    #[tokio::test]
+    async fn legacy_dir_without_membership_bin_recovers_via_log_scan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let contexts = make_contexts(dir.path());
+            let cluster =
+                ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+            cluster.init_context("default").await.unwrap();
+            cluster.bootstrap().await.unwrap();
+            wait_for_leader(&cluster).await;
+            let store = cluster.get_store("default").unwrap();
+            store.append(test_append()).await.unwrap();
+            let _ = cluster.raft_node().unwrap().shutdown().await;
+        }
+
+        // Simulate a pre-fix data dir: membership.bin does not exist.
+        let membership_file = dir
+            .path()
+            .join("default")
+            .join("raft")
+            .join("snapshots")
+            .join("membership.bin");
+        assert!(
+            membership_file.exists(),
+            "run 1 should have persisted membership.bin"
+        );
+        std::fs::remove_file(&membership_file).unwrap();
+
+        let contexts = reopen_contexts(dir.path()).await;
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+        wait_for_leader(&cluster).await;
+
+        let store = cluster.get_store("default").unwrap();
+        let resp = store.append(test_append()).await.unwrap();
+        assert_eq!(resp.count, 1);
+    }
+
+    /// Fast path: appends work WITHOUT Raft ever being initialized or
+    /// bootstrapped — direct proof consensus is bypassed.
+    #[tokio::test]
+    async fn fast_path_appends_without_raft() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = make_contexts(dir.path());
+
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), fast_path_config("127.0.0.1:50051"));
+        assert!(cluster.is_fast_path());
+        // No init_raft, no bootstrap — get_store registers the local engine.
+        let store = cluster.get_store("default").unwrap();
+        let resp = store.append(test_append()).await.unwrap();
+        assert_eq!(resp.count, 1);
+
+        // Runtime creation works too, locally and idempotently.
+        cluster.create_context_replicated("orders").await.unwrap();
+        cluster.create_context_replicated("orders").await.unwrap();
+        let orders = cluster.get_store("orders").unwrap();
+        assert_eq!(orders.append(test_append()).await.unwrap().count, 1);
+    }
+
+    /// Any configured peer or learner disables the fast path, even when the
+    /// flag is set — replication must never be silently skipped.
+    #[test]
+    fn fast_path_disabled_when_peers_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = make_contexts(dir.path());
+
+        let mut cfg = fast_path_config("127.0.0.1:50051");
+        cfg.voters.push(PeerConfig {
+            id: 2,
+            addr: "127.0.0.1:50052".into(),
+        });
+        let cluster = ClusterManager::new(Arc::clone(&contexts), cfg);
+        assert!(!cluster.is_fast_path());
+
+        let mut cfg = fast_path_config("127.0.0.1:50051");
+        cfg.learners.push(PeerConfig {
+            id: 3,
+            addr: "127.0.0.1:50053".into(),
+        });
+        let cluster = ClusterManager::new(Arc::clone(&contexts), cfg);
+        assert!(!cluster.is_fast_path());
+    }
+
+    /// Not a correctness test — prints a rough single-node timing comparison
+    /// between the consensus path and the fast path. Run manually:
+    /// `cargo test -p kronosdb-eventstore --lib raft::cluster -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "timing measurement, run manually"]
+    async fn fast_path_vs_raft_timing() {
+        const N: usize = 300;
+
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = make_contexts(dir.path());
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+        wait_for_leader(&cluster).await;
+        let store = cluster.get_store("default").unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            store.append(test_append()).await.unwrap();
+        }
+        let raft_elapsed = start.elapsed();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let contexts2 = make_contexts(dir2.path());
+        let cluster2 =
+            ClusterManager::new(Arc::clone(&contexts2), fast_path_config("127.0.0.1:50051"));
+        let store2 = cluster2.get_store("default").unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            store2.append(test_append()).await.unwrap();
+        }
+        let fast_elapsed = start.elapsed();
+
+        println!(
+            "raft path: {N} appends in {raft_elapsed:?} ({:.0} appends/s)",
+            N as f64 / raft_elapsed.as_secs_f64()
+        );
+        println!(
+            "fast path: {N} appends in {fast_elapsed:?} ({:.0} appends/s)",
+            N as f64 / fast_elapsed.as_secs_f64()
+        );
+    }
+
+    /// Concurrent variant: 64 writers with the server-default 2ms group
+    /// commit, where one fsync is amortized across every writer in the
+    /// window. Run manually:
+    /// `cargo test -p kronosdb-eventstore --release --lib fast_path_vs_raft_timing_concurrent -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+    #[ignore = "timing measurement, run manually"]
+    async fn fast_path_vs_raft_timing_concurrent_group_commit() {
+        const WRITERS: usize = 64;
+        const PER_WRITER: usize = 50;
+
+        fn gc_contexts(dir: &std::path::Path) -> Arc<ContextManager> {
+            let opts = crate::store::StoreOptions {
+                group_commit_interval_ms: 2,
+                ..Default::default()
+            };
+            let ctx = Arc::new(ContextManager::with_options(dir, opts).unwrap());
+            ctx.create_context("default").unwrap();
+            ctx
+        }
+
+        async fn run(store: Arc<dyn EventStore>) -> std::time::Duration {
+            let start = std::time::Instant::now();
+            let mut handles = Vec::new();
+            for _ in 0..WRITERS {
+                let s = Arc::clone(&store);
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..PER_WRITER {
+                        s.append(test_append()).await.unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            start.elapsed()
+        }
+
+        let total = WRITERS * PER_WRITER;
+
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = gc_contexts(dir.path());
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+        wait_for_leader(&cluster).await;
+        let raft_elapsed = run(cluster.get_store("default").unwrap()).await;
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let contexts2 = gc_contexts(dir2.path());
+        let cluster2 =
+            ClusterManager::new(Arc::clone(&contexts2), fast_path_config("127.0.0.1:50051"));
+        let fast_elapsed = run(cluster2.get_store("default").unwrap()).await;
+
+        println!(
+            "raft path (group commit, {WRITERS} writers): {total} appends in {raft_elapsed:?} ({:.0} appends/s)",
+            total as f64 / raft_elapsed.as_secs_f64()
+        );
+        println!(
+            "fast path (group commit, {WRITERS} writers): {total} appends in {fast_elapsed:?} ({:.0} appends/s)",
+            total as f64 / fast_elapsed.as_secs_f64()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_context_replicated_rejects_invalid_name_before_proposing() {
+        let dir = tempfile::tempdir().unwrap();
+        let contexts = make_contexts(dir.path());
+
+        let cluster =
+            ClusterManager::new(Arc::clone(&contexts), single_node_config("127.0.0.1:50051"));
+        cluster.init_context("default").await.unwrap();
+        cluster.bootstrap().await.unwrap();
+
+        // An invalid name must be rejected client-side — reaching the state
+        // machine would be a fatal StorageError.
+        assert!(cluster.create_context_replicated("bad/name").await.is_err());
+
+        // The raft group stays healthy afterwards.
+        cluster
+            .create_context_replicated("good-name")
+            .await
+            .unwrap();
+        assert!(cluster.get_store("good-name").is_ok());
     }
 
     #[tokio::test]

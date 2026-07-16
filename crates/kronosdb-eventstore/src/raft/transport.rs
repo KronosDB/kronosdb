@@ -1,14 +1,12 @@
 //! Inbound gRPC service for receiving Raft RPCs from peer nodes.
 //!
-//! Routes Raft messages to the correct context's Raft node.
-//! For now, uses a single "default" context Raft node.
-//! Future: context selection via gRPC metadata headers.
+//! Each node runs a single Raft group covering all contexts — log entries
+//! carry the target context (`RaftRequest::Append { context, .. }`), so no
+//! per-context routing is needed at the transport layer.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use openraft::Raft;
-use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
 use super::proto;
@@ -19,19 +17,13 @@ pub type RaftNode = Raft<TypeConfig>;
 
 /// gRPC service that handles incoming Raft RPCs from peer nodes.
 pub struct RaftTransportService {
-    /// For single-context clusters, just one Raft node.
+    /// The node's single Raft node.
     default_raft: Arc<RaftNode>,
-    /// For multi-context clusters (future), keyed by context name.
-    #[allow(dead_code)]
-    context_rafts: Arc<RwLock<HashMap<String, Arc<RaftNode>>>>,
 }
 
 impl RaftTransportService {
     pub fn new(raft: Arc<RaftNode>) -> Self {
-        Self {
-            default_raft: raft,
-            context_rafts: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self { default_raft: raft }
     }
 
     pub fn into_server(self) -> proto::raft_transport_server::RaftTransportServer<Self> {

@@ -115,6 +115,8 @@ fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
         }],
         learners: vec![],
         raft_config: default_raft_config(),
+        // This bench measures the CONSENSUS append path — keep it on.
+        single_node_fast_path: false,
     };
 
     let cluster = ClusterManager::new(Arc::clone(&ctx), cfg);
@@ -126,7 +128,7 @@ fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
         // election_timeout_min = 1500ms, so give it a generous buffer.
         for _ in 0..50 {
             let metrics = cluster
-                .get_raft_node("default")
+                .raft_node()
                 .expect("raft node")
                 .metrics()
                 .borrow()

@@ -221,6 +221,72 @@ impl SnapshotStore {
         }
     }
 
+    /// Atomically persists the last applied membership to `membership.bin`.
+    ///
+    /// The snapshot is not the only durable carrier of the voter set:
+    /// a node that restarts cleanly BEFORE its first snapshot (policy:
+    /// every 10k log entries) would otherwise recover an empty
+    /// `last_membership` — the cluster-init Membership entry sits in the
+    /// applied region of the log, which openraft does not rescan — and
+    /// come back as a Learner that can never elect a leader. Persisting
+    /// membership on every membership apply closes that window.
+    pub fn save_membership(
+        &self,
+        membership: &openraft::StoredMembership<NodeId, openraft::BasicNode>,
+    ) -> io::Result<()> {
+        let final_path = self.dir.join("membership.bin");
+        let tmp_path = self.dir.join("membership.bin.tmp");
+
+        let body = bincode::serialize(membership)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut buf = Vec::with_capacity(body.len() + 4);
+        buf.extend_from_slice(&body);
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        if let Ok(d) = fs::File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Loads the persisted membership, or `None` if the file is missing or
+    /// unreadable (corrupt files are skipped with a warning — the caller
+    /// falls back to snapshot meta / log scan / rescue).
+    pub fn load_membership(
+        &self,
+    ) -> io::Result<Option<openraft::StoredMembership<NodeId, openraft::BasicNode>>> {
+        let path = self.dir.join("membership.bin");
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if bytes.len() < 4 {
+            tracing::warn!(target: "raft.snapshot", "membership.bin too short; ignoring");
+            return Ok(None);
+        }
+        let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+        let stored_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        if crc32c::crc32c(body) != stored_crc {
+            tracing::warn!(target: "raft.snapshot", "membership.bin CRC mismatch; ignoring");
+            return Ok(None);
+        }
+        match bincode::deserialize(body) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) => {
+                tracing::warn!(target: "raft.snapshot", error = %e, "membership.bin undecodable; ignoring");
+                Ok(None)
+            }
+        }
+    }
+
     fn latest_snapshot_path(&self) -> io::Result<Option<PathBuf>> {
         let mut best: Option<(u64, u64, PathBuf)> = None;
         for entry in fs::read_dir(&self.dir)? {
