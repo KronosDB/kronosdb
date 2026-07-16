@@ -27,6 +27,13 @@ pub struct ContextManager {
 
     /// Store options for creating new contexts.
     store_options: StoreOptions,
+
+    /// Exclusive advisory lock on `<data_dir>/LOCK`, held for the manager's
+    /// lifetime (released by the OS when the process exits, even on crash).
+    /// Fences the data dir: a second process — e.g. two pods mounting the
+    /// same volume — fails fast instead of interleaving appends into the
+    /// same active segment and corrupting it.
+    _lock_file: std::fs::File,
 }
 
 impl ContextManager {
@@ -42,14 +49,32 @@ impl ContextManager {
     }
 
     /// Creates a new context manager with full store options.
+    ///
+    /// Takes an exclusive advisory lock on `<data_dir>/LOCK` and fails fast
+    /// if another live process already holds it.
     pub fn with_options(data_dir: &Path, store_options: StoreOptions) -> Result<Self, Error> {
         std::fs::create_dir_all(data_dir)?;
+
+        let lock_path = data_dir.join("LOCK");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "data dir '{}' is locked by another running process ({e}); \
+                 refusing to open it twice — concurrent writers would corrupt segments",
+                data_dir.display(),
+            )))
+        })?;
 
         let mut manager = Self {
             data_dir: data_dir.to_path_buf(),
             contexts: RwLock::new(HashMap::new()),
             snapshot_stores: RwLock::new(HashMap::new()),
             store_options,
+            _lock_file: lock_file,
         };
 
         // Auto-discover and open existing contexts.
@@ -136,6 +161,17 @@ impl ContextManager {
     pub fn context_exists(&self, name: &str) -> bool {
         let contexts = self.contexts.read();
         contexts.contains_key(name)
+    }
+
+    /// Initiates shutdown on every context's engine: appends are rejected
+    /// and each group-commit sync thread does a final fsync pass, releasing
+    /// in-flight writers. Part of graceful termination — acked writes are
+    /// already durable, this just prevents new work from hanging.
+    pub fn shutdown_all(&self) {
+        let contexts = self.contexts.read();
+        for engine in contexts.values() {
+            engine.shutdown();
+        }
     }
 
     /// Returns the maximum applied Raft `LogId` across every active context,
@@ -253,7 +289,7 @@ impl ContextManager {
 }
 
 /// Validates that a context name is safe to use as a directory name.
-fn validate_context_name(name: &str) -> Result<(), Error> {
+pub(crate) fn validate_context_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
         return Err(Error::InvalidContextName {
             name: name.to_string(),
@@ -289,6 +325,25 @@ mod tests {
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag::from_str(key, value)
+    }
+
+    /// Fencing: a second manager on the same data dir must fail fast, and
+    /// dropping the first must release the lock.
+    #[test]
+    fn second_manager_on_same_data_dir_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
+        let second = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let err = match second {
+            Ok(_) => panic!("second open must be fenced"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("locked by another"), "got: {err}");
+
+        drop(first);
+        ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE)
+            .expect("lock must be released on drop");
     }
 
     fn make_event(name: &str, tags: Vec<Tag>) -> AppendEvent {

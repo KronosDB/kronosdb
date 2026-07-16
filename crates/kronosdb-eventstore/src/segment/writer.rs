@@ -344,11 +344,20 @@ fn estimate_event_size(event: &AppendEvent) -> usize {
 }
 
 fn create_segment_file(path: &Path) -> Result<File, io::Error> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
-        .open(path)
+        .open(path)?;
+    // Make the new directory entry durable. `fdatasync` on the file persists
+    // its CONTENTS but not the filename: on some filesystems a crash right
+    // after rotation could lose the freshly created segment file entirely,
+    // even though its records were "synced". One dir fsync per segment
+    // creation (every ~256MB) is noise. Same pattern as raft/snapshot_store.
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(file)
 }
 
 fn write_segment_header(file: &mut File, base_position: u64) -> Result<(), io::Error> {
