@@ -1,17 +1,16 @@
-//! Shared harness for Phase 6 crash tests.
+//! Shared harness for server crash-recovery tests.
 //!
-//! Lives in kronosdb-eventstore per D-06: tests run on default `cargo test`, same crate
-//! as concurrent_dcb_cluster.rs and snapshot_coldjoin.rs. This harness shells out to the
-//! production `kronosdb-server` binary via env!("CARGO_BIN_EXE_kronosdb-server").
+//! The harness belongs to the event-store crate so it runs under the normal
+//! workspace test command. It drives the production `kronosdb-server` binary
+//! over gRPC and verifies the files it leaves on disk.
 //!
 //! Responsibilities:
 //!   1. Spawn kronosdb-server as a child process with env-var config.
-//!   2. Wait until the gRPC port accepts connections (with timeout).
-//!   3. Provide an `AckLog` that records every successful append to an in-memory Vec
-//!      AND an fsync-per-line sidecar file on the test side (D-10).
-//!   4. SIGKILL the child (std::process::Child::kill() — SIGKILL on Unix; satisfies D-01/D-13).
-//!   5. Raw-disk CRC scanner for log segments + event segments (CRASH-02).
-//!   6. Shared helpers: hash_payload (blake3), read_ack_sidecar, rand_in.
+//!   2. Wait until both gRPC and application readiness succeed.
+//!   3. Persist every successful append in a separately fsynced acknowledgement log.
+//!   4. SIGKILL and reap the child process.
+//!   5. Scan metadata-log and event-segment records for torn writes.
+//!   6. Provide shared restart and payload-verification helpers.
 
 #![allow(dead_code)] // Not every helper is used by every test file.
 
@@ -23,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Generated client stubs — compiled by crates/kronosdb-eventstore/build.rs
 /// (client-only for eventstore.proto). Usable ONLY from this harness module and
@@ -108,11 +109,8 @@ fn ensure_server_built() {
 /// call `wait_until_ready`.
 pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     // `KRONOSDB_SERVER_BIN` is set by crates/kronosdb-eventstore/build.rs. Stable
-    // Cargo does NOT expose `CARGO_BIN_EXE_kronosdb-server` for cross-package bins, and
-    // adding `[lib]` to kronosdb-server is explicitly out of scope for Phase 6 (the
-    // plan forbids touching the server crate — see acceptance criteria). The
-    // harness explicitly rebuilds the binary once per test-binary process via
-    // `ensure_server_built` below. Semantic synonym for `CARGO_BIN_EXE_kronosdb-server`.
+    // Cargo does not expose `CARGO_BIN_EXE_kronosdb-server` for cross-package
+    // binaries, so the harness builds the server once per test-binary process.
     ensure_server_built();
     let bin = env!("KRONOSDB_SERVER_BIN");
     let listen: SocketAddr = format!("127.0.0.1:{}", cfg.listen_port).parse().unwrap();
@@ -124,9 +122,12 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
         .env("KRONOSDB_DATA_DIR", &cfg.data_dir)
         .env("KRONOSDB_NODE_NAME", format!("crash-node-{}", cfg.node_id))
         .env("KRONOSDB_CLUSTER_NODE_ID", cfg.node_id.to_string())
-        .env("RUST_LOG", "kronosdb=info,warn")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("RUST_LOG", "kronosdb=debug,warn");
+    if std::env::var_os("KRONOSDB_TEST_LOGS").is_some() {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
 
     if !cfg.peers.is_empty() {
         let peer_str = cfg
@@ -150,19 +151,79 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     })
 }
 
-/// Polls the gRPC port until a TCP connection succeeds or timeout elapses.
-pub async fn wait_until_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String> {
+/// Polls until the gRPC listener accepts connections and the native write gate
+/// reports ready through the admin endpoint.
+pub async fn wait_until_ready(
+    listen: SocketAddr,
+    admin: SocketAddr,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = Instant::now();
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            // Brief grace — tonic service registration happens a moment after listener binds.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        if tokio::net::TcpStream::connect(listen).await.is_ok() && admin_reports_ready(admin).await
+        {
             return Ok(());
         }
         if start.elapsed() > timeout {
-            return Err(format!("server not ready on {addr} after {:?}", timeout));
+            return Err(format!(
+                "server not ready on {listen} (admin {admin}) after {timeout:?}"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn admin_reports_ready(addr: SocketAddr) -> bool {
+    let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
+        return false;
+    };
+    if stream
+        .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.is_ok() && response.starts_with(b"HTTP/1.1 200")
+}
+
+pub async fn wait_for_raft_leader(
+    servers: &[ServerHandle],
+    timeout: Duration,
+) -> Result<usize, String> {
+    let start = Instant::now();
+    loop {
+        let mut leaders = Vec::new();
+        for (index, server) in servers.iter().enumerate() {
+            let Ok(mut stream) = tokio::net::TcpStream::connect(server.admin).await else {
+                continue;
+            };
+            if stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let mut response = Vec::new();
+            if stream.read_to_end(&mut response).await.is_ok()
+                && String::from_utf8_lossy(&response)
+                    .lines()
+                    .any(|line| line == "kronosdb_raft_is_leader 1")
+            {
+                leaders.push(index);
+            }
+        }
+        if leaders.len() == 1 {
+            return Ok(leaders[0]);
+        }
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "expected one metadata leader within {timeout:?}, observed {leaders:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -176,7 +237,7 @@ pub struct AckRecord {
     pub server_sequence: i64,
 }
 
-/// In-memory + fsync'd-sidecar ack log (D-10).
+/// In-memory acknowledgement log with an fsynced sidecar.
 pub struct AckLog {
     path: PathBuf,
     file: std::sync::Mutex<std::fs::File>,
@@ -231,7 +292,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Payload hash — blake3, 32 bytes. LOCKED per plan revision.
+/// Payload hash used for post-restart content verification.
 pub fn hash_payload(payload: &[u8]) -> Vec<u8> {
     blake3::hash(payload).as_bytes().to_vec()
 }
@@ -295,14 +356,12 @@ pub struct SegmentScanResult {
     pub torn_reason: Option<String>, // short-read | len-zero | bincode-fail | crc-mismatch | None if clean
 }
 
-/// Scan a raft log segment (log-*.bin) using Phase 2's format:
-///   [u32 len_be][bincode payload][u32 crc32c_le], CRC over payload only.
+/// Scan a metadata Raft log segment (`log-*.bin`):
+/// `[u32 len_be][bincode payload][u32 crc32c_le]`, CRC over payload only.
 ///
-/// A "torn tail" is post-last-valid-record bytes that do NOT belong to either
-/// (a) a valid record or (b) preallocated zero padding. A preallocated-zero
-/// tail (len_prefix == 0x00000000) is explicit EOF per Phase 2 D-15 and NOT
-/// a torn record; we report it via `preallocated_tail_bytes` distinct from
-/// `torn_tail_bytes`.
+/// A "torn tail" is post-last-valid-record bytes that do not belong to either
+/// a valid record or preallocated zero padding. A zero length prefix marks the
+/// legitimate start of the preallocated tail and is not a torn record.
 pub fn scan_raft_log_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
     let mut f = std::fs::File::open(path)?;
     let total_len = f.metadata()?.len();
@@ -322,7 +381,7 @@ pub fn scan_raft_log_segment(path: &Path) -> std::io::Result<SegmentScanResult> 
         f.read_exact(&mut len_buf)?;
         let payload_len = u32::from_be_bytes(len_buf) as u64;
         if payload_len == 0 {
-            // Preallocated zero-tail — legitimate EOF per Phase 2 D-15.
+            // Preallocated zero tail is a legitimate end-of-log marker.
             hit_preallocated_zero = true;
             break;
         }
@@ -364,7 +423,7 @@ pub fn scan_raft_log_segment(path: &Path) -> std::io::Result<SegmentScanResult> 
 }
 
 /// Scan an event segment (*.seg):
-///   File header (13 bytes): [4 magic "KRON"][1 version=2][8 base_position]
+///   File header (13 bytes): [4 magic "KRON"][1 version=3][8 base_position]
 ///   Record header (9 bytes): [4 crc32c_le][4 record_len_le][1 flags]
 ///   CRC over [flags || payload]
 pub fn scan_event_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
@@ -380,12 +439,12 @@ pub fn scan_event_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
     }
     let mut hdr = [0u8; 13];
     f.read_exact(&mut hdr)?;
-    if &hdr[0..4] != b"KRON" {
+    if &hdr[0..4] != b"KRON" || hdr[4] != 3 {
         return Ok(SegmentScanResult {
             path: path.to_path_buf(),
             valid_records: 0,
             torn_tail_bytes: total_len,
-            torn_reason: Some("bad magic".into()),
+            torn_reason: Some("bad segment header".into()),
         });
     }
     let mut offset: u64 = 13;
@@ -444,14 +503,55 @@ pub fn scan_event_segment(path: &Path) -> std::io::Result<SegmentScanResult> {
     })
 }
 
-/// Walks `<data_dir>/<ctx>/` and scans every log-*.bin and *.seg.
+pub fn read_valid_event_log(data_dir: &Path, ctx: &str) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let ctx_dir = data_dir.join(ctx);
+    let mut entries: Vec<_> = std::fs::read_dir(ctx_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.ends_with(".seg"))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut file = std::fs::File::open(entry.path())?;
+            let mut bytes = vec![0u8; 13];
+            file.read_exact(&mut bytes)?;
+            loop {
+                let mut header = [0u8; 9];
+                match file.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(error),
+                }
+                let record_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+                if record_len == 0 {
+                    break;
+                }
+                let mut payload = vec![0u8; record_len - 1];
+                file.read_exact(&mut payload)?;
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(&payload);
+            }
+            Ok((entry.file_name().to_string_lossy().into_owned(), bytes))
+        })
+        .collect()
+}
+
+/// Walks the node-wide metadata journal and one context's event segments.
 /// Returns (total_valid_log_records, total_valid_event_records, scan_results).
 pub fn scan_all_segments(
     data_dir: &Path,
     ctx: &str,
 ) -> std::io::Result<(u64, u64, Vec<SegmentScanResult>)> {
     let ctx_dir = data_dir.join(ctx);
-    let raft_dir = ctx_dir.join("raft");
+    let raft_dir = data_dir.join("raft");
     let mut results = Vec::new();
     let mut total_log_records = 0u64;
     let mut total_event_records = 0u64;

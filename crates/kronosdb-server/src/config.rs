@@ -81,12 +81,9 @@ struct Cli {
     #[arg(long, default_value = "standard", env = "KRONOSDB_CLUSTER_NODE_TYPE")]
     cluster_node_type: String,
 
-    /// Append write path: "auto" (default) bypasses Raft consensus on
-    /// standalone single-voter deployments — one fsync per append instead of
-    /// two; "raft" forces every append through consensus even single-node.
-    /// Any configured peer or learner always forces the consensus path.
-    #[arg(long, default_value = "auto", env = "KRONOSDB_WRITE_PATH")]
-    write_path: String,
+    /// Maximum unacknowledged raw segment bytes per follower Tail session.
+    #[arg(long, env = "KRONOSDB_REPLICATION_INFLIGHT_BYTES")]
+    replication_inflight_bytes: Option<u64>,
 
     /// Cluster voter peers as "id=addr" pairs (e.g. "1=127.0.0.1:50051,2=127.0.0.1:50052").
     #[arg(long, env = "KRONOSDB_CLUSTER_PEERS", value_delimiter = ',')]
@@ -166,6 +163,8 @@ struct ConfigFile {
     #[serde(rename = "node-name")]
     node_name: Option<String>,
     manifest: Option<String>,
+    #[serde(rename = "replication-inflight-bytes")]
+    replication_inflight_bytes: Option<u64>,
 
     #[serde(default)]
     storage: StorageConfig,
@@ -329,8 +328,7 @@ pub struct ServerConfig {
     /// If set, clustering is enabled.
     pub cluster_node_id: Option<u64>,
     pub cluster_node_type: String,
-    /// "auto" (single-node fast path allowed) or "raft" (always consensus).
-    pub write_path: String,
+    pub replication_inflight_bytes: u64,
     pub cluster_peers: Vec<PeerEntry>,
     pub cluster_learners: Vec<PeerEntry>,
     /// Access token for gRPC auth. None = open access.
@@ -422,15 +420,10 @@ impl ServerConfig {
             drain_deadline_secs: cli.drain_deadline_secs,
             cluster_node_id: cli.cluster_node_id,
             cluster_node_type: cli.cluster_node_type,
-            write_path: match cli.write_path.as_str() {
-                "auto" | "raft" => cli.write_path,
-                other => {
-                    return Err(format!(
-                        "invalid --write-path '{other}': expected 'auto' or 'raft'"
-                    )
-                    .into());
-                }
-            },
+            replication_inflight_bytes: cli
+                .replication_inflight_bytes
+                .or(file_config.replication_inflight_bytes)
+                .unwrap_or(64 * 1024 * 1024),
             cluster_peers,
             cluster_learners,
             access_token: cli.access_token.or(file_config.security.access_token),
@@ -704,7 +697,7 @@ tls-ca = "/etc/kronosdb/ca.pem"
                 token: None,
                 oidc: None,
             },
-            write_path: "auto".into(),
+            replication_inflight_bytes: 64 * 1024 * 1024,
         };
         assert!(config.is_clustered());
     }
@@ -739,7 +732,7 @@ tls-ca = "/etc/kronosdb/ca.pem"
                 token: None,
                 oidc: None,
             },
-            write_path: "auto".into(),
+            replication_inflight_bytes: 64 * 1024 * 1024,
         };
         assert!(!config.is_clustered());
     }

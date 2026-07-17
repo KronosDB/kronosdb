@@ -1,18 +1,18 @@
 # KronosDB
 
-A open-source DCB eventstore and distributed messaging bus built for reliable event sourcing at scale.
+An open-source DCB event store and distributed messaging bus built for reliable event sourcing at scale.
 
-KronosDB provides append-only event storage with tag-based querying, and a distributed messaging layer (command bus, query bus, subscription queries), together with Raft-based replication for fault tolerance, and a built-in admin console, all in a single binary with no external dependencies.
+KronosDB provides append-only event storage with tag-based querying, and a distributed messaging layer (command bus, query bus, subscription queries), together with byte-exact segment replication and Raft-based leader election for fault tolerance, and a built-in admin console, all in a single binary with no external dependencies.
 
 ## Features
 
 - **Event Storage** — Append-only log with consistency conditions for optimistic concurrency. Tag-based filtering and time-based replay.
 - **Messaging** — Distributed command bus with routing, query bus with scatter-gather, and subscription queries with live updates.
-- **Raft Consensus** — Multi-node replication with automatic leader election, learner nodes, and passive backups.
+- **Native replication** — Group-commit waves stream as byte-exact segment records; Raft handles only membership, election, and fencing epochs.
 - **Snapshot store** — Key-sequence snapshot store for state caching.
 - **Admin Console** — Built-in web UI for monitoring and controlling contexts, events, clients, processors, messaging handlers, cluster state, and server configuration. Protected by static-token or OIDC auth (connect it to a Keycloak/Auth0/Entra admin realm).
 - **gRPC API** — Fast protocol buffer interface for all application operations. TLS and token-based authentication supported.
-- **Production-ready operations** — Liveness/readiness probes (`/ready`, `grpc.health.v1`), Prometheus `/metrics`, JSON logs, graceful drain on SIGTERM, data-dir fencing, and a single-node fast path that skips the Raft round-trip on standalone deployments. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+- **Production-ready operations** — Liveness/readiness probes (`/ready`, `grpc.health.v1`), Prometheus `/metrics`, JSON logs, graceful drain on SIGTERM, data-dir fencing, TLS/mTLS peer transport, and quorum-durable acknowledgements.
 - **Declarative manifest** — Declare contexts in a TOML manifest ensured to exist at startup, instead of creating them through the admin API.
 
 ## Declarative manifest
@@ -34,7 +34,7 @@ Point the server at it with `--manifest`, `KRONOSDB_MANIFEST`, or a `manifest = 
 
 Start using it today with:
 
-- **Kronos-ts** — A typescript framework inspired by Axon Framework 5 that can be used to build event sourced applications on Node. [kronos-ts](https://github.com/KronosDB/kronos-ts)
+- **Kronos-ts** — A TypeScript framework inspired by Axon Framework 5 that can be used to build event-sourced applications on Node. [kronos-ts](https://github.com/KronosDB/kronos-ts)
 - **Axon Framework** — First-class connector for Axon Framework 5 applications via [axon-kronosdb-connector](https://github.com/KronosDB/axon-kronosdb-connector).
 
 ## License

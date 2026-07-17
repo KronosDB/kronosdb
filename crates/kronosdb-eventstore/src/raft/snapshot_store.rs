@@ -15,25 +15,24 @@
 //!
 //! See: regression test `restart_after_snapshot_single_node.rs`.
 //!
-//! # On-disk layout (v2: split meta + data)
+//! # On-disk layout
 //!
-//! A snapshot is a PAIR of files so that meta hydration at boot never has
-//! to touch (or even CRC-scan) the potentially huge data segment, and the
-//! data segment can be built and consumed as a bounded-memory stream:
+//! A snapshot remains a PAIR of files so openraft can stream its data handle
+//! independently from `SnapshotMeta`:
 //!
-//! - `snap-<index:020>-<term:020>.meta` — small: `KRSN` header + bincoded
-//!   `PersistedMeta` + trailing CRC32C over the whole file.
-//! - `snap-<index:020>-<term:020>.data` — the `KSD2` chunked event stream
-//!   (see `snapshot_format.rs`; each chunk carries its own CRC).
+//! - `snap-<index:020>-<term:020>.meta` — `KRSN` header + bincoded
+//!   `PersistedMeta` + trailing CRC32C.
+//! - `snap-<index:020>-<term:020>.data` — the small `KSM4` metadata payload
+//!   from `snapshot_format.rs`. It never contains events.
+//!
+//! `control-state.bin` durably records the same application metadata together
+//! with `last_applied` and membership after every apply batch. This closes the
+//! restart window before the next snapshot without coupling Raft progress to
+//! event-segment markers.
 //!
 //! ```text
 //! .meta: | magic "KRSN" (4) | ver(1)=2 | rsv(3) | meta_len u32 LE | meta | crc32c |
 //! ```
-//!
-//! Pre-1.0 format note: v1 was a single `.snap` file with the data blob
-//! inline. There is no migration — v1 files are ignored (a node rebuilds a
-//! fresh snapshot at its next snapshot trigger; `membership.bin` carries
-//! the voter set across the format change).
 //!
 //! # Write protocol + crash points
 //!
@@ -62,10 +61,13 @@ use std::path::{Path, PathBuf};
 use openraft::SnapshotMeta;
 use serde::{Deserialize, Serialize};
 
+use super::snapshot_format::MetadataSnapshot;
 use super::types::NodeId;
 
 const MAGIC: &[u8; 4] = b"KRSN";
 const VERSION: u8 = 2;
+const CONTROL_STATE_MAGIC: &[u8; 4] = b"KRCS";
+const CONTROL_STATE_VERSION: u8 = 2;
 
 /// Header layout: magic(4) + version(1) + reserved(3) + meta_len(4) = 12 bytes.
 const HEADER_LEN: usize = 12;
@@ -99,6 +101,14 @@ impl From<PersistedMeta> for SnapshotMeta<NodeId, openraft::BasicNode> {
             snapshot_id: p.snapshot_id,
         }
     }
+}
+
+/// Durable state-machine progress between snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedControlState {
+    pub last_applied: Option<openraft::LogId<NodeId>>,
+    pub last_membership: openraft::StoredMembership<NodeId, openraft::BasicNode>,
+    pub metadata: MetadataSnapshot,
 }
 
 /// On-disk store for the latest snapshot in a single Raft node's data dir.
@@ -318,6 +328,90 @@ impl SnapshotStore {
         }
     }
 
+    /// Atomically persists state-machine progress independently from event
+    /// segments. Control-plane traffic is low-volume, so one fsync per apply
+    /// batch is preferable to reconstructing `last_applied` from data-plane
+    /// markers that no longer exist.
+    pub fn save_control_state(&self, state: &PersistedControlState) -> io::Result<()> {
+        let final_path = self.dir.join("control-state.bin");
+        let tmp_path = self.dir.join("control-state.bin.tmp");
+        let body =
+            bincode::serialize(state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut buf = Vec::with_capacity(9 + body.len() + 4);
+        buf.extend_from_slice(CONTROL_STATE_MAGIC);
+        buf.push(CONTROL_STATE_VERSION);
+        let body_len: u32 = body.len().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control state exceeds u32::MAX",
+            )
+        })?;
+        buf.extend_from_slice(&body_len.to_le_bytes());
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&crc32c::crc32c(&buf).to_le_bytes());
+
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&buf)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        if let Ok(dir) = fs::File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Loads durable state-machine progress. A missing file is expected on a
+    /// fresh node; corruption is an error because silently replaying from an
+    /// older point can resurrect superseded leadership metadata.
+    pub fn load_control_state(&self) -> io::Result<Option<PersistedControlState>> {
+        let path = self.dir.join("control-state.bin");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if bytes.len() < 13 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control-state.bin too short",
+            ));
+        }
+        if &bytes[0..4] != CONTROL_STATE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad control-state.bin magic",
+            ));
+        }
+        let version = bytes[4];
+        if version != CONTROL_STATE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported control state version: {version}"),
+            ));
+        }
+        let (body_and_header, crc_bytes) = bytes.split_at(bytes.len() - 4);
+        let expected_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        if crc32c::crc32c(body_and_header) != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control-state.bin CRC mismatch",
+            ));
+        }
+        let body_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        let body_end = 9usize
+            .checked_add(body_len)
+            .filter(|end| *end == body_and_header.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid control state length")
+            })?;
+        let state = bincode::deserialize(&bytes[9..body_end])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Some(state))
+    }
+
     fn cleanup_except(&self, keep_idx: u64, keep_term: u64) -> io::Result<()> {
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -328,14 +422,17 @@ impl SnapshotStore {
             };
             let is_current = parse_snapshot_filename(name, "meta") == Some((keep_idx, keep_term))
                 || parse_snapshot_filename(name, "data") == Some((keep_idx, keep_term));
-            if is_current || name == "membership.bin" {
+            if is_current
+                || name == "membership.bin"
+                || name == "membership.bin.tmp"
+                || name == "control-state.bin"
+                || name == "control-state.bin.tmp"
+            {
                 continue;
             }
-            // Older pairs, legacy v1 `.snap` files, and orphaned tmp files.
-            let droppable = name.ends_with(".meta")
-                || name.ends_with(".data")
-                || name.ends_with(".snap")
-                || name.ends_with(".tmp");
+            // Older snapshot pairs and orphaned temporary files.
+            let droppable =
+                name.ends_with(".meta") || name.ends_with(".data") || name.ends_with(".tmp");
             if droppable {
                 let _ = fs::remove_file(&path);
             }
@@ -509,15 +606,9 @@ mod tests {
     }
 
     #[test]
-    fn commit_cleans_up_older_snapshots_and_legacy_files() {
+    fn commit_cleans_up_older_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-        fs::write(
-            dir.path()
-                .join("snap-00000000000000000001-00000000000000000001.snap"),
-            b"v1",
-        )
-        .unwrap();
         commit(&store, 10, 1, b"a");
         commit(&store, 20, 1, b"b");
 
@@ -535,7 +626,7 @@ mod tests {
                 snapshot_filename(20, 1, "data"),
                 snapshot_filename(20, 1, "meta"),
             ],
-            "only the newest pair should remain (v1 + older pair removed)"
+            "only the newest snapshot pair should remain"
         );
     }
 

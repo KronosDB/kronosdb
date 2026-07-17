@@ -1,18 +1,14 @@
-//! Raft consensus integration for cluster-aware event stores.
+//! Metadata consensus and native data-plane coordination.
 //!
-//! Every KronosDB node runs Raft — a single-node cluster when alone,
-//! expanding to multi-node when peers join. This module contains:
-//!
-//! - `cluster` — `ClusterManager` that wraps event stores with Raft consensus
-//! - `types` — Raft request/response types and openraft type configuration
-//! - `log_store` — Persistent Raft log storage
-//! - `state_machine` — Applies committed Raft entries to the event store
-//! - `network` — gRPC network factory for peer connections
-//! - `transport` — Inbound gRPC service for Raft RPCs
+//! OpenRaft owns elections, membership, context metadata, and fencing-epoch
+//! allocation. Event records never enter its journal; `native_coordinator` and
+//! `routed_engine` connect committed claims to byte-exact segment replication.
 
 pub mod cluster;
 pub mod log_store;
+mod native_coordinator;
 pub mod network;
+mod routed_engine;
 pub mod snapshot_format;
 pub mod snapshot_store;
 pub mod state_machine;

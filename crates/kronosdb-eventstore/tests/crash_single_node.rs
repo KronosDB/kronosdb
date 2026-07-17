@@ -1,11 +1,10 @@
-//! Phase 6 CRASH-02/CRASH-03: 1-node kill-mid-append proof.
+//! Single-node kill-mid-append crash-recovery proof.
 //!
-//! Lives in kronosdb-eventstore per D-06. Spawns kronosdb-server (the production binary)
-//! as a child process, drives mixed conditional+unconditional appends across 8 aggregates,
-//! SIGKILLs the child 50-500ms after first ack (D-04), restarts against the same data dir,
-//! and performs the 3-way post-restart verification (D-11).
-//!
-//! Runs exactly 10 iterations (D-05), fresh tempdir each iteration (D-14).
+//! Spawns the production server, drives mixed conditional and unconditional
+//! appends across eight consistency boundaries, kills the process 50–500ms
+//! after the first acknowledgement, and restarts against the same data
+//! directory. Ten fresh-directory iterations verify that acknowledged events
+//! remain readable with their original contents and that appends can resume.
 
 mod crash_harness;
 use crash_harness::pb::eventstore as pb;
@@ -23,10 +22,10 @@ use pb::event_store_client::EventStoreClient;
 const ITERATIONS: usize = 10;
 const AGGREGATES: usize = 8;
 const WRITER_TASKS: usize = 4;
-const KILL_DELAY_MIN_MS: u64 = 50; // D-04 literal
-const KILL_DELAY_MAX_MS: u64 = 500; // D-04 literal
+const KILL_DELAY_MIN_MS: u64 = 50;
+const KILL_DELAY_MAX_MS: u64 = 500;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
-const WORKLOAD_STARTUP_GRACE: Duration = Duration::from_secs(3);
+const WORKLOAD_STARTUP_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn crash_single_node_ten_iterations() {
@@ -59,10 +58,10 @@ async fn run_one_iteration(iter: usize) {
         group_commit_ms: Some(2),
     };
 
-    // Phase 1: boot, hammer, kill.
+    // First boot: append under load, then kill the server.
     let acked_count_before_kill = {
         let mut srv = spawn_server(&cfg).expect("spawn server");
-        wait_until_ready(srv.listen, READY_TIMEOUT)
+        wait_until_ready(srv.listen, srv.admin, READY_TIMEOUT)
             .await
             .expect("server ready");
 
@@ -89,14 +88,15 @@ async fn run_one_iteration(iter: usize) {
         // Killer: wait for first ack, then uniform [50, 500] ms, then SIGKILL.
         {
             let mut rx = first_ack_rx.clone();
-            let _ = tokio::time::timeout(WORKLOAD_STARTUP_GRACE, async {
+            tokio::time::timeout(WORKLOAD_STARTUP_GRACE, async {
                 while !*rx.borrow_and_update() {
                     if rx.changed().await.is_err() {
-                        break;
+                        panic!("iter {iter}: append workers stopped before first ack");
                     }
                 }
             })
-            .await;
+            .await
+            .unwrap_or_else(|_| panic!("iter {iter}: no first ack within startup grace"));
         }
         let delay_ms = rand_in(KILL_DELAY_MIN_MS, KILL_DELAY_MAX_MS);
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -120,9 +120,9 @@ async fn run_one_iteration(iter: usize) {
         count
     };
 
-    // Phase 2: respawn against same data dir.
+    // Restart against the same data directory and verify recovery.
     let mut srv = spawn_server(&cfg).expect("respawn server");
-    wait_until_ready(srv.listen, READY_TIMEOUT)
+    wait_until_ready(srv.listen, srv.admin, READY_TIMEOUT)
         .await
         .expect("restarted server ready");
 

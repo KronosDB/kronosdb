@@ -1,8 +1,7 @@
 //! Inbound gRPC service for receiving Raft RPCs from peer nodes.
 //!
-//! Each node runs a single Raft group covering all contexts — log entries
-//! carry the target context (`RaftRequest::Append { context, .. }`), so no
-//! per-context routing is needed at the transport layer.
+//! One node-wide metadata Raft group carries context creation and fenced
+//! leader claims. Event bytes never enter this transport.
 
 use std::sync::Arc;
 
@@ -27,10 +26,7 @@ impl RaftTransportService {
     }
 
     pub fn into_server(self) -> proto::raft_transport_server::RaftTransportServer<Self> {
-        // Peer traffic carries coalesced append entries; tonic's 4MB default
-        // decode limit would make followers reject fat entries and wedge
-        // replication in a permanent retry loop (cluster-wide write
-        // livelock, found by the cluster bench at batch=1000 conc=16).
+        // Metadata entries remain small, but use the same explicit peer limit.
         proto::raft_transport_server::RaftTransportServer::new(self)
             .max_decoding_message_size(super::network::RAFT_MAX_MESSAGE_BYTES)
             .max_encoding_message_size(super::network::RAFT_MAX_MESSAGE_BYTES)

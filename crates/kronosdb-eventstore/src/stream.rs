@@ -6,13 +6,13 @@ use tokio::sync::broadcast;
 use crate::criteria::SourcingCondition;
 use crate::event::Position;
 
-/// Notification sent by the writer when new events are committed.
-/// This is a wake-up signal only — the head_position atomic is the
-/// source of truth, not this notification.
+/// Notification sent when the watermark advances (new events are committed
+/// and externally visible). This is a wake-up signal only — the watermark
+/// atomic is the source of truth, not this notification.
 #[derive(Debug, Clone)]
 pub struct CommitNotification {
-    /// The new head position after this batch (next-exclusive).
-    pub head_position: u64,
+    /// The watermark after this advance (next-exclusive).
+    pub watermark: u64,
 }
 
 /// A live event stream subscription.
@@ -22,11 +22,13 @@ pub struct CommitNotification {
 /// then calls `store.source()` for that range and sends the results to the client.
 ///
 /// Reliability guarantees:
-/// - Events are NEVER missed. The head_position atomic is the source of truth,
+/// - Events are NEVER missed. The watermark atomic is the source of truth,
 ///   not the broadcast notification. If a notification is dropped (slow
 ///   subscriber), the next wait will catch up by checking the atomic.
 /// - Events are always delivered in sequence order.
 /// - The cursor only advances after the caller has processed the events.
+/// - Delivery is watermark-bounded: only quorum-committed events are
+///   visible, so a delivered event can never be truncated away later.
 pub struct EventStream {
     /// The criteria to filter events.
     pub condition: SourcingCondition,
@@ -34,8 +36,8 @@ pub struct EventStream {
     pub cursor: Position,
     /// Receiver for commit notifications from the writer.
     receiver: broadcast::Receiver<CommitNotification>,
-    /// Shared head position — next-exclusive, the source of truth for what's available.
-    head_position: Arc<AtomicU64>,
+    /// Shared watermark — next-exclusive, the source of truth for what's available.
+    watermark: Arc<AtomicU64>,
 }
 
 impl EventStream {
@@ -43,13 +45,13 @@ impl EventStream {
         condition: SourcingCondition,
         cursor: Position,
         receiver: broadcast::Receiver<CommitNotification>,
-        head_position: Arc<AtomicU64>,
+        watermark: Arc<AtomicU64>,
     ) -> Self {
         Self {
             condition,
             cursor,
             receiver,
-            head_position,
+            watermark,
         }
     }
 
@@ -68,7 +70,7 @@ impl EventStream {
     pub async fn wait_for_new_events(&mut self) -> u64 {
         loop {
             // First check if there are already events at or beyond our cursor.
-            let current = self.head_position.load(Ordering::Acquire);
+            let current = self.watermark.load(Ordering::Acquire);
             if current > self.cursor.0 {
                 return current;
             }
@@ -76,24 +78,24 @@ impl EventStream {
             // Wait for a notification from the writer.
             match self.receiver.recv().await {
                 Ok(notification) => {
-                    if notification.head_position > self.cursor.0 {
-                        return notification.head_position;
+                    if notification.watermark > self.cursor.0 {
+                        return notification.watermark;
                     }
                     // Notification was for positions behind our cursor — keep waiting.
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // We missed some notifications. No problem — check the atomic
                     // directly. This is the catch-up path.
-                    let current = self.head_position.load(Ordering::Acquire);
+                    let current = self.watermark.load(Ordering::Acquire);
                     if current > self.cursor.0 {
                         return current;
                     }
                     // Still nothing ahead of our cursor — keep waiting.
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    // The store was dropped. Return current head to let
-                    // the caller clean up gracefully.
-                    return self.head_position.load(Ordering::Acquire);
+                    // The store was dropped. Return the current watermark to
+                    // let the caller clean up gracefully.
+                    return self.watermark.load(Ordering::Acquire);
                 }
             }
         }

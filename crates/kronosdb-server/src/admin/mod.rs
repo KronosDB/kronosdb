@@ -147,20 +147,15 @@ async fn health() -> &'static str {
 
 /// Readiness probe: 200 only when this node can serve. Liveness (`/health`)
 /// answers "is the process up"; this answers "should traffic be routed here"
-/// — contexts are open (implied by the server being wired) and the Raft
-/// group knows a leader, so writes can be accepted or forwarded.
+/// — contexts are open (implied by the server being wired) and a committed
+/// native leader claim can accept or forward writes.
 async fn ready(State(state): State<AdminState>) -> (StatusCode, &'static str) {
-    let leader_known = state
-        .cluster
-        .raft_node()
-        .map(|raft| raft.metrics().borrow().current_leader.is_some())
-        .unwrap_or(false);
-    if leader_known {
+    if state.cluster.native_ready() {
         (StatusCode::OK, "ready")
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "not ready: no raft leader known",
+            "not ready: native leader claim unavailable",
         )
     }
 }

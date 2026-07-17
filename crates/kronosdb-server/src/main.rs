@@ -20,8 +20,14 @@ use tracing::{error, info, warn};
 
 use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::raft::cluster::{ClusterConfig, ClusterManager, NodeType, PeerConfig};
+use kronosdb_eventstore::raft::network::RAFT_MAX_MESSAGE_BYTES;
+use kronosdb_eventstore::raft::proto::raft_transport_server::RaftTransportServer;
 use kronosdb_eventstore::raft::transport::RaftTransportService;
 use kronosdb_eventstore::raft::types::default_raft_config;
+use kronosdb_eventstore::replication::PEER_MAX_MESSAGE_BYTES;
+use kronosdb_eventstore::replication::peer::{PeerTlsConfig, PeerTransportConfig};
+use kronosdb_eventstore::replication::proto::segment_replication_server::SegmentReplicationServer;
+use kronosdb_eventstore::replication::service::SegmentReplicationService;
 use kronosdb_eventstore::store::StoreOptions;
 use kronosdb_messaging::client::ClientRegistry;
 use kronosdb_messaging::manager::MessagingManager;
@@ -54,13 +60,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse()?;
 
+    // Native segment quorum topology is required before contexts open: it
+    // determines recovery's initial watermark (a clustered node may not treat
+    // its local durable tail as quorum-committed).
+    let node_id = config.cluster_node_id.unwrap_or(1);
+    let voter_ids: Vec<u64> = if config.cluster_peers.is_empty() {
+        vec![node_id]
+    } else {
+        config.cluster_peers.iter().map(|peer| peer.id).collect()
+    };
+
     // Create the context manager and ensure a default context exists.
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
         index_cache_size: config.index_cache_size,
         bloom_cache_size: config.bloom_cache_size,
         group_commit_interval_ms: config.group_commit_ms,
-        ..Default::default()
+        node_id,
+        voters: voter_ids,
     };
     let contexts = Arc::new(ContextManager::with_options(
         &config.data_dir,
@@ -87,7 +104,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the cluster manager — every node is always a Raft node.
     // A node with no peers starts as a single-node cluster (instant leader).
-    let node_id = config.cluster_node_id.unwrap_or(1);
     let node_type = match config.cluster_node_type.as_str() {
         "passive-backup" => NodeType::PassiveBackup,
         _ => NodeType::Standard,
@@ -119,6 +135,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    let peer_tls = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert_path), Some(key_path)) => Some(PeerTlsConfig {
+            ca_certificate: config.tls_ca.as_ref().map(std::fs::read).transpose()?,
+            identity_certificate: std::fs::read(cert_path)?,
+            identity_key: std::fs::read(key_path)?,
+        }),
+        _ => None,
+    };
+    let peer_transport = PeerTransportConfig {
+        tls: peer_tls,
+        access_token: config.access_token.clone(),
+    };
+
     let cluster_config = ClusterConfig {
         node_id,
         node_type,
@@ -126,13 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         voters,
         learners,
         raft_config: default_raft_config(),
-        single_node_fast_path: config.write_path == "auto",
-        // Inline log fsync: openraft 0.9's core awaits every entry's flush
-        // callback before its next step, so deferring the fsync only adds
-        // latency. Concurrency is amortized ABOVE consensus instead — the
-        // append proposer coalesces concurrent appends into one log entry.
-        // Revisit (mirror group_commit_ms here) once openraft pipelines IO.
-        log_group_commit: None,
+        peer_transport,
     };
 
     // Log what the durability configuration means for this node. This is the
@@ -143,15 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cluster = Arc::new(ClusterManager::new(Arc::clone(&contexts), cluster_config));
 
-    if cluster.is_fast_path() {
-        tracing::info!(
-            "single-node fast path ACTIVE: appends go directly to the local engine \
-             (one fsync per append, no consensus round-trip); configure cluster peers \
-             or --write-path raft to force consensus"
-        );
-    }
-
-    // One shared Raft group per node; every context registers against it.
+    // One shared metadata Raft group per node; every context registers its
     cluster.init_raft().await?;
     for ctx_name in contexts.list_contexts() {
         cluster.register_context(&ctx_name)?;
@@ -355,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .add_service(PlatformServiceServer::with_interceptor(
             platform_service,
-            auth,
+            auth.clone(),
         ));
 
     // Raft transport — always enabled (every node is a Raft node).
@@ -363,7 +378,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .raft_node()
         .expect("shared Raft node must be initialized");
     let raft_transport = RaftTransportService::new(Arc::clone(&raft_node));
-    router = router.add_service(raft_transport.into_server());
+    let raft_server = RaftTransportServer::new(raft_transport)
+        .max_decoding_message_size(RAFT_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RAFT_MAX_MESSAGE_BYTES);
+    let raft_server =
+        tonic::service::interceptor::InterceptedService::new(raft_server, auth.clone());
+    router = router.add_service(raft_server);
+
+    // Native segment Tail transport uses the same authentication, TLS, and
+    // message limits as the metadata control plane.
+    let segment_replication = SegmentReplicationService::new(
+        Arc::clone(&contexts),
+        cluster.replication_control(),
+        config.replication_inflight_bytes,
+    );
+    let replication_server = SegmentReplicationServer::new(segment_replication)
+        .max_decoding_message_size(PEER_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(PEER_MAX_MESSAGE_BYTES);
+    let replication_server =
+        tonic::service::interceptor::InterceptedService::new(replication_server, auth);
+    router = router.add_service(replication_server);
 
     // grpc.health.v1 — unauthenticated by design (kubelet probes and gRPC
     // client-side health checking). Overall status tracks Raft leadership:
@@ -371,13 +405,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     router = router.add_service(health_service);
     {
-        let raft = Arc::clone(&raft_node);
+        let health_cluster = Arc::clone(&cluster);
         let reporter = health_reporter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let serving = raft.metrics().borrow().current_leader.is_some();
+                let serving = health_cluster.native_ready();
                 if serving {
                     reporter
                         .set_service_status("", tonic_health::ServingStatus::Serving)
@@ -451,6 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         })
     };
+    cluster.start_replication()?;
     router
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;
@@ -496,7 +531,7 @@ fn log_durability_summary(cluster: &ClusterConfig, group_commit_ms: u64) {
             durability = "strict",
             voters = voter_count,
             group_commit_ms,
-            "multi-node, strict durability: every write blocks on local fsync before ack — crash-safe"
+            "multi-node native durability: every write waits for a quorum-durable segment cursor"
         );
     } else {
         info!(

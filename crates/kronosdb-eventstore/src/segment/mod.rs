@@ -1,5 +1,6 @@
 pub mod format;
 pub mod reader;
+pub mod record;
 pub mod segment_index;
 pub mod writer;
 
@@ -10,11 +11,9 @@ pub const SEGMENT_MAGIC: [u8; 4] = *b"KRON";
 
 /// Current segment format version.
 ///
-/// v1: event records only.
-/// v2: event records interleaved with Raft entry markers (log-as-state).
-///     The record's flags byte discriminates record type — readers that want
-///     events skip markers, readers that want Raft entries skip events.
-pub const SEGMENT_VERSION: u8 = 2;
+/// Version 3 stores event records interleaved with native fencing and
+/// committed-watermark control records.
+pub const SEGMENT_VERSION: u8 = 3;
 
 /// Segment file header size in bytes.
 /// Layout: [4 magic] [1 version] [8 base_position] = 13 bytes
@@ -32,14 +31,13 @@ pub const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 ///
 /// Bits 4-7 discriminate record type. Bits 0-3 are per-type sub-flags.
 pub mod flags {
-    /// Deprecated alias for EVENT. Kept for call sites that haven't migrated.
-    pub const NONE: u8 = 0x00;
     /// Event record: payload is a serialized `StoredEvent`.
     pub const EVENT: u8 = 0x00;
-    /// Raft entry marker: payload is a serialized `RaftMarker`.
-    /// In v2 segments, markers precede the event records they refer to
-    /// (for Normal entries with events); Membership/Blank entries stand alone.
-    pub const RAFT_MARKER: u8 = 0x10;
+    /// Native replication control record. Low-nibble subtype identifies the
+    /// payload shape; readers of events skip all control records.
+    pub const CONTROL: u8 = 0x20;
+    pub const CONTROL_EPOCH_CHANGE: u8 = CONTROL | 0x01;
+    pub const CONTROL_WATERMARK_CHECKPOINT: u8 = CONTROL | 0x02;
 
     /// Mask to extract the record type (high nibble).
     pub const TYPE_MASK: u8 = 0xF0;
@@ -49,9 +47,9 @@ pub mod flags {
         flags & TYPE_MASK == EVENT
     }
 
-    /// Returns true if this flags byte denotes a Raft entry marker.
-    pub fn is_raft_marker(flags: u8) -> bool {
-        flags & TYPE_MASK == RAFT_MARKER
+    /// Returns true if this flags byte denotes a native control record.
+    pub fn is_control(flags: u8) -> bool {
+        flags & TYPE_MASK == CONTROL
     }
 }
 

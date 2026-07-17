@@ -22,13 +22,15 @@ growable-bloom-filter = "2"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "rt", "fs", "io-util"] }
+tokio-stream = "0.1"
 async-trait = "0.1"
 lru = "0.14"
 
 # Raft consensus
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
-tonic = "0.13"
+tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"
+bytes = "1"
 tracing = "0.1"
 fs2 = "0.4"
 
