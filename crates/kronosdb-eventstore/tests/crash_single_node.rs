@@ -163,10 +163,14 @@ async fn run_one_iteration(iter: usize) {
     let req = pb::SourceRequest {
         from_sequence: 0,
         criteria,
+        batch_size: 0,
     };
     let mut stream = client.source(req).await.expect("source rpc").into_inner();
     while let Some(resp) = stream.message().await.expect("stream msg") {
-        if let Some(pb::source_response::Result::Event(ev)) = resp.result {
+        let Some(pb::source_response::Result::Batch(batch)) = resp.result else {
+            continue;
+        };
+        for ev in batch.events {
             let seq = ev.sequence;
             let name = ev
                 .event

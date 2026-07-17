@@ -290,15 +290,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
     use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer;
 
-    // Configure TLS and gRPC keepalive. Aggressive cadence (2.5s ping,
-    // 5s timeout) keeps idle connector streams from being silently dropped
-    // by middleboxes; tonic delegates the actual PING handling to h2.
+    // Configure TLS and gRPC keepalive. The ping cadence keeps idle
+    // connector streams from being silently dropped by middleboxes while
+    // tolerating multi-second CPU saturation: a timeout shorter than a bad
+    // scheduling stall turns overload into connection kills for every
+    // stream on the connection. tonic delegates PING handling to h2.
     let make_builder = || {
         Server::builder()
-            .http2_keepalive_interval(Some(Duration::from_millis(2500)))
-            .http2_keepalive_timeout(Some(Duration::from_secs(5)))
+            .http2_keepalive_interval(Some(Duration::from_secs(10)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .http2_adaptive_window(Some(true))
+            // DCB clients legitimately issue very high rates of short Source
+            // reads and cancel the stream once they have what they need. With
+            // h2's default budget (20), that pattern trips the Rapid-Reset
+            // mitigation ("too_many_internal_resets") and kills the whole
+            // connection under load.
+            .http2_max_pending_accept_reset_streams(Some(2048))
     };
 
     let mut server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key)
@@ -429,7 +437,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::net::TcpListener::from_std(std_listener)?
     };
 
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    // tonic applies tcp_nodelay/tcp_keepalive only to sockets accepted by its
+    // own TcpIncoming; with a user-supplied incoming stream they must be set
+    // per accepted socket here. Without nodelay, Nagle + the client's delayed
+    // ACK holds every response that follows a small h2 frame for ~40ms.
+    let incoming = {
+        use tokio_stream::StreamExt;
+        tokio_stream::wrappers::TcpListenerStream::new(listener).map(|conn| {
+            conn.inspect(|stream| {
+                let _ = stream.set_nodelay(true);
+                let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60));
+                let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+            })
+        })
+    };
     router
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;

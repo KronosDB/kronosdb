@@ -1,5 +1,6 @@
 syntax = "proto3";
 package kronosdb.raft;
+option java_package = "io.kronosdb.grpc.raft";
 option java_multiple_files = true;
 
 /* Internal node-to-node Raft consensus transport.

@@ -21,7 +21,7 @@ dashmap = "6"
 growable-bloom-filter = "2"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "fs", "io-util"] }
 async-trait = "0.1"
 lru = "0.14"
 

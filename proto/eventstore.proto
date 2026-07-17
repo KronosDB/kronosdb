@@ -1,5 +1,6 @@
 syntax = "proto3";
 package kronosdb.eventstore;
+option java_package = "io.kronosdb.grpc.eventstore";
 option java_multiple_files = true;
 
 /* The Event Store service. */
@@ -111,16 +112,29 @@ message SourceRequest {
   int64 from_sequence = 1;
   /* Criteria to filter events. If empty, all events are returned. */
   repeated Criterion criteria = 2;
+  /* Maximum events per response message. 0 = server default (1024).
+     Batches never wait for events — the server sends whatever it has in
+     hand, so latency is unaffected; only per-message framing overhead is
+     amortized. */
+  uint32 batch_size = 3;
 }
 
-/* Response containing either a matching event or the final consistency marker. */
+/* A batch of sequenced events, in ascending sequence order. */
+message SequencedEventBatch {
+  repeated SequencedEvent events = 1;
+}
+
+/* Response containing a batch of matching events or the final consistency marker. */
 message SourceResponse {
+  /* Field 1 was a per-event `SequencedEvent event` in pre-0.5 servers. */
+  reserved 1;
+  reserved "event";
   oneof result {
-    /* A matching event with its sequence. */
-    SequencedEvent event = 1;
     /* The consistency marker at the end of the stream.
        Use this for subsequent appends related to the same criteria. */
     int64 consistency_marker = 2;
+    /* A batch of matching events. */
+    SequencedEventBatch batch = 3;
   }
 }
 
@@ -142,11 +156,16 @@ message StreamSubscribe {
   /* Criteria to filter events. If empty, all events are streamed. */
   repeated Criterion criteria = 2;
   /* Initial number of permits. The server will send at most this many events
-     before waiting for more permits. Must be > 0. */
+     before waiting for more permits. Must be > 0. Permits count EVENTS, not
+     messages — a batch of N events consumes N permits. */
   int64 initial_permits = 3;
   /* Optional: event type names to exclude from the stream.
      Events matching any of these names are silently skipped (payload blacklisting). */
   repeated string blacklisted_names = 4;
+  /* Maximum events per response message. 0 = server default (1024). The
+     server packs whatever is committed AND permitted into each message —
+     it never waits to fill a batch, so tail latency is unaffected. */
+  uint32 batch_size = 5;
 }
 
 /* Grants additional permits on an active stream. */
@@ -155,14 +174,17 @@ message StreamPermits {
   int64 permits = 1;
 }
 
-/* A message on the event stream — either a matching event or a keep-alive heartbeat. */
+/* A message on the event stream — a batch of matching events or a keep-alive heartbeat. */
 message StreamResponse {
+  /* Field 1 was a per-event `SequencedEvent event` in pre-0.5 servers. */
+  reserved 1;
+  reserved "event";
   oneof result {
-    /* A matching event with its sequence. */
-    SequencedEvent event = 1;
     /* Server heartbeat — sent periodically to detect slow/dead consumers.
        Clients should ignore this (no response needed). */
     StreamHeartbeat heartbeat = 2;
+    /* A batch of matching events, in ascending sequence order. */
+    SequencedEventBatch batch = 3;
   }
 }
 

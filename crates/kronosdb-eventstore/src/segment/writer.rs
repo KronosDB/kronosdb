@@ -1,11 +1,15 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::error::Error;
 use crate::event::{AppendEvent, Position, StoredEvent};
 
 use crate::segment::format::RaftMarker;
+use crate::segment::segment_index::SegmentIndex;
 use crate::segment::{
     RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format,
     segment_path,
@@ -38,6 +42,11 @@ pub struct SegmentWriter {
     serialize_buf: Vec<u8>,
     /// Reusable buffer for building the full record (header + payload).
     record_buf: Vec<u8>,
+    /// Index of the active segment, maintained incrementally as events are
+    /// written. Sealing serializes this instead of re-reading the segment
+    /// file. Shared (behind RwLock) so reads can direct-seek into the active
+    /// segment without taking the writer lock.
+    active_index: Arc<RwLock<SegmentIndex>>,
 }
 
 impl SegmentWriter {
@@ -64,6 +73,7 @@ impl SegmentWriter {
             next_position: start_position,
             serialize_buf: Vec::with_capacity(4096),
             record_buf: Vec::with_capacity(4096),
+            active_index: Arc::new(RwLock::new(SegmentIndex::new(base_position))),
         })
     }
 
@@ -117,6 +127,12 @@ impl SegmentWriter {
         use std::io::Seek;
         file.seek(std::io::SeekFrom::Start(write_offset))?;
 
+        // Rebuild the active segment's in-memory index from its recovered
+        // records (one-time boot cost, bounded by max_segment_size). The
+        // truncate + preallocate above guarantees iteration stops at the
+        // recovered tail (zeroed record header).
+        let active_index = SegmentIndex::build_from_segment(&path)?;
+
         Ok(Self {
             dir: dir.to_path_buf(),
             max_segment_size,
@@ -126,6 +142,7 @@ impl SegmentWriter {
             next_position,
             serialize_buf: Vec::with_capacity(4096),
             record_buf: Vec::with_capacity(4096),
+            active_index: Arc::new(RwLock::new(active_index)),
         })
     }
 
@@ -222,8 +239,17 @@ impl SegmentWriter {
         self.serialize_buf.clear();
         format::serialize_event(&stored, &mut self.serialize_buf);
         let payload = std::mem::take(&mut self.serialize_buf);
-        self.write_record(flags::EVENT, &payload)?;
+        let record_offset = self.write_record(flags::EVENT, &payload)?;
         self.serialize_buf = payload;
+
+        // Index the event AFTER its record is fully written, so a concurrent
+        // reader that sees the index entry can always read the record bytes.
+        self.active_index.write().insert_event(
+            self.next_position.0,
+            record_offset,
+            &event.name,
+            &event.tags,
+        );
 
         self.next_position = self.next_position.next();
         Ok(())
@@ -231,7 +257,9 @@ impl SegmentWriter {
 
     /// Low-level: writes a single record to the active segment.
     /// Rotates the segment if the record doesn't fit.
-    fn write_record(&mut self, flags_byte: u8, payload: &[u8]) -> Result<(), Error> {
+    /// Returns the byte offset of the record header within the (possibly
+    /// freshly rotated) active segment.
+    fn write_record(&mut self, flags_byte: u8, payload: &[u8]) -> Result<u64, Error> {
         let payload_with_flags_len = 1 + payload.len();
         let total_record_size = RECORD_HEADER_SIZE + payload.len();
 
@@ -252,9 +280,10 @@ impl SegmentWriter {
         self.record_buf.push(flags_byte);
         self.record_buf.extend_from_slice(payload);
 
+        let record_offset = self.write_offset;
         self.active_file.write_all(&self.record_buf)?;
         self.write_offset += total_record_size as u64;
-        Ok(())
+        Ok(record_offset)
     }
 
     /// Fsyncs the active segment to disk, making all written events durable.
@@ -288,6 +317,12 @@ impl SegmentWriter {
         segment_path(&self.dir, self.active_base_position)
     }
 
+    /// Shared handle to the active segment's in-memory index, for readers
+    /// that direct-seek into the active segment without the writer lock.
+    pub fn active_index_handle(&self) -> Arc<RwLock<SegmentIndex>> {
+        Arc::clone(&self.active_index)
+    }
+
     /// Rotates to a new segment file.
     /// Builds the per-segment `.idx` and `.bloom` files for the sealed segment.
     fn rotate_segment(&mut self) -> Result<(), Error> {
@@ -300,13 +335,18 @@ impl SegmentWriter {
         // It was pre-allocated to max_segment_size, so we trim the unused space.
         self.active_file.set_len(self.write_offset)?;
 
-        // Build per-segment index for the sealed segment.
-        let sealed_path = segment_path(&self.dir, self.active_base_position);
-        let index = super::segment_index::SegmentIndex::build_from_segment(&sealed_path)?;
-        index.write_to_disk(&sealed_path)?;
-
         // New segment starts at the current next_position.
         let new_base = self.next_position.0;
+
+        // Seal: swap in a fresh index for the new segment and persist the
+        // old one. The index was built incrementally at append time, so this
+        // is serialize-and-write only — no re-read of the segment file.
+        let sealed_path = segment_path(&self.dir, self.active_base_position);
+        let sealed_index = {
+            let mut idx = self.active_index.write();
+            std::mem::replace(&mut *idx, SegmentIndex::new(new_base))
+        };
+        sealed_index.write_to_disk(&sealed_path)?;
         let path = segment_path(&self.dir, new_base);
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, new_base)?;

@@ -20,6 +20,27 @@ const DEFAULT_CONTEXT: &str = "default";
 /// gRPC metadata header key for context routing.
 const CONTEXT_HEADER: &str = "kronosdb-context";
 
+/// One commit range, converted to protobuf ONCE and shared (via `Arc`)
+/// across every match-all subscriber on the context. Without this, N
+/// subscribers each re-read the engine and re-convert the same events on
+/// every commit — the dominant CPU cost at high fan-out.
+struct HubBatch {
+    /// First position covered by this batch (events may start later if the
+    /// range ends with non-events, but never earlier).
+    first: u64,
+    /// Next-exclusive position after this batch: subscribers advance their
+    /// cursor here after consuming.
+    next: u64,
+    events: Vec<pb::SequencedEvent>,
+}
+
+type HubSender = tokio::sync::broadcast::Sender<Arc<HubBatch>>;
+
+/// Buffered hub batches per subscriber before it counts as lagged and
+/// falls back to engine catch-up. Batches are Arc-shared, so capacity
+/// costs pointers, not event copies.
+const HUB_CAPACITY: usize = 64;
+
 /// gRPC service implementation for the event store.
 ///
 /// Routes requests to the correct context based on the `kronosdb-context`
@@ -32,11 +53,18 @@ const CONTEXT_HEADER: &str = "kronosdb-context";
 /// blocking the tokio async worker threads with synchronous file I/O.
 pub struct EventStoreService {
     cluster: Arc<ClusterManager>,
+    /// Per-context fan-out hubs (created lazily by the first match-all
+    /// subscriber). The hub task removes its entry and drops its sender on
+    /// engine shutdown, which propagates `Closed` to subscribers.
+    hubs: Arc<std::sync::Mutex<std::collections::HashMap<String, HubSender>>>,
 }
 
 impl EventStoreService {
     pub fn new(cluster: Arc<ClusterManager>) -> Self {
-        Self { cluster }
+        Self {
+            cluster,
+            hubs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 
     pub fn into_server(self) -> GrpcEventStoreServer<Self> {
@@ -55,6 +83,94 @@ impl EventStoreService {
     /// Gets an event store for the context (raw engine or Raft decorator).
     fn get_store(&self, context_name: &str) -> Result<Arc<dyn EventStore>, Status> {
         self.cluster.get_store(context_name).map_err(to_status)
+    }
+
+    /// Returns the context's fan-out hub, spawning it on first use.
+    fn get_or_spawn_hub(&self, context_name: &str, store: &Arc<dyn EventStore>) -> HubSender {
+        let mut hubs = self.hubs.lock().expect("hub map poisoned");
+        if let Some(tx) = hubs.get(context_name) {
+            return tx.clone();
+        }
+        let (tx, _) = tokio::sync::broadcast::channel(HUB_CAPACITY);
+        hubs.insert(context_name.to_string(), tx.clone());
+        tokio::spawn(run_fanout_hub(
+            Arc::clone(store),
+            tx.clone(),
+            Arc::clone(&self.hubs),
+            context_name.to_string(),
+        ));
+        tx
+    }
+}
+
+/// The per-context fan-out hub: tails the engine from its creation head and
+/// publishes each commit range as ONE protobuf conversion, shared by all
+/// match-all subscribers. With zero subscribers it skips the read+convert
+/// entirely (cursor jump only), so an idle hub costs nothing per commit.
+async fn run_fanout_hub(
+    store: Arc<dyn EventStore>,
+    tx: HubSender,
+    hubs: Arc<std::sync::Mutex<std::collections::HashMap<String, HubSender>>>,
+    context_name: String,
+) {
+    const PAGE: usize = 8192;
+    let condition = from_proto_read_criteria_empty();
+    let mut stream = store.subscribe(store.head(), condition.clone());
+    loop {
+        let bound = Position(stream.wait_for_new_events().await);
+        if bound.0 <= stream.cursor.0 {
+            // Non-advancing bound: engine commit channel closed (shutdown).
+            hubs.lock().expect("hub map poisoned").remove(&context_name);
+            return; // Dropping tx closes subscriber receivers.
+        }
+        if tx.receiver_count() == 0 {
+            stream.advance_cursor(bound);
+            continue;
+        }
+        while stream.cursor.0 < bound.0 {
+            let cursor = stream.cursor;
+            let page = {
+                let store2 = Arc::clone(&store);
+                let condition = condition.clone();
+                tokio::task::spawn_blocking(move || {
+                    store2.source_page(cursor, &condition, bound, PAGE)
+                })
+                .await
+            };
+            let events = match page {
+                Ok(Ok(events)) => events,
+                _ => {
+                    // Engine read failure mid-tail: drop the hub; subscribers
+                    // see Closed and their RPCs end (clients reconnect).
+                    hubs.lock().expect("hub map poisoned").remove(&context_name);
+                    return;
+                }
+            };
+            let page_len = events.len();
+            let next = match events.last() {
+                Some(last) if page_len == PAGE => Position(last.position.0 + 1),
+                _ => bound,
+            };
+            let protos: Vec<pb::SequencedEvent> =
+                events.iter().map(to_proto_sequenced_event).collect();
+            let _ = tx.send(Arc::new(HubBatch {
+                first: cursor.0,
+                next: next.0,
+                events: protos,
+            }));
+            stream.advance_cursor(next);
+        }
+    }
+}
+
+/// Match-all sourcing condition in the engine's normalized form (one empty
+/// criterion — an empty criteria LIST matches nothing).
+fn from_proto_read_criteria_empty() -> SourcingCondition {
+    SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![],
+            tags: vec![],
+        }],
     }
 }
 
@@ -103,6 +219,10 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let context_name = Self::extract_context(&request).to_string();
         let req = request.into_inner();
         let from_position = Position(req.from_sequence as u64);
+        let batch_size = match req.batch_size as usize {
+            0 => 1024, // Server default; 0 means "let the server pick".
+            n => n,
+        };
         let condition = from_proto_read_criteria(req.criteria);
         tracing::info!(
             from = from_position.0,
@@ -120,32 +240,72 @@ impl pb::event_store_server::EventStore for EventStoreService {
         );
 
         let store = self.get_store(&context_name)?;
-        let condition_clone = condition.clone();
-        let (events, marker) = tokio::task::spawn_blocking(move || {
-            let events = store.source(from_position, &condition_clone)?;
-            // head is next-exclusive: the position the next event would be
-            // written at, which is exactly the consistency marker the
-            // client should use for a subsequent DCB-conditioned append.
-            let marker = store.head().0;
-            Ok::<_, Error>((events, marker))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(to_status)?;
 
-        let (tx, rx) = mpsc::channel(128);
+        // Freeze the read bound (and thus the consistency marker) up front:
+        // head is next-exclusive — exactly the marker the client should use
+        // for a subsequent DCB-conditioned append. `head()` reads an atomic;
+        // no writer-lock contention on the read path.
+        let marker = store.head().0;
 
+        // Bound in-flight memory by EVENTS, not messages: a message is a
+        // whole batch, so a fixed message count would let a slow client pin
+        // capacity × batch_size events (~250MB at batch 5000) per stream.
+        // ~16k buffered events ≈ a few MB regardless of batch size.
+        let channel_capacity = (16384 / batch_size).clamp(2, 128);
+        let (tx, rx) = mpsc::channel(channel_capacity);
+
+        // Stream in bounded pages instead of materializing the whole result:
+        // memory stays flat regardless of log size, and a client dropping
+        // the stream stops the remaining work at the next page boundary
+        // (an abandoned whole-log scan can't keep burning CPU).
         tokio::spawn(async move {
-            for event in events {
-                let response = pb::SourceResponse {
-                    result: Some(pb::source_response::Result::Event(
-                        to_proto_sequenced_event(&event),
-                    )),
+            const PAGE: usize = 8192;
+            let mut cursor = from_position;
+            loop {
+                let store_page = Arc::clone(&store);
+                let condition_page = condition.clone();
+                let page = match tokio::task::spawn_blocking(move || {
+                    store_page.source_page(cursor, &condition_page, Position(marker), PAGE)
+                })
+                .await
+                {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(to_status(e))).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("task join error: {e}"))))
+                            .await;
+                        return;
+                    }
                 };
-                if tx.send(Ok(response)).await.is_err() {
-                    return;
+
+                let next_cursor = page.last().map(|e| Position(e.position.0 + 1));
+                let page_len = page.len();
+                // Pack what we already have in hand into up-to-batch_size
+                // messages. A short batch at the end of a page is sent
+                // immediately — never held back for fill.
+                for chunk in page.chunks(batch_size) {
+                    let response = pb::SourceResponse {
+                        result: Some(pb::source_response::Result::Batch(
+                            pb::SequencedEventBatch {
+                                events: chunk.iter().map(to_proto_sequenced_event).collect(),
+                            },
+                        )),
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        return; // Client went away — stop reading further pages.
+                    }
+                }
+
+                match next_cursor {
+                    Some(next) if page_len == PAGE => cursor = next,
+                    _ => break, // Short (or empty) page — nothing left below the bound.
                 }
             }
+
             let response = pb::SourceResponse {
                 result: Some(pb::source_response::Result::ConsistencyMarker(
                     marker as i64,
@@ -187,10 +347,16 @@ impl pb::event_store_server::EventStore for EventStoreService {
         let condition = from_proto_read_criteria(subscribe.criteria);
         let blacklist: std::collections::HashSet<String> =
             subscribe.blacklisted_names.into_iter().collect();
+        let batch_size = match subscribe.batch_size as usize {
+            0 => 1024, // Server default; 0 means "let the server pick".
+            n => n,
+        };
         let store = self.get_store(&context_name)?;
         let mut event_stream = store.subscribe(from_position, condition.clone());
 
-        let (tx, rx) = mpsc::channel(128);
+        // Bound in-flight memory by events, not messages (see `source`).
+        let channel_capacity = (16384 / batch_size).clamp(2, 128);
+        let (tx, rx) = mpsc::channel(channel_capacity);
         let permits = Arc::new(tokio::sync::Semaphore::new(
             subscribe.initial_permits as usize,
         ));
@@ -242,62 +408,108 @@ impl pb::event_store_server::EventStore for EventStoreService {
             }
         });
 
-        // Task: producer — historical replay, then live tail. Each event acquires
-        // one permit before send. Blacklisted events are silently dropped without
-        // consuming a permit.
+        // Match-all subscriptions (the common event-processor case) ride the
+        // shared fan-out hub: the engine read + protobuf conversion happens
+        // once per commit for the whole context instead of once per
+        // subscriber. Tag/name-criteria subscriptions keep the per-subscriber
+        // engine path (criteria can't be evaluated on the wire form — it has
+        // no tags).
+        let is_match_all = condition
+            .criteria
+            .iter()
+            .all(|c| c.names.is_empty() && c.tags.is_empty());
+        let hub_rx = if is_match_all {
+            // Subscribe BEFORE snapshotting the replay bound so no commit
+            // can fall between replay end and hub attach (overlap is fine —
+            // the cursor dedups).
+            Some(self.get_or_spawn_hub(&context_name, &store).subscribe())
+        } else {
+            None
+        };
+
+        // Task: producer — paged historical replay, then live tail. Permits
+        // count events: each batch acquires one permit per event before send,
+        // greedily — the first event of a batch awaits a permit, the rest
+        // take only what's immediately available, so a batch never waits to
+        // fill. Blacklisted events are dropped without consuming a permit.
         let permits_p = Arc::clone(&permits);
         tokio::spawn(async move {
-            // Historical replay.
-            let historical = {
-                let store2 = Arc::clone(&store);
-                let condition = condition.clone();
-                let cursor = event_stream.cursor;
-                tokio::task::spawn_blocking(move || store2.source(cursor, &condition)).await
-            };
-            let events = match historical {
-                Ok(Ok(events)) => events,
-                Ok(Err(e)) => {
-                    let _ = tx.send(Err(to_status(e))).await;
-                    return;
+            // Sends pre-converted events as permitted batches. Returns false
+            // when the client is gone (semaphore closed or channel dropped).
+            async fn send_protos(
+                protos: Vec<pb::SequencedEvent>,
+                permits: &tokio::sync::Semaphore,
+                tx: &mpsc::Sender<Result<pb::StreamResponse, Status>>,
+                batch_size: usize,
+            ) -> bool {
+                let mut i = 0;
+                while i < protos.len() {
+                    let Ok(first) = permits.acquire().await else {
+                        return false;
+                    };
+                    first.forget();
+                    let cap = batch_size.min(protos.len() - i);
+                    let extra = permits.available_permits().min(cap - 1);
+                    let n = if extra > 0 {
+                        match permits.try_acquire_many(extra as u32) {
+                            Ok(p) => {
+                                p.forget();
+                                1 + extra
+                            }
+                            Err(_) => 1,
+                        }
+                    } else {
+                        1
+                    };
+                    let response = pb::StreamResponse {
+                        result: Some(pb::stream_response::Result::Batch(
+                            pb::SequencedEventBatch {
+                                events: protos[i..i + n].to_vec(),
+                            },
+                        )),
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        return false;
+                    }
+                    i += n;
                 }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("task join error: {e}"))))
-                        .await;
-                    return;
-                }
-            };
-            for event in &events {
-                if blacklist.contains(&event.name) {
-                    continue;
-                }
-                let Ok(p) = permits_p.acquire().await else {
-                    return;
-                };
-                p.forget();
-                let response = pb::StreamResponse {
-                    result: Some(pb::stream_response::Result::Event(
-                        to_proto_sequenced_event(event),
-                    )),
-                };
-                if tx.send(Ok(response)).await.is_err() {
-                    return;
-                }
-            }
-            if let Some(last) = events.last() {
-                event_stream.advance_cursor(Position(last.position.0 + 1));
+                true
             }
 
-            // Live tail.
+            async fn send_batched(
+                events: &[kronosdb_eventstore::event::SequencedEvent],
+                blacklist: &std::collections::HashSet<String>,
+                permits: &tokio::sync::Semaphore,
+                tx: &mpsc::Sender<Result<pb::StreamResponse, Status>>,
+                batch_size: usize,
+            ) -> bool {
+                let protos: Vec<pb::SequencedEvent> = events
+                    .iter()
+                    .filter(|e| !blacklist.contains(&e.name))
+                    .map(to_proto_sequenced_event)
+                    .collect();
+                send_protos(protos, permits, tx, batch_size).await
+            }
+
+            // Historical replay, paged: memory stays bounded no matter how
+            // far behind the subscriber starts, and a dropped subscriber
+            // stops the work at the next page.
+            const PAGE: usize = 8192;
+            let replay_bound = store.head().0;
             loop {
-                let _committed = event_stream.wait_for_new_events().await;
-                let new_events = {
+                let cursor = event_stream.cursor;
+                if cursor.0 >= replay_bound {
+                    break;
+                }
+                let page = {
                     let store2 = Arc::clone(&store);
                     let condition = condition.clone();
-                    let cursor = event_stream.cursor;
-                    tokio::task::spawn_blocking(move || store2.source(cursor, &condition)).await
+                    tokio::task::spawn_blocking(move || {
+                        store2.source_page(cursor, &condition, Position(replay_bound), PAGE)
+                    })
+                    .await
                 };
-                let events = match new_events {
+                let events = match page {
                     Ok(Ok(events)) => events,
                     Ok(Err(e)) => {
                         let _ = tx.send(Err(to_status(e))).await;
@@ -310,25 +522,177 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         return;
                     }
                 };
-                for event in &events {
-                    if blacklist.contains(&event.name) {
-                        continue;
+                let page_len = events.len();
+                if !send_batched(&events, &blacklist, &permits_p, &tx, batch_size).await {
+                    return;
+                }
+                match events.last() {
+                    Some(last) if page_len == PAGE => {
+                        event_stream.advance_cursor(Position(last.position.0 + 1));
                     }
-                    let Ok(p) = permits_p.acquire().await else {
-                        return;
+                    Some(last) => {
+                        event_stream.advance_cursor(Position(last.position.0 + 1));
+                        break; // Short page — replay caught up to the bound.
+                    }
+                    None => break,
+                }
+            }
+
+            // Pages [cursor, bound) from the engine and sends it, advancing
+            // the cursor. Used by the engine live tail and by hub-lag
+            // recovery. Returns false when the stream should end (client
+            // gone or error already sent).
+            #[allow(clippy::too_many_arguments)]
+            async fn engine_catch_up(
+                store: &Arc<dyn EventStore>,
+                condition: &kronosdb_eventstore::criteria::SourcingCondition,
+                event_stream: &mut kronosdb_eventstore::stream::EventStream,
+                bound: Position,
+                blacklist: &std::collections::HashSet<String>,
+                permits: &tokio::sync::Semaphore,
+                tx: &mpsc::Sender<Result<pb::StreamResponse, Status>>,
+                batch_size: usize,
+            ) -> bool {
+                const PAGE: usize = 8192;
+                while event_stream.cursor.0 < bound.0 {
+                    let cursor = event_stream.cursor;
+                    let page = {
+                        let store2 = Arc::clone(store);
+                        let condition = condition.clone();
+                        tokio::task::spawn_blocking(move || {
+                            store2.source_page(cursor, &condition, bound, PAGE)
+                        })
+                        .await
                     };
-                    p.forget();
-                    let response = pb::StreamResponse {
-                        result: Some(pb::stream_response::Result::Event(
-                            to_proto_sequenced_event(event),
-                        )),
+                    let events = match page {
+                        Ok(Ok(events)) => events,
+                        Ok(Err(e)) => {
+                            let _ = tx.send(Err(to_status(e))).await;
+                            return false;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("task join error: {e}"))))
+                                .await;
+                            return false;
+                        }
                     };
-                    if tx.send(Ok(response)).await.is_err() {
-                        return;
+                    let page_len = events.len();
+                    if !send_batched(&events, blacklist, permits, tx, batch_size).await {
+                        return false;
+                    }
+                    match events.last() {
+                        Some(last) if page_len == PAGE => {
+                            event_stream.advance_cursor(Position(last.position.0 + 1));
+                        }
+                        _ => {
+                            // Short/empty page: everything below the bound is
+                            // delivered (or doesn't match). Jump the cursor to
+                            // the bound so the gap isn't re-scanned.
+                            event_stream.advance_cursor(bound);
+                        }
                     }
                 }
-                if let Some(last) = events.last() {
-                    event_stream.advance_cursor(Position(last.position.0 + 1));
+                true
+            }
+
+            if let Some(mut hub_rx) = hub_rx {
+                // Live tail via the shared fan-out hub: events arrive already
+                // converted; this subscriber only filters (cursor dedup +
+                // blacklist), clones its wire copies, and sends within its
+                // permit budget. A subscriber that falls > HUB_CAPACITY
+                // batches behind gets Lagged and catches up from the engine.
+                loop {
+                    use tokio::sync::broadcast::error::RecvError;
+                    match hub_rx.recv().await {
+                        Ok(batch) => {
+                            if batch.next <= event_stream.cursor.0 {
+                                continue; // Entirely covered by replay/catch-up.
+                            }
+                            if batch.first > event_stream.cursor.0 {
+                                // Safety net: shouldn't happen (rx attaches
+                                // before the replay bound is read), but a gap
+                                // must never skip events silently.
+                                let to = Position(batch.first);
+                                if !engine_catch_up(
+                                    &store,
+                                    &condition,
+                                    &mut event_stream,
+                                    to,
+                                    &blacklist,
+                                    &permits_p,
+                                    &tx,
+                                    batch_size,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            let cursor = event_stream.cursor.0;
+                            let protos: Vec<pb::SequencedEvent> = batch
+                                .events
+                                .iter()
+                                .filter(|e| e.sequence as u64 >= cursor)
+                                .filter(|e| {
+                                    e.event
+                                        .as_ref()
+                                        .is_none_or(|ev| !blacklist.contains(&ev.name))
+                                })
+                                .cloned()
+                                .collect();
+                            if !send_protos(protos, &permits_p, &tx, batch_size).await {
+                                return;
+                            }
+                            event_stream.advance_cursor(Position(batch.next));
+                        }
+                        Err(RecvError::Lagged(_)) => {
+                            let bound = store.head();
+                            if !engine_catch_up(
+                                &store,
+                                &condition,
+                                &mut event_stream,
+                                bound,
+                                &blacklist,
+                                &permits_p,
+                                &tx,
+                                batch_size,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                        Err(RecvError::Closed) => return, // Hub gone (shutdown).
+                    }
+                }
+            }
+
+            // Live tail via per-subscriber engine reads (criteria
+            // subscriptions — the engine's tag index does the filtering).
+            // Paged like the replay: a permit-starved subscriber whose
+            // cursor fell far behind must not force one giant
+            // materialization when it finally drains permits.
+            loop {
+                let bound = Position(event_stream.wait_for_new_events().await);
+                if bound.0 <= event_stream.cursor.0 {
+                    // wait_for_new_events only returns a non-advancing bound
+                    // when the engine's commit channel closed (shutdown).
+                    return;
+                }
+                if !engine_catch_up(
+                    &store,
+                    &condition,
+                    &mut event_stream,
+                    bound,
+                    &blacklist,
+                    &permits_p,
+                    &tx,
+                    batch_size,
+                )
+                .await
+                {
+                    return;
                 }
             }
         });

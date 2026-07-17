@@ -209,6 +209,21 @@ impl<'a> Iterator for SegmentIterator<'a> {
 
             let payload = &self.data[payload_start..payload_end];
 
+            // Check the position bound BEFORE the CRC. The active segment is
+            // preallocated and mmap'd at full length, so an iterator can
+            // catch a record mid-write; a record at or past the committed
+            // bound must read as end-of-data, not as corruption. The
+            // position is the first field of an event payload and is written
+            // in the same buffered write as the rest of the record.
+            if let Some(up_to) = self.up_to {
+                if flags::is_event(flags_byte) && payload.len() >= 8 {
+                    let position = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    if position >= up_to.0 {
+                        return None;
+                    }
+                }
+            }
+
             // Verify CRC.
             let computed_crc = {
                 let digest = crc32c::crc32c(&[flags_byte]);
@@ -233,7 +248,8 @@ impl<'a> Iterator for SegmentIterator<'a> {
             // Deserialize the event.
             match format::deserialize_event(payload) {
                 Ok((event, _)) => {
-                    // Check position limit.
+                    // Check position limit (redundant with the pre-CRC check
+                    // above, kept as the authoritative post-deserialize bound).
                     if let Some(up_to) = self.up_to {
                         if event.position >= up_to {
                             return None;

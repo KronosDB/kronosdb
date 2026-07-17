@@ -428,6 +428,7 @@ async fn post_restart_verify(
             client.source(pb::SourceRequest {
                 from_sequence: 0,
                 criteria,
+                batch_size: 0,
             }),
         )
         .await
@@ -447,9 +448,11 @@ async fn post_restart_verify(
                 })
                 .expect("stream msg");
             let Some(resp) = msg else { break };
-            if let Some(pb::source_response::Result::Event(ev)) = resp.result {
-                let payload = ev.event.map(|e| e.payload).unwrap_or_default();
-                events.insert(ev.sequence, payload);
+            if let Some(pb::source_response::Result::Batch(batch)) = resp.result {
+                for ev in batch.events {
+                    let payload = ev.event.map(|e| e.payload).unwrap_or_default();
+                    events.insert(ev.sequence, payload);
+                }
             }
         }
         eprintln!(

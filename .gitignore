@@ -1,6 +1,8 @@
 /target
 /reference
 /data
+/benchmarks
+connectors/axon/target
 
 *.swp
 *.swo

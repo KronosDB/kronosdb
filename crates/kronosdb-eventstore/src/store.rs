@@ -413,6 +413,12 @@ pub struct EventStoreEngine {
     /// Broadcast channel for notifying stream subscribers of new commits.
     commit_tx: broadcast::Sender<CommitNotification>,
 
+    /// The active segment's in-memory index (bitmaps + position→offset
+    /// table), maintained incrementally by the writer. Lets source queries
+    /// direct-seek into the active segment instead of sequentially scanning
+    /// it, without taking the writer lock.
+    active_index: Arc<parking_lot::RwLock<SegmentIndex>>,
+
     /// LRU cache for sealed segment indices, bloom filters, and mmap handles.
     cache: Arc<IndexCache>,
 
@@ -446,6 +452,7 @@ impl EventStoreEngine {
         std::fs::create_dir_all(dir)?;
         let seg_writer = SegmentWriter::new(dir, Position(0), opts.max_segment_size)?;
         let active_base = seg_writer.active_base_position();
+        let active_index = seg_writer.active_index_handle();
         let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
         let gc_enabled = opts.group_commit_interval_ms > 0;
@@ -467,6 +474,7 @@ impl EventStoreEngine {
             sync_state,
             head_position: Arc::new(AtomicU64::new(0)),
             commit_tx,
+            active_index,
             cache: Arc::new(IndexCache::new(
                 opts.index_cache_size,
                 opts.bloom_cache_size,
@@ -500,6 +508,7 @@ impl EventStoreEngine {
         let seg_writer = SegmentWriter::open(dir, opts.max_segment_size)?;
         let head = seg_writer.head();
         let active_base = seg_writer.active_base_position();
+        let active_index = seg_writer.active_index_handle();
 
         // Rebuild the active segment's tag index from its events.
         // Sealed segments have their own `.idx` files on disk.
@@ -534,6 +543,7 @@ impl EventStoreEngine {
             sync_state,
             head_position: Arc::new(AtomicU64::new(head_pos)),
             commit_tx,
+            active_index,
             cache: Arc::new(IndexCache::new(
                 opts.index_cache_size,
                 opts.bloom_cache_size,
@@ -777,6 +787,8 @@ impl EventStoreEngine {
                     seg_list.sealed_count += 1;
                     seg_list.bases.push(new_active_base);
                     self.metrics.record_segment_rotation();
+                    drop(seg_list);
+                    self.spawn_tag_index_prune(new_active_base);
                 }
 
                 let mut pos = first_position;
@@ -862,6 +874,20 @@ impl EventStoreEngine {
         self.metrics
             .record_append(response.count, timer.elapsed_us());
         Ok(response)
+    }
+
+    /// Prunes sealed-segment positions from the in-memory tag index on a
+    /// background thread. Runs after rotation, once the sealed segment's
+    /// `.idx`/`.bloom` are durable (rotation writes them synchronously), so
+    /// every pruned position is resolvable through the sealed-segment
+    /// indexes. Off-thread because a prune walks every tag bitmap — doing
+    /// that under the writer lock would reintroduce a seal-time stall.
+    fn spawn_tag_index_prune(&self, base: u64) {
+        let tag_index = Arc::clone(&self.tag_index);
+        std::thread::Builder::new()
+            .name("kronos-tagindex-prune".into())
+            .spawn(move || tag_index.prune_below(base))
+            .ok();
     }
 
     /// Checks a DCB condition against committed state (sealed segments +
@@ -973,6 +999,8 @@ impl EventStoreEngine {
                 seg_list.sealed_count += 1;
                 seg_list.bases.push(new_active_base);
                 self.metrics.record_segment_rotation();
+                drop(seg_list);
+                self.spawn_tag_index_prune(new_active_base);
             }
 
             // Step 3: Update in-memory tag index.
@@ -1101,8 +1129,13 @@ impl EventStoreEngine {
 
     /// Returns the current head position (next position to be assigned;
     /// equivalently, the count of events committed).
+    ///
+    /// Reads the committed-head atomic — no writer lock, so read-path
+    /// callers (Source/GetHead) never contend with appends or the group
+    /// commit sync thread. Mid-batch writes are not visible here until the
+    /// batch commits, which is exactly the externally-observable head.
     pub fn head(&self) -> Position {
-        self.writer.lock().head()
+        Position(self.head_position.load(Ordering::Acquire))
     }
 
     /// Returns the tail position (first available event position).
@@ -1172,12 +1205,13 @@ impl EventStoreEngine {
                 let bm = idx.matching(condition);
                 (bm, Some(idx))
             } else {
-                // Active segment — use in-memory index.
-                // tag_index is internally sharded; no lock needed.
-                (
-                    self.tag_index.matching_bitmap(condition, from_position),
-                    None,
-                )
+                // Active segment — use the in-memory tag index, clamped to
+                // this segment's position range. The tag index holds every
+                // position since boot, so without the clamp a tag whose
+                // matches are all in sealed segments would still produce a
+                // non-empty bitmap here and force needless work.
+                let clamped = Position(from_position.0.max(base));
+                (self.tag_index.matching_bitmap(condition, clamped), None)
             };
 
             let matching_positions = match matching_positions {
@@ -1193,9 +1227,8 @@ impl EventStoreEngine {
                 SegmentReader::open(&seg_path)?
             };
 
-            // Sealed segments: direct seek via offset table — O(K) matching events.
-            // Active segment: sequential scan with bitmap filter.
             if let Some(idx) = &seg_index {
+                // Sealed segment: direct seek via offset table — O(K) matching events.
                 self.metrics.record_direct_seek();
                 for pos in matching_positions.iter() {
                     if pos < from_position.0 || pos >= head {
@@ -1207,16 +1240,36 @@ impl EventStoreEngine {
                     }
                 }
             } else {
-                self.metrics.record_sequential_scan();
-                for result in reader.iter(Some(Position(head))) {
-                    let stored = result?;
-
-                    if stored.position.0 < from_position.0 {
-                        continue;
+                // Active segment: direct seek via the incrementally-built
+                // in-memory index. Falls back to a sequential scan when the
+                // index doesn't cover this segment (rotation raced the
+                // segment-list snapshot, or an unindexed sealed segment
+                // after crash recovery).
+                let active_idx = self.active_index.read();
+                if active_idx.base_position() == base {
+                    self.metrics.record_direct_seek();
+                    for pos in matching_positions.iter() {
+                        if pos < from_position.0 || pos >= head {
+                            continue;
+                        }
+                        if let Some(offset) = active_idx.get_offset(pos) {
+                            let stored = reader.read_event_at(offset as usize)?;
+                            events.push(stored.into_sequenced());
+                        }
                     }
+                } else {
+                    drop(active_idx);
+                    self.metrics.record_sequential_scan();
+                    for result in reader.iter(Some(Position(head))) {
+                        let stored = result?;
 
-                    if matching_positions.contains(stored.position.0) {
-                        events.push(stored.into_sequenced());
+                        if stored.position.0 < from_position.0 {
+                            continue;
+                        }
+
+                        if matching_positions.contains(stored.position.0) {
+                            events.push(stored.into_sequenced());
+                        }
                     }
                 }
             }
@@ -1234,7 +1287,42 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, Error> {
+        self.source_stored_bounded(from_position, condition, None, limit)
+    }
+
+    /// Reads up to `limit` matching events with position in
+    /// `[from_position, up_to)`. Chunked-streaming building block: callers
+    /// freeze `up_to` at the head once, then advance `from_position` past the
+    /// last returned event — memory stays bounded by `limit` and dropping the
+    /// caller stops the work between pages.
+    pub fn source_page(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+        up_to: Position,
+        limit: usize,
+    ) -> Result<Vec<SequencedEvent>, Error> {
+        let stored = self.source_stored_bounded(from_position, condition, Some(up_to), limit)?;
+        Ok(stored.into_iter().map(|e| e.into_sequenced()).collect())
+    }
+
+    /// Bounded variant of `source_stored`: up to `limit` matching events with
+    /// position in `[from_position, min(head, up_to))`, tags included.
+    /// pub(crate) for the Raft snapshot builder, which pages the whole store
+    /// through this with a frozen `up_to` so builds are consistent with the
+    /// snapshot's `last_applied` and memory stays bounded.
+    pub(crate) fn source_stored_bounded(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+        up_to: Option<Position>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, Error> {
         let head = self.head_position.load(Ordering::Acquire);
+        let head = match up_to {
+            Some(bound) => head.min(bound.0),
+            None => head,
+        };
 
         let seg_list = self.segments.read().clone();
         if seg_list.bases.is_empty() || head == 0 {
@@ -1264,14 +1352,21 @@ impl EventStoreEngine {
                     continue;
                 }
                 let idx = self.cache.get_index(&seg_path, base)?;
-                let bm = idx.matching(condition);
-                (bm, Some(idx))
+                let mut bm = idx.matching(condition);
+                // Drop already-consumed positions up front so chunked callers
+                // (cursor advancing through the log) don't re-skip the prefix
+                // one position at a time on every call.
+                if from_position.0 > base {
+                    if let Some(bm) = &mut bm {
+                        bm.remove_range(0..from_position.0);
+                    }
+                }
+                (bm.filter(|bm| !bm.is_empty()), Some(idx))
             } else {
-                // tag_index is internally sharded; no lock needed.
-                (
-                    self.tag_index.matching_bitmap(condition, from_position),
-                    None,
-                )
+                // Active segment — in-memory tag index, clamped to this
+                // segment's range (see `source` for rationale).
+                let clamped = Position(from_position.0.max(base));
+                (self.tag_index.matching_bitmap(condition, clamped), None)
             };
 
             let matching_positions = match matching_positions {
@@ -1300,17 +1395,34 @@ impl EventStoreEngine {
                     }
                 }
             } else {
-                for result in reader.iter(Some(Position(head))) {
-                    let stored = result?;
-
-                    if stored.position.0 < from_position.0 {
-                        continue;
+                let active_idx = self.active_index.read();
+                if active_idx.base_position() == base {
+                    for pos in matching_positions.iter() {
+                        if pos < from_position.0 || pos >= head {
+                            continue;
+                        }
+                        if let Some(offset) = active_idx.get_offset(pos) {
+                            let stored = reader.read_event_at(offset as usize)?;
+                            events.push(stored);
+                            if events.len() >= limit {
+                                return Ok(events);
+                            }
+                        }
                     }
+                } else {
+                    drop(active_idx);
+                    for result in reader.iter(Some(Position(head))) {
+                        let stored = result?;
 
-                    if matching_positions.contains(stored.position.0) {
-                        events.push(stored);
-                        if events.len() >= limit {
-                            return Ok(events);
+                        if stored.position.0 < from_position.0 {
+                            continue;
+                        }
+
+                        if matching_positions.contains(stored.position.0) {
+                            events.push(stored);
+                            if events.len() >= limit {
+                                return Ok(events);
+                            }
                         }
                     }
                 }
@@ -1434,6 +1546,16 @@ impl EventStore for EventStoreEngine {
         self.source(from_position, condition)
     }
 
+    fn source_page(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+        up_to: Position,
+        limit: usize,
+    ) -> Result<Vec<SequencedEvent>, Error> {
+        self.source_page(from_position, condition, up_to, limit)
+    }
+
     fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
         self.subscribe(from_position, condition)
     }
@@ -1523,6 +1645,81 @@ mod tests {
             payload: b"test-data".to_vec(),
             metadata: vec![],
             tags,
+        }
+    }
+
+    /// After rotation prunes sealed positions from the in-memory tag index,
+    /// tag queries and DCB checks must still resolve them via the sealed
+    /// segments' `.idx`/`.bloom` files — pruning changes memory footprint,
+    /// never answers.
+    #[test]
+    fn tag_index_prune_preserves_queries_and_dcb() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny segments force several rotations.
+        let store = EventStoreEngine::create_with_options(dir.path(), 4 * 1024).unwrap();
+
+        for i in 0..100 {
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(
+                        "OrderPlaced",
+                        vec![tag("orderId", &format!("ord-{i}"))],
+                    )],
+                })
+                .unwrap();
+        }
+        let sealed = store.segments.read().clone();
+        assert!(sealed.sealed_count > 0, "expected at least one rotation");
+        let active_base = *sealed.bases.last().unwrap();
+
+        // Deterministic prune (the rotation-spawned threads race the test).
+        store.tag_index.prune_below(active_base);
+
+        // Query for an early (sealed-only) tag still finds its event.
+        let cond = SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![tag("orderId", "ord-0")],
+            }],
+        };
+        let events = store.source(Position(0), &cond).unwrap();
+        assert_eq!(events.len(), 1, "sealed event must resolve via .idx");
+
+        // DCB against an early tag still detects the conflict.
+        let result = store.append(AppendRequest {
+            condition: Some(AppendCondition {
+                consistency_marker: Position(0),
+                criteria: SourcingCondition {
+                    criteria: vec![Criterion {
+                        names: vec![],
+                        tags: vec![tag("orderId", "ord-0")],
+                    }],
+                },
+            }),
+            events: vec![make_event("Dup", vec![tag("orderId", "ord-0")])],
+        });
+        match result {
+            Err(Error::ConsistencyConditionViolated { .. }) => {}
+            Err(e) => panic!("expected DCB violation, got other error: {e}"),
+            Ok(_) => panic!("DCB must still see sealed conflicts after prune"),
+        }
+
+        // The index really did shrink: no positions below the active base.
+        let all = store
+            .tag_index
+            .matching_bitmap(&cond_match_all(), Position(0));
+        if let Some(bm) = all {
+            assert!(bm.min().unwrap_or(u64::MAX) >= active_base);
+        }
+    }
+
+    fn cond_match_all() -> SourcingCondition {
+        SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![],
+            }],
         }
     }
 

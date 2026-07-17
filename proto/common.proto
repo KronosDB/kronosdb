@@ -1,5 +1,6 @@
 syntax = "proto3";
 package kronosdb;
+option java_package = "io.kronosdb.grpc";
 option java_multiple_files = true;
 
 /* A serialized object with type information. */

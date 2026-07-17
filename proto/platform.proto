@@ -1,5 +1,6 @@
 syntax = "proto3";
 package kronosdb.platform;
+option java_package = "io.kronosdb.grpc.platform";
 option java_multiple_files = true;
 
 import "common.proto";

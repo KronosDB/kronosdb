@@ -15,43 +15,48 @@
 //!
 //! See: regression test `restart_after_snapshot_single_node.rs`.
 //!
-//! # On-disk format ("KRSN" v1)
+//! # On-disk layout (v2: split meta + data)
+//!
+//! A snapshot is a PAIR of files so that meta hydration at boot never has
+//! to touch (or even CRC-scan) the potentially huge data segment, and the
+//! data segment can be built and consumed as a bounded-memory stream:
+//!
+//! - `snap-<index:020>-<term:020>.meta` — small: `KRSN` header + bincoded
+//!   `PersistedMeta` + trailing CRC32C over the whole file.
+//! - `snap-<index:020>-<term:020>.data` — the `KSD2` chunked event stream
+//!   (see `snapshot_format.rs`; each chunk carries its own CRC).
 //!
 //! ```text
-//! +----------+--------+----------+----------+----------+----------+----------+----------+
-//! | magic(4) | ver(1) | rsv(3)   | meta_len | meta     | data_len | data     | crc32c   |
-//! | "KRSN"   |  0x01  | zeros    | u32 LE   | bincode  | u64 LE   | raw      | u32 LE   |
-//! +----------+--------+----------+----------+----------+----------+----------+----------+
+//! .meta: | magic "KRSN" (4) | ver(1)=2 | rsv(3) | meta_len u32 LE | meta | crc32c |
 //! ```
 //!
-//! The CRC covers every byte of the file except itself.
+//! Pre-1.0 format note: v1 was a single `.snap` file with the data blob
+//! inline. There is no migration — v1 files are ignored (a node rebuilds a
+//! fresh snapshot at its next snapshot trigger; `membership.bin` carries
+//! the voter set across the format change).
 //!
-//! # File naming
+//! # Write protocol + crash points
 //!
-//! `<dir>/snap-<index:020>-<term:020>.snap` — sortable by filename so
-//! "latest" is just the lexicographically-largest entry. The index is the
-//! snapshot's `last_log_id.index`; the term is its `leader_id.term`. Both
-//! are zero-padded to 20 digits (max u64).
-//!
-//! # Atomic write + retention
-//!
-//! Each snapshot is written to `<name>.tmp`, fsynced, renamed into place,
-//! and the parent dir fsynced. After a successful write, all older `.snap`
-//! files are removed. A crash between rename and cleanup leaves multiple
-//! valid snapshot files; `load_latest` picks the highest, and the next
-//! successful `write` will clean up the stragglers.
+//! Data is written first (to `*.data.tmp`, fsync, rename), then meta
+//! (`*.meta.tmp`, fsync, rename), then the dir is fsynced. A snapshot
+//! "exists" iff its `.meta` file is valid AND its `.data` sibling is
+//! present — so a crash mid-protocol leaves either nothing visible (data
+//! without meta) or a complete pair. After a successful commit, older
+//! pairs and stray tmp files are removed; `load_latest_meta` picks the
+//! highest `(index, term)` pair, so stragglers from a crashed cleanup are
+//! harmless.
 //!
 //! # Concurrency
 //!
 //! `SnapshotStore` is `Send + Sync`. openraft serializes snapshot building
-//! through its single state-machine worker, so concurrent `write` calls do
-//! not occur in practice. `load_latest_meta` and `load_latest` may be
-//! called concurrently with `write` on different threads; the rename-based
-//! atomic write guarantees readers see either the old or the new file, not
-//! a half-written one.
+//! through its single state-machine worker, so concurrent `commit_snapshot`
+//! calls do not occur in practice. Readers racing a commit see either the
+//! old or the new pair thanks to the rename-based protocol; a reader that
+//! opened the old `.data` file keeps a valid fd even after cleanup unlinks
+//! it (POSIX semantics).
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use openraft::SnapshotMeta;
@@ -60,7 +65,7 @@ use serde::{Deserialize, Serialize};
 use super::types::NodeId;
 
 const MAGIC: &[u8; 4] = b"KRSN";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Header layout: magic(4) + version(1) + reserved(3) + meta_len(4) = 12 bytes.
 const HEADER_LEN: usize = 12;
@@ -96,12 +101,6 @@ impl From<PersistedMeta> for SnapshotMeta<NodeId, openraft::BasicNode> {
     }
 }
 
-/// A snapshot ready to write to disk, or one just read back.
-pub struct PersistedSnapshot {
-    pub meta: SnapshotMeta<NodeId, openraft::BasicNode>,
-    pub data: Vec<u8>,
-}
-
 /// On-disk store for the latest snapshot in a single Raft node's data dir.
 pub struct SnapshotStore {
     dir: PathBuf,
@@ -118,23 +117,45 @@ impl SnapshotStore {
         &self.dir
     }
 
-    /// Atomically write `snap` to disk, then delete older `.snap` files.
-    ///
-    /// Crash points:
-    /// - before rename: `.tmp` orphan; ignored by `load_latest`, cleaned on
-    ///   the next successful `write`.
-    /// - after rename, before cleanup: multiple `.snap` files coexist;
-    ///   `load_latest` picks the highest by `(index, term)`; the next
-    ///   successful `write` removes the stragglers.
-    pub fn write(&self, snap: &PersistedSnapshot) -> io::Result<()> {
-        let (idx, term) = match snap.meta.last_log_id {
-            Some(id) => (id.index, id.leader_id.term),
-            None => (0, 0),
-        };
-        let final_path = self.dir.join(snapshot_filename(idx, term));
-        let tmp_path = final_path.with_extension("snap.tmp");
+    /// Creates (truncating) the staging file that snapshot data is streamed
+    /// into — by the local builder, or by openraft chunk reception
+    /// (`begin_receiving_snapshot`). Only one staging file exists at a time;
+    /// openraft's state-machine worker serializes both producers.
+    pub fn create_staging_data_file(&self) -> io::Result<(PathBuf, fs::File)> {
+        let path = self.staging_data_path();
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok((path, file))
+    }
 
-        let meta_bytes = bincode::serialize(&PersistedMeta::from(&snap.meta))
+    fn staging_data_path(&self) -> PathBuf {
+        self.dir.join("staging.data.tmp")
+    }
+
+    /// Commits a fully-written staging data file as the new latest snapshot:
+    /// fsync + rename data into place, then write the meta file, fsync the
+    /// dir, and clean up older snapshots. See the module docs for the crash
+    /// analysis.
+    pub fn commit_snapshot(
+        &self,
+        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+        staging_data: &Path,
+    ) -> io::Result<PathBuf> {
+        let (idx, term) = index_term(meta);
+        let data_path = self.dir.join(snapshot_filename(idx, term, "data"));
+        let meta_path = self.dir.join(snapshot_filename(idx, term, "meta"));
+
+        // 1. Data durable + in place.
+        fs::File::open(staging_data)?.sync_all()?;
+        fs::rename(staging_data, &data_path)?;
+
+        // 2. Meta durable + in place (its presence is what makes the pair
+        //    "exist", so it goes second).
+        let meta_bytes = bincode::serialize(&PersistedMeta::from(meta))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let meta_len: u32 = meta_bytes.len().try_into().map_err(|_| {
             io::Error::new(
@@ -142,83 +163,93 @@ impl SnapshotStore {
                 "snapshot meta exceeds u32::MAX",
             )
         })?;
-        let data_len: u64 = snap.data.len() as u64;
-
-        // Build the full payload in memory so the CRC is computed against
-        // exactly the bytes we write, then write them in one shot.
-        let mut buf = Vec::with_capacity(HEADER_LEN + meta_bytes.len() + 8 + snap.data.len() + 4);
+        let mut buf = Vec::with_capacity(HEADER_LEN + meta_bytes.len() + 4);
         buf.extend_from_slice(MAGIC);
         buf.push(VERSION);
         buf.extend_from_slice(&[0u8; 3]); // reserved
         buf.extend_from_slice(&meta_len.to_le_bytes());
         buf.extend_from_slice(&meta_bytes);
-        buf.extend_from_slice(&data_len.to_le_bytes());
-        buf.extend_from_slice(&snap.data);
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
+        let meta_tmp = meta_path.with_extension("meta.tmp");
         {
-            let mut f = fs::File::create(&tmp_path)?;
+            let mut f = fs::File::create(&meta_tmp)?;
             f.write_all(&buf)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp_path, &final_path)?;
-        // Fsync the directory to make the rename durable.
+        fs::rename(&meta_tmp, &meta_path)?;
+
+        // 3. Make both renames durable.
         if let Ok(d) = fs::File::open(&self.dir) {
             let _ = d.sync_all();
         }
 
-        // Retention: drop older `.snap` files (keep only the one we just
-        // wrote). Errors here are not fatal — stragglers are harmless and
-        // the next `write` retries cleanup.
-        let _ = self.cleanup_older_than(&final_path);
-        Ok(())
+        // 4. Retention: drop older pairs and stray tmp files. Errors are not
+        //    fatal — stragglers are harmless and the next commit retries.
+        let _ = self.cleanup_except(idx, term);
+        Ok(data_path)
     }
 
-    /// Load the highest-`(index, term)` snapshot from disk, or `None` if
-    /// no valid snapshot file exists. Stale `.tmp` files and corrupt
-    /// `.snap` files (bad magic / version / CRC) are skipped.
-    pub fn load_latest(&self) -> io::Result<Option<PersistedSnapshot>> {
-        let Some(path) = self.latest_snapshot_path()? else {
-            return Ok(None);
-        };
-        let bytes = fs::read(&path)?;
-        match parse(&bytes) {
-            Ok(snap) => Ok(Some(snap)),
-            Err(e) => {
-                tracing::warn!(
-                    target: "raft.snapshot",
-                    path = %path.display(),
-                    error = %e,
-                    "skipping unreadable snapshot file"
-                );
-                Ok(None)
-            }
-        }
-    }
-
-    /// Load only the meta of the highest-`(index, term)` snapshot. Avoids
-    /// reading the (potentially large) data segment when only meta is
-    /// needed — startup uses this for fast hydration of `last_applied` /
-    /// `last_membership`.
+    /// Loads the meta of the highest-`(index, term)` snapshot pair, or
+    /// `None`. Corrupt meta files and pairs missing their `.data` sibling
+    /// are skipped with a warning. Never touches the data file's contents —
+    /// this is the boot-time hydration path and must stay cheap.
     pub fn load_latest_meta(
         &self,
     ) -> io::Result<Option<SnapshotMeta<NodeId, openraft::BasicNode>>> {
-        let Some(path) = self.latest_snapshot_path()? else {
-            return Ok(None);
-        };
-        match parse_meta_only(&path) {
-            Ok(meta) => Ok(Some(meta)),
-            Err(e) => {
-                tracing::warn!(
-                    target: "raft.snapshot",
-                    path = %path.display(),
-                    error = %e,
-                    "skipping unreadable snapshot file (meta scan)"
-                );
-                Ok(None)
+        Ok(self.latest_valid_pair()?.map(|(meta, _)| meta))
+    }
+
+    /// Returns the latest snapshot's meta together with the path of its
+    /// data file, for `get_current_snapshot` to open and stream.
+    pub fn open_latest(
+        &self,
+    ) -> io::Result<Option<(SnapshotMeta<NodeId, openraft::BasicNode>, PathBuf)>> {
+        self.latest_valid_pair()
+    }
+
+    fn latest_valid_pair(
+        &self,
+    ) -> io::Result<Option<(SnapshotMeta<NodeId, openraft::BasicNode>, PathBuf)>> {
+        let mut candidates: Vec<(u64, u64)> = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(pair) = parse_snapshot_filename(name, "meta") {
+                candidates.push(pair);
             }
         }
+        // Highest (index, term) first.
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+
+        for (idx, term) in candidates {
+            let meta_path = self.dir.join(snapshot_filename(idx, term, "meta"));
+            let data_path = self.dir.join(snapshot_filename(idx, term, "data"));
+            if !data_path.exists() {
+                tracing::warn!(
+                    target: "raft.snapshot",
+                    path = %meta_path.display(),
+                    "snapshot meta has no data sibling; skipping"
+                );
+                continue;
+            }
+            match parse_meta_file(&meta_path) {
+                Ok(meta) => return Ok(Some((meta, data_path))),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "raft.snapshot",
+                        path = %meta_path.display(),
+                        error = %e,
+                        "skipping unreadable snapshot meta"
+                    );
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Atomically persists the last applied membership to `membership.bin`.
@@ -287,40 +318,25 @@ impl SnapshotStore {
         }
     }
 
-    fn latest_snapshot_path(&self) -> io::Result<Option<PathBuf>> {
-        let mut best: Option<(u64, u64, PathBuf)> = None;
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some((idx, term)) = parse_snapshot_filename(name) else {
-                continue;
-            };
-            let candidate = (idx, term, entry.path());
-            best = match best {
-                Some(prev) if (prev.0, prev.1) >= (candidate.0, candidate.1) => Some(prev),
-                _ => Some(candidate),
-            };
-        }
-        Ok(best.map(|(_, _, p)| p))
-    }
-
-    fn cleanup_older_than(&self, keep: &Path) -> io::Result<()> {
+    fn cleanup_except(&self, keep_idx: u64, keep_term: u64) -> io::Result<()> {
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path == keep {
-                continue;
-            }
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
-            // Drop both `.snap` (older snapshots) and `.snap.tmp` (orphans
-            // from a crashed write).
-            if name.ends_with(".snap") || name.ends_with(".snap.tmp") {
+            let is_current = parse_snapshot_filename(name, "meta") == Some((keep_idx, keep_term))
+                || parse_snapshot_filename(name, "data") == Some((keep_idx, keep_term));
+            if is_current || name == "membership.bin" {
+                continue;
+            }
+            // Older pairs, legacy v1 `.snap` files, and orphaned tmp files.
+            let droppable = name.ends_with(".meta")
+                || name.ends_with(".data")
+                || name.ends_with(".snap")
+                || name.ends_with(".tmp");
+            if droppable {
                 let _ = fs::remove_file(&path);
             }
         }
@@ -328,12 +344,21 @@ impl SnapshotStore {
     }
 }
 
-fn snapshot_filename(index: u64, term: u64) -> String {
-    format!("snap-{index:020}-{term:020}.snap")
+fn index_term(meta: &SnapshotMeta<NodeId, openraft::BasicNode>) -> (u64, u64) {
+    match meta.last_log_id {
+        Some(id) => (id.index, id.leader_id.term),
+        None => (0, 0),
+    }
 }
 
-fn parse_snapshot_filename(name: &str) -> Option<(u64, u64)> {
-    let rest = name.strip_prefix("snap-")?.strip_suffix(".snap")?;
+fn snapshot_filename(index: u64, term: u64, ext: &str) -> String {
+    format!("snap-{index:020}-{term:020}.{ext}")
+}
+
+fn parse_snapshot_filename(name: &str, ext: &str) -> Option<(u64, u64)> {
+    let rest = name
+        .strip_prefix("snap-")?
+        .strip_suffix(&format!(".{ext}"))?;
     let mut parts = rest.split('-');
     let idx: u64 = parts.next()?.parse().ok()?;
     let term: u64 = parts.next()?.parse().ok()?;
@@ -343,11 +368,12 @@ fn parse_snapshot_filename(name: &str) -> Option<(u64, u64)> {
     Some((idx, term))
 }
 
-fn parse(bytes: &[u8]) -> io::Result<PersistedSnapshot> {
-    if bytes.len() < HEADER_LEN + 8 + 4 {
+fn parse_meta_file(path: &Path) -> io::Result<SnapshotMeta<NodeId, openraft::BasicNode>> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < HEADER_LEN + 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "snapshot file too short",
+            "snapshot meta file too short",
         ));
     }
     if &bytes[0..4] != MAGIC {
@@ -356,92 +382,24 @@ fn parse(bytes: &[u8]) -> io::Result<PersistedSnapshot> {
     if bytes[4] != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported snapshot file version: {}", bytes[4]),
+            format!("unsupported snapshot meta version: {}", bytes[4]),
+        ));
+    }
+    let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+    let stored_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    if crc32c::crc32c(body) != stored_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot meta CRC mismatch",
         ));
     }
     let meta_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let meta_start = HEADER_LEN;
-    let meta_end = meta_start
+    let meta_end = HEADER_LEN
         .checked_add(meta_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "meta_len overflow"))?;
-    if meta_end + 8 > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated meta or missing data_len",
-        ));
-    }
-    let meta: PersistedMeta = bincode::deserialize(&bytes[meta_start..meta_end])
+        .filter(|&end| end <= body.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated meta"))?;
+    let meta: PersistedMeta = bincode::deserialize(&bytes[HEADER_LEN..meta_end])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let data_len_start = meta_end;
-    let data_start = data_len_start + 8;
-    let data_len =
-        u64::from_le_bytes(bytes[data_len_start..data_start].try_into().unwrap()) as usize;
-    let data_end = data_start
-        .checked_add(data_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "data_len overflow"))?;
-    if data_end + 4 > bytes.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated data"));
-    }
-    let data = bytes[data_start..data_end].to_vec();
-
-    let crc_stored = u32::from_le_bytes(bytes[data_end..data_end + 4].try_into().unwrap());
-    let crc_computed = crc32c::crc32c(&bytes[..data_end]);
-    if crc_stored != crc_computed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("crc mismatch: stored={crc_stored:08x} computed={crc_computed:08x}"),
-        ));
-    }
-
-    Ok(PersistedSnapshot {
-        meta: meta.into(),
-        data,
-    })
-}
-
-fn parse_meta_only(path: &Path) -> io::Result<SnapshotMeta<NodeId, openraft::BasicNode>> {
-    let mut f = fs::File::open(path)?;
-    let mut header = [0u8; HEADER_LEN];
-    f.read_exact(&mut header)?;
-    if &header[0..4] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
-    }
-    if header[4] != VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported snapshot file version: {}", header[4]),
-        ));
-    }
-    let meta_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-    let mut meta_buf = vec![0u8; meta_len];
-    f.read_exact(&mut meta_buf)?;
-    let meta: PersistedMeta = bincode::deserialize(&meta_buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    // Verify CRC against stored value at end-of-file. Without this, a
-    // corrupted snapshot could feed garbage membership into startup.
-    let total_len = f.metadata()?.len();
-    if total_len < (HEADER_LEN as u64) + (meta_len as u64) + 8 + 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too short"));
-    }
-    let crc_offset = total_len - 4;
-    f.seek(SeekFrom::Start(crc_offset))?;
-    let mut crc_buf = [0u8; 4];
-    f.read_exact(&mut crc_buf)?;
-    let crc_stored = u32::from_le_bytes(crc_buf);
-
-    f.seek(SeekFrom::Start(0))?;
-    let mut all = vec![0u8; crc_offset as usize];
-    f.read_exact(&mut all)?;
-    let crc_computed = crc32c::crc32c(&all);
-    if crc_stored != crc_computed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("crc mismatch: stored={crc_stored:08x} computed={crc_computed:08x}"),
-        ));
-    }
-
     Ok(meta.into())
 }
 
@@ -472,34 +430,33 @@ mod tests {
         StoredMembership::new(Some(log_id(1, node_id, 1)), m)
     }
 
-    fn snap(idx: u64, term: u64, data_len: usize) -> PersistedSnapshot {
-        let mut data = vec![0u8; data_len];
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
+    fn meta(idx: u64, term: u64) -> SnapshotMeta<NodeId, BasicNode> {
+        SnapshotMeta {
+            last_log_id: Some(log_id(term, 1, idx)),
+            last_membership: membership_one_voter(1),
+            snapshot_id: format!("snap-{idx}-{term}"),
         }
-        PersistedSnapshot {
-            meta: SnapshotMeta {
-                last_log_id: Some(log_id(term, 1, idx)),
-                last_membership: membership_one_voter(1),
-                snapshot_id: format!("snap-{idx}-{term}"),
-            },
-            data,
-        }
+    }
+
+    fn commit(store: &SnapshotStore, idx: u64, term: u64, data: &[u8]) -> PathBuf {
+        let (path, mut f) = store.create_staging_data_file().unwrap();
+        f.write_all(data).unwrap();
+        drop(f);
+        store.commit_snapshot(&meta(idx, term), &path).unwrap()
     }
 
     #[test]
     fn roundtrip_preserves_meta_and_data() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-        let s = snap(42, 7, 1024);
-        store.write(&s).unwrap();
+        let payload = b"streamed snapshot data".to_vec();
+        commit(&store, 42, 7, &payload);
 
-        let loaded = store.load_latest().unwrap().expect("snapshot present");
-        assert_eq!(loaded.meta.last_log_id, s.meta.last_log_id);
-        assert_eq!(loaded.meta.snapshot_id, s.meta.snapshot_id);
-        assert_eq!(loaded.data, s.data);
-        let members: Vec<_> = loaded
-            .meta
+        let (loaded_meta, data_path) = store.open_latest().unwrap().expect("snapshot present");
+        assert_eq!(loaded_meta.last_log_id, meta(42, 7).last_log_id);
+        assert_eq!(loaded_meta.snapshot_id, "snap-42-7");
+        assert_eq!(fs::read(&data_path).unwrap(), payload);
+        let members: Vec<_> = loaded_meta
             .last_membership
             .membership()
             .voter_ids()
@@ -508,91 +465,126 @@ mod tests {
     }
 
     #[test]
-    fn meta_only_load_skips_data_segment() {
+    fn meta_only_load_never_opens_data() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-        let s = snap(99, 3, 16 * 1024);
-        store.write(&s).unwrap();
+        let data_path = commit(&store, 99, 3, &[0u8; 16 * 1024]);
 
-        let meta = store.load_latest_meta().unwrap().expect("meta present");
-        assert_eq!(meta.last_log_id, s.meta.last_log_id);
-        assert_eq!(meta.snapshot_id, s.meta.snapshot_id);
+        // Replace the data file's CONTENT with garbage — meta hydration must
+        // still succeed because it never reads the data segment.
+        fs::write(&data_path, b"garbage").unwrap();
+        let m = store.load_latest_meta().unwrap().expect("meta present");
+        assert_eq!(m.last_log_id, meta(99, 3).last_log_id);
     }
 
-    /// Simulates a partial-cleanup state where multiple `.snap` files
-    /// coexist (e.g. crash between rename and the older-file delete on
-    /// the previous `write`). `load_latest` must pick the highest
-    /// `(index, term)` pair without depending on cleanup having run.
     #[test]
-    fn load_latest_picks_highest_index_with_multiple_snap_files() {
+    fn latest_picks_highest_index_with_multiple_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-
-        // Plant three valid snapshot files directly so cleanup doesn't run.
+        // Plant pairs directly (bypassing commit's cleanup) to simulate a
+        // crash between rename and cleanup.
         for &(idx, term) in &[(10u64, 1u64), (50, 1), (30, 1)] {
-            let s = snap(idx, term, 16);
-            let path = dir.path().join(snapshot_filename(idx, term));
-            let mut buf = Vec::new();
-            buf.extend_from_slice(MAGIC);
-            buf.push(VERSION);
-            buf.extend_from_slice(&[0u8; 3]);
-            let meta_bytes = bincode::serialize(&PersistedMeta::from(&s.meta)).unwrap();
-            buf.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&meta_bytes);
-            buf.extend_from_slice(&(s.data.len() as u64).to_le_bytes());
-            buf.extend_from_slice(&s.data);
-            let crc = crc32c::crc32c(&buf);
-            buf.extend_from_slice(&crc.to_le_bytes());
-            fs::write(&path, &buf).unwrap();
+            let (staging, mut f) = store.create_staging_data_file().unwrap();
+            f.write_all(b"d").unwrap();
+            drop(f);
+            let data_path = dir.path().join(snapshot_filename(idx, term, "data"));
+            fs::rename(&staging, &data_path).unwrap();
+            // Write meta by committing to a scratch store, then copying the
+            // meta file over — simpler: hand-encode via commit on a temp dir.
+            let scratch = tempfile::tempdir().unwrap();
+            let sstore = SnapshotStore::new(scratch.path()).unwrap();
+            let (spath, mut sf) = sstore.create_staging_data_file().unwrap();
+            sf.write_all(b"d").unwrap();
+            drop(sf);
+            sstore.commit_snapshot(&meta(idx, term), &spath).unwrap();
+            fs::copy(
+                scratch.path().join(snapshot_filename(idx, term, "meta")),
+                dir.path().join(snapshot_filename(idx, term, "meta")),
+            )
+            .unwrap();
         }
 
-        let latest = store.load_latest().unwrap().unwrap();
-        assert_eq!(latest.meta.last_log_id.unwrap().index, 50);
+        let (m, _) = store.open_latest().unwrap().unwrap();
+        assert_eq!(m.last_log_id.unwrap().index, 50);
     }
 
     #[test]
-    fn write_cleans_up_older_snapshots() {
+    fn commit_cleans_up_older_snapshots_and_legacy_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-        store.write(&snap(10, 1, 8)).unwrap();
-        store.write(&snap(20, 1, 8)).unwrap();
+        fs::write(
+            dir.path()
+                .join("snap-00000000000000000001-00000000000000000001.snap"),
+            b"v1",
+        )
+        .unwrap();
+        commit(&store, 10, 1, b"a");
+        commit(&store, 20, 1, b"b");
 
-        let snaps: Vec<_> = fs::read_dir(dir.path())
+        let names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().into_string().unwrap())
-            .filter(|n| n.ends_with(".snap"))
+            .filter(|n| n != "membership.bin")
             .collect();
-        assert_eq!(snaps.len(), 1, "only newest snapshot should remain");
+        let mut names = names;
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                snapshot_filename(20, 1, "data"),
+                snapshot_filename(20, 1, "meta"),
+            ],
+            "only the newest pair should remain (v1 + older pair removed)"
+        );
     }
 
     #[test]
-    fn corrupted_file_returns_none_not_panic() {
+    fn meta_without_data_sibling_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-        // Plant a malformed file with the right naming convention so it's
-        // discovered as the "latest" candidate.
-        let path = dir.path().join(snapshot_filename(7, 1));
-        fs::write(&path, b"not a snapshot file").unwrap();
-
-        assert!(store.load_latest().unwrap().is_none());
+        let data_path = commit(&store, 7, 1, b"d");
+        fs::remove_file(&data_path).unwrap();
         assert!(store.load_latest_meta().unwrap().is_none());
+        assert!(store.open_latest().unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupted_meta_returns_none_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path()).unwrap();
+        fs::write(dir.path().join(snapshot_filename(7, 1, "meta")), b"junk").unwrap();
+        fs::write(dir.path().join(snapshot_filename(7, 1, "data")), b"junk").unwrap();
+        assert!(store.load_latest_meta().unwrap().is_none());
+        assert!(store.open_latest().unwrap().is_none());
     }
 
     #[test]
     fn empty_dir_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
-        assert!(store.load_latest().unwrap().is_none());
         assert!(store.load_latest_meta().unwrap().is_none());
+        assert!(store.open_latest().unwrap().is_none());
+    }
+
+    #[test]
+    fn membership_survives_snapshot_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path()).unwrap();
+        store.save_membership(&membership_one_voter(1)).unwrap();
+        commit(&store, 5, 1, b"d");
+        let m = store.load_membership().unwrap().expect("membership kept");
+        let voters: Vec<_> = m.membership().voter_ids().collect();
+        assert_eq!(voters, vec![1]);
     }
 
     #[test]
     fn parse_filename_rejects_bad_inputs() {
-        assert!(parse_snapshot_filename("snap-1-2.snap").is_some());
-        assert!(parse_snapshot_filename("snap-1.snap").is_none());
-        assert!(parse_snapshot_filename("snap-1-2-3.snap").is_none());
-        assert!(parse_snapshot_filename("not-a-snap.snap").is_none());
-        assert!(parse_snapshot_filename("snap-1-2.snap.tmp").is_none());
+        assert!(parse_snapshot_filename("snap-1-2.meta", "meta").is_some());
+        assert!(parse_snapshot_filename("snap-1.meta", "meta").is_none());
+        assert!(parse_snapshot_filename("snap-1-2-3.meta", "meta").is_none());
+        assert!(parse_snapshot_filename("not-a-snap.meta", "meta").is_none());
+        assert!(parse_snapshot_filename("snap-1-2.meta.tmp", "meta").is_none());
+        assert!(parse_snapshot_filename("snap-1-2.data", "meta").is_none());
     }
 }

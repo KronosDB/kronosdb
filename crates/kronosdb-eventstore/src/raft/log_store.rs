@@ -402,6 +402,11 @@ pub struct LogStore {
     deferred: bool,
     /// Stops the background drive thread (final drive runs before exit).
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Approximate log bytes appended since the last purge. Shared with the
+    /// byte-aware snapshot trigger (cluster.rs): openraft's snapshot policy
+    /// counts ENTRIES, and with coalesced multi-MB entries an entry count
+    /// alone can retain tens of GB of log after bulk ingest.
+    bytes_since_purge: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Drop for LogStore {
@@ -836,7 +841,15 @@ impl LogStore {
             inner,
             deferred: group_commit_interval.is_some(),
             shutdown,
+            bytes_since_purge: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Shared counter of approximate log bytes appended since the last
+    /// purge. Handed to the byte-aware snapshot trigger before this store
+    /// moves into openraft.
+    pub fn bytes_since_purge_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.bytes_since_purge)
     }
 
     /// Returns the recovered `last_log_id` without going through the async
@@ -1062,6 +1075,11 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         self.drive_group_commit()?;
         let mut inner = self.inner.lock();
         purge_inner(&mut inner, log_id).map_err(io_err)?;
+        // Approximation: purge keeps up to `max_in_snapshot_log_to_keep`
+        // entries, but resetting to zero only means the next byte-trigger
+        // fires marginally late — never early.
+        self.bytes_since_purge
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1121,6 +1139,8 @@ impl LogStore {
                 .index
                 .insert(log_id.index, (segment_id, offset, record_len));
             inner.buffered_bytes += rec_buf.len();
+            self.bytes_since_purge
+                .fetch_add(rec_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
             // Maintain last_log_id cache (the incoming stream is append-ordered;
             // take max defensively in case openraft ever reorders).
