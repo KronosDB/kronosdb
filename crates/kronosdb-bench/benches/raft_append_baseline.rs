@@ -117,6 +117,7 @@ fn boot_single_node_cluster(selectivity: Selectivity, kind: Kind) -> Fixture {
         raft_config: default_raft_config(),
         // This bench measures the CONSENSUS append path — keep it on.
         single_node_fast_path: false,
+        log_group_commit: None,
     };
 
     let cluster = ClusterManager::new(Arc::clone(&ctx), cfg);

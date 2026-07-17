@@ -265,6 +265,14 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Clones the active segment's file handle so a group-commit thread can
+    /// fsync it WITHOUT holding the writer lock. The clone shares the open
+    /// file description; fsyncing it covers every byte written to the file
+    /// before the fsync, regardless of which handle wrote them.
+    pub fn active_file_handle(&self) -> Result<File, Error> {
+        Ok(self.active_file.try_clone()?)
+    }
+
     /// Returns the current head position (next position to be assigned).
     pub fn head(&self) -> Position {
         self.next_position
@@ -623,6 +631,15 @@ fn preallocate(file: &File, size: u64) {
 /// On macOS, uses F_FULLFSYNC via fcntl (the only way to guarantee
 /// data hits the physical disk, not just the drive's write cache).
 /// On other platforms, falls back to sync_data().
+/// Fsyncs a standalone file handle (see `active_file_handle`) with the same
+/// platform semantics as `SegmentWriter::sync`.
+pub(crate) fn sync_file(file: &File) -> Result<(), crate::error::Error> {
+    fdatasync(file)?;
+    #[cfg(feature = "bench-instrumentation")]
+    bi::bump_fsync();
+    Ok(())
+}
+
 fn fdatasync(file: &File) -> Result<(), io::Error> {
     #[cfg(target_os = "linux")]
     {

@@ -45,6 +45,14 @@ pub struct LogStoreConfig {
     pub idle_window: std::time::Duration,
     /// Buffered-byte threshold that triggers an early group-commit fsync.
     pub buffered_cap: usize,
+    /// Deferred group commit: when `Some`, `append()` buffers and returns
+    /// immediately, and a background thread fsyncs + fires the flush
+    /// callbacks every interval. openraft's core loop is then free to keep
+    /// appending while the fsync is in flight, so entries accumulate and
+    /// commit/apply advance in batches instead of one entry per fsync.
+    /// `None` = fsync inline before `append()` returns (strict, original
+    /// behavior).
+    pub group_commit_interval: Option<std::time::Duration>,
 }
 
 impl Default for LogStoreConfig {
@@ -53,6 +61,7 @@ impl Default for LogStoreConfig {
             segment_cap: DEFAULT_SEGMENT_CAP,
             idle_window: DEFAULT_IDLE_WINDOW,
             buffered_cap: DEFAULT_BUFFERED_CAP,
+            group_commit_interval: None,
         }
     }
 }
@@ -387,6 +396,19 @@ fn fdatasync(file: &std::fs::File) -> std::io::Result<()> {
 /// accounting). Callbacks fire in FIFO order after the last fsync returns.
 pub struct LogStore {
     inner: Arc<Mutex<LogStoreInner>>,
+    /// True when a background thread drives group commit (see
+    /// `LogStoreConfig::group_commit_interval`); `append()` then returns
+    /// without fsyncing and callbacks fire from the thread.
+    deferred: bool,
+    /// Stops the background drive thread (final drive runs before exit).
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LogStore {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 struct LogStoreInner {
@@ -761,21 +783,59 @@ impl LogStore {
             "log_store recovered from disk"
         );
 
+        let group_commit_interval = config.group_commit_interval;
+        let inner = Arc::new(Mutex::new(LogStoreInner {
+            dir: dir.to_path_buf(),
+            config,
+            sealed,
+            active,
+            index,
+            last_log_id,
+            vote,
+            committed,
+            last_purged,
+            pending_callbacks: Vec::new(),
+            buffered_bytes: 0,
+            committed_dirty: false,
+        }));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Deferred group commit: fsync + fire flush callbacks every interval
+        // from a dedicated thread, so openraft's core loop never blocks on
+        // an fsync and log entries accumulate into real batches. Mirrors the
+        // segment writer's group-commit thread; on fsync failure every
+        // pending callback receives the StorageError (openraft halts).
+        if let Some(interval) = group_commit_interval {
+            let thread_inner = Arc::clone(&inner);
+            let thread_shutdown = Arc::clone(&shutdown);
+            std::thread::Builder::new()
+                .name("kronosdb-raft-log-sync".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(interval);
+                        let shutting_down =
+                            thread_shutdown.load(std::sync::atomic::Ordering::Acquire);
+                        let has_pending = {
+                            let inner = thread_inner.lock();
+                            !inner.pending_callbacks.is_empty() || inner.committed_dirty
+                        };
+                        if has_pending {
+                            // Errors are delivered through the callbacks
+                            // themselves (D-09); nothing more to do here.
+                            let _ = drive_group_commit_now(&thread_inner);
+                        }
+                        if shutting_down {
+                            return;
+                        }
+                    }
+                })
+                .expect("spawn raft log sync thread");
+        }
+
         Ok(Self {
-            inner: Arc::new(Mutex::new(LogStoreInner {
-                dir: dir.to_path_buf(),
-                config,
-                sealed,
-                active,
-                index,
-                last_log_id,
-                vote,
-                committed,
-                last_purged,
-                pending_callbacks: Vec::new(),
-                buffered_bytes: 0,
-                committed_dirty: false,
-            })),
+            inner,
+            deferred: group_commit_interval.is_some(),
+            shutdown,
         })
     }
 
@@ -978,21 +1038,28 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        // Split into two phases so we can carry lock state across the fsync
-        // drive without holding the lock across the `.await` (there are no
-        // awaits in either helper today, but the structure is kept for the
-        // day a background fsync drive replaces caller-drives per D-06).
         self.append_buffer(entries, Some(callback))?;
-        self.drive_group_commit()
+        if self.deferred {
+            // Deferred mode: the group-commit thread fsyncs and fires the
+            // callback within one interval. Returning now lets openraft keep
+            // appending — that accumulation is what makes batching real.
+            Ok(())
+        } else {
+            self.drive_group_commit()
+        }
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        // Settle any deferred appends first: their callbacks must fire (in
+        // order) before the log shrinks underneath them.
+        self.drive_group_commit()?;
         let mut inner = self.inner.lock();
         truncate_inner(&mut inner, log_id).map_err(io_err)?;
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        self.drive_group_commit()?;
         let mut inner = self.inner.lock();
         purge_inner(&mut inner, log_id).map_err(io_err)?;
         Ok(())
@@ -1115,10 +1182,20 @@ impl LogStore {
     ///
     /// Both cases fire callbacks only after the last fsync returns (D-08).
     fn drive_group_commit(&mut self) -> Result<(), StorageError<NodeId>> {
+        drive_group_commit_now(&self.inner)
+    }
+}
+
+/// Fsyncs the active log segment (folding a dirty `committed.bin` write into
+/// the same pass) and fires all pending flush callbacks in FIFO order.
+/// Callable from the `LogStore` methods (inline mode) and from the deferred
+/// group-commit thread.
+fn drive_group_commit_now(inner_mutex: &Mutex<LogStoreInner>) -> Result<(), StorageError<NodeId>> {
+    {
         #[cfg(feature = "bench-instrumentation")]
         let _t = Timer::new(Region::LogGroupCommit);
 
-        let mut inner = self.inner.lock();
+        let mut inner = inner_mutex.lock();
 
         // D-07 idle_window is unused in the single-caller openraft path;
         // keep for future multi-producer experiments.

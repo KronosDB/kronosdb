@@ -13,7 +13,9 @@ use crate::context::ContextManager;
 use crate::error::Error;
 
 use super::snapshot_store::{PersistedSnapshot, SnapshotStore};
-use super::types::{NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConfig};
+use super::types::{
+    BatchAppendResult, NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConfig,
+};
 
 #[cfg(feature = "bench-instrumentation")]
 use super::bench_instrumentation::{Region, Timer};
@@ -319,6 +321,92 @@ impl EventStoreStateMachine {
         Ok(report)
     }
 
+    /// Flushes coalesced Append entries: one `append_with_raft_batch` call
+    /// per context (order preserved within each context), one fsync per
+    /// batch. Per-item DCB rejections land in their entry's response slot;
+    /// everything else is a fatal `StorageError` per D-04..D-08.
+    fn flush_append_batch(
+        &self,
+        pending: &mut Vec<(usize, String, AppendRequest, AppliedLogId)>,
+        responses: &mut [Option<RaftResponse>],
+    ) -> Result<(), StorageError<NodeId>> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        #[cfg(feature = "bench-instrumentation")]
+        let _t = Timer::new(Region::ApplyEventPath);
+
+        // Group by context, preserving arrival order within each context —
+        // an item's DCB check must see every earlier item's writes.
+        let mut by_context: Vec<(String, Vec<(usize, AppendRequest, AppliedLogId)>)> = Vec::new();
+        for (slot, ctx, req, applied) in pending.drain(..) {
+            match by_context.iter_mut().find(|(c, _)| *c == ctx) {
+                Some((_, items)) => items.push((slot, req, applied)),
+                None => by_context.push((ctx, vec![(slot, req, applied)])),
+            }
+        }
+
+        for (ctx, items) in by_context {
+            let slots: Vec<usize> = items.iter().map(|(slot, _, _)| *slot).collect();
+            let batch: Vec<(AppendRequest, AppliedLogId)> =
+                items.into_iter().map(|(_, req, a)| (req, a)).collect();
+            let results = self
+                .contexts
+                .with_context(&ctx, |store| store.append_with_raft_batch(batch))
+                .map_err(|e| Self::fatal_append_error(&ctx, e))?;
+
+            for (slot, item_result) in slots.into_iter().zip(results) {
+                responses[slot] = Some(match item_result {
+                    Ok(resp) => RaftResponse::Append {
+                        first_position: resp.first_position.0,
+                        count: resp.count,
+                        consistency_marker: resp.consistency_marker.0,
+                    },
+                    // D-04: deterministic rejection is a valid apply response.
+                    Err(Error::ConsistencyConditionViolated {
+                        conflicting_position,
+                    }) => RaftResponse::AppendRejected {
+                        reason: RaftRejectReason::ConsistencyConditionViolated {
+                            conflicting_position: conflicting_position.0,
+                        },
+                    },
+                    Err(other) => return Err(Self::fatal_append_error(&ctx, other)),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Maps a fatal append-path error to a `StorageError` per D-05..D-08
+    /// (same classification as `apply_request`'s Append arm).
+    fn fatal_append_error(context: &str, err: Error) -> StorageError<NodeId> {
+        match err {
+            Error::ContextNotFound { name } => StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("apply: context not found: {name} (batch context {context})"),
+                ),
+            ),
+            Error::Io(io_err) => StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                io_err,
+            ),
+            Error::Corrupted { message } => StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ),
+            other => StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::other(format!("unexpected apply error: {other}")),
+            ),
+        }
+    }
+
     /// Apply a single Raft request to the event store.
     ///
     /// Returns `Result<RaftResponse, StorageError<NodeId>>` so every apply-time
@@ -423,6 +511,17 @@ impl EventStoreStateMachine {
                     }
                 }
             }
+            RaftRequest::AppendBatch { .. } => {
+                // Handled directly in `apply` (needs response-slot plumbing);
+                // reaching here would be a routing bug.
+                Err(StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::other(
+                        "AppendBatch must be applied via apply(), not apply_request()",
+                    ),
+                ))
+            }
             RaftRequest::CreateContext { name } => {
                 match self.contexts.create_context(name) {
                     Ok(()) => Ok(RaftResponse::ContextCreated),
@@ -476,22 +575,96 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut responses = Vec::new();
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        let mut responses: Vec<Option<RaftResponse>> = Vec::with_capacity(entries.len());
+        responses.resize_with(entries.len(), || None);
 
-        for entry in entries {
+        // Append entries are coalesced and flushed as ONE engine batch per
+        // context — one fsync per apply() call instead of one per entry.
+        // Without this, concurrent consensus appends serialize on their
+        // individual group-commit windows and throughput collapses to
+        // ~1/interval regardless of writer concurrency. Non-append Normal
+        // entries (CreateContext) act as ordering barriers.
+        let mut pending: Vec<(usize, String, AppendRequest, AppliedLogId)> = Vec::new();
+
+        for (i, entry) in entries.into_iter().enumerate() {
             let log_id = *entry.get_log_id();
             self.last_applied = Some(log_id);
 
             match entry.payload {
+                EntryPayload::Normal(RaftRequest::Append {
+                    context,
+                    events,
+                    condition,
+                }) => {
+                    // Only Append entries produce durable effects via the
+                    // event segment — the entry's LogId is threaded down so
+                    // the segment writer emits a `RaftMarker::normal(term,
+                    // index, count)` record inside the same fsync.
+                    // Membership/Blank below do NOT emit markers; they're
+                    // recovered as idempotent replay past `last_applied`.
+                    let append_req = AppendRequest {
+                        condition: condition.as_ref().map(|c| c.to_condition()),
+                        events: events.iter().map(|e| e.to_event()).collect(),
+                    };
+                    let applied = AppliedLogId {
+                        term: log_id.leader_id.get_term(),
+                        index: log_id.index,
+                    };
+                    pending.push((i, context, append_req, applied));
+                }
+                EntryPayload::Normal(RaftRequest::AppendBatch { context, items }) => {
+                    // A proposer-coalesced entry: N independent appends to
+                    // one context under ONE raft marker. Ordering barrier
+                    // like any append — flush what's pending first.
+                    self.flush_append_batch(&mut pending, &mut responses)?;
+                    let applied = AppliedLogId {
+                        term: log_id.leader_id.get_term(),
+                        index: log_id.index,
+                    };
+                    let requests: Vec<AppendRequest> = items
+                        .iter()
+                        .map(|item| AppendRequest {
+                            condition: item.condition.as_ref().map(|c| c.to_condition()),
+                            events: item.events.iter().map(|e| e.to_event()).collect(),
+                        })
+                        .collect();
+                    let results = self
+                        .contexts
+                        .with_context(&context, |store| {
+                            store.append_with_raft_entry_batch(requests, applied)
+                        })
+                        .map_err(|e| Self::fatal_append_error(&context, e))?;
+                    let mut batch_results = Vec::with_capacity(results.len());
+                    for item_result in results {
+                        batch_results.push(match item_result {
+                            Ok(resp) => BatchAppendResult::Append {
+                                first_position: resp.first_position.0,
+                                count: resp.count,
+                                consistency_marker: resp.consistency_marker.0,
+                            },
+                            Err(Error::ConsistencyConditionViolated {
+                                conflicting_position,
+                            }) => BatchAppendResult::Rejected {
+                                reason: RaftRejectReason::ConsistencyConditionViolated {
+                                    conflicting_position: conflicting_position.0,
+                                },
+                            },
+                            Err(other) => {
+                                return Err(Self::fatal_append_error(&context, other));
+                            }
+                        });
+                    }
+                    responses[i] = Some(RaftResponse::AppendBatch {
+                        results: batch_results,
+                    });
+                }
                 EntryPayload::Normal(req) => {
-                    // Only Normal entries produce durable effects via the event
-                    // segment — thread the entry's LogId down so the segment
-                    // writer can emit a `RaftMarker::normal(term, index, count)`
-                    // record inside the same fsync. Membership/Blank below do
-                    // NOT emit markers; they're recovered as idempotent replay
-                    // past `last_applied` on restart.
+                    // CreateContext (and any future non-append request):
+                    // appends logged before it must land first.
+                    self.flush_append_batch(&mut pending, &mut responses)?;
                     let resp = self.apply_request(&req, &log_id)?;
-                    responses.push(resp);
+                    responses[i] = Some(resp);
                 }
                 EntryPayload::Membership(ref membership) => {
                     self.last_membership = StoredMembership::new(Some(log_id), membership.clone());
@@ -507,15 +680,19 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
                                 e,
                             )
                         })?;
-                    responses.push(RaftResponse::Ok);
+                    responses[i] = Some(RaftResponse::Ok);
                 }
                 EntryPayload::Blank => {
-                    responses.push(RaftResponse::Ok);
+                    responses[i] = Some(RaftResponse::Ok);
                 }
             }
         }
+        self.flush_append_batch(&mut pending, &mut responses)?;
 
-        Ok(responses)
+        Ok(responses
+            .into_iter()
+            .map(|r| r.expect("every applied entry produces a response"))
+            .collect())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -1013,6 +1190,177 @@ mod tests {
         // Verify events in the store: 2 events committed → head = 2 (next slot).
         let store = contexts.get_context("default").unwrap();
         assert_eq!(store.head(), Position(2));
+    }
+
+    /// The coalesced apply path: a mixed batch in ONE apply() call — appends
+    /// to two contexts, a CreateContext barrier, an append to the created
+    /// context, and a mid-batch DCB rejection — must produce ordered,
+    /// per-entry responses identical to entry-at-a-time semantics.
+    #[tokio::test]
+    async fn apply_mixed_batch_coalesces_appends() {
+        let (mut sm, contexts) = create_sm();
+        contexts.create_context("other").unwrap();
+
+        // Entry 5 conflicts with entry 1: same `id` tag value, condition
+        // demanding no prior event with it exists past marker 0.
+        let conflicting = Entry {
+            log_id: log_id(1, 5),
+            payload: EntryPayload::Normal(RaftRequest::Append {
+                context: "default".to_string(),
+                events: vec![super::super::types::RaftAppendEvent {
+                    identifier: "evt-dup".to_string(),
+                    name: "OrderPlaced".to_string(),
+                    version: "1.0".to_string(),
+                    timestamp: 1712345678000,
+                    payload: b"data".to_vec(),
+                    metadata: vec![],
+                    tags: vec![(b"id".to_vec(), b"1".to_vec())],
+                }],
+                condition: Some(super::super::types::RaftAppendCondition {
+                    consistency_marker: 0,
+                    criteria: vec![super::super::types::RaftCriterion {
+                        names: vec![],
+                        tags: vec![(b"id".to_vec(), b"1".to_vec())],
+                    }],
+                }),
+            }),
+        };
+
+        let entries = vec![
+            make_append_entry(1, 1, "default", "OrderPlaced"),
+            make_append_entry(1, 2, "other", "OrderPlaced"),
+            Entry {
+                log_id: log_id(1, 3),
+                payload: EntryPayload::Normal(RaftRequest::CreateContext {
+                    name: "created-mid-batch".to_string(),
+                }),
+            },
+            make_append_entry(1, 4, "created-mid-batch", "OrderPlaced"),
+            conflicting,
+            make_append_entry(1, 6, "default", "PaymentReceived"),
+        ];
+
+        let responses = sm.apply(entries).await.unwrap();
+        assert_eq!(responses.len(), 6);
+        assert!(matches!(
+            responses[0],
+            RaftResponse::Append { count: 1, .. }
+        ));
+        assert!(matches!(
+            responses[1],
+            RaftResponse::Append { count: 1, .. }
+        ));
+        assert!(matches!(responses[2], RaftResponse::ContextCreated));
+        assert!(matches!(
+            responses[3],
+            RaftResponse::Append { count: 1, .. }
+        ));
+        assert!(matches!(responses[4], RaftResponse::AppendRejected { .. }));
+        assert!(matches!(
+            responses[5],
+            RaftResponse::Append { count: 1, .. }
+        ));
+
+        // The rejected entry wrote nothing: default has exactly 2 events.
+        assert_eq!(contexts.get_context("default").unwrap().head(), Position(2));
+        assert_eq!(contexts.get_context("other").unwrap().head(), Position(1));
+        assert_eq!(
+            contexts.get_context("created-mid-batch").unwrap().head(),
+            Position(1)
+        );
+
+        let (applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(applied.unwrap().index, 6);
+    }
+
+    /// An AppendBatch entry: per-item results in order, in-batch DCB
+    /// visibility (item 2's condition sees item 0's events), one shared
+    /// consistency marker, rejected items write nothing.
+    #[tokio::test]
+    async fn apply_append_batch_entry() {
+        let (mut sm, contexts) = create_sm();
+
+        fn item(id_tag: &str, condition_tag: Option<&str>) -> super::super::types::BatchAppendItem {
+            super::super::types::BatchAppendItem {
+                events: vec![super::super::types::RaftAppendEvent {
+                    identifier: format!("evt-{id_tag}"),
+                    name: "OrderPlaced".to_string(),
+                    version: "1.0".to_string(),
+                    timestamp: 1712345678000,
+                    payload: b"data".to_vec(),
+                    metadata: vec![],
+                    tags: vec![(b"id".to_vec(), id_tag.as_bytes().to_vec())],
+                }],
+                condition: condition_tag.map(|tag| super::super::types::RaftAppendCondition {
+                    consistency_marker: 0,
+                    criteria: vec![super::super::types::RaftCriterion {
+                        names: vec![],
+                        tags: vec![(b"id".to_vec(), tag.as_bytes().to_vec())],
+                    }],
+                }),
+            }
+        }
+
+        let entry = Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Normal(RaftRequest::AppendBatch {
+                context: "default".to_string(),
+                items: vec![
+                    item("a", None),
+                    item("b", None),
+                    // Conflicts with item 0 INSIDE the same batch.
+                    item("a-dup", Some("a")),
+                    item("c", None),
+                ],
+            }),
+        };
+
+        let responses = sm.apply(vec![entry]).await.unwrap();
+        assert_eq!(responses.len(), 1);
+        let results = match &responses[0] {
+            RaftResponse::AppendBatch { results } => results,
+            other => panic!("expected AppendBatch, got {other:?}"),
+        };
+        assert_eq!(results.len(), 4);
+        assert!(matches!(
+            results[0],
+            BatchAppendResult::Append {
+                first_position: 0,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            results[1],
+            BatchAppendResult::Append {
+                first_position: 1,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            results[2],
+            BatchAppendResult::Rejected {
+                reason: RaftRejectReason::ConsistencyConditionViolated {
+                    conflicting_position: 0
+                }
+            }
+        ));
+        assert!(matches!(
+            results[3],
+            BatchAppendResult::Append {
+                first_position: 2,
+                count: 1,
+                ..
+            }
+        ));
+
+        // Rejected item wrote nothing: exactly 3 events landed.
+        let store = contexts.get_context("default").unwrap();
+        assert_eq!(store.head(), Position(3));
+
+        let (applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(applied.unwrap().index, 1);
     }
 
     #[tokio::test]

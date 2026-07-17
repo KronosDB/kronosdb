@@ -44,6 +44,32 @@ pub enum RaftRequest {
     },
     /// Create a new context.
     CreateContext { name: String },
+    /// Multiple independent appends to ONE context, proposed as a single log
+    /// entry. openraft 0.9 blocks its core loop on every log-entry fsync
+    /// ("append_to_log … a temp wrapper to make non-blocking append_to_log a
+    /// blocking"), so consensus throughput is capped at entries-per-fsync —
+    /// batching appends into one entry is what lets concurrent writers share
+    /// a consensus round. Items are checked and applied independently
+    /// (per-item DCB) but persist under ONE raft marker, so a torn write
+    /// replays the whole entry instead of losing its tail.
+    ///
+    /// New variant appended at the enum tail: entries written by older
+    /// binaries keep decoding; older binaries cannot decode entries carrying
+    /// this variant (no rolling downgrade across this point).
+    AppendBatch {
+        /// The single context every item appends to. One context per entry
+        /// keeps the torn-write recovery story single-file: the entry's
+        /// marker+events either fully survive or fully replay.
+        context: String,
+        items: Vec<BatchAppendItem>,
+    },
+}
+
+/// One append inside an `AppendBatch` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchAppendItem {
+    pub events: Vec<RaftAppendEvent>,
+    pub condition: Option<RaftAppendCondition>,
 }
 
 /// Application response returned after applying a Raft log entry.
@@ -66,6 +92,21 @@ pub enum RaftResponse {
     /// (cluster.rs) maps this back to the existing `Error` taxonomy for the
     /// client-facing surface (D-02) so connector wire contracts stay stable.
     AppendRejected { reason: RaftRejectReason },
+    /// Per-item outcomes of an `AppendBatch` entry, in item order.
+    AppendBatch { results: Vec<BatchAppendResult> },
+}
+
+/// Outcome of one item inside an `AppendBatch` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BatchAppendResult {
+    Append {
+        first_position: u64,
+        count: u32,
+        consistency_marker: u64,
+    },
+    Rejected {
+        reason: RaftRejectReason,
+    },
 }
 
 /// Reason an apply-time append was rejected.
