@@ -1421,16 +1421,11 @@ dependencies = [
 name = "kronosdb-bench"
 version = "0.5.0"
 dependencies = [
- "chrono",
  "criterion",
  "kronosdb-eventstore",
- "openraft",
  "rand 0.8.5",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
- "tonic",
 ]
 
 [[package]]
@@ -1440,6 +1435,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake3",
+ "bytes",
  "crc32c",
  "dashmap",
  "fs2",

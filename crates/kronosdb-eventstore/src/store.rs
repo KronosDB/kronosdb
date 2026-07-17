@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::api::EventStore;
-use crate::append::{AppendCondition, AppendRequest, AppendResponse, AppliedLogId};
+use crate::append::{AppendCondition, AppendRequest, AppendResponse};
 use crate::cache::IndexCache;
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
@@ -17,6 +17,8 @@ use crate::stream::{CommitNotification, EventStream};
 
 use crate::index::tag_index::TagIndex;
 use crate::metrics::{StoreMetrics, Timer};
+use crate::replication::dispatcher::{WaveDescriptor, WavePublisher, WaveSlice};
+use crate::replication::watermark::WatermarkState;
 use crate::segment::reader::SegmentReader;
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::writer::SegmentWriter;
@@ -52,6 +54,13 @@ impl SegmentList {
 
 /// Default group commit interval (0 = disabled, sync per write).
 const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 0;
+
+/// Default node id for direct engine use and tests. The server always
+/// supplies its configured control-plane node id through `StoreOptions`.
+const DEFAULT_NODE_ID: crate::replication::watermark::NodeId = 0;
+
+/// Initial epoch before the first control-plane LeaderClaim.
+const INITIAL_EPOCH: crate::replication::watermark::Epoch = 0;
 
 /// Group commit synchronization.
 ///
@@ -104,6 +113,9 @@ impl SyncState {
 
     /// Blocks until the given wave's fsync completed. Returns an error — the
     /// write is NOT durable — if the fsync failed.
+    ///
+    /// Production leader appends use `WatermarkState::wait_for`; follower Tail
+    /// tasks use this direct wave wait before sending a durable acknowledgement.
     fn wait_for_sync(&self, target_wave: u64) -> Result<(), Error> {
         let mut completed = self.completed.lock().unwrap();
         while *completed < target_wave {
@@ -167,28 +179,29 @@ impl SyncState {
     }
 }
 
-/// Does an event (by name + tags) match a single DCB criterion? Mirrors the
-/// index-side semantics: name must be in `names` (or `names` empty), and
-/// EVERY criterion tag must be present on the event.
-fn event_matches_criterion(
-    criterion: &crate::criteria::Criterion,
-    name: &str,
-    tags: &[Tag],
-) -> bool {
-    if !criterion.names.is_empty() && !criterion.names.iter().any(|n| n == name) {
-        return false;
-    }
-    criterion.tags.iter().all(|ct| tags.contains(ct))
-}
-
 fn spawn_sync_thread(
+    dir: PathBuf,
     sync_state: Arc<SyncState>,
     writer: Arc<parking_lot::Mutex<SegmentWriter>>,
+    local_tail: Arc<AtomicU64>,
+    durable_tail: Arc<AtomicU64>,
+    node_id: crate::replication::watermark::NodeId,
+    replication: Arc<WavePublisher>,
+    watermark: Arc<WatermarkState>,
+    commit_tx: broadcast::Sender<CommitNotification>,
     interval: Duration,
 ) {
     std::thread::Builder::new()
         .name("kronosdb-sync".into())
         .spawn(move || {
+            // Cursor delimiting the start of the next wave's raw byte range.
+            // Existing bytes on open are not live-republished; a Tail session
+            // catches them up from its durable position before subscribing.
+            let (mut wave_base, mut wave_offset, mut wave_position) = {
+                let w = writer.lock();
+                (w.active_base_position(), w.write_offset(), w.head().0)
+            };
+
             loop {
                 std::thread::sleep(interval);
                 // Read the flag BEFORE the final sync pass: writers that
@@ -197,22 +210,70 @@ fn spawn_sync_thread(
                 let shutting_down = sync_state.shutdown.load(Ordering::Relaxed);
                 if sync_state.has_pending() {
                     // Barrier: take the writer lock only long enough to seal
-                    // the wave and clone the active file handle, then fsync
-                    // OUTSIDE the lock. Holding the lock across the fsync
-                    // would serialize every writer behind it — a single
-                    // producer (e.g. the raft state-machine worker) would
-                    // land exactly one write per fsync window.
-                    let sealed = {
+                    // the wave, snapshot its raw byte ranges and covered tail,
+                    // and clone the active file handle. Dispatch and fsync
+                    // proceed independently after the lock is released.
+                    let sealed: Result<_, Error> = (|| {
                         let w = writer.lock();
                         let wave = sync_state.seal_wave();
-                        w.active_file_handle().map(|file| (wave, file))
-                    };
-                    let result = sealed.and_then(|(wave, file)| {
+                        let durable = local_tail.load(Ordering::Acquire);
+                        let current_base = w.active_base_position();
+                        let current_offset = w.write_offset();
+
+                        let epoch = watermark.epoch();
+                        let descriptor = if replication.has_subscribers() {
+                            build_wave_descriptor(
+                                &dir,
+                                wave,
+                                epoch,
+                                wave_base,
+                                wave_offset,
+                                wave_position,
+                                current_base,
+                                current_offset,
+                                durable,
+                            )?
+                        } else {
+                            WaveDescriptor {
+                                wave_id: wave,
+                                epoch,
+                                previous_segment_base: wave_base,
+                                first_position: wave_position,
+                                next_position: durable,
+                                slices: Vec::new(),
+                            }
+                        };
+
+                        // Advance the next wave's starting cursor regardless
+                        // of subscriber presence. A newly-opened Tail catches
+                        // up from disk before joining live dispatch.
+                        wave_base = current_base;
+                        wave_offset = current_offset;
+                        wave_position = durable;
+
+                        let file = w.active_file_handle()?;
+                        Ok((wave, durable, descriptor, file))
+                    })();
+                    let result = sealed.and_then(|(wave, durable, descriptor, file)| {
+                        // Queue before fsync: the dispatcher preads on its own
+                        // thread while this thread enters fdatasync.
+                        replication.try_publish(descriptor);
                         crate::segment::writer::sync_file(&file)?;
-                        Ok(wave)
+                        Ok((wave, durable))
                     });
                     match result {
-                        Ok(wave) => sync_state.complete_wave(wave),
+                        Ok((wave, durable)) => {
+                            durable_tail.store(durable, Ordering::Release);
+                            sync_state.complete_wave(wave);
+                            // This node's durable cursor advances. With a
+                            // quorum of one this IS the watermark bump that
+                            // releases ack waiters; under replication
+                            // follower cursors join the math.
+                            if let Some(wm) = watermark.advance(node_id, watermark.epoch(), durable)
+                            {
+                                let _ = commit_tx.send(CommitNotification { watermark: wm });
+                            }
+                        }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
@@ -220,9 +281,7 @@ fn spawn_sync_thread(
                                  pending writes are not durable and new appends will be rejected"
                             );
                             sync_state.fail_sync(&e);
-                            // No retry: a post-failure fsync "success" would
-                            // not cover the dropped pages. The thread exits;
-                            // the poisoned flag gates all further appends.
+                            watermark.abort_all(&e.to_string());
                             return;
                         }
                     }
@@ -235,6 +294,81 @@ fn spawn_sync_thread(
         .expect("spawn sync thread");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_wave_descriptor(
+    dir: &Path,
+    wave_id: u64,
+    epoch: u64,
+    previous_base: u64,
+    previous_offset: u64,
+    first_position: u64,
+    current_base: u64,
+    current_offset: u64,
+    next_position: u64,
+) -> Result<WaveDescriptor, Error> {
+    let bases = segment::list_segment_files(dir)?;
+    let mut slices = Vec::new();
+    let selected: Vec<u64> = bases
+        .into_iter()
+        .filter(|base| *base >= previous_base && *base <= current_base)
+        .collect();
+    for (index, &base) in selected.iter().enumerate() {
+        let path = segment::segment_path(dir, base);
+        let byte_start = if base == previous_base {
+            previous_offset
+        } else {
+            segment::SEGMENT_HEADER_SIZE as u64
+        };
+        let byte_end = if base == current_base {
+            current_offset
+        } else {
+            // Sealed segments are truncated to their exact data length at
+            // rotation; unlike the active file this is not preallocation.
+            std::fs::metadata(&path)?.len()
+        };
+        if byte_end > byte_start {
+            slices.push(WaveSlice {
+                path,
+                segment_base: base,
+                byte_start,
+                byte_end,
+                first_position: if base == previous_base {
+                    first_position
+                } else {
+                    base
+                },
+                next_position: selected.get(index + 1).copied().unwrap_or(next_position),
+            });
+        }
+    }
+
+    Ok(WaveDescriptor {
+        wave_id,
+        epoch,
+        previous_segment_base: previous_base,
+        first_position,
+        next_position,
+        slices,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicationCursor {
+    pub position: Position,
+    pub segment_base: u64,
+    pub byte_offset: u64,
+    pub last_record_crc: u32,
+}
+
+/// Result returned to a follower Tail task after bytes enter its local group-
+/// commit wave. The task waits for `wave` before acknowledging upstream.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicatedWrite {
+    pub wave: Option<u64>,
+    pub durable_position: Position,
+    pub byte_count: u64,
+}
+
 /// Configuration options for an event store engine.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
@@ -243,6 +377,10 @@ pub struct StoreOptions {
     pub bloom_cache_size: usize,
     /// Group commit interval in milliseconds. 0 = disabled (sync per write).
     pub group_commit_interval_ms: u64,
+    /// This node's control-plane identity for durable-cursor acknowledgements.
+    pub node_id: crate::replication::watermark::NodeId,
+    /// Exact voter set used for native segment quorum calculations.
+    pub voters: Vec<crate::replication::watermark::NodeId>,
 }
 
 impl Default for StoreOptions {
@@ -252,6 +390,8 @@ impl Default for StoreOptions {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             bloom_cache_size: DEFAULT_BLOOM_CACHE_SIZE,
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
+            node_id: DEFAULT_NODE_ID,
+            voters: vec![DEFAULT_NODE_ID],
         }
     }
 }
@@ -299,6 +439,8 @@ impl StoreOptions {
             index_cache_size,
             bloom_cache_size,
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
+            node_id: DEFAULT_NODE_ID,
+            voters: vec![DEFAULT_NODE_ID],
         }
     }
 }
@@ -406,9 +548,30 @@ pub struct EventStoreEngine {
     /// Group commit synchronization.
     sync_state: Arc<SyncState>,
 
-    /// The head position — next-exclusive: the position the next event will
-    /// be written at, equivalently the count of events committed.
-    head_position: Arc<AtomicU64>,
+    /// This node's control-plane identity.
+    node_id: crate::replication::watermark::NodeId,
+
+    /// The local tail — next-exclusive: the position the next event will be
+    /// written at locally, equivalently the count of events written to the
+    /// local segment log. Advanced at write time, under the writer lock.
+    local_tail: Arc<AtomicU64>,
+
+    /// Highest next-exclusive event position known to have completed local
+    /// fdatasync. Unlike `local_tail`, this never includes a pending wave.
+    durable_tail: Arc<AtomicU64>,
+
+    /// Publishes raw byte ranges at the group-commit wave barrier. It is
+    /// dormant (one subscriber-count check per wave) unless a Tail session is
+    /// attached.
+    replication: Arc<WavePublisher>,
+
+    /// The watermark — the quorum-committed position (next-exclusive). THE
+    /// bound for everything externally visible: reads, subscriptions,
+    /// consistency markers, and acks. On a single node the quorum is one, so
+    /// the watermark tracks the local durable cursor; under native replication
+    /// it advances when a quorum of durable cursors passes a position. Split from `local_tail` so no client can
+    /// ever observe an event that a leader change could truncate.
+    watermark: Arc<WatermarkState>,
 
     /// Broadcast channel for notifying stream subscribers of new commits.
     commit_tx: broadcast::Sender<CommitNotification>,
@@ -458,11 +621,28 @@ impl EventStoreEngine {
         let gc_enabled = opts.group_commit_interval_ms > 0;
         let sync_state = Arc::new(SyncState::new(gc_enabled));
         let writer = Arc::new(parking_lot::Mutex::new(seg_writer));
+        let local_tail = Arc::new(AtomicU64::new(0));
+        let durable_tail = Arc::new(AtomicU64::new(0));
+        let replication = WavePublisher::new();
+        // Fresh stores begin at watermark zero for any voter topology.
+        let voters = if opts.voters.is_empty() {
+            vec![opts.node_id]
+        } else {
+            opts.voters.clone()
+        };
+        let watermark = Arc::new(WatermarkState::new(INITIAL_EPOCH, voters, 0));
 
         if gc_enabled {
             spawn_sync_thread(
+                dir.to_path_buf(),
                 Arc::clone(&sync_state),
                 Arc::clone(&writer),
+                Arc::clone(&local_tail),
+                Arc::clone(&durable_tail),
+                opts.node_id,
+                Arc::clone(&replication),
+                Arc::clone(&watermark),
+                commit_tx.clone(),
                 Duration::from_millis(opts.group_commit_interval_ms),
             );
         }
@@ -472,7 +652,11 @@ impl EventStoreEngine {
             writer,
             tag_index: Arc::new(TagIndex::new()),
             sync_state,
-            head_position: Arc::new(AtomicU64::new(0)),
+            node_id: opts.node_id,
+            local_tail,
+            durable_tail,
+            replication,
+            watermark,
             commit_tx,
             active_index,
             cache: Arc::new(IndexCache::new(
@@ -527,11 +711,41 @@ impl EventStoreEngine {
         let gc_enabled = opts.group_commit_interval_ms > 0;
         let sync_state = Arc::new(SyncState::new(gc_enabled));
         let writer = Arc::new(parking_lot::Mutex::new(seg_writer));
+        let local_tail = Arc::new(AtomicU64::new(head_pos));
+        let durable_tail = Arc::new(AtomicU64::new(head_pos));
+        let replication = WavePublisher::new();
+        // A standalone node may expose every recovered durable byte
+        // immediately. In a cluster, recovery starts at zero until the
+        // control-plane checkpoint/claim re-establishes a quorum; local tail
+        // alone is not evidence of cluster commitment.
+        let voters = if opts.voters.is_empty() {
+            vec![opts.node_id]
+        } else {
+            opts.voters.clone()
+        };
+        let (recovered_epoch, checkpoint_floor) = recover_native_control_state(dir, head_pos)?;
+        let recovered_watermark = if voters.len() == 1 {
+            head_pos
+        } else {
+            checkpoint_floor
+        };
+        let watermark = Arc::new(WatermarkState::new(
+            recovered_epoch,
+            voters,
+            recovered_watermark,
+        ));
 
         if gc_enabled {
             spawn_sync_thread(
+                dir.to_path_buf(),
                 Arc::clone(&sync_state),
                 Arc::clone(&writer),
+                Arc::clone(&local_tail),
+                Arc::clone(&durable_tail),
+                opts.node_id,
+                Arc::clone(&replication),
+                Arc::clone(&watermark),
+                commit_tx.clone(),
                 Duration::from_millis(opts.group_commit_interval_ms),
             );
         }
@@ -541,7 +755,11 @@ impl EventStoreEngine {
             writer,
             tag_index: Arc::new(tag_index),
             sync_state,
-            head_position: Arc::new(AtomicU64::new(head_pos)),
+            node_id: opts.node_id,
+            local_tail,
+            durable_tail,
+            replication,
+            watermark,
             commit_tx,
             active_index,
             cache: Arc::new(IndexCache::new(
@@ -568,6 +786,517 @@ impl EventStoreEngine {
         &self.metrics
     }
 
+    /// Subscribes to raw records published at future wave seals. Tail service
+    /// callers must first source the on-disk catch-up range and only then
+    /// switch to this receiver; its lag error is a reconnect-from-cursor
+    /// signal, never permission to skip bytes.
+    pub fn subscribe_replication(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::replication::dispatcher::LiveFrame> {
+        self.replication.subscribe()
+    }
+
+    /// Local (possibly uncommitted) next-exclusive segment cursor.
+    pub fn local_tail(&self) -> Position {
+        Position(self.local_tail.load(Ordering::Acquire))
+    }
+
+    /// Local next-exclusive cursor that has completed fdatasync.
+    pub fn durable_tail(&self) -> Position {
+        Position(self.durable_tail.load(Ordering::Acquire))
+    }
+
+    /// Waits for all bytes currently admitted to the local writer to complete
+    /// their group-commit wave. The native write gate must be closed when this
+    /// is used as a catch-up/truncation barrier.
+    pub fn drain_pending(&self) -> Result<(), Error> {
+        if !self.sync_state.enabled {
+            return Ok(());
+        }
+        let target = {
+            let _writer = self.writer.lock();
+            let wave = self.sync_state.wave.load(Ordering::Acquire);
+            if self.sync_state.has_pending() {
+                wave
+            } else {
+                wave.saturating_sub(1)
+            }
+        };
+        self.sync_state.wait_for_sync(target)
+    }
+
+    pub fn replication_cursor(&self) -> Result<ReplicationCursor, Error> {
+        self.drain_pending()?;
+        let writer = self.writer.lock();
+        let path = writer.active_segment_path();
+        let byte_offset = writer.write_offset();
+        Ok(ReplicationCursor {
+            position: writer.head(),
+            segment_base: writer.active_base_position(),
+            byte_offset,
+            last_record_crc: last_physical_record_crc(&path, byte_offset)?,
+        })
+    }
+
+    pub fn verify_replication_probe(
+        &self,
+        segment_base: u64,
+        byte_offset: u64,
+        expected_crc: u32,
+    ) -> Result<bool, Error> {
+        let path = segment::segment_path(&self.dir, segment_base);
+        if !path.exists() || byte_offset < segment::SEGMENT_HEADER_SIZE as u64 {
+            return Ok(false);
+        }
+        let valid_end = {
+            let writer = self.writer.lock();
+            if writer.active_base_position() == segment_base {
+                writer.write_offset()
+            } else {
+                std::fs::metadata(&path)?.len()
+            }
+        };
+        if byte_offset > valid_end {
+            return Ok(false);
+        }
+        Ok(last_physical_record_crc(&path, byte_offset)? == expected_crc)
+    }
+
+    pub fn replication_epoch(&self) -> u64 {
+        self.watermark.epoch()
+    }
+
+    /// Sources a suffix from an exact verified physical cursor. Unlike the
+    /// position-only fallback, this includes control records written at an
+    /// unchanged event position (notably EpochChange).
+    pub fn replication_catchup_from_cursor(
+        &self,
+        cursor: ReplicationCursor,
+    ) -> Result<(Position, Vec<WaveSlice>), Error> {
+        let writer = self.writer.lock();
+        let local_tail = self.local_tail.load(Ordering::Acquire);
+        if cursor.position.0 > local_tail {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "replication cursor {} is beyond local tail {local_tail}",
+                    cursor.position.0
+                ),
+            });
+        }
+        let active_base = writer.active_base_position();
+        let active_end = writer.write_offset();
+        let seg_list = self.segments.read().clone();
+        drop(writer);
+        let first_index = seg_list
+            .bases
+            .binary_search(&cursor.segment_base)
+            .map_err(|_| Error::Corrupted {
+                message: format!(
+                    "replication cursor segment {} is not present",
+                    cursor.segment_base
+                ),
+            })?;
+
+        let mut slices = Vec::new();
+        for (index, &base) in seg_list.bases.iter().enumerate().skip(first_index) {
+            let path = segment::segment_path(&self.dir, base);
+            let byte_end = if base == active_base {
+                active_end
+            } else {
+                std::fs::metadata(&path)?.len()
+            };
+            let byte_start = if index == first_index {
+                cursor.byte_offset
+            } else {
+                segment::SEGMENT_HEADER_SIZE as u64
+            };
+            if byte_start > byte_end {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "replication cursor offset {byte_start} exceeds segment {base} end {byte_end}"
+                    ),
+                });
+            }
+            if byte_start < byte_end {
+                slices.push(WaveSlice {
+                    path,
+                    segment_base: base,
+                    byte_start,
+                    byte_end,
+                    first_position: if index == first_index {
+                        cursor.position.0
+                    } else {
+                        base
+                    },
+                    next_position: seg_list.bases.get(index + 1).copied().unwrap_or(local_tail),
+                });
+            }
+        }
+        Ok((Position(local_tail), slices))
+    }
+
+    /// Builds byte ranges that reproduce the local native segment suffix
+    /// beginning at the first event position `from`. Segment headers are
+    /// represented by Rotate boundaries, not data.
+    pub fn replication_catchup_slices(
+        &self,
+        from: Position,
+    ) -> Result<(Position, Vec<WaveSlice>), Error> {
+        // Snapshot tail, active byte end, and segment list under the writer
+        // lock in the same lock order as append (writer → segments). This is
+        // the catch-up/live handoff boundary.
+        let writer = self.writer.lock();
+        let local_tail = self.local_tail.load(Ordering::Acquire);
+        if from.0 > local_tail {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "replication cursor {} is beyond local tail {}",
+                    from.0, local_tail
+                ),
+            });
+        }
+        if from.0 == local_tail {
+            return Ok((Position(local_tail), Vec::new()));
+        }
+
+        let active_base = writer.active_base_position();
+        let active_end = writer.write_offset();
+        let seg_list = self.segments.read().clone();
+        drop(writer);
+        let first_index = match seg_list.bases.binary_search(&from.0) {
+            Ok(index) => index,
+            Err(0) => 0,
+            Err(index) => index - 1,
+        };
+
+        let mut slices = Vec::new();
+        for (index, &base) in seg_list.bases.iter().enumerate().skip(first_index) {
+            let path = segment::segment_path(&self.dir, base);
+            let byte_end = if base == active_base {
+                active_end
+            } else {
+                std::fs::metadata(&path)?.len()
+            };
+            let byte_start = if index == first_index {
+                find_replication_start(&path, from)?
+            } else {
+                segment::SEGMENT_HEADER_SIZE as u64
+            };
+            if byte_start < byte_end {
+                slices.push(WaveSlice {
+                    path,
+                    segment_base: base,
+                    byte_start,
+                    byte_end,
+                    first_position: if index == first_index { from.0 } else { base },
+                    next_position: seg_list.bases.get(index + 1).copied().unwrap_or(local_tail),
+                });
+            }
+        }
+        Ok((Position(local_tail), slices))
+    }
+
+    /// Applies raw Tail bytes to this follower's authoritative segment log.
+    /// No DCB evaluation occurs: the claimed leader already serialized the
+    /// write under the same epoch. The returned wave must be durable before a
+    /// TailAck is sent.
+    pub fn apply_replicated_records(
+        &self,
+        epoch: u64,
+        segment_base: u64,
+        first_position: Position,
+        bytes: &[u8],
+    ) -> Result<ReplicatedWrite, Error> {
+        if epoch != self.watermark.epoch() {
+            return Err(Error::Io(io::Error::other(format!(
+                "replication frame epoch {epoch} does not match current epoch {}",
+                self.watermark.epoch()
+            ))));
+        }
+        if self.sync_state.is_failed() {
+            return Err(self.sync_state.failure_error());
+        }
+        if self.sync_state.shutdown.load(Ordering::Acquire) {
+            return Err(Error::Io(io::Error::other(
+                "event store is shutting down; replicated append rejected",
+            )));
+        }
+
+        let (result, wave) = {
+            let mut writer = self.writer.lock();
+            if writer.active_base_position() != segment_base {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "replication frame targets segment {segment_base}, active segment is {}",
+                        writer.active_base_position()
+                    ),
+                });
+            }
+            let wave = self
+                .sync_state
+                .enabled
+                .then(|| self.sync_state.mark_pending());
+            let result = writer.append_raw_replicated(bytes, first_position)?;
+            self.local_tail
+                .store(result.durable_position.0, Ordering::Release);
+            if !self.sync_state.enabled {
+                writer.sync()?;
+            }
+            (result, wave)
+        };
+
+        if !self.sync_state.enabled {
+            self.durable_tail
+                .store(result.durable_position.0, Ordering::Release);
+        }
+        for fields in &result.events {
+            self.tag_index
+                .index_event(fields.position, &fields.name, &fields.tags);
+        }
+
+        Ok(ReplicatedWrite {
+            wave,
+            durable_position: result.durable_position,
+            byte_count: bytes.len() as u64,
+        })
+    }
+
+    /// Waits until a replicated frame's local segment bytes are fdatasync'd.
+    pub fn wait_replicated_durable(&self, write: ReplicatedWrite) -> Result<(), Error> {
+        if let Some(wave) = write.wave {
+            self.sync_state.wait_for_sync(wave)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Applies an explicit leader-decided rotation. This is the only way a
+    /// follower changes segment boundaries, preserving byte-identical files.
+    pub fn rotate_replicated(&self, epoch: u64, new_base: Position) -> Result<(), Error> {
+        if epoch != self.watermark.epoch() {
+            return Err(Error::Io(io::Error::other("stale Rotate epoch")));
+        }
+        let mut writer = self.writer.lock();
+        let old_base = writer.active_base_position();
+        if old_base == new_base.0 && writer.head() == new_base {
+            return Ok(()); // Idempotent replay after reconnect.
+        }
+        writer.rotate_replicated(new_base)?;
+        let mut seg_list = self.segments.write();
+        seg_list.sealed_count += 1;
+        seg_list.bases.push(new_base.0);
+        self.metrics.record_segment_rotation();
+        drop(seg_list);
+        drop(writer);
+        self.spawn_tag_index_prune(new_base.0);
+        Ok(())
+    }
+
+    /// Truncates an uncommitted suffix during divergence repair. This is the
+    /// sole destructive entry point and will crash rather than cross the
+    /// watermark invariant.
+    pub fn truncate_to(&self, pos: Position) -> Result<(), Error> {
+        self.drain_pending()?;
+        let watermark = self.watermark.get();
+        assert!(
+            pos.0 >= watermark,
+            "refusing to truncate committed data: target {} < watermark {}",
+            pos.0,
+            watermark
+        );
+        let old_tail = self.local_tail.load(Ordering::Acquire);
+        if pos.0 > old_tail {
+            return Err(Error::Corrupted {
+                message: format!("truncate target {} exceeds local tail {old_tail}", pos.0),
+            });
+        }
+        if pos.0 == old_tail {
+            return Ok(());
+        }
+
+        let mut writer = self.writer.lock();
+        let mut seg_list = self.segments.write();
+        let target_index = match seg_list.bases.binary_search(&pos.0) {
+            Ok(index) => index,
+            Err(0) => {
+                return Err(Error::Corrupted {
+                    message: format!("no segment contains truncate position {}", pos.0),
+                });
+            }
+            Err(index) => index - 1,
+        };
+        let target_base = seg_list.bases[target_index];
+        let target_path = segment::segment_path(&self.dir, target_base);
+        let truncate_offset = find_replication_start(&target_path, pos)?;
+
+        for &base in &seg_list.bases[target_index + 1..] {
+            let path = segment::segment_path(&self.dir, base);
+            remove_if_exists(&path)?;
+            remove_if_exists(&path.with_extension("idx"))?;
+            remove_if_exists(&path.with_extension("bloom"))?;
+            self.cache.invalidate(base);
+        }
+        // The containing segment becomes active; its sealed companions no
+        // longer describe the truncated file.
+        remove_if_exists(&target_path.with_extension("idx"))?;
+        remove_if_exists(&target_path.with_extension("bloom"))?;
+        self.cache.invalidate(target_base);
+
+        writer.reopen_truncated(target_base, truncate_offset, pos)?;
+        seg_list.bases.truncate(target_index + 1);
+        seg_list.sealed_count = target_index;
+        self.local_tail.store(pos.0, Ordering::Release);
+        self.durable_tail.store(pos.0, Ordering::Release);
+        drop(seg_list);
+        drop(writer);
+
+        self.tag_index.prune_from(pos.0);
+        // If truncation reopened a previously sealed segment, restore its
+        // retained prefix to the active TagIndex.
+        rebuild_active_segment_index(&self.dir, &self.tag_index)?;
+        Ok(())
+    }
+
+    /// Installs a claimed epoch and exact voter set, aborting all prior-epoch
+    /// append waiters. The caller must durably append the leader's EpochChange
+    /// before opening its write gate.
+    pub fn begin_replication_epoch(
+        &self,
+        epoch: u64,
+        voters: impl IntoIterator<Item = u64>,
+    ) -> Result<(), Error> {
+        self.watermark.begin_epoch(epoch, voters)
+    }
+
+    /// Writes and durably commits the EpochChange record at a hard segment
+    /// boundary. Called only by the newly claimed leader before accepting
+    /// native writes.
+    pub fn persist_epoch_change(&self, epoch: u64, leader_id: u64) -> Result<(), Error> {
+        if epoch != self.watermark.epoch() || leader_id != self.node_id {
+            return Err(Error::Io(io::Error::other(
+                "cannot persist an epoch not claimed by this node",
+            )));
+        }
+        let wave = {
+            let mut writer = self.writer.lock();
+            let strict_start = (!self.sync_state.enabled).then(|| {
+                (
+                    writer.active_base_position(),
+                    writer.write_offset(),
+                    writer.head().0,
+                )
+            });
+            if writer.has_records() {
+                let new_base = writer.head();
+                writer.rotate_replicated(new_base)?;
+                let mut seg_list = self.segments.write();
+                seg_list.sealed_count += 1;
+                seg_list.bases.push(new_base.0);
+                self.metrics.record_segment_rotation();
+            }
+            let wave = self
+                .sync_state
+                .enabled
+                .then(|| self.sync_state.mark_pending());
+            let start_position = writer.head().0;
+            writer.write_control(&crate::segment::format::ControlRecord::EpochChange {
+                epoch,
+                leader_id,
+                start_position,
+            })?;
+            if let Some((base, offset, position)) = strict_start {
+                if self.replication.has_subscribers() {
+                    self.replication.try_publish(build_wave_descriptor(
+                        &self.dir,
+                        epoch,
+                        epoch,
+                        base,
+                        offset,
+                        position,
+                        writer.active_base_position(),
+                        writer.write_offset(),
+                        writer.head().0,
+                    )?);
+                }
+                writer.sync()?;
+            }
+            wave
+        };
+        if let Some(wave) = wave {
+            self.sync_state.wait_for_sync(wave)?;
+        }
+        Ok(())
+    }
+
+    /// Persists a coarse committed-watermark floor in the authoritative segment
+    /// log. The control record enters the normal group-commit wave, so live
+    /// followers receive and fdatasync the exact same bytes.
+    pub fn persist_watermark_checkpoint(&self) -> Result<(), Error> {
+        let epoch = self.watermark.epoch();
+        let position = self.watermark.get();
+        let wave = {
+            let mut writer = self.writer.lock();
+            let strict_start = (!self.sync_state.enabled).then(|| {
+                (
+                    writer.active_base_position(),
+                    writer.write_offset(),
+                    writer.head().0,
+                )
+            });
+            let wave = self
+                .sync_state
+                .enabled
+                .then(|| self.sync_state.mark_pending());
+            writer.write_control(
+                &crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position },
+            )?;
+            if let Some((base, offset, first_position)) = strict_start {
+                if self.replication.has_subscribers() {
+                    self.replication.try_publish(build_wave_descriptor(
+                        &self.dir,
+                        position,
+                        epoch,
+                        base,
+                        offset,
+                        first_position,
+                        writer.active_base_position(),
+                        writer.write_offset(),
+                        writer.head().0,
+                    )?);
+                }
+                writer.sync()?;
+            }
+            wave
+        };
+        if let Some(wave) = wave {
+            self.sync_state.wait_for_sync(wave)?;
+        }
+        Ok(())
+    }
+
+    /// Waits until the current epoch's quorum watermark reaches `pos`.
+    pub fn wait_for_watermark(&self, pos: Position) -> Result<(), Error> {
+        self.watermark.wait_for(pos.0)
+    }
+
+    /// Leader-side durable cursor acknowledgement. If quorum moves, wakes
+    /// append waiters and publishes the new externally-visible bound.
+    pub fn acknowledge_replica(&self, node: u64, epoch: u64, pos: Position) -> Option<Position> {
+        let watermark = self.watermark.advance(node, epoch, pos.0)?;
+        let _ = self.commit_tx.send(CommitNotification { watermark });
+        Some(Position(watermark))
+    }
+
+    /// Follower-side adoption of the claimed leader's computed watermark.
+    pub fn adopt_watermark(&self, epoch: u64, pos: Position) {
+        if pos.0 > self.local_tail.load(Ordering::Acquire) {
+            return; // Never expose bytes this follower has not applied.
+        }
+        if let Some(watermark) = self.watermark.adopt(epoch, pos.0) {
+            let _ = self.commit_tx.send(CommitNotification { watermark });
+        }
+    }
+
     /// Takes a point-in-time snapshot of all metrics, including cache stats.
     pub fn metrics_snapshot(&self) -> crate::metrics::MetricsSnapshot {
         let mut snap = self.metrics.snapshot();
@@ -586,251 +1315,10 @@ impl EventStoreEngine {
     /// 3. Updates the in-memory tag index
     /// 4. Advances the head position (next-exclusive)
     pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
-        self.append_internal(request, None)
+        self.append_internal(request)
     }
 
-    /// Like `append`, but atomically persists the applied Raft `LogId` alongside
-    /// the events by emitting a `RaftMarker::normal(term, index, count)` record
-    /// in the same segment fsync. Used by the Raft state machine so boot-time
-    /// recovery can reconstruct `last_applied` from segment scan — no sidecar
-    /// file, no extra fsync.
-    ///
-    /// For empty event batches (condition-only or rejected-after-check) this
-    /// method does not emit a marker — `last_applied` will be recovered from
-    /// the next Normal entry that produces events. Membership/Blank entries
-    /// are not persisted here; see `state_machine::apply` for rationale.
-    pub fn append_with_raft(
-        &self,
-        request: AppendRequest,
-        applied: AppliedLogId,
-    ) -> Result<AppendResponse, Error> {
-        self.append_internal(request, Some(applied))
-    }
-
-    /// Applies a whole batch of raft-marked appends under ONE writer lock and
-    /// ONE fsync. This is the state machine's bulk path: openraft delivers
-    /// `apply()` batches, and syncing once per batch instead of once per entry
-    /// is what lets concurrent consensus appends share an fsync the same way
-    /// concurrent direct appends share one via group commit.
-    ///
-    /// Per-item DCB violations come back as `Err` in that item's slot (they
-    /// are deterministic, valid outcomes); any other error aborts the whole
-    /// batch as fatal. Items are applied in order — an item's DCB check sees
-    /// every earlier item's writes.
-    pub fn append_with_raft_batch(
-        &self,
-        batch: Vec<(AppendRequest, AppliedLogId)>,
-    ) -> Result<Vec<Result<AppendResponse, Error>>, Error> {
-        if batch.is_empty() {
-            return Ok(vec![]);
-        }
-        let timer = Timer::start();
-
-        if self.sync_state.is_failed() {
-            return Err(self.sync_state.failure_error());
-        }
-        if self.sync_state.shutdown.load(Ordering::Relaxed) {
-            return Err(Error::Io(io::Error::other(
-                "event store is shutting down; append rejected",
-            )));
-        }
-
-        let target_epoch = if self.sync_state.enabled {
-            Some(self.sync_state.mark_pending())
-        } else {
-            None
-        };
-
-        let item_count = batch.len() as u64;
-        let results = {
-            let mut writer = self.writer.lock();
-            let mut results = Vec::with_capacity(batch.len());
-            for (request, applied) in &batch {
-                match self.append_locked(&mut writer, request, Some(*applied)) {
-                    Ok(resp) => results.push(Ok(resp)),
-                    Err(e @ Error::ConsistencyConditionViolated { .. }) => results.push(Err(e)),
-                    // Anything else is fatal for the whole batch: the writer
-                    // may hold partially-written earlier items whose fsync
-                    // outcome the caller must not assume.
-                    Err(fatal) => return Err(fatal),
-                }
-            }
-            // Strict mode: one explicit fsync for the whole batch.
-            if !self.sync_state.enabled {
-                writer.sync()?;
-            }
-            results
-        };
-
-        // Group-commit mode: NO wait. For consensus appends the client-ack
-        // durability guarantee comes from the raft LOG fsync (an entry is
-        // only committed once quorum-durable in the log), and the write is
-        // replayable: if the process dies before the segment fsync lands,
-        // the missing `RaftMarker` makes recovery re-apply these entries
-        // from the log (see `reconcile_with_log`). `mark_pending` above has
-        // already scheduled the fsync with the sync thread. Not blocking
-        // here keeps openraft's state-machine worker free to apply the next
-        // batch — waiting would cap consensus throughput at ~1 apply per
-        // group-commit interval regardless of concurrency.
-        let _ = target_epoch;
-
-        let per_item_us = timer.elapsed_us() / item_count.max(1);
-        for result in results.iter().flatten() {
-            self.metrics.record_append(result.count, per_item_us);
-        }
-        Ok(results)
-    }
-
-    /// Applies every item of ONE raft `AppendBatch` entry under a single
-    /// writer lock, a single raft marker, and (in group-commit mode) zero
-    /// fsync waits.
-    ///
-    /// Crash-safety shape: unlike `append_with_raft_batch` (independent
-    /// entries, marker per entry), all items here belong to one log entry —
-    /// a torn write must never leave a *prefix* of the entry durable with a
-    /// marker claiming the entry applied, or the tail would be lost without
-    /// replay. So the whole entry persists as ONE `RaftMarker` followed by
-    /// every accepted event: either the marker+events survive recovery
-    /// (entry fully applied) or they're truncated (entry replays from the
-    /// raft log).
-    ///
-    /// DCB checks run in a first pass with in-batch visibility: item K's
-    /// condition sees committed state plus the accepted events of items
-    /// 0..K. Rejections are deterministic per-item outcomes.
-    pub fn append_with_raft_entry_batch(
-        &self,
-        items: Vec<AppendRequest>,
-        applied: AppliedLogId,
-    ) -> Result<Vec<Result<AppendResponse, Error>>, Error> {
-        if items.is_empty() {
-            return Ok(vec![]);
-        }
-        let timer = Timer::start();
-
-        if self.sync_state.is_failed() {
-            return Err(self.sync_state.failure_error());
-        }
-        if self.sync_state.shutdown.load(Ordering::Relaxed) {
-            return Err(Error::Io(io::Error::other(
-                "event store is shutting down; append rejected",
-            )));
-        }
-
-        let item_count = items.len() as u64;
-        let results = {
-            let mut writer = self.writer.lock();
-            if self.sync_state.enabled {
-                // Register with the current group-commit wave (no wait below;
-                // durability comes from the raft log — see batch fn).
-                self.sync_state.mark_pending();
-            }
-
-            // Pass 1: per-item DCB with in-batch visibility. Provisional
-            // positions start at the current head; accepted events extend
-            // the in-batch view the next items are checked against.
-            let base = writer.head();
-            let mut outcomes: Vec<Result<Position, Error>> = Vec::with_capacity(items.len());
-            let mut accepted_events: Vec<&crate::event::AppendEvent> = Vec::new();
-            for request in &items {
-                if let Some(condition) = &request.condition {
-                    if let Some(pos) = self.check_dcb_locked(condition)? {
-                        outcomes.push(Err(Error::ConsistencyConditionViolated {
-                            conflicting_position: pos,
-                        }));
-                        continue;
-                    }
-                    // In-batch conflicts: earlier accepted items' events.
-                    let conflict = accepted_events.iter().enumerate().find(|(_, e)| {
-                        condition
-                            .criteria
-                            .criteria
-                            .iter()
-                            .any(|c| event_matches_criterion(c, &e.name, &e.tags))
-                    });
-                    if let Some((offset, _)) = conflict {
-                        self.metrics.record_dcb_violation();
-                        outcomes.push(Err(Error::ConsistencyConditionViolated {
-                            conflicting_position: Position(base.0 + offset as u64),
-                        }));
-                        continue;
-                    }
-                }
-                outcomes.push(Ok(Position(base.0 + accepted_events.len() as u64)));
-                accepted_events.extend(request.events.iter());
-            }
-
-            // Pass 2: one marker covering every accepted event, then the
-            // events themselves, all in one segment (write_raft_entry
-            // pre-rotates so marker+events never straddle a boundary).
-            let total = accepted_events.len();
-            if total > 0 {
-                let count_u16 = u16::try_from(total).map_err(|_| Error::Corrupted {
-                    message: "raft-marked batch exceeds u16::MAX events".into(),
-                })?;
-                let marker = crate::segment::format::RaftMarker::normal(
-                    applied.term,
-                    applied.index,
-                    count_u16,
-                );
-                let all_events: Vec<crate::event::AppendEvent> =
-                    accepted_events.iter().map(|e| (*e).clone()).collect();
-                let old_active_base = writer.active_base_position();
-                let (first_position, _count) = writer.write_raft_entry(&marker, &all_events)?;
-                debug_assert_eq!(first_position, base);
-                if !self.sync_state.enabled {
-                    writer.sync()?;
-                }
-
-                let new_active_base = writer.active_base_position();
-                if new_active_base != old_active_base {
-                    let mut seg_list = self.segments.write();
-                    seg_list.sealed_count += 1;
-                    seg_list.bases.push(new_active_base);
-                    self.metrics.record_segment_rotation();
-                    drop(seg_list);
-                    self.spawn_tag_index_prune(new_active_base);
-                }
-
-                let mut pos = first_position;
-                for event in &all_events {
-                    self.tag_index.index_event(pos, &event.name, &event.tags);
-                    pos = pos.next();
-                }
-                let new_head = first_position.0 + total as u64;
-                self.head_position.store(new_head, Ordering::Release);
-                let _ = self.commit_tx.send(CommitNotification {
-                    head_position: new_head,
-                });
-            }
-
-            let final_head = self.head_position.load(Ordering::Acquire);
-            items
-                .iter()
-                .zip(outcomes)
-                .map(|(request, outcome)| {
-                    outcome.map(|first_position| AppendResponse {
-                        first_position,
-                        count: request.events.len() as u32,
-                        consistency_marker: Position(final_head),
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Group-commit mode: no fsync wait — same durability argument as
-        // `append_with_raft_batch` (raft log fsync + marker replay).
-        let per_item_us = timer.elapsed_us() / item_count.max(1);
-        for result in results.iter().flatten() {
-            self.metrics.record_append(result.count, per_item_us);
-        }
-        Ok(results)
-    }
-
-    fn append_internal(
-        &self,
-        request: AppendRequest,
-        applied: Option<AppliedLogId>,
-    ) -> Result<AppendResponse, Error> {
+    fn append_internal(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
         let timer = Timer::start();
 
         // Fail fast once poisoned: after an fsync failure nothing written
@@ -847,29 +1335,86 @@ impl EventStoreEngine {
             )));
         }
 
-        let target_epoch = if self.sync_state.enabled {
-            Some(self.sync_state.mark_pending())
-        } else {
-            None
-        };
-
-        let response = {
+        let outcome = {
             // Lock the writer. DCB check + write + index update must be atomic.
             let mut writer = self.writer.lock();
-            let response = self.append_locked(&mut writer, &request, applied)?;
-            // Strict (non-group-commit) mode: make the write durable before
-            // acking. `append_locked` never fsyncs by itself.
-            if !self.sync_state.enabled && response.count > 0 {
-                writer.sync()?;
+            let strict_start = (!self.sync_state.enabled).then(|| {
+                (
+                    writer.active_base_position(),
+                    writer.write_offset(),
+                    writer.head().0,
+                )
+            });
+            if self.sync_state.enabled {
+                self.sync_state.mark_pending();
             }
-            response
+            match self.append_locked(&mut writer, &request) {
+                Ok(response) => {
+                    // Strict mode still publishes the raw wave before entering
+                    // fdatasync, preserving replication/fsync overlap.
+                    if let Some((base, offset, position)) = strict_start
+                        && response.count > 0
+                    {
+                        if self.replication.has_subscribers() {
+                            let descriptor = build_wave_descriptor(
+                                &self.dir,
+                                response.consistency_marker.0,
+                                self.watermark.epoch(),
+                                base,
+                                offset,
+                                position,
+                                writer.active_base_position(),
+                                writer.write_offset(),
+                                response.consistency_marker.0,
+                            )?;
+                            self.replication.try_publish(descriptor);
+                        }
+                        writer.sync()?;
+                        self.durable_tail
+                            .store(response.consistency_marker.0, Ordering::Release);
+                    }
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
         };
 
-        // Step 6: Wait for fsync (group commit only). A failed fsync surfaces
-        // here as an error — the caller must NOT treat the write as durable.
-        if let Some(epoch) = target_epoch {
-            self.sync_state.wait_for_sync(epoch)?;
+        let response = match outcome {
+            Ok(response) => response,
+            Err(
+                error @ Error::ConsistencyConditionViolated {
+                    conflicting_position,
+                },
+            ) => {
+                // A local conflict above the watermark may still be truncated
+                // on epoch loss. Do not expose a rejection until the event
+                // justifying it is quorum-committed. Waiting happens after the
+                // writer lock is released so the sync thread can seal its wave.
+                self.watermark.wait_for(conflicting_position.0 + 1)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        // Step 6: Ack gate. The consistency marker is the append's covering
+        // tail (its own last position + 1, or — for condition-only appends —
+        // everything the DCB check read), so `watermark >= marker` means the
+        // write is quorum-committed and externally visible.
+        if !self.sync_state.enabled && response.count > 0 {
+            // Strict mode fsynced inline above; that advances only this node's
+            // durable cursor. A clustered leader still waits for follower
+            // cursors to form a quorum.
+            if let Some(watermark) = self.watermark.advance(
+                self.node_id,
+                self.watermark.epoch(),
+                response.consistency_marker.0,
+            ) {
+                let _ = self.commit_tx.send(CommitNotification { watermark });
+            }
         }
+        // Group commit: the sync thread advances this node after fdatasync.
+        // Both modes share the same quorum ack gate.
+        self.watermark.wait_for(response.consistency_marker.0)?;
 
         self.metrics
             .record_append(response.count, timer.elapsed_us());
@@ -943,7 +1488,6 @@ impl EventStoreEngine {
         &self,
         writer: &mut SegmentWriter,
         request: &AppendRequest,
-        applied: Option<AppliedLogId>,
     ) -> Result<AppendResponse, Error> {
         {
             // Step 1: Check DCB condition.
@@ -960,37 +1504,15 @@ impl EventStoreEngine {
                 return Ok(AppendResponse {
                     first_position: head,
                     count: 0,
-                    consistency_marker: Position(self.head_position.load(Ordering::Acquire)),
+                    consistency_marker: Position(self.local_tail.load(Ordering::Acquire)),
                 });
             }
 
             let old_active_base = writer.active_base_position();
 
-            // Step 2: Write events (+ Raft marker, if threaded in).
-            //
-            // When `applied` is Some, we route through `SegmentWriter::write_raft_entry`
-            // which emits a `RaftMarker::normal(term, index, count)` record *before* the
-            // event records in the same segment. That marker is the durable witness of
-            // `last_applied` — on restart, scanning raft markers across all segments
-            // reconstructs it without an extra fsync or sidecar file. The marker + its
-            // events are guaranteed not to straddle a segment boundary (see
-            // `write_raft_entry` pre-rotate check).
-            let (first_position, count) = if let Some(log_id) = applied {
-                let count_u16 =
-                    u16::try_from(request.events.len()).map_err(|_| Error::Corrupted {
-                        message: "raft-marked append exceeds u16::MAX events".into(),
-                    })?;
-                let marker = crate::segment::format::RaftMarker::normal(
-                    log_id.term,
-                    log_id.index,
-                    count_u16,
-                );
-                writer.write_raft_entry(&marker, &request.events)?
-            } else {
-                // Write without fsync — durability is the caller's job
-                // (group-commit epoch wait, or an explicit strict-mode sync).
-                writer.write_events(&request.events)?
-            };
+            // Step 2: Write events without fsync. Durability is the caller's
+            // group-commit wave wait or explicit strict-mode sync.
+            let (first_position, count) = writer.write_events(&request.events)?;
 
             // Step 2b: Detect rotation and update cached segment list.
             let new_active_base = writer.active_base_position();
@@ -1012,15 +1534,13 @@ impl EventStoreEngine {
                 pos = pos.next();
             }
 
-            // Step 4: Advance head position (next-exclusive: first event's
+            // Step 4: Advance the local tail (next-exclusive: first event's
             // position + count = position the next event will land at).
+            // Watermark publication — and with it the subscriber wakeup —
+            // is the caller's job at its commit point: the sync thread after
+            // the wave fsync (group commit) or the inline fsync (strict mode).
             let new_head = first_position.0 + count as u64;
-            self.head_position.store(new_head, Ordering::Release);
-
-            // Step 5: Notify stream subscribers.
-            let _ = self.commit_tx.send(CommitNotification {
-                head_position: new_head,
-            });
+            self.local_tail.store(new_head, Ordering::Release);
 
             Ok(AppendResponse {
                 first_position,
@@ -1032,7 +1552,7 @@ impl EventStoreEngine {
 
     /// Gets tags for an event at the given position by reading from the segment.
     pub fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error> {
-        let head = self.head_position.load(Ordering::Acquire);
+        let head = self.watermark.get();
         if position.0 >= head {
             return Err(Error::Corrupted {
                 message: format!("position {} does not exist", position.0),
@@ -1082,7 +1602,7 @@ impl EventStoreEngine {
     /// Scans segments from oldest to newest, reading events linearly within each segment.
     /// This is an infrequently-called operation so a linear scan is acceptable.
     pub fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
-        let head = self.head_position.load(Ordering::Acquire);
+        let head = self.watermark.get();
         if head == 0 {
             return Ok(None);
         }
@@ -1117,25 +1637,27 @@ impl EventStoreEngine {
         Ok(None)
     }
 
-    /// Creates a live event stream subscription.
+    /// Creates a live event stream subscription. Delivery is bounded by the
+    /// watermark — subscribers only ever see quorum-committed events.
     pub fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
         EventStream::new(
             condition,
             from_position,
             self.commit_tx.subscribe(),
-            Arc::clone(&self.head_position),
+            self.watermark.handle(),
         )
     }
 
     /// Returns the current head position (next position to be assigned;
-    /// equivalently, the count of events committed).
+    /// equivalently, the count of events committed). This is the watermark —
+    /// the externally visible, quorum-committed head.
     ///
-    /// Reads the committed-head atomic — no writer lock, so read-path
-    /// callers (Source/GetHead) never contend with appends or the group
-    /// commit sync thread. Mid-batch writes are not visible here until the
-    /// batch commits, which is exactly the externally-observable head.
+    /// Reads an atomic — no writer lock, so read-path callers (Source/
+    /// GetHead) never contend with appends or the group commit sync thread.
+    /// Mid-batch writes are not visible here until the batch commits, which
+    /// is exactly the externally-observable head.
     pub fn head(&self) -> Position {
-        Position(self.head_position.load(Ordering::Acquire))
+        Position(self.watermark.get())
     }
 
     /// Returns the tail position (first available event position).
@@ -1144,12 +1666,8 @@ impl EventStoreEngine {
     /// For a non-empty, non-truncated store, returns `Position(0)` — the
     /// position of the first event, since the log is 0-based.
     pub fn tail(&self) -> Position {
-        let head = self.head_position.load(Ordering::Acquire);
-        if head == 0 {
-            Position(0) // Empty: tail == head == 0.
-        } else {
-            Position(0) // TODO: Track actual tail for truncated stores.
-        }
+        // Authoritative event segments are never truncated.
+        Position(0)
     }
 
     /// Reads events matching a query from `from_position` up to the current head.
@@ -1165,7 +1683,7 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
     ) -> Result<Vec<SequencedEvent>, Error> {
         let timer = Timer::start();
-        let head = self.head_position.load(Ordering::Acquire);
+        let head = self.watermark.get();
 
         // Read cached segment list — no readdir syscall.
         let seg_list = self.segments.read().clone();
@@ -1318,7 +1836,7 @@ impl EventStoreEngine {
         up_to: Option<Position>,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, Error> {
-        let head = self.head_position.load(Ordering::Acquire);
+        let head = self.watermark.get();
         let head = match up_to {
             Some(bound) => head.min(bound.0),
             None => head,
@@ -1431,110 +1949,12 @@ impl EventStoreEngine {
 
         Ok(events)
     }
-
-    /// Scans all on-disk segments for persisted `RaftMarker` records and
-    /// returns the maximum `(term, index)` seen. Used on boot to reconstruct
-    /// the Raft state-machine's `last_applied` without any sidecar file.
-    ///
-    /// Cheap enough for boot: sealed segments have bounded size (256 MB default)
-    /// and only markers are deserialized; event payloads are skipped by the
-    /// `iter_raft_markers` iterator. Returns `None` if no markers are present
-    /// (fresh store, or legacy data written before this plan).
-    pub fn max_applied_log_id(&self) -> Result<Option<AppliedLogId>, Error> {
-        use crate::segment::format::RaftEntryType;
-
-        let seg_list = self.segments.read().clone();
-        let mut best: Option<(u64, u64)> = None;
-        for &base in &seg_list.bases {
-            let seg_path = segment::segment_path(&self.dir, base);
-            let reader = match SegmentReader::open(&seg_path) {
-                Ok(r) => r,
-                Err(_) => continue, // Missing / unreadable segments don't contribute.
-            };
-            for item in reader.iter_raft_markers() {
-                let (_, marker) = match item {
-                    Ok(m) => m,
-                    Err(_) => break, // Torn tail in this segment — stop scanning it.
-                };
-                // Membership and Blank markers are informational here (we don't
-                // persist them in this plan), but if any appear just honour their
-                // term/index as well — they cannot decrease the max.
-                let _ = RaftEntryType::Normal; // readability
-                let candidate = (marker.term, marker.index);
-                if best.map(|b| candidate > b).unwrap_or(true) {
-                    best = Some(candidate);
-                }
-            }
-        }
-        Ok(best.map(|(term, index)| AppliedLogId { term, index }))
-    }
-
-    /// Returns every stored event with position >= `from_position` up to the
-    /// current committed head, in ascending position order, with tags attached.
-    ///
-    /// Used by the Raft snapshot builder (Phase 4, SNAP-01). Unlike `source` /
-    /// `source_stored`, this applies no criterion filter — every event matches.
-    /// Walks sealed segments (via cached mmap) and the active segment with no
-    /// readdir / stat calls in the hot loop; iteration mirrors the same
-    /// segment-list walk used by `source` / `source_stored`.
-    ///
-    /// Scope note: this is an inherent method on `EventStoreEngine`, not a
-    /// trait method on `EventStore`. The trait is the client-facing contract
-    /// (kept wire-stable per PROJECT.md constraint); snapshot building is
-    /// internal to the Raft state-machine path.
-    pub fn source_all(&self, from_position: Position) -> Result<Vec<StoredEvent>, Error> {
-        let head = self.head_position.load(Ordering::Acquire);
-        let seg_list = self.segments.read().clone();
-        if seg_list.bases.is_empty() || head == 0 {
-            return Ok(vec![]);
-        }
-
-        let mut events = Vec::new();
-        for (i, &base) in seg_list.bases.iter().enumerate() {
-            if base >= head {
-                break;
-            }
-            let seg_path = segment::segment_path(&self.dir, base);
-            let is_last = i + 1 == seg_list.bases.len();
-            let seg_end = if !is_last {
-                seg_list.bases[i + 1] - 1
-            } else {
-                head - 1
-            };
-            if seg_end < from_position.0 {
-                continue;
-            }
-
-            let reader = if seg_list.is_sealed(i) {
-                let mmap = self.cache.get_mmap(&seg_path, base)?;
-                SegmentReader::from_shared_mmap(mmap)?
-            } else {
-                SegmentReader::open(&seg_path)?
-            };
-
-            // `iter(Some(up_to))` stops once it sees a position >= up_to;
-            // pass head so every committed event (positions 0..head) is yielded.
-            for result in reader.iter(Some(Position(head))) {
-                let stored = result?;
-                if stored.position.0 < from_position.0 {
-                    continue;
-                }
-                if stored.position.0 >= head {
-                    break;
-                }
-                events.push(stored);
-            }
-        }
-        Ok(events)
-    }
 }
 
 #[async_trait::async_trait]
 impl EventStore for EventStoreEngine {
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
-        // Delegates to the inherent sync method. No .await points —
-        // compiles to a ready future. The inherent method is what the
-        // Raft state machine calls directly (bypassing the trait).
+        // Delegates to the inherent synchronous native append method.
         self.append(request)
     }
 
@@ -1577,6 +1997,14 @@ impl EventStore for EventStoreEngine {
     }
 }
 
+fn remove_if_exists(path: &Path) -> Result<(), Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Counts how many segments are sealed (have companion .idx/.bloom files).
 /// Called once during open to populate the cached segment list.
 fn count_sealed_segments(dir: &Path, bases: &[u64], active_base: u64) -> usize {
@@ -1593,6 +2021,134 @@ fn count_sealed_segments(dir: &Path, bases: &[u64], active_base: u64) -> usize {
         }
     }
     count
+}
+
+fn recover_native_control_state(dir: &Path, local_tail: u64) -> Result<(u64, u64), Error> {
+    use std::io::Read;
+
+    let mut recovered_epoch = INITIAL_EPOCH;
+    let mut checkpoint = 0u64;
+    for base in segment::list_segment_files(dir)? {
+        let path = segment::segment_path(dir, base);
+        let mut file = std::fs::File::open(&path)?;
+        let mut segment_header = [0u8; segment::SEGMENT_HEADER_SIZE];
+        file.read_exact(&mut segment_header)?;
+        loop {
+            let mut header = [0u8; segment::RECORD_HEADER_SIZE];
+            match file.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            }
+            let header = match crate::segment::record::parse_header(&header)? {
+                Some(header) => header,
+                None => break,
+            };
+            let mut payload = vec![0u8; header.payload_len];
+            if let Err(error) = file.read_exact(&mut payload) {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(error.into());
+            }
+            if !crate::segment::record::validate_crc(header, &payload) {
+                break;
+            }
+            let crate::segment::record::NativeRecord::Control(control) =
+                crate::segment::record::decode_native(header, &payload)?
+            else {
+                continue;
+            };
+            match control {
+                crate::segment::format::ControlRecord::EpochChange { epoch, .. } => {
+                    recovered_epoch = recovered_epoch.max(epoch);
+                }
+                crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position }
+                    if position <= local_tail =>
+                {
+                    checkpoint = checkpoint.max(position);
+                    recovered_epoch = recovered_epoch.max(epoch);
+                }
+                crate::segment::format::ControlRecord::WatermarkCheckpoint { .. } => {}
+            }
+        }
+    }
+    Ok((recovered_epoch, checkpoint))
+}
+
+fn last_physical_record_crc(path: &Path, byte_end: u64) -> Result<u32, Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if byte_end <= segment::SEGMENT_HEADER_SIZE as u64 {
+        return Ok(0);
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(segment::SEGMENT_HEADER_SIZE as u64))?;
+    let mut offset = segment::SEGMENT_HEADER_SIZE as u64;
+    let mut last_crc = 0;
+    while offset < byte_end {
+        let mut header = [0u8; segment::RECORD_HEADER_SIZE];
+        file.read_exact(&mut header)?;
+        let header =
+            crate::segment::record::parse_header(&header)?.ok_or_else(|| Error::Corrupted {
+                message: format!("zero record inside physical prefix in {}", path.display()),
+            })?;
+        if offset + header.total_len() as u64 > byte_end {
+            return Err(Error::Corrupted {
+                message: format!("invalid physical record boundary in {}", path.display()),
+            });
+        }
+        last_crc = header.stored_crc;
+        file.seek(SeekFrom::Current(header.payload_len as i64))?;
+        offset += header.total_len() as u64;
+    }
+    Ok(last_crc)
+}
+
+/// Finds the raw native record offset from which a follower at `from` resumes.
+/// Control records before the requested event position remain behind the
+/// cursor; control records at the current physical cursor are preserved by the
+/// exact `(segment_base, byte_offset, crc)` resume path.
+fn find_replication_start(path: &Path, from: Position) -> Result<u64, Error> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut segment_header = [0u8; segment::SEGMENT_HEADER_SIZE];
+    file.read_exact(&mut segment_header)?;
+    let base = u64::from_le_bytes(segment_header[5..13].try_into().unwrap());
+    if from.0 <= base {
+        return Ok(segment::SEGMENT_HEADER_SIZE as u64);
+    }
+
+    let mut offset = segment::SEGMENT_HEADER_SIZE as u64;
+    loop {
+        let mut header = [0u8; segment::RECORD_HEADER_SIZE];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(offset),
+            Err(error) => return Err(error.into()),
+        }
+        let header = match crate::segment::record::parse_header(&header)? {
+            Some(header) => header,
+            None => return Ok(offset),
+        };
+        let record_end = offset + header.total_len() as u64;
+        let mut payload = vec![0u8; header.payload_len];
+        file.read_exact(&mut payload)?;
+        if !crate::segment::record::validate_crc(header, &payload) {
+            return Err(Error::Corrupted {
+                message: format!("CRC mismatch in replication source at byte {offset}"),
+            });
+        }
+        match crate::segment::record::decode_native(header, &payload)? {
+            crate::segment::record::NativeRecord::Event { position } if position >= from.0 => {
+                return Ok(offset);
+            }
+            crate::segment::record::NativeRecord::Event { .. }
+            | crate::segment::record::NativeRecord::Control(_) => {}
+        }
+        offset = record_end;
+    }
 }
 
 /// Rebuilds the tag index for the active (unsealed) segment.
@@ -1761,6 +2317,84 @@ mod tests {
         let wave = state.seal_wave();
         state.complete_wave(wave);
         assert!(waiter.join().unwrap().is_ok());
+    }
+
+    /// Group-commit acknowledgements gate on the watermark: an acknowledged
+    /// append implies the watermark — and therefore every read path —
+    /// covers its events.
+    #[test]
+    fn group_commit_append_acks_through_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            group_commit_interval_ms: 1,
+            ..Default::default()
+        };
+        let store = EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap();
+
+        let resp = store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+            })
+            .unwrap();
+        assert_eq!(resp.first_position, Position(0));
+        assert_eq!(resp.consistency_marker, Position(1));
+        // Acked ⇒ quorum-committed ⇒ externally visible.
+        assert_eq!(store.head(), Position(1));
+        assert_eq!(store.watermark.get(), 1);
+
+        // A condition-only append (zero events) still acks: its wait target
+        // is the tail the DCB check read, which the next wave covers.
+        let resp = store
+            .append(AppendRequest {
+                condition: Some(AppendCondition {
+                    consistency_marker: Position(1),
+                    criteria: cond_match_all(),
+                }),
+                events: vec![],
+            })
+            .unwrap();
+        assert_eq!(resp.count, 0);
+        store.shutdown();
+    }
+
+    /// Concurrent group-commit appenders all ack and the watermark converges
+    /// on the final tail — no waiter is stranded by wave/watermark races.
+    #[test]
+    fn group_commit_concurrent_appends_all_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            group_commit_interval_ms: 1,
+            ..Default::default()
+        };
+        let store =
+            Arc::new(EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap());
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        store
+                            .append(AppendRequest {
+                                condition: None,
+                                events: vec![make_event(
+                                    &format!("E-{t}-{i}"),
+                                    vec![tag("t", &t.to_string())],
+                                )],
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(store.head(), Position(200));
+        assert_eq!(store.watermark.get(), 200);
+        store.shutdown();
     }
 
     #[test]
@@ -2019,75 +2653,5 @@ mod tests {
 
             assert!(result.is_ok(), "condition with fresh marker should pass");
         }
-    }
-
-    // ------------------------------------------------------------------
-    // source_all — Phase 4 SNAP-01 (Task 1)
-    // Tag-bearing sequential dump of all events. Used by the Raft
-    // snapshot builder. Unlike `source` / `source_stored`, no criterion
-    // filter is applied — every committed event is emitted in ascending
-    // position order with its original tags.
-    // ------------------------------------------------------------------
-    #[test]
-    fn source_all_returns_all_events_in_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = EventStoreEngine::create(dir.path()).unwrap();
-        for (i, name) in ["A", "B", "C"].iter().enumerate() {
-            engine
-                .append(AppendRequest {
-                    condition: None,
-                    events: vec![AppendEvent {
-                        identifier: format!("id-{i}"),
-                        name: (*name).to_string(),
-                        version: "1.0".into(),
-                        timestamp: 1712345678000,
-                        payload: vec![],
-                        metadata: vec![],
-                        tags: vec![Tag::from_str("k", &format!("v{i}"))],
-                    }],
-                })
-                .unwrap();
-        }
-        let all = engine.source_all(Position(0)).unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].position, Position(0));
-        assert_eq!(all[1].position, Position(1));
-        assert_eq!(all[2].position, Position(2));
-        assert_eq!(all[0].name, "A");
-        assert_eq!(all[0].tags.len(), 1);
-    }
-
-    #[test]
-    fn source_all_empty_engine_returns_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = EventStoreEngine::create(dir.path()).unwrap();
-        let all = engine.source_all(Position(0)).unwrap();
-        assert!(all.is_empty());
-    }
-
-    #[test]
-    fn source_all_honours_from_position() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = EventStoreEngine::create(dir.path()).unwrap();
-        for i in 0..3 {
-            engine
-                .append(AppendRequest {
-                    condition: None,
-                    events: vec![AppendEvent {
-                        identifier: format!("id-{i}"),
-                        name: "E".into(),
-                        version: "1.0".into(),
-                        timestamp: 0,
-                        payload: vec![],
-                        metadata: vec![],
-                        tags: vec![],
-                    }],
-                })
-                .unwrap();
-        }
-        let tail = engine.source_all(Position(1)).unwrap();
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].position, Position(1));
-        assert_eq!(tail[1].position, Position(2));
     }
 }

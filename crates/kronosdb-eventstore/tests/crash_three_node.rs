@@ -1,8 +1,8 @@
-//! Phase 6 CRASH-02/CRASH-03 on a 3-node cluster (D-07, D-08).
-//! Leader is SIGKILL'd mid-commit; remaining two nodes elect a new leader;
-//! killed node restarts and catches up; all three converge.
+//! Three-node kill-mid-commit failover and recovery proof.
 //!
-//! Lives in kronosdb-eventstore per D-06.
+//! The leader is killed while writes are active, the remaining voters elect a
+//! new leader, and writes continue. The killed node then restarts, catches up,
+//! and all three nodes must converge on byte-identical valid segment prefixes.
 
 #![allow(clippy::result_large_err)]
 
@@ -23,8 +23,8 @@ use pb::event_store_client::EventStoreClient;
 const ITERATIONS: usize = 10;
 const AGGREGATES: usize = 8;
 const WRITER_TASKS: usize = 4;
-const KILL_DELAY_MIN_MS: u64 = 50; // D-04 LITERAL — same as 1-node
-const KILL_DELAY_MAX_MS: u64 = 500; // D-04 LITERAL
+const KILL_DELAY_MIN_MS: u64 = 50;
+const KILL_DELAY_MAX_MS: u64 = 500;
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -73,7 +73,7 @@ async fn run_one_iteration(iter: usize) {
 
     // Wait for each node's listener.
     for srv in &srvs {
-        wait_until_ready(srv.listen, READY_TIMEOUT)
+        wait_until_ready(srv.listen, srv.admin, READY_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("iter {iter}: node not ready: {e}"));
     }
@@ -103,8 +103,9 @@ async fn run_one_iteration(iter: usize) {
         )));
     }
 
-    // --- Killer: wait for first ack, identify leader, random 50-500ms delay, SIGKILL.
-    let leader_idx = {
+    // Wait for the workload to become active, then identify the actual metadata
+    // leader rather than the follower through which the first append was sent.
+    let _first_request_target = {
         let mut rx = first_ack_rx.clone();
         match tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -122,6 +123,9 @@ async fn run_one_iteration(iter: usize) {
             Err(_) => panic!("iter {iter}: no acks in 10s — cluster not functional"),
         }
     };
+    let leader_idx = wait_for_raft_leader(&srvs, READY_TIMEOUT)
+        .await
+        .unwrap_or_else(|error| panic!("iter {iter}: {error}"));
     let delay_ms = rand_in(KILL_DELAY_MIN_MS, KILL_DELAY_MAX_MS);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     eprintln!(
@@ -131,7 +135,14 @@ async fn run_one_iteration(iter: usize) {
     );
     srvs[leader_idx].kill();
 
-    // Stop writers.
+    let new_leader = wait_for_raft_leader(&srvs, READY_TIMEOUT)
+        .await
+        .unwrap_or_else(|error| panic!("iter {iter}: failover did not elect: {error}"));
+    assert_ne!(new_leader, leader_idx);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Stop writers after they have crossed the election and resumed through
+    // the surviving claimed leader.
     let _ = kill_tx.send(true);
     for w in writers {
         let _ = tokio::time::timeout(Duration::from_secs(3), w).await;
@@ -267,8 +278,8 @@ async fn post_restart_verify(
     admin: [u16; 3],
     peers_str: Vec<(u64, String)>,
 ) {
-    // Wait for survivors to elect a new leader (do NOT drive more writes — Phase 6 scope).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The survivors already elected and accepted post-failover writes; restart
+    // the killed node and require it to converge from its durable cursor.
 
     // Restart the killed node against its same data dir.
     let killed_data_dir = tmp
@@ -284,9 +295,13 @@ async fn post_restart_verify(
         group_commit_ms: Some(2),
     };
     srvs[leader_idx] = spawn_server(&cfg).expect("respawn killed node");
-    wait_until_ready(srvs[leader_idx].listen, READY_TIMEOUT)
-        .await
-        .expect("restarted node ready");
+    wait_until_ready(
+        srvs[leader_idx].listen,
+        srvs[leader_idx].admin,
+        READY_TIMEOUT,
+    )
+    .await
+    .expect("restarted node ready");
 
     // Grace for follower catch-up.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -299,10 +314,8 @@ async fn post_restart_verify(
         "iter {iter}: sidecar drift"
     );
 
-    // Wait for cross-node head convergence. Raft replication after the killed
-    // node rejoins is asynchronous; the node needs time to receive append_entries
-    // from the new leader and apply them. Poll all three nodes' heads until
-    // they all agree (or CONVERGENCE_TIMEOUT elapses, which signals a real bug).
+    // Wait for cross-node native-log convergence after the restarted node
+    // reconnects from its durable physical cursor.
     {
         let start = Instant::now();
         let mut clients: Vec<EventStoreClient<Channel>> = Vec::new();
@@ -368,6 +381,7 @@ async fn post_restart_verify(
     // For EACH node: scan segments + Source-All + record head.
     let mut per_node_events: Vec<HashMap<i64, Vec<u8>>> = Vec::new();
     let mut per_node_head: Vec<i64> = Vec::new();
+    let mut per_node_log_bytes = Vec::new();
 
     for (i, srv) in srvs.iter().enumerate() {
         // Raw CRC scan (CRASH-02 torn detection, per-node).
@@ -386,11 +400,13 @@ async fn post_restart_verify(
             );
         }
         eprintln!(
-            "iter {iter} node{}: CRC scan clean ({} log, {} events)",
+            "iter {iter} node{}: CRC scan clean ({} metadata records, {} event records)",
             i + 1,
             log_rs,
             event_rs
         );
+        per_node_log_bytes
+            .push(read_valid_event_log(&data_dir, "default").expect("read valid event log bytes"));
 
         // Connect + Source-All via per-aggregate criteria (empty criteria returns
         // nothing in this DCB engine; union one criterion per aggregate mirrors
@@ -497,6 +513,17 @@ async fn post_restart_verify(
         }
     }
 
+    // The native segment log is the replicated authority: segment boundaries,
+    // control records, framing, CRCs, and event bytes must converge exactly.
+    for (i, bytes) in per_node_log_bytes.iter().enumerate().skip(1) {
+        assert_eq!(
+            bytes,
+            &per_node_log_bytes[0],
+            "iter {iter}: byte-exact event log divergence between node1 and node{}",
+            i + 1
+        );
+    }
+
     // CRASH-03 under replication: every acked write present on EVERY node.
     for rec in &acked {
         for (i, events) in per_node_events.iter().enumerate() {
@@ -517,6 +544,46 @@ async fn post_restart_verify(
             );
         }
     }
+
+    // A leader isolated from both followers may write an uncommitted suffix,
+    // but it must never acknowledge it without a fresh durable quorum.
+    let isolated_leader = wait_for_raft_leader(srvs, READY_TIMEOUT)
+        .await
+        .expect("leader before quorum-loss check");
+    for (index, server) in srvs.iter_mut().enumerate() {
+        if index != isolated_leader {
+            server.kill();
+        }
+    }
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", listen[isolated_leader]))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect isolated leader");
+    let mut client = EventStoreClient::new(channel);
+    let request = pb::AppendRequest {
+        condition: None,
+        events: vec![pb::TaggedEvent {
+            event: Some(pb::Event {
+                identifier: format!("quorum-loss-{iter}"),
+                timestamp: 1_712_999_999_999,
+                name: "MustNotAck".into(),
+                version: "1.0".into(),
+                payload: b"uncommitted".to_vec(),
+                metadata: Default::default(),
+            }),
+            tags: vec![],
+        }],
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.append(tokio_stream::iter([request])),
+    )
+    .await;
+    assert!(
+        !matches!(result, Ok(Ok(_))),
+        "iter {iter}: isolated leader acknowledged without a quorum"
+    );
 
     eprintln!(
         "iter {iter}: OK  acked={}, readable={}, head={}",

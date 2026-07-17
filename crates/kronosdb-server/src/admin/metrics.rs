@@ -33,9 +33,18 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     let mut snaps = Vec::new();
     for name in state.contexts.list_contexts() {
         if let Ok(engine) = state.contexts.get_context(&name) {
-            let head = engine.head().0;
+            let watermark = engine.head().0;
+            let local_tail = engine.local_tail().0;
+            let durable_tail = engine.durable_tail().0;
             let tail = engine.tail().0;
-            snaps.push((name, engine.metrics_snapshot(), head, tail));
+            snaps.push((
+                name,
+                engine.metrics_snapshot(),
+                watermark,
+                local_tail,
+                durable_tail,
+                tail,
+            ));
         }
     }
 
@@ -48,7 +57,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
                 $help,
                 &snaps
                     .iter()
-                    .map(|(n, s, _, _)| (ctx_label(n), s.$field))
+                    .map(|(n, s, _, _, _, _)| (ctx_label(n), s.$field))
                     .collect::<Vec<_>>(),
             );
         };
@@ -58,10 +67,42 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         &mut out,
         "kronosdb_head_position",
         "gauge",
-        "Next position to be assigned in the context",
+        "Next-exclusive quorum-committed watermark in the context",
         &snaps
             .iter()
-            .map(|(n, _, head, _)| (ctx_label(n), *head))
+            .map(|(n, _, watermark, _, _, _)| (ctx_label(n), *watermark))
+            .collect::<Vec<_>>(),
+    );
+    family(
+        &mut out,
+        "kronosdb_local_tail_position",
+        "gauge",
+        "Next-exclusive locally written event cursor",
+        &snaps
+            .iter()
+            .map(|(n, _, _, local_tail, _, _)| (ctx_label(n), *local_tail))
+            .collect::<Vec<_>>(),
+    );
+    family(
+        &mut out,
+        "kronosdb_durable_tail_position",
+        "gauge",
+        "Next-exclusive locally fdatasynced event cursor",
+        &snaps
+            .iter()
+            .map(|(n, _, _, _, durable_tail, _)| (ctx_label(n), *durable_tail))
+            .collect::<Vec<_>>(),
+    );
+    family(
+        &mut out,
+        "kronosdb_replication_lag_events",
+        "gauge",
+        "Locally durable events not yet visible below the quorum watermark",
+        &snaps
+            .iter()
+            .map(|(n, _, watermark, _, durable_tail, _)| {
+                (ctx_label(n), durable_tail.saturating_sub(*watermark))
+            })
             .collect::<Vec<_>>(),
     );
     family(
@@ -71,7 +112,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         "Oldest retained position in the context",
         &snaps
             .iter()
-            .map(|(n, _, _, tail)| (ctx_label(n), *tail))
+            .map(|(n, _, _, _, _, tail)| (ctx_label(n), *tail))
             .collect::<Vec<_>>(),
     );
     engine_family!(
@@ -147,7 +188,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         segment_rotations
     );
 
-    // ── Raft metrics (node-wide; empty on fast-path-only startup) ──
+    // ── Metadata Raft metrics (node-wide) ──
     if let Some(raft) = state.cluster.raft_node() {
         let m = raft.metrics().borrow().clone();
         let is_leader = (m.current_leader == Some(m.id)) as u64;
@@ -201,12 +242,26 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         );
     }
 
+    let control = state.cluster.replication_control();
+    let claim = control.claim();
     family(
         &mut out,
-        "kronosdb_write_path_fast",
+        "kronosdb_native_epoch",
         "gauge",
-        "1 when the single-node fast path (raft bypass) is active",
-        &[(String::new(), state.cluster.is_fast_path() as u64)],
+        "Committed native replication fencing epoch",
+        &[(String::new(), claim.map(|claim| claim.epoch).unwrap_or(0))],
+    );
+    family(
+        &mut out,
+        "kronosdb_native_write_gate_open",
+        "gauge",
+        "1 when this node may execute native appends locally",
+        &[(
+            String::new(),
+            claim
+                .map(|claim| (claim.leader_id == control.node_id() && claim.writable) as u64)
+                .unwrap_or(0),
+        )],
     );
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)

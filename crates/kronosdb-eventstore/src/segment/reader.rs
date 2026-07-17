@@ -67,13 +67,6 @@ impl SegmentReader {
         self.base_position
     }
 
-    /// Returns the raw mmap bytes of this segment — for low-level scanners
-    /// (Raft log recovery) that need to walk records in physical order
-    /// including non-event records that the event iterators skip.
-    pub fn raw_bytes(&self) -> &[u8] {
-        &self.mmap
-    }
-
     /// Returns an iterator over all valid events in the segment.
     ///
     /// `up_to` limits the read to events with position < up_to.
@@ -83,16 +76,6 @@ impl SegmentReader {
             data: &self.mmap,
             offset: SEGMENT_HEADER_SIZE,
             up_to,
-        }
-    }
-
-    /// Returns an iterator over Raft entry markers in the segment.
-    /// Event records are skipped — this iterator is for the log-as-state
-    /// Raft log reader which only cares about entries, not their payload events.
-    pub fn iter_raft_markers(&self) -> RaftMarkerIterator<'_> {
-        RaftMarkerIterator {
-            data: &self.mmap,
-            offset: SEGMENT_HEADER_SIZE,
         }
     }
 
@@ -259,74 +242,6 @@ impl<'a> Iterator for SegmentIterator<'a> {
                 }
                 Err(e) => return Some(Err(e)),
             }
-        }
-    }
-}
-
-/// Iterates over Raft entry markers in a segment, skipping event records.
-///
-/// Used by the log-as-state Raft log reader. Each item is `(byte_offset, RaftMarker)`
-/// so callers can build a `log_index → offset` map for efficient random access.
-pub struct RaftMarkerIterator<'a> {
-    data: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Iterator for RaftMarkerIterator<'a> {
-    type Item = Result<(usize, format::RaftMarker), Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.offset + RECORD_HEADER_SIZE > self.data.len() {
-                return None;
-            }
-
-            let header_start = self.offset;
-            let stored_crc = u32::from_le_bytes(
-                self.data[header_start..header_start + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            let record_len = u32::from_le_bytes(
-                self.data[header_start + 4..header_start + 8]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let flags_byte = self.data[header_start + 8];
-
-            if record_len == 0 {
-                return None;
-            }
-
-            let payload_len = record_len - 1;
-            let payload_start = header_start + RECORD_HEADER_SIZE;
-            let payload_end = payload_start + payload_len;
-
-            if payload_end > self.data.len() {
-                return None;
-            }
-
-            let payload = &self.data[payload_start..payload_end];
-
-            let computed_crc = {
-                let digest = crc32c::crc32c(&[flags_byte]);
-                crc32c::crc32c_append(digest, payload)
-            };
-            if computed_crc != stored_crc {
-                return Some(Err(Error::Corrupted {
-                    message: format!("CRC mismatch at offset {header_start}"),
-                }));
-            }
-
-            self.offset = payload_end;
-
-            if !flags::is_raft_marker(flags_byte) {
-                continue;
-            }
-
-            return Some(
-                format::deserialize_raft_marker(payload).map(|(marker, _)| (header_start, marker)),
-            );
         }
     }
 }

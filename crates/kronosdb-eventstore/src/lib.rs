@@ -11,6 +11,7 @@ pub mod context;
 pub mod index;
 pub mod metrics;
 pub mod raft;
+pub mod replication;
 pub mod segment;
 pub mod snapshot;
 pub mod store;
