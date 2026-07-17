@@ -312,6 +312,7 @@ impl ClusterManager {
         }
 
         // Create Raft node.
+        let log_bytes = log_store.bytes_since_purge_handle();
         let raft = Raft::new(
             self.cluster_config.node_id,
             Arc::new(self.cluster_config.raft_config.clone()),
@@ -324,7 +325,45 @@ impl ClusterManager {
             message: format!("failed to create raft node: {e}"),
         })?;
 
-        *self.raft.write() = Some(Arc::new(raft));
+        let raft = Arc::new(raft);
+
+        // Byte-aware snapshot trigger. openraft's snapshot policy counts
+        // ENTRIES (LogsSinceLast), which is blind to entry size: with
+        // coalesced multi-MB append entries, bulk ingest can retain tens of
+        // GB of raft log before the entry-count policy fires. This task
+        // triggers a snapshot (and thus purge) once the log grows past a
+        // byte threshold, whichever comes first.
+        {
+            const LOG_BYTES_SNAPSHOT_THRESHOLD: u64 = 256 * 1024 * 1024;
+            let raft = Arc::clone(&raft);
+            let log_bytes = Arc::clone(&log_bytes);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if log_bytes.load(std::sync::atomic::Ordering::Relaxed)
+                        < LOG_BYTES_SNAPSHOT_THRESHOLD
+                    {
+                        continue;
+                    }
+                    tracing::info!(
+                        target: "raft.snapshot",
+                        threshold_bytes = LOG_BYTES_SNAPSHOT_THRESHOLD,
+                        "raft log exceeded byte threshold; triggering snapshot"
+                    );
+                    // Fatal error => raft is shutting down; end the task.
+                    if raft.trigger().snapshot().await.is_err() {
+                        return;
+                    }
+                    // Snapshot+purge run asynchronously; back off so we don't
+                    // re-trigger against a counter that hasn't reset yet.
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            });
+        }
+
+        *self.raft.write() = Some(raft);
 
         Ok(())
     }
@@ -567,10 +606,34 @@ type ProposeItem = (
     tokio::sync::oneshot::Sender<Result<AppendResponse, Error>>,
 );
 
-/// Cap per coalesced entry: keeps entries comfortably under the marker's
-/// u16 event budget and bounds worst-case entry size.
+/// Caps per coalesced entry: comfortably under the marker's u16 event
+/// budget, and — critically — bounded in BYTES. An event count alone is not
+/// a size bound (16k × ~430B events ≈ 7MB entries, which blew through the
+/// raft transport's message limit and wedged replication; see the cluster
+/// bench). The byte cap also bounds per-entry log fsync latency.
 const MAX_BATCH_ITEMS: usize = 512;
 const MAX_BATCH_EVENTS: usize = 16 * 1024;
+const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
+
+/// Approximate wire size of one event inside a raft entry.
+fn estimate_event_bytes(e: &crate::event::AppendEvent) -> usize {
+    let mut n = 64 // framing + fixed fields
+        + e.identifier.len()
+        + e.name.len()
+        + e.version.len()
+        + e.payload.len();
+    for (k, v) in &e.metadata {
+        n += k.len() + v.len() + 8;
+    }
+    for t in &e.tags {
+        n += t.key.len() + t.value.len() + 8;
+    }
+    n
+}
+
+fn estimate_request_bytes(r: &AppendRequest) -> usize {
+    r.events.iter().map(estimate_event_bytes).sum()
+}
 
 impl RaftEngine {
     pub fn new(
@@ -593,11 +656,16 @@ impl RaftEngine {
             tokio::spawn(async move {
                 while let Some(first) = rx.recv().await {
                     let mut event_count = first.0.events.len();
+                    let mut byte_count = estimate_request_bytes(&first.0);
                     let mut batch = vec![first];
-                    while batch.len() < MAX_BATCH_ITEMS && event_count < MAX_BATCH_EVENTS {
+                    while batch.len() < MAX_BATCH_ITEMS
+                        && event_count < MAX_BATCH_EVENTS
+                        && byte_count < MAX_BATCH_BYTES
+                    {
                         match rx.try_recv() {
                             Ok(item) => {
                                 event_count += item.0.events.len();
+                                byte_count += estimate_request_bytes(&item.0);
                                 batch.push(item);
                             }
                             Err(_) => break,
@@ -845,6 +913,17 @@ impl EventStore for RaftEngine {
         condition: &SourcingCondition,
     ) -> Result<Vec<SequencedEvent>, Error> {
         self.local_engine.source(from_position, condition)
+    }
+
+    fn source_page(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+        up_to: Position,
+        limit: usize,
+    ) -> Result<Vec<SequencedEvent>, Error> {
+        self.local_engine
+            .source_page(from_position, condition, up_to, limit)
     }
 
     fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {

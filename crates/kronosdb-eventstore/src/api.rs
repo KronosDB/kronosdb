@@ -29,6 +29,19 @@ pub trait EventStore: Send + Sync {
         condition: &SourcingCondition,
     ) -> Result<Vec<SequencedEvent>, Error>;
 
+    /// Reads up to `limit` matching events with position in `[from_position, up_to)`.
+    ///
+    /// Chunked-streaming building block: freeze `up_to` at `head()` once,
+    /// then advance `from_position` past the last returned event. Memory
+    /// stays bounded by `limit` and abandoning the read stops the work.
+    fn source_page(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+        up_to: Position,
+        limit: usize,
+    ) -> Result<Vec<SequencedEvent>, Error>;
+
     /// Creates a live event stream subscription.
     fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream;
 

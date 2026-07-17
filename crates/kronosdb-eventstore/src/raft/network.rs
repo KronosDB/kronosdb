@@ -14,6 +14,11 @@ use super::types::{NodeId, TypeConfig};
 type RaftRPCError<E = openraft::error::Infallible> =
     RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
 
+/// Message-size ceiling for raft peer traffic (both directions). Must stay
+/// well above the proposer's per-entry byte cap (`MAX_BATCH_BYTES` in
+/// cluster.rs) plus framing, and above `snapshot_max_chunk_size`.
+pub const RAFT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Factory that creates gRPC network connections to peer nodes.
 pub struct NetworkFactory;
 
@@ -43,7 +48,15 @@ impl NetworkConnection {
                 .connect()
                 .await
                 .map_err(|e| tonic::Status::unavailable(format!("connect failed: {e}")))?;
-            self.client = Some(RaftTransportClient::new(channel));
+            // Raft traffic can carry coalesced append entries and snapshot
+            // chunks; keep limits well above the proposer's byte cap so
+            // replication can never wedge on message size (a rejected
+            // AppendEntries retries forever — a cluster-wide write livelock).
+            self.client = Some(
+                RaftTransportClient::new(channel)
+                    .max_decoding_message_size(RAFT_MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(RAFT_MAX_MESSAGE_BYTES),
+            );
         }
         Ok(self.client.as_mut().unwrap())
     }

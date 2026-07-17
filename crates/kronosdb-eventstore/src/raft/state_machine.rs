@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
 use openraft::storage::RaftStateMachine;
@@ -6,13 +5,17 @@ use openraft::{
     CommittedLeaderId, Entry, EntryPayload, LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder,
     Snapshot, SnapshotMeta, StorageError, StoredMembership,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::append::{AppendRequest, AppliedLogId};
 use crate::context::ContextManager;
+use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
+use crate::event::Position;
 
-use super::snapshot_store::{PersistedSnapshot, SnapshotStore};
+use super::snapshot_format::{
+    CHUNK_EVENTS, SnapshotDataReader, SnapshotDataWriter, SnapshotEvent, SnapshotItem,
+};
+use super::snapshot_store::SnapshotStore;
 use super::types::{
     BatchAppendResult, NodeId, RaftRejectReason, RaftRequest, RaftResponse, TypeConfig,
 };
@@ -20,50 +23,15 @@ use super::types::{
 #[cfg(feature = "bench-instrumentation")]
 use super::bench_instrumentation::{Region, Timer};
 
-/// Snapshot body version. Increment on breaking layout changes so an
-/// older install path can detect and refuse incompatible payloads.
-/// Phase 4 ships at version 1; Phase 4-03 may evolve it.
-const SNAPSHOT_VERSION: u8 = 1;
-
-/// Raft snapshot payload — the bytes that live in `Snapshot.snapshot`
-/// (the `Cursor<Vec<u8>>` per D-02). Carries every context's events,
-/// head position (implied by the last event's position), and tags;
-/// the per-context tag index is NOT serialized because 04-02's install
-/// rebuilds it deterministically by re-appending events.
-///
-/// Field order is the canonical bincode layout for v1: changing it
-/// requires bumping `SNAPSHOT_VERSION` and adding a migration branch
-/// in the install path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StateMachineSnapshot {
-    version: u8,
-    last_applied: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, openraft::BasicNode>,
-    contexts: Vec<ContextSnapshot>,
-}
-
-/// Per-context slice of the snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ContextSnapshot {
-    name: String,
-    /// Events ordered by position ascending, covering positions 1..head.
-    events: Vec<SnapshotEvent>,
-}
-
-/// One event frozen for transport in a snapshot. Mirrors `StoredEvent`
-/// field-for-field but uses `(Vec<u8>, Vec<u8>)` tag tuples to stay in
-/// lock-step with `RaftAppendEvent`'s wire shape (types.rs:84-93) so
-/// 04-02's install can re-append these via `AppendEvent` directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotEvent {
-    position: u64,
-    identifier: String,
-    name: String,
-    version: String,
-    timestamp: i64,
-    payload: Vec<u8>,
-    metadata: Vec<(String, String)>,
-    tags: Vec<(Vec<u8>, Vec<u8>)>,
+/// Match-all condition for snapshot reads: one empty criterion resolves to
+/// every position (see `TagIndex::resolve_criterion` / `SegmentIndex`).
+fn match_all() -> SourcingCondition {
+    SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![],
+            tags: vec![],
+        }],
+    }
 }
 
 /// Outcome of `EventStoreStateMachine::reconcile_with_log`.
@@ -696,9 +664,23 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        // Capture per-context head bounds HERE, on the state-machine worker,
+        // where nothing applies concurrently — so the snapshot's contents
+        // are exactly consistent with `last_applied` even though openraft
+        // runs the build itself on a separate task while applies continue.
+        let bounds = self
+            .contexts
+            .list_contexts()
+            .into_iter()
+            .filter_map(|name| {
+                let head = self.contexts.get_context(&name).ok()?.head().0;
+                Some((name, head))
+            })
+            .collect();
         EventStoreSnapshotBuilder {
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
+            bounds,
             contexts: Arc::clone(&self.contexts),
             snapshot_store: Arc::clone(&self.snapshot_store),
         }
@@ -706,157 +688,10 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NodeId>> {
-        let data = snapshot.into_inner();
-        let sm_snapshot: StateMachineSnapshot = bincode::deserialize(&data).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-            )
-        })?;
-
-        // Version check BEFORE any destructive action (atomicity guard — a
-        // payload we cannot interpret must NOT wipe follower state). The
-        // unknown-version error literal below is the sole site of that
-        // string in the module; 04-01 deliberately left its stub untouched
-        // so the literal appears exactly once.
-        if sm_snapshot.version != SNAPSHOT_VERSION {
-            return Err(StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unsupported snapshot version {}", sm_snapshot.version),
-                ),
-            ));
-        }
-
-        // D-03: wipe-and-replace. Close existing engines, remove context dirs,
-        // fsync data_dir — all inside ContextManager::reset_all.
-        self.contexts.reset_all().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("install_snapshot: reset_all failed: {e}"),
-                ),
-            )
-        })?;
-
-        // Rebuild each context by creating it and re-appending its events
-        // with no condition. Positions align because disk was wiped: a fresh
-        // engine assigns Position(0) to its first append, matching what the
-        // leader's snapshot records.
-        for ctx in &sm_snapshot.contexts {
-            self.contexts.create_context(&ctx.name).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("install_snapshot: create_context({}) failed: {e}", ctx.name),
-                    ),
-                )
-            })?;
-
-            if ctx.events.is_empty() {
-                continue;
-            }
-
-            // Rebuild event list for this context. Each SnapshotEvent becomes
-            // an AppendEvent in the same order; append all of them in a
-            // single AppendRequest to preserve the leader's intra-batch
-            // position ordering.
-            let append_events: Vec<crate::event::AppendEvent> = ctx
-                .events
-                .iter()
-                .map(|se| crate::event::AppendEvent {
-                    identifier: se.identifier.clone(),
-                    name: se.name.clone(),
-                    version: se.version.clone(),
-                    timestamp: se.timestamp,
-                    payload: se.payload.clone(),
-                    metadata: se.metadata.clone(),
-                    tags: se
-                        .tags
-                        .iter()
-                        .map(|(k, v)| crate::event::Tag {
-                            key: k.clone(),
-                            value: v.clone(),
-                        })
-                        .collect(),
-                })
-                .collect();
-
-            // Per apply-time authority (Phase 3): install is NOT an apply.
-            // Condition is None unconditionally — snapshot bytes are
-            // authoritative; DCB evaluation must NOT run here. This append
-            // call also rebuilds the per-context tag index (bloom filter +
-            // per-tag roaring bitmap) as a side effect — see must_haves truth
-            // about tag index rebuild.
-            let expected_first_pos = ctx.events.first().map(|e| e.position);
-            let resp = self
-                .contexts
-                .with_context(&ctx.name, |engine| {
-                    engine.append(crate::append::AppendRequest {
-                        condition: None,
-                        events: append_events,
-                    })
-                })
-                .map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::StateMachine,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("install_snapshot: append({}) failed: {e}", ctx.name),
-                        ),
-                    )
-                })?;
-
-            // Sanity: the first position assigned must match what the leader
-            // recorded for this event. If disk wipe + fresh create_context
-            // did not produce Position(0), something is very wrong and we
-            // must halt rather than apply on a divergent base.
-            if let Some(expected) = expected_first_pos {
-                if resp.first_position.0 != expected {
-                    return Err(StorageError::from_io_error(
-                        openraft::ErrorSubject::StateMachine,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "install_snapshot: position drift in {}: leader={} follower={}",
-                                ctx.name, expected, resp.first_position.0
-                            ),
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // D-06: restore last_applied and last_membership LAST, after all
-        // context state is rebuilt successfully. Doing it last means a
-        // partial-install crash leaves last_applied unchanged so a retry
-        // rewinds all the way.
-        self.last_applied = sm_snapshot.last_applied;
-        self.last_membership = sm_snapshot.last_membership;
-
-        // Keep membership.bin in sync with the installed snapshot so the
-        // startup hydration priority (membership.bin first) never resurrects
-        // a pre-install voter set.
-        self.snapshot_store
-            .save_membership(&self.last_membership)
+    ) -> Result<Box<tokio::fs::File>, StorageError<NodeId>> {
+        let (_path, file) = self
+            .snapshot_store
+            .create_staging_data_file()
             .map_err(|e| {
                 StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
@@ -864,20 +699,143 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
                     e,
                 )
             })?;
+        Ok(Box::new(tokio::fs::File::from_std(file)))
+    }
 
-        // Persist the installed snapshot to disk. Without this, a restart
-        // after install would lose `last_membership` (since markers don't
-        // carry membership) and the node would default to Learner — exactly
-        // the bug we're fixing for the locally-built snapshot path. The
-        // disk write happens AFTER the in-memory restore so a crash here
-        // leaves us in a recoverable state: SM has new state in memory,
-        // disk still has the old snapshot, next restart re-applies the
-        // committed log range to catch up.
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+        snapshot: Box<tokio::fs::File>,
+    ) -> Result<(), StorageError<NodeId>> {
+        use std::io::{BufReader, Seek, SeekFrom};
+
+        let io_err = |verb: openraft::ErrorVerb, e: std::io::Error| {
+            StorageError::from_io_error(openraft::ErrorSubject::StateMachine, verb, e)
+        };
+        let read_err = |e: std::io::Error| io_err(openraft::ErrorVerb::Read, e);
+        let write_msg =
+            |msg: String| io_err(openraft::ErrorVerb::Write, std::io::Error::other(msg));
+
+        let mut file = snapshot.into_std().await;
+
+        // PASS 1 — validate the ENTIRE stream (magic, version, structure,
+        // per-chunk CRCs) before any destructive action. A payload we cannot
+        // interpret must NOT wipe follower state; this streaming pass keeps
+        // that v1 guarantee with bounded memory.
+        file.seek(SeekFrom::Start(0)).map_err(read_err)?;
+        {
+            let mut reader =
+                SnapshotDataReader::new(BufReader::new(&mut file)).map_err(read_err)?;
+            while reader.next_item().map_err(read_err)?.is_some() {}
+        }
+
+        // D-03: wipe-and-replace. Close existing engines, remove context dirs,
+        // fsync data_dir — all inside ContextManager::reset_all.
+        self.contexts
+            .reset_all()
+            .map_err(|e| write_msg(format!("install_snapshot: reset_all failed: {e}")))?;
+
+        // PASS 2 — rebuild each context chunk by chunk. Positions align
+        // because disk was wiped: a fresh engine assigns Position(0) to its
+        // first append, and consecutive chunk appends stay consecutive; the
+        // per-chunk first-position check catches any drift immediately.
+        //
+        // Per apply-time authority (Phase 3): install is NOT an apply.
+        // Condition is None unconditionally — snapshot bytes are
+        // authoritative; DCB evaluation must NOT run here. These appends
+        // also rebuild the per-context tag index as a side effect.
+        file.seek(SeekFrom::Start(0)).map_err(read_err)?;
+        let mut reader = SnapshotDataReader::new(BufReader::new(&mut file)).map_err(read_err)?;
+        let mut current_ctx: Option<String> = None;
+        while let Some(item) = reader.next_item().map_err(read_err)? {
+            match item {
+                SnapshotItem::Context(name) => {
+                    self.contexts.create_context(&name).map_err(|e| {
+                        write_msg(format!(
+                            "install_snapshot: create_context({name}) failed: {e}"
+                        ))
+                    })?;
+                    current_ctx = Some(name);
+                }
+                SnapshotItem::Chunk(events) => {
+                    let ctx_name = current_ctx.as_deref().ok_or_else(|| {
+                        write_msg("install_snapshot: chunk before any context header".into())
+                    })?;
+                    let expected_first = events.first().map(|e| e.position);
+                    let append_events: Vec<crate::event::AppendEvent> = events
+                        .into_iter()
+                        .map(|se| crate::event::AppendEvent {
+                            identifier: se.identifier,
+                            name: se.name,
+                            version: se.version,
+                            timestamp: se.timestamp,
+                            payload: se.payload,
+                            metadata: se.metadata,
+                            tags: se
+                                .tags
+                                .into_iter()
+                                .map(|(k, v)| crate::event::Tag { key: k, value: v })
+                                .collect(),
+                        })
+                        .collect();
+                    let resp = self
+                        .contexts
+                        .with_context(ctx_name, |engine| {
+                            engine.append(crate::append::AppendRequest {
+                                condition: None,
+                                events: append_events,
+                            })
+                        })
+                        .map_err(|e| {
+                            write_msg(format!("install_snapshot: append({ctx_name}) failed: {e}"))
+                        })?;
+                    if let Some(expected) = expected_first {
+                        if resp.first_position.0 != expected {
+                            return Err(write_msg(format!(
+                                "install_snapshot: position drift in {ctx_name}: leader={} follower={}",
+                                expected, resp.first_position.0
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // D-06: restore last_applied and last_membership LAST, after all
+        // context state is rebuilt successfully. Doing it last means a
+        // partial-install crash leaves last_applied unchanged so a retry
+        // rewinds all the way. Both come from openraft's SnapshotMeta —
+        // the data stream carries only events.
+        self.last_applied = meta.last_log_id;
+        self.last_membership = meta.last_membership.clone();
+
+        // Keep membership.bin in sync with the installed snapshot so the
+        // startup hydration priority (membership.bin first) never resurrects
+        // a pre-install voter set.
         self.snapshot_store
-            .write(&PersistedSnapshot {
-                meta: meta.clone(),
-                data,
-            })
+            .save_membership(&self.last_membership)
+            .map_err(|e| io_err(openraft::ErrorVerb::Write, e))?;
+
+        // PASS 3 — persist the installed snapshot. Without this, a restart
+        // after install would lose `last_membership` (markers don't carry
+        // membership) and the node would default to Learner. The provided
+        // file is stream-copied to a dedicated tmp (never the staging path —
+        // the provided handle may BE the staging file) and committed. This
+        // happens AFTER the in-memory restore so a crash here leaves us
+        // recoverable: SM has new state in memory, disk still has the old
+        // snapshot, next restart re-applies the committed log range.
+        drop(reader);
+        file.seek(SeekFrom::Start(0)).map_err(read_err)?;
+        let install_tmp = self.snapshot_store.dir().join("install.data.tmp");
+        {
+            let mut out = std::fs::File::create(&install_tmp)
+                .map_err(|e| io_err(openraft::ErrorVerb::Write, e))?;
+            std::io::copy(&mut file, &mut out)
+                .map_err(|e| io_err(openraft::ErrorVerb::Write, e))?;
+        }
+        drop(file);
+        self.snapshot_store
+            .commit_snapshot(meta, &install_tmp)
             .map_err(|e| {
                 StorageError::from_io_error(
                     openraft::ErrorSubject::Snapshot(Some(meta.signature())),
@@ -896,123 +854,141 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         // exists, else None. openraft's startup helper rebuilds via
         // `get_snapshot_builder` when this returns None and logs have been
         // purged (helper.rs:132-143), so we don't need to materialize on
-        // demand here — that would just duplicate work and produce a
-        // snapshot whose meta doesn't match anything on disk.
-        match self.snapshot_store.load_latest().map_err(|e| {
+        // demand here. The data file is handed back as an open handle —
+        // openraft streams it to followers in bounded chunks; nothing is
+        // read into memory here.
+        match self.snapshot_store.open_latest().map_err(|e| {
             StorageError::from_io_error(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
         })? {
-            Some(persisted) => Ok(Some(Snapshot {
-                meta: persisted.meta,
-                snapshot: Box::new(Cursor::new(persisted.data)),
-            })),
+            Some((meta, data_path)) => {
+                let file = std::fs::File::open(&data_path).map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                        openraft::ErrorVerb::Read,
+                        e,
+                    )
+                })?;
+                Ok(Some(Snapshot {
+                    meta,
+                    snapshot: Box::new(tokio::fs::File::from_std(file)),
+                }))
+            }
             None => Ok(None),
         }
     }
 }
 
+/// Streams every context's events (bounded by `bounds`, captured on the
+/// state-machine worker) through a `SnapshotDataWriter` in `CHUNK_EVENTS`
+/// pages. Peak memory: one page of events + one bincoded chunk, regardless
+/// of database size.
+fn write_snapshot_data(
+    contexts: &ContextManager,
+    bounds: &[(String, u64)],
+    w: &mut SnapshotDataWriter<impl std::io::Write>,
+) -> Result<(), Error> {
+    let condition = match_all();
+    for (name, head) in bounds {
+        let engine = contexts.get_context(name)?;
+        w.begin_context(name).map_err(Error::Io)?;
+        let mut cursor = 0u64;
+        while cursor < *head {
+            let page = engine.source_stored_bounded(
+                Position(cursor),
+                &condition,
+                Some(Position(*head)),
+                CHUNK_EVENTS,
+            )?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = last.position.0 + 1;
+            let chunk: Vec<SnapshotEvent> = page.into_iter().map(SnapshotEvent::from).collect();
+            w.write_chunk(&chunk).map_err(Error::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Streams a snapshot to the store's staging file and commits it. Shared by
+/// the openraft builder and the boot-time rescue path. Returns the final
+/// data path and the meta.
+fn build_and_commit_snapshot(
+    contexts: &ContextManager,
+    snapshot_store: &SnapshotStore,
+    bounds: &[(String, u64)],
+    meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+) -> Result<std::path::PathBuf, Error> {
+    let (staging_path, staging_file) = snapshot_store
+        .create_staging_data_file()
+        .map_err(Error::Io)?;
+    let mut writer =
+        SnapshotDataWriter::new(std::io::BufWriter::new(staging_file)).map_err(Error::Io)?;
+    write_snapshot_data(contexts, bounds, &mut writer)?;
+    let buf = writer.finish().map_err(Error::Io)?;
+    // into_inner flushes the BufWriter; durability (sync_all) happens in
+    // commit_snapshot, which reopens the staging path.
+    drop(buf.into_inner().map_err(|e| Error::Io(e.into_error()))?);
+
+    // Persist before handing back to openraft. If commit fails, openraft
+    // sees the build as failed and won't purge logs against this snapshot —
+    // preserving the invariant that purge is only safe once a snapshot
+    // covering those entries is durable.
+    snapshot_store
+        .commit_snapshot(meta, &staging_path)
+        .map_err(Error::Io)
+}
+
 /// Builds a Raft snapshot from the current state machine state.
 ///
-/// Holds a cloned `Arc<ContextManager>` so `build_snapshot` can walk every
-/// context via `list_contexts` + `get_context`, calling the new
-/// `EventStoreEngine::source_all` helper for each to materialize the
-/// per-context event stream (Phase 4, SNAP-01). Also carries an
-/// `Arc<SnapshotStore>` so the built snapshot is persisted to disk before
-/// it is handed back to openraft — without that, restart loses
-/// `last_membership` and the node refuses to elect.
+/// Carries per-context head `bounds` captured at `get_snapshot_builder`
+/// time (on the state-machine worker) so the snapshot's contents match
+/// `last_applied` even though openraft runs the build on a separate task
+/// while applies continue. Also carries an `Arc<SnapshotStore>` so the
+/// built snapshot is persisted to disk before it is handed back to
+/// openraft — without that, restart loses `last_membership` and the node
+/// refuses to elect.
 pub struct EventStoreSnapshotBuilder {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
+    /// (context name, head at builder creation) — the read bound per context.
+    bounds: Vec<(String, u64)>,
     contexts: Arc<ContextManager>,
     snapshot_store: Arc<SnapshotStore>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let names = self.contexts.list_contexts();
-        let mut context_snaps = Vec::with_capacity(names.len());
-        for name in names {
-            let engine = self.contexts.get_context(&name).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("snapshot: get_context({name}) failed: {e}"),
-                    ),
-                )
-            })?;
-            let stored = engine.source_all(crate::event::Position(0)).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("snapshot: source_all({name}) failed: {e}"),
-                    ),
-                )
-            })?;
-            let events = stored
-                .into_iter()
-                .map(|s| SnapshotEvent {
-                    position: s.position.0,
-                    identifier: s.identifier,
-                    name: s.name,
-                    version: s.version,
-                    timestamp: s.timestamp,
-                    payload: s.payload,
-                    metadata: s.metadata,
-                    tags: s.tags.into_iter().map(|t| (t.key, t.value)).collect(),
-                })
-                .collect();
-            context_snaps.push(ContextSnapshot { name, events });
-        }
-
-        let sm_snapshot = StateMachineSnapshot {
-            version: SNAPSHOT_VERSION,
-            last_applied: self.last_applied,
-            last_membership: self.last_membership.clone(),
-            contexts: context_snaps,
-        };
-
-        let data = bincode::serialize(&sm_snapshot).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
-        })?;
-
         let snapshot_id = self
             .last_applied
             .map(|id| format!("{}-{}", id.leader_id, id.index))
             .unwrap_or_else(|| "empty".to_string());
-
         let meta = SnapshotMeta {
             last_log_id: self.last_applied,
             last_membership: self.last_membership.clone(),
             snapshot_id,
         };
 
-        // Persist before handing back to openraft. If this fails, openraft
-        // sees the build as failed and won't purge logs against this
-        // snapshot — preserving the invariant that purge is only safe once
-        // a snapshot covering those entries is durable.
-        self.snapshot_store
-            .write(&PersistedSnapshot {
-                meta: meta.clone(),
-                data: data.clone(),
-            })
-            .map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(Some(meta.signature())),
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
-            })?;
+        let data_path =
+            build_and_commit_snapshot(&self.contexts, &self.snapshot_store, &self.bounds, &meta)
+                .map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::other(format!("snapshot build: {e}")),
+                    )
+                })?;
 
+        let file = std::fs::File::open(&data_path).map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                openraft::ErrorVerb::Read,
+                e,
+            )
+        })?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(tokio::fs::File::from_std(file)),
         })
     }
 }
@@ -1038,37 +1014,15 @@ pub fn synthesize_rescue_snapshot(
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
 ) -> Result<(), Error> {
-    let names = contexts.list_contexts();
-    let mut context_snaps = Vec::with_capacity(names.len());
-    for name in names {
-        let engine = contexts.get_context(&name)?;
-        let stored = engine.source_all(crate::event::Position(0))?;
-        let events = stored
-            .into_iter()
-            .map(|s| SnapshotEvent {
-                position: s.position.0,
-                identifier: s.identifier,
-                name: s.name,
-                version: s.version,
-                timestamp: s.timestamp,
-                payload: s.payload,
-                metadata: s.metadata,
-                tags: s.tags.into_iter().map(|t| (t.key, t.value)).collect(),
-            })
-            .collect();
-        context_snaps.push(ContextSnapshot { name, events });
-    }
-
-    let sm_snapshot = StateMachineSnapshot {
-        version: SNAPSHOT_VERSION,
-        last_applied,
-        last_membership: last_membership.clone(),
-        contexts: context_snaps,
-    };
-
-    let data = bincode::serialize(&sm_snapshot).map_err(|e| Error::Corrupted {
-        message: format!("rescue snapshot serialize: {e}"),
-    })?;
+    // Boot-time path — the node is quiescent, so live heads ARE the bounds.
+    let bounds: Vec<(String, u64)> = contexts
+        .list_contexts()
+        .into_iter()
+        .filter_map(|name| {
+            let head = contexts.get_context(&name).ok()?.head().0;
+            Some((name, head))
+        })
+        .collect();
 
     let snapshot_id = last_applied
         .map(|id| format!("rescue-{}-{}", id.leader_id, id.index))
@@ -1080,10 +1034,7 @@ pub fn synthesize_rescue_snapshot(
         snapshot_id,
     };
 
-    snapshot_store
-        .write(&PersistedSnapshot { meta, data })
-        .map_err(Error::Io)?;
-
+    build_and_commit_snapshot(contexts, snapshot_store, &bounds, &meta)?;
     Ok(())
 }
 
@@ -1527,6 +1478,27 @@ mod tests {
         assert!(contexts.context_exists("orders"));
     }
 
+    /// Decodes a snapshot data file into (context name, events) pairs.
+    /// Magic + version are validated by `SnapshotDataReader::new`.
+    async fn decode_snapshot(file: Box<tokio::fs::File>) -> Vec<(String, Vec<SnapshotEvent>)> {
+        use std::io::Seek;
+        let mut f = file.into_std().await;
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut r = SnapshotDataReader::new(std::io::BufReader::new(f)).unwrap();
+        let mut out: Vec<(String, Vec<SnapshotEvent>)> = Vec::new();
+        while let Some(item) = r.next_item().unwrap() {
+            match item {
+                SnapshotItem::Context(name) => out.push((name, Vec::new())),
+                SnapshotItem::Chunk(events) => out
+                    .last_mut()
+                    .expect("chunk before context")
+                    .1
+                    .extend(events),
+            }
+        }
+        out
+    }
+
     #[tokio::test]
     async fn snapshot_roundtrip() {
         let (mut sm, _ctx) = create_sm();
@@ -1541,16 +1513,16 @@ mod tests {
 
         assert_eq!(snapshot.meta.last_log_id.unwrap().index, 2);
 
-        // Inspect the payload bytes directly — the test state machine has
-        // one context ("default") created in create_sm(); the two applied
+        // Inspect the payload stream — the test state machine has one
+        // context ("default") created in create_sm(); the two applied
         // entries are blank (Membership/Blank payloads, no Append), so
-        // "default" must be present with zero events and version=1.
-        let bytes = snapshot.snapshot.get_ref().clone();
-        let decoded: StateMachineSnapshot = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.version, SNAPSHOT_VERSION);
-        assert_eq!(decoded.contexts.len(), 1);
-        assert_eq!(decoded.contexts[0].name, "default");
-        assert!(decoded.contexts[0].events.is_empty());
+        // "default" must be present with zero events.
+        let mut builder2 = sm.get_snapshot_builder().await;
+        let snapshot2 = builder2.build_snapshot().await.unwrap();
+        let decoded = decode_snapshot(snapshot2.snapshot).await;
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "default");
+        assert!(decoded[0].1.is_empty());
 
         // Install snapshot into a fresh state machine.
         let (mut sm2, _ctx2) = create_sm();
@@ -1608,37 +1580,23 @@ mod tests {
         sm.apply(entries).await.unwrap();
         let mut builder = sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
-        let bytes = snap.snapshot.get_ref().clone();
-        let decoded: StateMachineSnapshot = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.version, SNAPSHOT_VERSION);
-        assert_eq!(decoded.last_applied.unwrap().index, 5);
+        assert_eq!(snap.meta.last_log_id.unwrap().index, 5);
+        let decoded = decode_snapshot(snap.snapshot).await;
         // list_contexts() returns names sorted; look up by name rather
         // than positional index.
-        let orders = decoded
-            .contexts
-            .iter()
-            .find(|c| c.name == "orders")
-            .unwrap();
-        let payments = decoded
-            .contexts
-            .iter()
-            .find(|c| c.name == "payments")
-            .unwrap();
-        assert_eq!(orders.events.len(), 3);
-        assert_eq!(payments.events.len(), 2);
-        assert_eq!(orders.events[0].position, 0);
-        assert_eq!(orders.events[1].position, 1);
-        assert_eq!(orders.events[2].position, 2);
-        assert_eq!(orders.events[0].name, "OrderPlaced");
-        assert_eq!(payments.events[0].position, 0);
-        assert_eq!(payments.events[1].position, 1);
+        let orders = &decoded.iter().find(|(n, _)| n == "orders").unwrap().1;
+        let payments = &decoded.iter().find(|(n, _)| n == "payments").unwrap().1;
+        assert_eq!(orders.len(), 3);
+        assert_eq!(payments.len(), 2);
+        assert_eq!(orders[0].position, 0);
+        assert_eq!(orders[1].position, 1);
+        assert_eq!(orders[2].position, 2);
+        assert_eq!(orders[0].name, "OrderPlaced");
+        assert_eq!(payments[0].position, 0);
+        assert_eq!(payments[1].position, 1);
         // "default" context from create_sm() is present but empty:
-        let default = decoded
-            .contexts
-            .iter()
-            .find(|c| c.name == "default")
-            .unwrap();
-        assert!(default.events.is_empty());
+        let default = &decoded.iter().find(|(n, _)| n == "default").unwrap().1;
+        assert!(default.is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -1756,30 +1714,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Hand-roll a bogus payload with version=99. Serde is structural: we
-        // build a struct that shares the layout but carries a different u8.
-        #[derive(serde::Serialize)]
-        struct BogusSnap {
-            version: u8,
-            last_applied: Option<LogId<NodeId>>,
-            last_membership: StoredMembership<NodeId, openraft::BasicNode>,
-            contexts: Vec<ContextSnapshot>,
+        // Hand-roll a bogus payload: right magic, unsupported version byte.
+        // The pre-wipe validation pass must reject it before any
+        // destructive action.
+        let mut bogus = std::fs::File::from(tempfile::tempfile().unwrap());
+        {
+            use std::io::Write;
+            bogus.write_all(b"KSD2").unwrap();
+            bogus.write_all(&[99]).unwrap();
         }
-        let bogus = BogusSnap {
-            version: 99,
-            last_applied: None,
-            last_membership: StoredMembership::default(),
-            contexts: vec![],
-        };
-        let bytes = bincode::serialize(&bogus).unwrap();
-        let cursor = Box::new(Cursor::new(bytes));
+        let file = Box::new(tokio::fs::File::from_std(bogus));
         let meta: SnapshotMeta<NodeId, openraft::BasicNode> = SnapshotMeta {
             last_log_id: None,
             last_membership: StoredMembership::default(),
             snapshot_id: "bogus".into(),
         };
 
-        let result = follower_sm.install_snapshot(&meta, cursor).await;
+        let result = follower_sm.install_snapshot(&meta, file).await;
         assert!(result.is_err(), "expected version-mismatch StorageError");
         // Crucially, the follower's state was NOT wiped:
         assert!(follower_ctx.context_exists("orders"));
@@ -1845,18 +1796,13 @@ mod tests {
             .unwrap();
         let mut builder = sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.unwrap();
-        let bytes = snap.snapshot.get_ref().clone();
-        let decoded: StateMachineSnapshot = bincode::deserialize(&bytes).unwrap();
-        let default = decoded
-            .contexts
-            .iter()
-            .find(|c| c.name == "default")
-            .unwrap();
-        assert_eq!(default.events.len(), 1);
+        let decoded = decode_snapshot(snap.snapshot).await;
+        let default = &decoded.iter().find(|(n, _)| n == "default").unwrap().1;
+        assert_eq!(default.len(), 1);
         // make_append_entry seeds one tag: ("id", index_as_bytes).
-        assert_eq!(default.events[0].tags.len(), 1);
-        assert_eq!(default.events[0].tags[0].0, b"id");
-        assert_eq!(default.events[0].tags[0].1, b"1");
+        assert_eq!(default[0].tags.len(), 1);
+        assert_eq!(default[0].tags[0].0, b"id");
+        assert_eq!(default[0].tags[0].1, b"1");
     }
 
     /// Sentinel-to-real rewrite of `last_applied` when the log has an entry

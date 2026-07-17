@@ -1,5 +1,3 @@
-use std::io::Cursor;
-
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Entry;
@@ -17,6 +15,10 @@ pub type NodeId = u64;
 pub type Node = BasicNode;
 
 // The openraft type config for KronosDB.
+//
+// SnapshotData is a FILE, not an in-memory buffer: snapshots stream
+// disk-to-disk on both build and install (see raft/snapshot_format.rs), so
+// snapshot size is bounded by disk, never by RAM.
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = RaftRequest,
@@ -24,7 +26,7 @@ openraft::declare_raft_types!(
         NodeId = NodeId,
         Node = Node,
         Entry = Entry<TypeConfig>,
-        SnapshotData = Cursor<Vec<u8>>,
+        SnapshotData = tokio::fs::File,
 );
 
 /// Commands that can be proposed to the Raft cluster.

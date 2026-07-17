@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use growable_bloom_filter::GrowableBloom;
@@ -8,7 +8,7 @@ use roaring::RoaringTreemap;
 
 use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
-use crate::event::Position;
+use crate::event::{Position, Tag};
 use crate::segment::reader::SegmentReader;
 /// Reserved tag key for event type names (same as in tag_index.rs).
 const EVENT_TYPE_TAG_KEY: &[u8] = b"__kronosdb_event_type__";
@@ -43,6 +43,52 @@ pub struct SegmentIndex {
 }
 
 impl SegmentIndex {
+    /// Creates an empty index for an in-progress (active) segment. Populated
+    /// incrementally via `insert_event` as records are written, so sealing
+    /// never has to re-read the segment file.
+    pub fn new(base_position: u64) -> Self {
+        Self {
+            bitmaps: HashMap::new(),
+            bloom: GrowableBloom::new(BLOOM_FPR, 1000),
+            all_positions: RoaringTreemap::new(),
+            base_position,
+            offsets: Vec::new(),
+        }
+    }
+
+    /// Returns the base position of the segment this index covers.
+    pub fn base_position(&self) -> u64 {
+        self.base_position
+    }
+
+    /// Indexes one event written at `record_offset` within the segment file.
+    /// Positions within a segment are dense and ascending.
+    pub fn insert_event(&mut self, position: u64, record_offset: u64, name: &str, tags: &[Tag]) {
+        self.all_positions.insert(position);
+
+        let relative = (position - self.base_position) as usize;
+        if self.offsets.len() <= relative {
+            self.offsets.resize(relative + 1, 0);
+        }
+        self.offsets[relative] = record_offset;
+
+        let type_key = make_forward_key(EVENT_TYPE_TAG_KEY, name.as_bytes());
+        self.bloom.insert(&type_key);
+        self.bitmaps
+            .entry(type_key)
+            .or_insert_with(RoaringTreemap::new)
+            .insert(position);
+
+        for tag in tags {
+            let key = make_forward_key(&tag.key, &tag.value);
+            self.bloom.insert(&key);
+            self.bitmaps
+                .entry(key)
+                .or_insert_with(RoaringTreemap::new)
+                .insert(position);
+        }
+    }
+
     /// Builds a segment index by reading all events from a segment file.
     pub fn build_from_segment(segment_path: &Path) -> Result<Self, Error> {
         let reader = SegmentReader::open(segment_path)?;
@@ -188,7 +234,9 @@ impl SegmentIndex {
     /// Writes the index to an `.idx` file.
     pub fn write_idx(&self, path: &Path) -> Result<(), Error> {
         let tmp_path = path.with_extension("idx.tmp");
-        let mut file = File::create(&tmp_path)?;
+        // Buffered: the offset table alone is one 8-byte write per event —
+        // unbuffered that is ~1M syscalls per seal.
+        let mut file = BufWriter::new(File::create(&tmp_path)?);
 
         // Header.
         file.write_all(&IDX_MAGIC)?;
@@ -225,7 +273,8 @@ impl SegmentIndex {
             file.write_all(&offset.to_le_bytes())?;
         }
 
-        file.sync_all()?;
+        file.flush()?;
+        file.get_ref().sync_all()?;
         fs::rename(&tmp_path, path)?;
         Ok(())
     }
@@ -311,7 +360,7 @@ impl SegmentIndex {
     /// Writes the bloom filter to a `.bloom` file.
     pub fn write_bloom(&self, path: &Path) -> Result<(), Error> {
         let tmp_path = path.with_extension("bloom.tmp");
-        let mut file = File::create(&tmp_path)?;
+        let mut file = BufWriter::new(File::create(&tmp_path)?);
 
         file.write_all(&BLOOM_MAGIC)?;
         file.write_all(&[BLOOM_VERSION])?;
@@ -322,7 +371,8 @@ impl SegmentIndex {
         file.write_all(&(encoded.len() as u32).to_le_bytes())?;
         file.write_all(&encoded)?;
 
-        file.sync_all()?;
+        file.flush()?;
+        file.get_ref().sync_all()?;
         fs::rename(&tmp_path, path)?;
         Ok(())
     }

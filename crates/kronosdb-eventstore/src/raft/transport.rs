@@ -27,7 +27,13 @@ impl RaftTransportService {
     }
 
     pub fn into_server(self) -> proto::raft_transport_server::RaftTransportServer<Self> {
+        // Peer traffic carries coalesced append entries; tonic's 4MB default
+        // decode limit would make followers reject fat entries and wedge
+        // replication in a permanent retry loop (cluster-wide write
+        // livelock, found by the cluster bench at batch=1000 conc=16).
         proto::raft_transport_server::RaftTransportServer::new(self)
+            .max_decoding_message_size(super::network::RAFT_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(super::network::RAFT_MAX_MESSAGE_BYTES)
     }
 }
 

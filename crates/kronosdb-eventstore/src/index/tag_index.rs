@@ -71,6 +71,25 @@ impl TagIndex {
         }
     }
 
+    /// Drops all positions below `base` — called after a segment seals and
+    /// its `.idx`/`.bloom` companions are durable, at which point queries
+    /// and DCB checks resolve those positions through the sealed-segment
+    /// indexes instead. Without this the in-memory index grows for the life
+    /// of the process (every position ever appended).
+    ///
+    /// Safe concurrently with appends: appends only insert positions >=
+    /// `base` (the new active segment's range), which this never touches.
+    pub fn prune_below(&self, base: u64) {
+        if base == 0 {
+            return;
+        }
+        self.forward.retain(|_, bitmap| {
+            bitmap.remove_range(0..base);
+            !bitmap.is_empty()
+        });
+        self.all_positions.lock().remove_range(0..base);
+    }
+
     /// Adds tags to an existing event's index. Used by the AddTags RPC.
     pub fn add_tags(&self, position: Position, tags: &[Tag]) {
         let pos = position.0;
