@@ -10,21 +10,7 @@ kronosdb-eventstore = { path = "../kronosdb-eventstore", features = ["bench-inst
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# openraft: log_store_only (07-01) constructs `Entry<TypeConfig>` directly and
-# drives `LogStore::append_test`; raft_append_3node (07-02) drives Raft per-node.
-# Must match the version + features pinned in `kronosdb-eventstore/Cargo.toml`
-# so there is only one `openraft` in the dep graph.
-# tonic: raft_append_3node binds its own gRPC transport per node.
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
-tonic = { version = "0.13", features = ["transport"] }
-
-[[bin]]
-name = "aggregate_baseline"
-path = "src/bin/aggregate_baseline.rs"
 
 [package.metadata.release]
 release = false
@@ -61,16 +47,4 @@ harness = false
 
 [[bench]]
 name = "throughput_sustained"
-harness = false
-
-[[bench]]
-name = "raft_append_baseline"
-harness = false
-
-[[bench]]
-name = "log_store_only"
-harness = false
-
-[[bench]]
-name = "raft_append_3node"
 harness = false

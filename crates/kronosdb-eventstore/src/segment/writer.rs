@@ -8,15 +8,32 @@ use parking_lot::RwLock;
 use crate::error::Error;
 use crate::event::{AppendEvent, Position, StoredEvent};
 
-use crate::segment::format::RaftMarker;
+use crate::segment::format::EventIndexFields;
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::{
-    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format,
+    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, flags, format, record,
     segment_path,
 };
 
 #[cfg(feature = "bench-instrumentation")]
 use crate::raft::bench_instrumentation::{self as bi, Region, Timer};
+
+/// Result of applying a frame of raw replicated segment records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAppendResult {
+    /// First event position expected before the frame was applied.
+    pub first_position: Position,
+    /// Number of event records in the frame (control/marker records excluded).
+    pub event_count: u32,
+    /// Next-exclusive local cursor after the frame.
+    pub durable_position: Position,
+    /// Raw byte range appended within the active segment.
+    pub byte_start: u64,
+    pub byte_end: u64,
+    /// Index projections for the applied events. The engine feeds these into
+    /// its active `TagIndex`; payloads are absent by design.
+    pub events: Vec<EventIndexFields>,
+}
 
 /// Writes events to segmented append-only log files.
 ///
@@ -180,47 +197,154 @@ impl SegmentWriter {
         Ok((first_position, events.len() as u32))
     }
 
-    /// Writes a Raft log entry — a `RaftMarker` followed, for Normal entries,
-    /// by `event_count` event records. The marker and all its events are
-    /// written as one atomic unit: if they don't fit in the current segment,
-    /// we rotate first. This guarantees a Raft entry never straddles a
-    /// segment boundary, which keeps sealed segments self-contained.
-    ///
-    /// Returns the first-event position (if any events) and the count.
-    /// For Membership/Blank entries (no events), first_position is the
-    /// current next_position and count is 0.
-    pub fn write_raft_entry(
-        &mut self,
-        marker: &RaftMarker,
-        events: &[AppendEvent],
-    ) -> Result<(Position, u32), Error> {
-        // Compute the total bytes we need. Rotate up front if the whole
-        // entry doesn't fit — this prevents a marker from ending up in one
-        // segment and its events in another.
-        let marker_len = estimate_marker_size(marker);
-        let events_len: usize = events
-            .iter()
-            .map(|e| RECORD_HEADER_SIZE + estimate_event_size(e))
-            .sum();
-        let total = marker_len + events_len;
-
-        if self.write_offset + total as u64 > self.max_segment_size {
-            self.rotate_segment()?;
-        }
-
-        // Write the marker first.
+    /// Writes a native control record without consuming an event position or
+    /// fsyncing. The caller commits it through the normal group-commit wave.
+    pub fn write_control(&mut self, control: &format::ControlRecord) -> Result<(), Error> {
         self.serialize_buf.clear();
-        format::serialize_raft_marker(marker, &mut self.serialize_buf);
+        let flags_byte = format::serialize_control(control, &mut self.serialize_buf);
         let payload = std::mem::take(&mut self.serialize_buf);
-        self.write_record(flags::RAFT_MARKER, &payload)?;
+        self.write_record(flags_byte, &payload)?;
         self.serialize_buf = payload;
+        Ok(())
+    }
 
-        let first_position = self.next_position;
-        for event in events {
-            self.write_one_event(event)?;
+    /// Applies already-framed segment records received from the leader.
+    ///
+    /// The bytes are CRC-checked and event positions are verified before any
+    /// write happens, then written verbatim in one `write_all`. Event payloads
+    /// are never materialized: only position, name, and tags are partially
+    /// decoded to maintain the active index. Rotation is leader-decided and
+    /// must arrive separately via `rotate_replicated`; a frame that does not
+    /// fit the active segment is rejected rather than silently rotating and
+    /// breaking byte equality.
+    pub fn append_raw_replicated(
+        &mut self,
+        bytes: &[u8],
+        first_position: Position,
+    ) -> Result<RawAppendResult, Error> {
+        if first_position != self.next_position {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "replicated frame starts at position {}, local tail is {}",
+                    first_position.0, self.next_position.0
+                ),
+            });
+        }
+        if self.write_offset + bytes.len() as u64 > self.max_segment_size {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "replicated frame exceeds active segment {} without Rotate",
+                    self.active_base_position
+                ),
+            });
         }
 
-        Ok((first_position, events.len() as u32))
+        // Validate the entire frame before mutating disk or indexes. Store the
+        // tiny index projections and record-relative offsets; payload bytes
+        // remain borrowed from the frame and are never copied.
+        let mut cursor = 0usize;
+        let mut expected = first_position;
+        let mut events: Vec<(usize, EventIndexFields)> = Vec::new();
+        while cursor < bytes.len() {
+            if bytes.len() - cursor < RECORD_HEADER_SIZE {
+                return Err(Error::Corrupted {
+                    message: "replicated frame ends inside a record header".into(),
+                });
+            }
+            let record_start = cursor;
+            let stored_crc = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let record_len =
+                u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+            if record_len < 1 {
+                return Err(Error::Corrupted {
+                    message: "replicated record has zero length".into(),
+                });
+            }
+            let record_end = cursor
+                .checked_add(8)
+                .and_then(|v| v.checked_add(record_len))
+                .ok_or_else(|| Error::Corrupted {
+                    message: "replicated record length overflow".into(),
+                })?;
+            if record_end > bytes.len() {
+                return Err(Error::Corrupted {
+                    message: "replicated frame ends inside a record payload".into(),
+                });
+            }
+
+            let flags_byte = bytes[cursor + 8];
+            let payload = &bytes[cursor + RECORD_HEADER_SIZE..record_end];
+            let computed_crc = crc32c::crc32c_append(crc32c::crc32c(&[flags_byte]), payload);
+            if computed_crc != stored_crc {
+                return Err(Error::Corrupted {
+                    message: format!("CRC mismatch in replicated record at frame byte {cursor}"),
+                });
+            }
+
+            if flags::is_event(flags_byte) {
+                let (fields, consumed) = format::deserialize_event_index_fields(payload)?;
+                if consumed != payload.len() {
+                    return Err(Error::Corrupted {
+                        message: "replicated event has trailing bytes".into(),
+                    });
+                }
+                if fields.position != expected {
+                    return Err(Error::Corrupted {
+                        message: format!(
+                            "replicated event position {}, expected {}",
+                            fields.position.0, expected.0
+                        ),
+                    });
+                }
+                expected = expected.next();
+                events.push((record_start, fields));
+            }
+            cursor = record_end;
+        }
+
+        let byte_start = self.write_offset;
+        self.active_file.write_all(bytes)?;
+        self.write_offset += bytes.len() as u64;
+
+        // Publish index entries only after the full frame write succeeds, so
+        // a concurrent reader can never seek to an incomplete record.
+        {
+            let mut index = self.active_index.write();
+            for (relative_offset, fields) in &events {
+                index.insert_event(
+                    fields.position.0,
+                    byte_start + *relative_offset as u64,
+                    &fields.name,
+                    &fields.tags,
+                );
+            }
+        }
+        self.next_position = expected;
+
+        let projections = events.into_iter().map(|(_, fields)| fields).collect();
+        Ok(RawAppendResult {
+            first_position,
+            event_count: (expected.0 - first_position.0) as u32,
+            durable_position: expected,
+            byte_start,
+            byte_end: self.write_offset,
+            events: projections,
+        })
+    }
+
+    /// Mirrors a leader-decided segment rotation. The current segment is
+    /// synced, truncated to its exact byte length, and indexed before the new
+    /// segment is created. `new_base` must equal the follower's local tail.
+    pub fn rotate_replicated(&mut self, new_base: Position) -> Result<(), Error> {
+        if new_base != self.next_position {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "replicated Rotate base {}, local tail is {}",
+                    new_base.0, self.next_position.0
+                ),
+            });
+        }
+        self.rotate_segment()
     }
 
     /// Writes a single event record, rotating the segment if needed.
@@ -307,6 +431,44 @@ impl SegmentWriter {
         self.next_position
     }
 
+    /// Returns the current write offset within the active segment. A wave
+    /// descriptor snapshots this under the writer lock so its raw byte range
+    /// is ordered against the seal barrier.
+    pub fn write_offset(&self) -> u64 {
+        self.write_offset
+    }
+
+    pub fn has_records(&self) -> bool {
+        self.write_offset > SEGMENT_HEADER_SIZE as u64
+    }
+
+    /// Reopens `base` as the active segment after an engine-level suffix
+    /// truncation. Later segment files have already been deleted by the
+    /// caller. Preserves the shared active-index handle used by readers.
+    pub fn reopen_truncated(
+        &mut self,
+        base: u64,
+        write_offset: u64,
+        next_position: Position,
+    ) -> Result<(), Error> {
+        use std::io::{Seek, SeekFrom};
+
+        let path = segment_path(&self.dir, base);
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        file.set_len(write_offset)?;
+        file.sync_data()?;
+        preallocate(&file, self.max_segment_size);
+        file.seek(SeekFrom::Start(write_offset))?;
+
+        let rebuilt = SegmentIndex::build_from_segment(&path)?;
+        *self.active_index.write() = rebuilt;
+        self.active_file = file;
+        self.active_base_position = base;
+        self.write_offset = write_offset;
+        self.next_position = next_position;
+        Ok(())
+    }
+
     /// Returns the base position of the currently active segment.
     pub fn active_base_position(&self) -> u64 {
         self.active_base_position
@@ -365,32 +527,6 @@ struct SegmentHeader {
     base_position: u64,
 }
 
-/// Upper bound on the serialized size of a Raft marker record (header + payload).
-fn estimate_marker_size(marker: &RaftMarker) -> usize {
-    // Fixed marker payload is 23 bytes; extra is variable.
-    RECORD_HEADER_SIZE + 23 + marker.extra.len()
-}
-
-/// Upper bound on the serialized size of an event payload (without record header).
-/// Matches the layout in format::serialize_event.
-fn estimate_event_size(event: &AppendEvent) -> usize {
-    let mut n = 8 // position
-        + 2 + event.identifier.len()
-        + 2 + event.name.len()
-        + 2 + event.version.len()
-        + 8 // timestamp
-        + 2; // metadata_count
-    for (k, v) in &event.metadata {
-        n += 2 + k.len() + 2 + v.len();
-    }
-    n += 2; // tag_count
-    for tag in &event.tags {
-        n += 2 + tag.key.len() + 2 + tag.value.len();
-    }
-    n += 4 + event.payload.len(); // payload_len + payload
-    n
-}
-
 fn create_segment_file(path: &Path) -> Result<File, io::Error> {
     let file = OpenOptions::new()
         .create_new(true)
@@ -439,206 +575,56 @@ fn read_segment_header(file: &mut File) -> Result<SegmentHeader, Error> {
     Ok(SegmentHeader { base_position })
 }
 
-/// Scans the segment from after the header, validating CRCs and enforcing
-/// marker-group atomicity.
+/// Scans an active segment to its last complete CRC-valid native record.
+/// Events must be position-contiguous; control records consume no position.
+/// The first torn, malformed, unknown, or out-of-sequence record terminates
+/// recovery and the caller truncates the physical suffix.
 ///
-/// Returns `(write_offset, next_position)` — the offset to resume writing
-/// and the next position to assign.
-///
-/// # Marker-authoritative recovery
-///
-/// A Raft apply fsyncs as a single unit: one `RaftMarker` record followed
-/// (for `Normal` entries) by exactly `event_count` event records. A crash
-/// mid-fsync can leave three possible on-disk states for a group:
-///
-/// 1. **Marker not durable** — nothing from this group reached disk; the
-///    previous complete group is the tail.
-/// 2. **Marker durable, 0..k events durable** (where `k < event_count`) —
-///    orphan events with no matching acknowledged Raft log entry. These
-///    MUST be truncated: Raft replay from `committed+1` will re-issue the
-///    apply, and keeping orphans would either double-apply or diverge the
-///    event segment from the cluster (root cause of CRASH-02 Shape 1 /
-///    Shape 2 in the three-node convergence tests).
-/// 3. **Marker + all `event_count` events durable** — complete group;
-///    keep in full.
-///
-/// Algorithm: walk records, tracking `last_complete_offset` (the tail of
-/// the last fully-committed group). When a marker opens a group, it sets
-/// `pending_events_remaining` to `event_count`; each subsequent event
-/// decrements it. Only when the counter reaches zero do we advance
-/// `last_complete_offset`. On corruption, CRC failure, or a marker
-/// arriving mid-group, we stop and return `last_complete_offset` — the
-/// orphan tail is truncated by the caller via `file.set_len(write_offset)`.
-///
-/// # Legacy / snapshot-install fallback
-///
-/// Segments written via `SegmentWriter::append()` (the non-Raft path used
-/// by the snapshot-install rebuild in `state_machine::install_snapshot`)
-/// contain no markers. For those, marker-authoritative recovery would
-/// truncate every event. When we complete the scan without seeing any
-/// marker, we fall back to the pre-Option-D behavior: accept every
-/// CRC-valid event record up to the first torn/corrupt record.
+/// Returns `(write_offset, next_position)` — the offset to resume writing and
+/// the next position to assign.
 fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
     use std::io::{Read, Seek, SeekFrom};
 
+    file.seek(SeekFrom::Start(0))?;
+    let header = read_segment_header(file)?;
     let file_len = file.seek(SeekFrom::End(0))?;
-    file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
-
-    // Marker-group tracking.
     let mut offset = SEGMENT_HEADER_SIZE as u64;
-    let mut last_complete_offset = offset;
-    let mut last_complete_position: Option<Position> = None;
-    // Fallback tracking (no markers in segment).
-    let mut fallback_tail_offset = offset;
-    let mut fallback_last_position: Option<Position> = None;
-    let mut seen_any_marker = false;
-    // Pending-group state.
-    let mut pending_events_remaining: u32 = 0;
-    let mut pending_last_position: Option<Position> = None;
-    // Set to true when we observe a malformed record mid-scan; disables
-    // the zero-markers fallback (the corruption is real, not a marker-vs-no-marker
-    // ambiguity).
-    let mut corruption_seen = false;
+    let mut valid_offset = offset;
+    let mut next_position = Position(header.base_position);
+    file.seek(SeekFrom::Start(offset))?;
 
     while offset + RECORD_HEADER_SIZE as u64 <= file_len {
-        // Read the record header.
         let mut header_buf = [0u8; RECORD_HEADER_SIZE];
         if file.read_exact(&mut header_buf).is_err() {
-            corruption_seen = true;
             break;
         }
 
-        let stored_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-        let record_len = u32::from_le_bytes(header_buf[4..8].try_into().unwrap()) as usize;
-        let flags_byte = header_buf[8];
-
-        // Sanity check record length.
-        if record_len < 1 || offset + RECORD_HEADER_SIZE as u64 + (record_len - 1) as u64 > file_len
-        {
-            corruption_seen = true;
-            break; // Torn write — stop here.
-        }
-
-        // Read flags + payload (record_len includes the flags byte we already have in header).
-        let payload_len = record_len - 1; // subtract the flags byte
-        let mut payload_buf = vec![0u8; payload_len];
-        if file.read_exact(&mut payload_buf).is_err() {
-            corruption_seen = true;
-            break;
-        }
-
-        // Verify CRC over flags + payload.
-        let computed_crc = {
-            let mut digest = crc32c::crc32c(&[flags_byte]);
-            digest = crc32c::crc32c_append(digest, &payload_buf);
-            digest
+        let header = match record::parse_header(&header_buf)? {
+            Some(header) => header,
+            None => break,
         };
-
-        if computed_crc != stored_crc {
-            corruption_seen = true;
-            break; // Corruption or torn write — stop here.
+        if offset + header.total_len() as u64 > file_len {
+            break;
         }
 
-        let record_end = offset + RECORD_HEADER_SIZE as u64 + payload_len as u64;
-
-        // Fallback bookkeeping: track the furthest CRC-valid event record,
-        // regardless of marker-group state. Used only when the whole segment
-        // contains no markers.
-        if flags::is_event(flags_byte) && payload_buf.len() >= 8 {
-            let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
-            fallback_last_position = Some(Position(position));
-            fallback_tail_offset = record_end;
+        let mut payload = vec![0u8; header.payload_len];
+        if file.read_exact(&mut payload).is_err() || !record::validate_crc(header, &payload) {
+            break;
         }
 
-        if flags::is_raft_marker(flags_byte) {
-            // A marker arriving while a previous group is still pending means
-            // the previous group's event tail was truncated by a crash. Stop
-            // at `last_complete_offset` — the orphan marker and any events
-            // after it are dropped.
-            if pending_events_remaining > 0 {
-                break;
+        match record::decode_native(header, &payload) {
+            Ok(record::NativeRecord::Event { position }) if position == next_position.0 => {
+                next_position = next_position.next();
             }
-            seen_any_marker = true;
-
-            match format::deserialize_raft_marker(&payload_buf) {
-                Ok((marker, _)) => {
-                    if marker.event_count == 0 {
-                        // Blank / Membership entry: group is trivially complete.
-                        last_complete_offset = record_end;
-                        // No event written; `last_complete_position` unchanged.
-                    } else {
-                        pending_events_remaining = marker.event_count as u32;
-                        pending_last_position = None;
-                        // Do NOT yet advance `last_complete_offset` — we only
-                        // commit the group after all `event_count` events.
-                    }
-                }
-                Err(_) => {
-                    // Deserialize failure after CRC pass is unexpected; be
-                    // conservative and stop at the last complete group.
-                    corruption_seen = true;
-                    break;
-                }
-            }
-        } else if flags::is_event(flags_byte) {
-            if pending_events_remaining > 0 {
-                // Event belongs to the currently pending marker-group.
-                if payload_buf.len() >= 8 {
-                    let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
-                    pending_last_position = Some(Position(position));
-                }
-                pending_events_remaining -= 1;
-                if pending_events_remaining == 0 {
-                    // Group complete — commit it.
-                    last_complete_offset = record_end;
-                    if let Some(pos) = pending_last_position.take() {
-                        last_complete_position = Some(pos);
-                    }
-                }
-            } else if !seen_any_marker {
-                // Zero-markers fallback (legacy/snapshot-install rebuild):
-                // accept every CRC-valid event. `last_complete_offset` is
-                // updated so that, should we later encounter a marker, we
-                // correctly treat this prefix as committed; but the primary
-                // authority for the fallback is `fallback_tail_offset`.
-                if payload_buf.len() >= 8 {
-                    let position = u64::from_le_bytes(payload_buf[0..8].try_into().unwrap());
-                    last_complete_position = Some(Position(position));
-                }
-                last_complete_offset = record_end;
-            } else {
-                // Event after a complete group, with no opening marker for
-                // this event → orphan. Stop.
-                break;
-            }
+            Ok(record::NativeRecord::Control(_)) => {}
+            _ => break,
         }
-        // Other record types (none defined today): ignore, do not advance
-        // any committed offset.
 
-        offset = record_end;
+        offset += header.total_len() as u64;
+        valid_offset = offset;
     }
 
-    // Zero-markers fallback: a segment that made it through the scan with
-    // no markers and no mid-stream corruption uses pre-Option-D behavior.
-    // This path is exercised by the snapshot-install rebuild, where
-    // `EventStoreEngine::append` writes events without a Raft marker.
-    let (final_offset, final_position) = if !seen_any_marker && !corruption_seen {
-        (fallback_tail_offset, fallback_last_position)
-    } else {
-        (last_complete_offset, last_complete_position)
-    };
-
-    let next_position = match final_position {
-        Some(pos) => pos.next(),
-        None => {
-            // No valid records in this segment. Read the base position from the header.
-            file.seek(SeekFrom::Start(0))?;
-            let header = read_segment_header(file)?;
-            Position(header.base_position)
-        }
-    };
-
-    Ok((final_offset, next_position))
+    Ok((valid_offset, next_position))
 }
 
 /// Pre-allocates disk space for a file.
@@ -759,92 +745,6 @@ mod tests {
 
         let recovered = SegmentWriter::open(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
         assert_eq!(recovered.head(), Position(3));
-    }
-
-    #[test]
-    fn raft_entry_writes_marker_and_events() {
-        use crate::segment::format::{RaftEntryType, RaftMarker};
-        use crate::segment::reader::SegmentReader;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
-
-        // Write: marker(normal, 2 events), marker(blank), marker(normal, 1 event).
-        let events1 = vec![
-            make_event("OrderPlaced", b"o1"),
-            make_event("PaymentReceived", b"p1"),
-        ];
-        let (first, count) = writer
-            .write_raft_entry(&RaftMarker::normal(1, 1, 2), &events1)
-            .unwrap();
-        assert_eq!(first, Position(0));
-        assert_eq!(count, 2);
-
-        let (_, count) = writer
-            .write_raft_entry(&RaftMarker::blank(1, 2), &[])
-            .unwrap();
-        assert_eq!(count, 0);
-
-        let events2 = vec![make_event("OrderShipped", b"s1")];
-        let (first, _) = writer
-            .write_raft_entry(&RaftMarker::normal(1, 3, 1), &events2)
-            .unwrap();
-        assert_eq!(first, Position(2));
-
-        writer.sync().unwrap();
-        let seg_path = writer.active_segment_path();
-        drop(writer);
-
-        // Event iterator should skip markers — returns 3 events total.
-        let reader = SegmentReader::open(&seg_path).unwrap();
-        let events: Vec<_> = reader.iter(None).collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].name, "OrderPlaced");
-        assert_eq!(events[1].name, "PaymentReceived");
-        assert_eq!(events[2].name, "OrderShipped");
-
-        // Raft marker iterator should see all 3 markers.
-        let markers: Vec<_> = reader
-            .iter_raft_markers()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(markers.len(), 3);
-        assert_eq!(markers[0].1.index, 1);
-        assert_eq!(markers[0].1.event_count, 2);
-        assert_eq!(markers[0].1.entry_type, RaftEntryType::Normal);
-        assert_eq!(markers[1].1.index, 2);
-        assert_eq!(markers[1].1.entry_type, RaftEntryType::Blank);
-        assert_eq!(markers[2].1.index, 3);
-        assert_eq!(markers[2].1.event_count, 1);
-    }
-
-    #[test]
-    fn raft_entry_survives_recovery() {
-        use crate::segment::format::RaftMarker;
-
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mut writer =
-                SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
-            writer
-                .write_raft_entry(
-                    &RaftMarker::normal(1, 1, 2),
-                    &[
-                        make_event("OrderPlaced", b"a"),
-                        make_event("PaymentReceived", b"b"),
-                    ],
-                )
-                .unwrap();
-            writer
-                .write_raft_entry(&RaftMarker::blank(1, 2), &[])
-                .unwrap();
-            writer.sync().unwrap();
-        }
-
-        // Reopen — recovery should skip the marker (non-event record) and set
-        // next_position based on the last event record's position.
-        let recovered = SegmentWriter::open(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        assert_eq!(recovered.head(), Position(2));
     }
 
     #[test]

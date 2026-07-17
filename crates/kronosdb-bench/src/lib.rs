@@ -10,8 +10,6 @@
 //! user activity, etc.), not millions. The scale challenge is having millions
 //! of *entities*, each with a small number of events spread across many segments.
 
-pub mod baseline_aggregate;
-
 use kronosdb_eventstore::append::AppendRequest;
 use kronosdb_eventstore::criteria::{Criterion, SourcingCondition};
 use kronosdb_eventstore::event::{AppendEvent, Tag};

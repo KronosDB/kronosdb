@@ -9,8 +9,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&[format!("{proto_dir}/raft.proto")], &[proto_dir])?;
 
-    // Phase 6 additive: compile eventstore.proto as CLIENT-ONLY stubs so the crash-test
-    // harness can drive the server via gRPC without touching the server crate.
+    // Native segment replication — both sides live in the eventstore crate:
+    // the leader serves Tail and followers run the generated client.
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .bytes([".kronosdb.replication.Records.data"])
+        .compile_protos(&[format!("{proto_dir}/replication.proto")], &[proto_dir])?;
+
+    // Compile eventstore.proto as client-only stubs so the crash-test harness can
+    // drive the server via gRPC without depending on the server crate.
     // The server crate still compiles its own server+client stubs via its own build.rs —
     // this is a second, independent compilation into kronosdb-eventstore's OUT_DIR.
     tonic_build::configure()
@@ -24,8 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[proto_dir],
         )?;
 
-    // Phase 6 Task 1: export the path where the `kronosdb-server` binary is expected
-    // to live so integration tests can spawn it without an artifact-dependency.
+    // Export the path where the `kronosdb-server` binary is expected to live so
+    // integration tests can spawn it without an artifact dependency.
     // Stable Cargo does not expose `CARGO_BIN_EXE_*` for cross-package bins, and
     // kronosdb-server has no `[lib]` target (so a regular dev-dependency is ignored).
     // We do NOT invoke `cargo build` from this build script — doing so would be

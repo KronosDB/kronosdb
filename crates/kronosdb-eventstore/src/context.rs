@@ -4,10 +4,14 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::append::AppliedLogId;
 use crate::error::Error;
 use crate::snapshot::SnapshotStore;
 use crate::store::{EventStoreEngine, StoreOptions};
+
+struct ContextEntry {
+    engine: Arc<EventStoreEngine>,
+    snapshots: Arc<SnapshotStore>,
+}
 
 /// Manages multiple isolated event store contexts.
 ///
@@ -19,11 +23,8 @@ pub struct ContextManager {
     /// Root data directory. Each context gets a subdirectory.
     data_dir: PathBuf,
 
-    /// Active contexts, keyed by name.
-    contexts: RwLock<HashMap<String, Arc<EventStoreEngine>>>,
-
-    /// Snapshot stores per context, keyed by name.
-    snapshot_stores: RwLock<HashMap<String, Arc<SnapshotStore>>>,
+    /// Fully initialized contexts, published atomically by name.
+    contexts: RwLock<HashMap<String, ContextEntry>>,
 
     /// Store options for creating new contexts.
     store_options: StoreOptions,
@@ -72,7 +73,6 @@ impl ContextManager {
         let mut manager = Self {
             data_dir: data_dir.to_path_buf(),
             contexts: RwLock::new(HashMap::new()),
-            snapshot_stores: RwLock::new(HashMap::new()),
             store_options,
             _lock_file: lock_file,
         };
@@ -96,13 +96,12 @@ impl ContextManager {
         }
 
         let context_dir = self.data_dir.join(name);
-        let store = EventStoreEngine::create_with_store_options(&context_dir, &self.store_options)?;
-        contexts.insert(name.to_string(), Arc::new(store));
-
-        let snap_store = SnapshotStore::open(&context_dir.join("snapshots"))?;
-        self.snapshot_stores
-            .write()
-            .insert(name.to_string(), Arc::new(snap_store));
+        let engine = Arc::new(EventStoreEngine::create_with_store_options(
+            &context_dir,
+            &self.store_options,
+        )?);
+        let snapshots = Arc::new(SnapshotStore::open(&context_dir.join("snapshots"))?);
+        contexts.insert(name.to_string(), ContextEntry { engine, snapshots });
 
         Ok(())
     }
@@ -114,10 +113,10 @@ impl ContextManager {
         F: FnOnce(&EventStoreEngine) -> Result<R, Error>,
     {
         let contexts = self.contexts.read();
-        let store = contexts.get(name).ok_or_else(|| Error::ContextNotFound {
+        let entry = contexts.get(name).ok_or_else(|| Error::ContextNotFound {
             name: name.to_string(),
         })?;
-        f(store)
+        f(&entry.engine)
     }
 
     /// Returns the root data directory.
@@ -132,7 +131,7 @@ impl ContextManager {
         let contexts = self.contexts.read();
         contexts
             .get(name)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.engine))
             .ok_or_else(|| Error::ContextNotFound {
                 name: name.to_string(),
             })
@@ -140,10 +139,10 @@ impl ContextManager {
 
     /// Gets a cloneable reference to a context's snapshot store.
     pub fn get_snapshot_store(&self, name: &str) -> Result<Arc<SnapshotStore>, Error> {
-        let stores = self.snapshot_stores.read();
-        stores
+        let contexts = self.contexts.read();
+        contexts
             .get(name)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.snapshots))
             .ok_or_else(|| Error::ContextNotFound {
                 name: name.to_string(),
             })
@@ -169,81 +168,9 @@ impl ContextManager {
     /// already durable, this just prevents new work from hanging.
     pub fn shutdown_all(&self) {
         let contexts = self.contexts.read();
-        for engine in contexts.values() {
-            engine.shutdown();
+        for entry in contexts.values() {
+            entry.engine.shutdown();
         }
-    }
-
-    /// Returns the maximum applied Raft `LogId` across every active context,
-    /// reconstructed from on-disk `RaftMarker` records in each context's
-    /// event segments. Used at Raft state-machine construction time to
-    /// recover `last_applied` without a sidecar file (Option D).
-    ///
-    /// Returns `Ok(None)` if no context holds any marker (fresh data dir or
-    /// legacy data written before this plan). On a multi-context deployment,
-    /// the true `last_applied` is the max across all of them because the
-    /// Raft log is a single stream that all contexts apply from.
-    pub fn max_applied_log_id(&self) -> Result<Option<AppliedLogId>, Error> {
-        let contexts = self.contexts.read();
-        let mut best: Option<AppliedLogId> = None;
-        for store in contexts.values() {
-            if let Some(candidate) = store.max_applied_log_id()? {
-                best = Some(match best {
-                    Some(cur) => {
-                        // Compare by (term, index) lexicographic order.
-                        if (candidate.term, candidate.index) > (cur.term, cur.index) {
-                            candidate
-                        } else {
-                            cur
-                        }
-                    }
-                    None => candidate,
-                });
-            }
-        }
-        Ok(best)
-    }
-
-    /// Drains every active context and removes its on-disk subdirectory.
-    ///
-    /// Used by Raft snapshot install (Phase 4, D-03). Ordering is load-bearing:
-    /// 1. Take ownership of the inner maps (drop `Arc<EventStoreEngine>` before
-    ///    removing files — this lets the engine's Drop close file handles).
-    /// 2. `fs::remove_dir_all` each context subdirectory.
-    /// 3. fsync `data_dir` so the removes are durable before this returns.
-    ///
-    /// After this returns, `list_contexts()` is empty and fresh contexts can be
-    /// created under the same names. `data_dir` itself is preserved.
-    ///
-    /// Strict-durability: per PROJECT.md, `DurabilityMode::Window` is
-    /// unreachable; this method always fsyncs.
-    pub fn reset_all(&self) -> Result<(), Error> {
-        // Step 1: drain maps (scope the write guards so Drop runs before fs ops).
-        let drained_names: Vec<String> = {
-            let mut contexts = self.contexts.write();
-            let mut snap_stores = self.snapshot_stores.write();
-            let names: Vec<String> = contexts.keys().cloned().collect();
-            contexts.clear(); // drops Arc<EventStoreEngine>; engine's Drop closes files
-            snap_stores.clear(); // drops Arc<SnapshotStore>
-            names
-        };
-
-        // Step 2: remove directories (guards released — fs ops outside the lock).
-        for name in &drained_names {
-            let dir = self.data_dir.join(name);
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
-            }
-        }
-
-        // Step 3: fsync the parent dir so the unlink entries are durable.
-        // Skips if drained_names was empty (no change to persist).
-        if !drained_names.is_empty() {
-            let parent = std::fs::File::open(&self.data_dir).map_err(Error::Io)?;
-            parent.sync_all().map_err(Error::Io)?;
-        }
-
-        Ok(())
     }
 
     /// Discovers and opens existing contexts from the data directory.
@@ -274,13 +201,12 @@ impl ContextManager {
                 .any(|e| e.path().extension().is_some_and(|ext| ext == "seg"));
 
             if has_segments {
-                let store = EventStoreEngine::open_with_store_options(&path, &self.store_options)?;
-                contexts.insert(name.clone(), Arc::new(store));
-
-                let snap_store = SnapshotStore::open(&path.join("snapshots"))?;
-                self.snapshot_stores
-                    .write()
-                    .insert(name, Arc::new(snap_store));
+                let engine = Arc::new(EventStoreEngine::open_with_store_options(
+                    &path,
+                    &self.store_options,
+                )?);
+                let snapshots = Arc::new(SnapshotStore::open(&path.join("snapshots"))?);
+                contexts.insert(name, ContextEntry { engine, snapshots });
             }
         }
 
@@ -506,86 +432,5 @@ mod tests {
 
         let list = manager.list_contexts();
         assert_eq!(list, vec!["alpha", "beta"]); // Sorted.
-    }
-
-    // ------------------------------------------------------------------
-    // Phase 4 SNAP-02 (Task 1): reset_all — drain engines, remove dirs,
-    // fsync data_dir. Used by Raft snapshot install (D-03).
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn reset_all_on_empty_manager_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        assert!(mgr.reset_all().is_ok());
-        assert!(mgr.list_contexts().is_empty());
-    }
-
-    #[test]
-    fn reset_all_removes_contexts_and_disk_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        mgr.create_context("orders").unwrap();
-        mgr.with_context("orders", |store| {
-            for i in 0..3 {
-                store.append(AppendRequest {
-                    condition: None,
-                    events: vec![make_event(
-                        &format!("E{i}"),
-                        vec![tag("k", &format!("v{i}"))],
-                    )],
-                })?;
-            }
-            Ok(())
-        })
-        .unwrap();
-        let orders_dir = dir.path().join("orders");
-        assert!(orders_dir.exists(), "precondition: orders dir exists");
-
-        mgr.reset_all().unwrap();
-
-        assert!(mgr.list_contexts().is_empty());
-        assert!(!orders_dir.exists(), "orders dir should be removed");
-    }
-
-    #[test]
-    fn reset_all_allows_recreating_same_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        mgr.create_context("orders").unwrap();
-        mgr.reset_all().unwrap();
-        // Recreating a name that used to exist should succeed.
-        mgr.create_context("orders").unwrap();
-        assert!(mgr.context_exists("orders"));
-    }
-
-    #[test]
-    fn reset_all_then_reopen_manager_sees_no_contexts() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mgr = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-            mgr.create_context("a").unwrap();
-            mgr.create_context("b").unwrap();
-            mgr.reset_all().unwrap();
-        }
-        // Reopen — discover_contexts should find nothing to discover.
-        let mgr2 = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        assert!(mgr2.list_contexts().is_empty());
-    }
-
-    #[test]
-    fn reset_all_tolerates_external_arc_holder() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = ContextManager::new(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
-        mgr.create_context("orders").unwrap();
-        // Simulate something else holding the Arc (e.g. a request in flight).
-        let external: Arc<EventStoreEngine> = mgr.get_context("orders").unwrap();
-        // reset_all must still complete — ContextManager's internal map is
-        // emptied; the external Arc keeps its engine alive but that engine's
-        // files may be gone from disk. Dropping the external Arc at the end
-        // must not panic or hang.
-        mgr.reset_all().unwrap();
-        assert!(mgr.list_contexts().is_empty());
-        drop(external);
     }
 }

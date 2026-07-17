@@ -1,12 +1,10 @@
+use std::collections::BTreeMap;
+
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Entry;
 use openraft::SnapshotPolicy;
 use serde::{Deserialize, Serialize};
-
-use crate::criteria::SourcingCondition;
-use crate::event::AppendEvent;
-use crate::event::Position;
 
 /// Node ID type — simple u64.
 pub type NodeId = u64;
@@ -14,11 +12,7 @@ pub type NodeId = u64;
 /// Node info — address for gRPC transport.
 pub type Node = BasicNode;
 
-// The openraft type config for KronosDB.
-//
-// SnapshotData is a FILE, not an in-memory buffer: snapshots stream
-// disk-to-disk on both build and install (see raft/snapshot_format.rs), so
-// snapshot size is bounded by disk, never by RAM.
+// The openraft type config for KronosDB's metadata control plane.
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = RaftRequest,
@@ -29,197 +23,54 @@ openraft::declare_raft_types!(
         SnapshotData = tokio::fs::File,
 );
 
-/// Commands that can be proposed to the Raft cluster.
+/// Commands replicated by the metadata-only Raft control plane.
 ///
-/// This is the "D" (application data) type in openraft.
-/// Each variant becomes a Raft log entry.
+/// Event data never belongs in this type. Segments are replicated by the
+/// native data plane; Raft carries only context and leadership metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftRequest {
-    /// Append events to the event store.
-    Append {
-        /// The context to append to.
-        context: String,
-        /// Serialized events (we serialize AppendEvents to avoid trait object issues).
-        events: Vec<RaftAppendEvent>,
-        /// Optional DCB consistency condition.
-        condition: Option<RaftAppendCondition>,
-    },
-    /// Create a new context.
+    /// Create a context on every node. Applying this more than once succeeds.
     CreateContext { name: String },
-    /// Multiple independent appends to ONE context, proposed as a single log
-    /// entry. openraft 0.9 blocks its core loop on every log-entry fsync
-    /// ("append_to_log … a temp wrapper to make non-blocking append_to_log a
-    /// blocking"), so consensus throughput is capped at entries-per-fsync —
-    /// batching appends into one entry is what lets concurrent writers share
-    /// a consensus round. Items are checked and applied independently
-    /// (per-item DCB) but persist under ONE raft marker, so a torn write
-    /// replays the whole entry instead of losing its tail.
+
+    /// Claim native data-plane leadership.
     ///
-    /// New variant appended at the enum tail: entries written by older
-    /// binaries keep decoding; older binaries cannot decode entries carrying
-    /// this variant (no rolling downgrade across this point).
-    AppendBatch {
-        /// The single context every item appends to. One context per entry
-        /// keeps the torn-write recovery story single-file: the entry's
-        /// marker+events either fully survive or fully replay.
-        context: String,
-        items: Vec<BatchAppendItem>,
+    /// The fencing epoch is deliberately absent: the state machine derives it
+    /// from the applied entry's `log_id.index`, which is globally ordered and
+    /// cannot be chosen or reused by the claimant.
+    LeaderClaim {
+        node_id: NodeId,
+        term: u64,
+        prior_epoch: u64,
+        voters: Vec<NodeId>,
+        per_context_tails: BTreeMap<String, u64>,
     },
 }
 
-/// One append inside an `AppendBatch` entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchAppendItem {
-    pub events: Vec<RaftAppendEvent>,
-    pub condition: Option<RaftAppendCondition>,
-}
-
-/// Application response returned after applying a Raft log entry.
+/// Application response returned after applying a control-plane entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftResponse {
-    /// Response from an append operation.
-    Append {
-        first_position: u64,
-        count: u32,
-        consistency_marker: u64,
-    },
-    /// Context was created.
     ContextCreated,
-    /// No-op / membership change applied.
+    /// The epoch allocated from the applied LeaderClaim's log index.
+    LeaderClaimed {
+        epoch: u64,
+    },
+    /// Blank or membership entry applied.
     Ok,
-    /// Apply-time rejection of an append (e.g. DCB consistency violation).
-    ///
-    /// Returned by the state machine when `apply` cannot honour the
-    /// `RaftRequest` against the current committed state (D-01). Downstream
-    /// (cluster.rs) maps this back to the existing `Error` taxonomy for the
-    /// client-facing surface (D-02) so connector wire contracts stay stable.
-    AppendRejected { reason: RaftRejectReason },
-    /// Per-item outcomes of an `AppendBatch` entry, in item order.
-    AppendBatch { results: Vec<BatchAppendResult> },
 }
 
-/// Outcome of one item inside an `AppendBatch` entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BatchAppendResult {
-    Append {
-        first_position: u64,
-        count: u32,
-        consistency_marker: u64,
-    },
-    Rejected {
-        reason: RaftRejectReason,
-    },
+/// Applied leader metadata retained by the state machine and its snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaderClaim {
+    pub epoch: u64,
+    pub node_id: NodeId,
+    pub term: u64,
+    pub prior_epoch: u64,
+    pub voters: Vec<NodeId>,
+    pub per_context_tails: BTreeMap<String, u64>,
 }
 
-/// Reason an apply-time append was rejected.
-///
-/// Extensible: future rejection classes add variants here rather than
-/// changing `RaftResponse`'s shape (D-01, D-03). `u64` (not `event::Position`)
-/// on the wire keeps this serde surface decoupled from the event-layer type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RaftRejectReason {
-    /// The DCB consistency condition was violated at apply time.
-    /// `conflicting_position` is the `u64` form of `event::Position` of
-    /// the event that caused the rejection.
-    ConsistencyConditionViolated { conflicting_position: u64 },
-}
-
-/// Serializable version of AppendEvent (for Raft log entries).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RaftAppendEvent {
-    pub identifier: String,
-    pub name: String,
-    pub version: String,
-    pub timestamp: i64,
-    pub payload: Vec<u8>,
-    pub metadata: Vec<(String, String)>,
-    pub tags: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-/// Serializable version of AppendCondition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RaftAppendCondition {
-    pub consistency_marker: u64,
-    pub criteria: Vec<RaftCriterion>,
-}
-
-/// Serializable version of Criterion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RaftCriterion {
-    pub names: Vec<String>,
-    pub tags: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-// --- Conversions between Raft types and eventstore types ---
-
-impl RaftAppendEvent {
-    pub fn from_event(e: &AppendEvent) -> Self {
-        Self {
-            identifier: e.identifier.clone(),
-            name: e.name.clone(),
-            version: e.version.clone(),
-            timestamp: e.timestamp,
-            payload: e.payload.clone(),
-            metadata: e.metadata.clone(),
-            tags: e
-                .tags
-                .iter()
-                .map(|t| (t.key.clone(), t.value.clone()))
-                .collect(),
-        }
-    }
-
-    pub fn to_event(&self) -> AppendEvent {
-        AppendEvent {
-            identifier: self.identifier.clone(),
-            name: self.name.clone(),
-            version: self.version.clone(),
-            timestamp: self.timestamp,
-            payload: self.payload.clone(),
-            metadata: self.metadata.clone(),
-            tags: self
-                .tags
-                .iter()
-                .map(|(k, v)| crate::event::Tag {
-                    key: k.clone(),
-                    value: v.clone(),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl RaftAppendCondition {
-    pub fn to_condition(&self) -> crate::append::AppendCondition {
-        crate::append::AppendCondition {
-            consistency_marker: Position(self.consistency_marker),
-            criteria: SourcingCondition {
-                criteria: self.criteria.iter().map(|c| c.to_criterion()).collect(),
-            },
-        }
-    }
-}
-
-impl RaftCriterion {
-    pub fn to_criterion(&self) -> crate::criteria::Criterion {
-        crate::criteria::Criterion {
-            names: self.names.clone(),
-            tags: self
-                .tags
-                .iter()
-                .map(|(k, v)| crate::event::Tag {
-                    key: k.clone(),
-                    value: v.clone(),
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Default cadence for the Raft snapshot policy (D-04): build a snapshot
-/// every N log entries since the last one. At ≥ 1 k ev/s (Phase 7 target)
-/// this is roughly one snapshot per minute. Refine empirically in Phase 7.
-/// Integration tests override this to a much smaller N to exercise install.
+/// Default cadence for metadata snapshots. The control-plane log entries are
+/// tiny, so an entry-count policy is sufficient and bounds restart replay.
 pub const RAFT_SNAPSHOT_LOGS_SINCE_LAST: u64 = 10_000;
 
 /// Helper to build a Raft config with sensible defaults.
@@ -238,60 +89,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn append_rejected_roundtrip_bincode() {
-        let r = RaftResponse::AppendRejected {
-            reason: RaftRejectReason::ConsistencyConditionViolated {
-                conflicting_position: 42,
-            },
-        };
-        let bytes = bincode::serialize(&r).expect("serialize");
+    fn leader_claim_response_roundtrips() {
+        let response = RaftResponse::LeaderClaimed { epoch: 42 };
+        let bytes = bincode::serialize(&response).expect("serialize");
         let decoded: RaftResponse = bincode::deserialize(&bytes).expect("deserialize");
-        match decoded {
-            RaftResponse::AppendRejected {
-                reason:
-                    RaftRejectReason::ConsistencyConditionViolated {
-                        conflicting_position,
-                    },
-            } => assert_eq!(conflicting_position, 42),
-            other => panic!("expected AppendRejected, got {other:?}"),
-        }
+        assert!(matches!(decoded, RaftResponse::LeaderClaimed { epoch: 42 }));
     }
 
     #[test]
     fn default_raft_config_enables_snapshot_policy() {
         let cfg = default_raft_config();
-        match cfg.snapshot_policy {
-            openraft::SnapshotPolicy::LogsSinceLast(n) => {
-                assert_eq!(n, RAFT_SNAPSHOT_LOGS_SINCE_LAST);
-                assert_eq!(n, 10_000);
-            }
-            other => panic!("expected LogsSinceLast(10_000), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn default_raft_config_snapshot_policy_is_stable() {
-        let a = default_raft_config().snapshot_policy;
-        let b = default_raft_config().snapshot_policy;
-        assert_eq!(format!("{a:?}"), format!("{b:?}"));
-    }
-
-    #[test]
-    fn existing_variants_still_roundtrip() {
-        let cases = vec![
-            RaftResponse::Append {
-                first_position: 1,
-                count: 2,
-                consistency_marker: 3,
-            },
-            RaftResponse::ContextCreated,
-            RaftResponse::Ok,
-        ];
-        for r in cases {
-            let bytes = bincode::serialize(&r).expect("serialize");
-            let decoded: RaftResponse = bincode::deserialize(&bytes).expect("deserialize");
-            // Debug-string equality is sufficient — no PartialEq on RaftResponse today.
-            assert_eq!(format!("{r:?}"), format!("{decoded:?}"));
-        }
+        assert!(matches!(
+            cfg.snapshot_policy,
+            openraft::SnapshotPolicy::LogsSinceLast(RAFT_SNAPSHOT_LOGS_SINCE_LAST)
+        ));
     }
 }

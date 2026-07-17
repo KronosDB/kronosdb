@@ -90,6 +90,16 @@ impl TagIndex {
         self.all_positions.lock().remove_range(0..base);
     }
 
+    /// Removes an uncommitted suffix from the active in-memory index during
+    /// follower divergence repair. Sealed prefixes below `from` are untouched.
+    pub fn prune_from(&self, from: u64) {
+        self.forward.retain(|_, bitmap| {
+            bitmap.remove_range(from..);
+            !bitmap.is_empty()
+        });
+        self.all_positions.lock().remove_range(from..);
+    }
+
     /// Adds tags to an existing event's index. Used by the AddTags RPC.
     pub fn add_tags(&self, position: Position, tags: &[Tag]) {
         let pos = position.0;

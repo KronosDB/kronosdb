@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package kronosdb.replication;
+
+// Native segment tailing. A follower opens one bidirectional stream per
+// context, sends durable acknowledgements upstream, and receives byte-exact
+// segment records plus control frames from the leader.
+service SegmentReplication {
+  rpc Tail(stream TailRequest) returns (stream TailFrame);
+  rpc ForwardAppend(ForwardAppendRequest) returns (ForwardAppendResponse);
+  rpc GetCursors(GetCursorsRequest) returns (GetCursorsResponse);
+}
+
+message GetCursorsRequest {}
+message ContextCursor {
+  string context = 1;
+  uint64 durable_position = 2;
+  uint64 watermark = 3;
+  uint64 segment_base = 4;
+  uint64 byte_offset = 5;
+  uint32 last_record_crc = 6;
+}
+message GetCursorsResponse {
+  uint64 node_id = 1;
+  // Minimum in-memory data epoch across contexts (diagnostics only).
+  uint64 epoch = 2;
+  repeated ContextCursor contexts = 3;
+  // Committed metadata claim observed by this node. A candidate only trusts
+  // cursor snapshots after this equals its newly committed fencing claim.
+  uint64 control_epoch = 4;
+}
+
+message ForwardAppendRequest {
+  string context = 1;
+  uint64 epoch = 2;
+  uint64 leader_id = 3;
+  repeated ForwardEvent events = 4;
+  optional ForwardCondition condition = 5;
+}
+
+message ForwardEvent {
+  string identifier = 1;
+  string name = 2;
+  string version = 3;
+  int64 timestamp = 4;
+  bytes payload = 5;
+  repeated ForwardMetadata metadata = 6;
+  repeated ForwardTag tags = 7;
+}
+
+message ForwardMetadata { string key = 1; string value = 2; }
+message ForwardTag { bytes key = 1; bytes value = 2; }
+message ForwardCriterion {
+  repeated string names = 1;
+  repeated ForwardTag tags = 2;
+}
+message ForwardCondition {
+  uint64 consistency_marker = 1;
+  repeated ForwardCriterion criteria = 2;
+}
+
+message ForwardAppendResponse {
+  oneof result {
+    ForwardAppendSuccess success = 1;
+    ForwardAppendRejected rejected = 2;
+    ForwardAppendRetry retry = 3;
+  }
+}
+message ForwardAppendSuccess {
+  uint64 first_position = 1;
+  uint32 count = 2;
+  uint64 consistency_marker = 3;
+  uint64 epoch = 4;
+}
+message ForwardAppendRejected { uint64 conflicting_position = 1; }
+message ForwardAppendRetry { string reason = 1; }
+
+message TailRequest {
+  oneof request {
+    TailOpen open = 1;
+    TailAck ack = 2;
+  }
+}
+
+message TailOpen {
+  string context = 1;
+  uint64 follower_id = 2;
+  // Next-exclusive durable cursor on the follower.
+  uint64 from_position = 3;
+  // CRC32C stored on the last durable physical record (0 when empty).
+  uint32 last_record_crc = 4;
+  uint64 epoch_seen = 5;
+  uint64 segment_base = 6;
+  // Byte offset immediately after the last durable physical record.
+  uint64 byte_offset = 7;
+  // Follower's externally visible commit floor. A leader must never instruct
+  // truncation below it, even when the physical divergence probe fails.
+  uint64 watermark = 8;
+  // Recovery-only source mode used by a newly fenced leader to pull a stable
+  // prior-epoch prefix from another voter before opening its write gate.
+  bool recovery_source = 9;
+  uint64 claim_epoch = 10;
+  uint64 claim_leader_id = 11;
+}
+
+message TailAck {
+  string context = 1;
+  uint64 follower_id = 2;
+  uint64 epoch = 3;
+  // Next-exclusive post-fdatasync cursor.
+  uint64 durable_position = 4;
+  // Total record bytes durably consumed by this session. Used to release
+  // the leader's byte-based in-flight window even for marker-only frames.
+  uint64 durable_bytes = 5;
+}
+
+message TailFrame {
+  oneof frame {
+    Records records = 1;
+    EpochChange epoch_change = 2;
+    Rotate rotate = 3;
+    Watermark watermark = 4;
+    NeedSnapshot need_snapshot = 5;
+    Truncate truncate = 6;
+  }
+}
+
+message Truncate {
+  uint64 epoch = 1;
+  uint64 position = 2;
+}
+
+message Records {
+  uint64 epoch = 1;
+  uint64 segment_base = 2;
+  uint64 first_position = 3;
+  // Raw .seg record bytes, including CRC/length/flags framing. The segment
+  // header is not included.
+  bytes data = 4;
+  // Monotonic byte sequence for byte-based flow-control acknowledgements.
+  uint64 stream_bytes_end = 5;
+  // Next-exclusive event cursor after applying this frame.
+  uint64 next_position = 6;
+}
+
+message EpochChange {
+  uint64 epoch = 1;
+  uint64 leader_id = 2;
+  uint64 start_position = 3;
+}
+
+message Rotate {
+  uint64 epoch = 1;
+  uint64 new_segment_base = 2;
+}
+
+message Watermark {
+  uint64 epoch = 1;
+  uint64 position = 2;
+}
+
+message NeedSnapshot {
+  string context = 1;
+  uint64 available_from = 2;
+  uint64 watermark = 3;
+  string reason = 4;
+}

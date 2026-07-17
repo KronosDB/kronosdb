@@ -12,14 +12,14 @@ use crate::stream::EventStream;
 ///
 /// The gRPC service layer programs against this trait, not the concrete `EventStore` type.
 ///
-/// `append` is async because it may involve Raft consensus (network I/O).
+/// `append` is async because clustered nodes may forward it to the claimed leader.
 /// All read methods are sync because they operate on local mmap'd data.
 #[async_trait::async_trait]
 pub trait EventStore: Send + Sync {
     /// Appends events to the store, optionally with a DCB consistency condition.
     ///
-    /// In cluster mode, this goes through Raft consensus before the events
-    /// are committed to the local store.
+    /// In cluster mode, the claimed leader writes the group-commit wave and
+    /// acknowledges after native segment cursors reach quorum durability.
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error>;
 
     /// Reads events matching a sourcing condition from `from_position` up to the current head.
