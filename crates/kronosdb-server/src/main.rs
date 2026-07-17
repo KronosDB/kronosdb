@@ -127,6 +127,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         learners,
         raft_config: default_raft_config(),
         single_node_fast_path: config.write_path == "auto",
+        // Inline log fsync: openraft 0.9's core awaits every entry's flush
+        // callback before its next step, so deferring the fsync only adds
+        // latency. Concurrency is amortized ABOVE consensus instead — the
+        // append proposer coalesces concurrent appends into one log entry.
+        // Revisit (mirror group_commit_ms here) once openraft pipelines IO.
+        log_group_commit: None,
     };
 
     // Log what the durability configuration means for this node. This is the

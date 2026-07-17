@@ -71,6 +71,10 @@ pub struct ClusterConfig {
     /// path is ever active (the invariant that prevents dual-write bugs).
     /// Ignored whenever peers or learners are configured.
     pub single_node_fast_path: bool,
+    /// Deferred group-commit interval for the Raft log store. `None` = fsync
+    /// inline on every append (strict, serializes consensus appends).
+    /// Typically mirrors the segment group-commit interval.
+    pub log_group_commit: Option<std::time::Duration>,
 }
 
 /// Manages event store access — always backed by Raft consensus.
@@ -131,7 +135,14 @@ impl ClusterManager {
 
         // Node-wide Raft log store (kept under default/ for back-compat).
         let raft_dir = self.context_manager.data_dir().join("default").join("raft");
-        let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
+        let log_store = LogStore::new(
+            &raft_dir,
+            LogStoreConfig {
+                group_commit_interval: self.cluster_config.log_group_commit,
+                ..Default::default()
+            },
+        )
+        .map_err(Error::Io)?;
 
         // On-disk snapshot store. Lives in `<raft_dir>/snapshots`. Used to
         // persist `last_membership` across restart — without this, the
@@ -375,19 +386,7 @@ impl ClusterManager {
         let raft_req = RaftRequest::CreateContext {
             name: name.to_string(),
         };
-        let response = match raft.client_write(raft_req.clone()).await {
-            Ok(resp) => resp.data,
-            Err(e) => {
-                let err_str = format!("{e}");
-                if err_str.contains("forward request to") || err_str.contains("ForwardToLeader") {
-                    forward_write_to_leader(&raft, &raft_req).await?
-                } else {
-                    return Err(Error::Corrupted {
-                        message: format!("raft create_context failed: {e}"),
-                    });
-                }
-            }
-        };
+        let response = submit_raft_request(&raft, raft_req).await?;
 
         match response {
             RaftResponse::ContextCreated => Ok(()),
@@ -558,8 +557,20 @@ impl ClusterManager {
 pub struct RaftEngine {
     raft: Arc<Raft<TypeConfig>>,
     local_engine: Arc<EventStoreEngine>,
-    context_name: String,
+    /// Hands appends to the proposer task, which coalesces everything that
+    /// queued up during the previous consensus round into one log entry.
+    proposer_tx: tokio::sync::mpsc::UnboundedSender<ProposeItem>,
 }
+
+type ProposeItem = (
+    AppendRequest,
+    tokio::sync::oneshot::Sender<Result<AppendResponse, Error>>,
+);
+
+/// Cap per coalesced entry: keeps entries comfortably under the marker's
+/// u16 event budget and bounds worst-case entry size.
+const MAX_BATCH_ITEMS: usize = 512;
+const MAX_BATCH_EVENTS: usize = 16 * 1024;
 
 impl RaftEngine {
     pub fn new(
@@ -567,47 +578,195 @@ impl RaftEngine {
         local_engine: Arc<EventStoreEngine>,
         context_name: String,
     ) -> Self {
+        let (proposer_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProposeItem>();
+
+        // Proposer: self-clocking append coalescing. openraft 0.9 blocks its
+        // core loop on every log entry's fsync, so consensus throughput is
+        // entries/sec, not appends/sec — the fix is fewer, fatter entries.
+        // While one client_write round-trip is in flight, new appends queue
+        // here; the next round proposes them all as ONE AppendBatch entry.
+        // A lone append still goes out immediately as a plain Append entry
+        // (no added latency, wire-identical to older nodes).
+        {
+            let raft = Arc::clone(&raft);
+            let context = context_name.clone();
+            tokio::spawn(async move {
+                while let Some(first) = rx.recv().await {
+                    let mut event_count = first.0.events.len();
+                    let mut batch = vec![first];
+                    while batch.len() < MAX_BATCH_ITEMS && event_count < MAX_BATCH_EVENTS {
+                        match rx.try_recv() {
+                            Ok(item) => {
+                                event_count += item.0.events.len();
+                                batch.push(item);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    propose_appends(&raft, &context, batch).await;
+                }
+            });
+        }
+
         Self {
             raft,
             local_engine,
-            context_name,
+            proposer_tx,
         }
     }
 
     pub fn raft(&self) -> &Raft<TypeConfig> {
         &self.raft
     }
+}
 
-    fn build_raft_request(&self, request: &AppendRequest) -> RaftRequest {
-        RaftRequest::Append {
-            context: self.context_name.clone(),
-            events: request
-                .events
-                .iter()
-                .map(RaftAppendEvent::from_event)
-                .collect(),
-            condition: request.condition.as_ref().map(|c| RaftAppendCondition {
-                consistency_marker: c.consistency_marker.0,
-                criteria: c
-                    .criteria
-                    .criteria
+fn to_raft_append(context: &str, request: &AppendRequest) -> RaftRequest {
+    RaftRequest::Append {
+        context: context.to_string(),
+        events: request
+            .events
+            .iter()
+            .map(RaftAppendEvent::from_event)
+            .collect(),
+        condition: convert_condition(request),
+    }
+}
+
+fn convert_condition(request: &AppendRequest) -> Option<RaftAppendCondition> {
+    request.condition.as_ref().map(|c| RaftAppendCondition {
+        consistency_marker: c.consistency_marker.0,
+        criteria: c
+            .criteria
+            .criteria
+            .iter()
+            .map(|cr| RaftCriterion {
+                names: cr.names.clone(),
+                tags: cr
+                    .tags
                     .iter()
-                    .map(|cr| RaftCriterion {
-                        names: cr.names.clone(),
-                        tags: cr
-                            .tags
-                            .iter()
-                            .map(|t| (t.key.clone(), t.value.clone()))
-                            .collect(),
-                    })
+                    .map(|t| (t.key.clone(), t.value.clone()))
                     .collect(),
-            }),
+            })
+            .collect(),
+    })
+}
+
+/// Submits a request through consensus, forwarding to the leader when this
+/// node is a follower.
+async fn submit_raft_request(
+    raft: &Raft<TypeConfig>,
+    raft_req: RaftRequest,
+) -> Result<RaftResponse, Error> {
+    match raft.client_write(raft_req.clone()).await {
+        Ok(resp) => Ok(resp.data),
+        Err(e) => {
+            let err_str = format!("{e}");
+            if err_str.contains("forward request to") || err_str.contains("ForwardToLeader") {
+                forward_write_to_leader(raft, &raft_req).await
+            } else {
+                Err(Error::Corrupted {
+                    message: format!("raft write failed: {e}"),
+                })
+            }
         }
     }
+}
 
-    /// Forwards a write to the current leader via the ForwardWrite RPC.
-    async fn forward_to_leader(&self, raft_req: &RaftRequest) -> Result<RaftResponse, Error> {
-        forward_write_to_leader(&self.raft, raft_req).await
+fn map_append_response(response: RaftResponse) -> Result<AppendResponse, Error> {
+    match response {
+        RaftResponse::Append {
+            first_position,
+            count,
+            consistency_marker,
+        } => Ok(AppendResponse {
+            first_position: Position(first_position),
+            count,
+            consistency_marker: Position(consistency_marker),
+        }),
+        RaftResponse::AppendRejected {
+            reason:
+                RaftRejectReason::ConsistencyConditionViolated {
+                    conflicting_position,
+                },
+        } => Err(Error::ConsistencyConditionViolated {
+            conflicting_position: Position(conflicting_position),
+        }),
+        _ => Err(Error::Corrupted {
+            message: "unexpected raft response type for append".into(),
+        }),
+    }
+}
+
+/// Proposes one coalesced round of appends and fans the per-item results
+/// back out to their waiting callers.
+async fn propose_appends(raft: &Raft<TypeConfig>, context: &str, batch: Vec<ProposeItem>) {
+    let (requests, senders): (Vec<AppendRequest>, Vec<_>) = batch.into_iter().unzip();
+
+    let raft_req = if requests.len() == 1 {
+        to_raft_append(context, &requests[0])
+    } else {
+        RaftRequest::AppendBatch {
+            context: context.to_string(),
+            items: requests
+                .iter()
+                .map(|request| super::types::BatchAppendItem {
+                    events: request
+                        .events
+                        .iter()
+                        .map(RaftAppendEvent::from_event)
+                        .collect(),
+                    condition: convert_condition(request),
+                })
+                .collect(),
+        }
+    };
+
+    match submit_raft_request(raft, raft_req).await {
+        Ok(RaftResponse::AppendBatch { results }) if results.len() == senders.len() => {
+            for (sender, result) in senders.into_iter().zip(results) {
+                let mapped = match result {
+                    super::types::BatchAppendResult::Append {
+                        first_position,
+                        count,
+                        consistency_marker,
+                    } => Ok(AppendResponse {
+                        first_position: Position(first_position),
+                        count,
+                        consistency_marker: Position(consistency_marker),
+                    }),
+                    super::types::BatchAppendResult::Rejected {
+                        reason:
+                            RaftRejectReason::ConsistencyConditionViolated {
+                                conflicting_position,
+                            },
+                    } => Err(Error::ConsistencyConditionViolated {
+                        conflicting_position: Position(conflicting_position),
+                    }),
+                };
+                let _ = sender.send(mapped);
+            }
+        }
+        Ok(response) if senders.len() == 1 => {
+            let mapped = map_append_response(response);
+            if let Some(sender) = senders.into_iter().next() {
+                let _ = sender.send(mapped);
+            }
+        }
+        Ok(other) => {
+            for sender in senders {
+                let _ = sender.send(Err(Error::Corrupted {
+                    message: format!("unexpected raft response for append batch: {other:?}"),
+                }));
+            }
+        }
+        Err(e) => {
+            let message = e.to_string();
+            for sender in senders {
+                let _ = sender.send(Err(Error::Corrupted {
+                    message: message.clone(),
+                }));
+            }
+        }
     }
 }
 
@@ -665,50 +824,19 @@ async fn forward_write_to_leader(
 #[async_trait::async_trait]
 impl EventStore for RaftEngine {
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
-        let raft_req = self.build_raft_request(&request);
-
-        let response = match self.raft.client_write(raft_req.clone()).await {
-            Ok(resp) => Ok(resp.data),
-            Err(e) => {
-                let err_str = format!("{e}");
-                if err_str.contains("forward request to") || err_str.contains("ForwardToLeader") {
-                    self.forward_to_leader(&raft_req).await
-                } else {
-                    Err(Error::Corrupted {
-                        message: format!("raft write failed: {e}"),
-                    })
-                }
-            }
-        }?;
-
-        match response {
-            RaftResponse::Append {
-                first_position,
-                count,
-                consistency_marker,
-            } => Ok(AppendResponse {
-                first_position: Position(first_position),
-                count,
-                consistency_marker: Position(consistency_marker),
-            }),
-            RaftResponse::AppendRejected {
-                reason:
-                    RaftRejectReason::ConsistencyConditionViolated {
-                        conflicting_position,
-                    },
-            } => {
-                // D-02: Apply-time DCB rejection surfaces as the same typed error
-                // the direct (non-Raft) append path in store.rs::EventStoreEngine::append
-                // returns. service.rs::to_status already maps this to Status::aborted
-                // with the position — wire contract unchanged for connectors.
-                Err(Error::ConsistencyConditionViolated {
-                    conflicting_position: Position(conflicting_position),
-                })
-            }
-            _ => Err(Error::Corrupted {
-                message: "unexpected raft response type for append".into(),
-            }),
-        }
+        // Hand off to the proposer, which coalesces concurrent appends into
+        // one consensus round. DCB rejections come back as the same typed
+        // error the direct (non-Raft) path returns (D-02) — wire contract
+        // unchanged for connectors.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.proposer_tx
+            .send((request, tx))
+            .map_err(|_| Error::Corrupted {
+                message: "raft append proposer stopped".into(),
+            })?;
+        rx.await.map_err(|_| Error::Corrupted {
+            message: "raft append proposer dropped the response".into(),
+        })?
     }
 
     fn source(
@@ -764,6 +892,7 @@ mod tests {
             learners: vec![],
             raft_config: super::super::types::default_raft_config(),
             single_node_fast_path: false,
+            log_group_commit: None,
         }
     }
 

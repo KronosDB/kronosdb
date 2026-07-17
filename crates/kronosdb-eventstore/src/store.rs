@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::api::EventStore;
-use crate::append::{AppendRequest, AppendResponse, AppliedLogId};
+use crate::append::{AppendCondition, AppendRequest, AppendResponse, AppliedLogId};
 use crate::cache::IndexCache;
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
@@ -59,8 +59,14 @@ const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 0;
 /// then wait for the sync thread to fsync and advance the epoch.
 /// Multiple writers share one fsync — that's the throughput win.
 struct SyncState {
-    epoch: StdMutex<u64>,
+    /// Highest completed group-commit wave.
+    completed: StdMutex<u64>,
     synced: Condvar,
+    /// Wave currently accepting writes. Read by writers UNDER the writer
+    /// lock; advanced by the sync thread at its barrier (also under the
+    /// writer lock), so a writer's wave is always the one whose fsync will
+    /// cover its bytes.
+    wave: AtomicU64,
     pending_writes: AtomicU64,
     enabled: bool,
     shutdown: AtomicBool,
@@ -77,8 +83,9 @@ struct SyncState {
 impl SyncState {
     fn new(enabled: bool) -> Self {
         Self {
-            epoch: StdMutex::new(0),
+            completed: StdMutex::new(0),
             synced: Condvar::new(),
+            wave: AtomicU64::new(1),
             pending_writes: AtomicU64::new(0),
             enabled,
             shutdown: AtomicBool::new(false),
@@ -87,20 +94,23 @@ impl SyncState {
         }
     }
 
+    /// Registers a write with the current wave. MUST be called while holding
+    /// the writer lock — that's what orders it against the sync thread's
+    /// barrier.
     fn mark_pending(&self) -> u64 {
         self.pending_writes.fetch_add(1, Ordering::Relaxed);
-        *self.epoch.lock().unwrap() + 1
+        self.wave.load(Ordering::Acquire)
     }
 
-    /// Blocks until the sync thread has fsynced past `target_epoch`.
-    /// Returns an error — the write is NOT durable — if the fsync failed.
-    fn wait_for_sync(&self, target_epoch: u64) -> Result<(), Error> {
-        let mut epoch = self.epoch.lock().unwrap();
-        while *epoch < target_epoch {
+    /// Blocks until the given wave's fsync completed. Returns an error — the
+    /// write is NOT durable — if the fsync failed.
+    fn wait_for_sync(&self, target_wave: u64) -> Result<(), Error> {
+        let mut completed = self.completed.lock().unwrap();
+        while *completed < target_wave {
             if self.failed.load(Ordering::Acquire) {
                 return Err(self.failure_error());
             }
-            epoch = self.synced.wait(epoch).unwrap();
+            completed = self.synced.wait(completed).unwrap();
         }
         if self.failed.load(Ordering::Acquire) {
             return Err(self.failure_error());
@@ -108,10 +118,20 @@ impl SyncState {
         Ok(())
     }
 
-    fn complete_sync(&self) {
+    /// Barrier: called by the sync thread UNDER the writer lock. Seals the
+    /// current wave (every registered write finished before this point) and
+    /// opens the next one for writers that arrive during the fsync.
+    fn seal_wave(&self) -> u64 {
         self.pending_writes.store(0, Ordering::Relaxed);
-        let mut epoch = self.epoch.lock().unwrap();
-        *epoch += 1;
+        self.wave.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Marks a sealed wave durable and wakes its waiters.
+    fn complete_wave(&self, wave: u64) {
+        let mut completed = self.completed.lock().unwrap();
+        if *completed < wave {
+            *completed = wave;
+        }
         self.synced.notify_all();
     }
 
@@ -120,9 +140,9 @@ impl SyncState {
     fn fail_sync(&self, err: &Error) {
         *self.failure_msg.lock().unwrap() = Some(err.to_string());
         self.failed.store(true, Ordering::Release);
-        // Grab the epoch lock so the store/notify pair cannot interleave
+        // Grab the completed lock so the store/notify pair cannot interleave
         // between a waiter's predicate check and its wait().
-        let _epoch = self.epoch.lock().unwrap();
+        let _completed = self.completed.lock().unwrap();
         self.synced.notify_all();
     }
 
@@ -147,6 +167,20 @@ impl SyncState {
     }
 }
 
+/// Does an event (by name + tags) match a single DCB criterion? Mirrors the
+/// index-side semantics: name must be in `names` (or `names` empty), and
+/// EVERY criterion tag must be present on the event.
+fn event_matches_criterion(
+    criterion: &crate::criteria::Criterion,
+    name: &str,
+    tags: &[Tag],
+) -> bool {
+    if !criterion.names.is_empty() && !criterion.names.iter().any(|n| n == name) {
+        return false;
+    }
+    criterion.tags.iter().all(|ct| tags.contains(ct))
+}
+
 fn spawn_sync_thread(
     sync_state: Arc<SyncState>,
     writer: Arc<parking_lot::Mutex<SegmentWriter>>,
@@ -162,11 +196,23 @@ fn spawn_sync_thread(
                 // their wakeup) instead of hanging on a dead thread.
                 let shutting_down = sync_state.shutdown.load(Ordering::Relaxed);
                 if sync_state.has_pending() {
-                    let mut w = writer.lock();
-                    let result = w.sync();
-                    drop(w);
+                    // Barrier: take the writer lock only long enough to seal
+                    // the wave and clone the active file handle, then fsync
+                    // OUTSIDE the lock. Holding the lock across the fsync
+                    // would serialize every writer behind it — a single
+                    // producer (e.g. the raft state-machine worker) would
+                    // land exactly one write per fsync window.
+                    let sealed = {
+                        let w = writer.lock();
+                        let wave = sync_state.seal_wave();
+                        w.active_file_handle().map(|file| (wave, file))
+                    };
+                    let result = sealed.and_then(|(wave, file)| {
+                        crate::segment::writer::sync_file(&file)?;
+                        Ok(wave)
+                    });
                     match result {
-                        Ok(()) => sync_state.complete_sync(),
+                        Ok(wave) => sync_state.complete_wave(wave),
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
@@ -551,6 +597,223 @@ impl EventStoreEngine {
         self.append_internal(request, Some(applied))
     }
 
+    /// Applies a whole batch of raft-marked appends under ONE writer lock and
+    /// ONE fsync. This is the state machine's bulk path: openraft delivers
+    /// `apply()` batches, and syncing once per batch instead of once per entry
+    /// is what lets concurrent consensus appends share an fsync the same way
+    /// concurrent direct appends share one via group commit.
+    ///
+    /// Per-item DCB violations come back as `Err` in that item's slot (they
+    /// are deterministic, valid outcomes); any other error aborts the whole
+    /// batch as fatal. Items are applied in order — an item's DCB check sees
+    /// every earlier item's writes.
+    pub fn append_with_raft_batch(
+        &self,
+        batch: Vec<(AppendRequest, AppliedLogId)>,
+    ) -> Result<Vec<Result<AppendResponse, Error>>, Error> {
+        if batch.is_empty() {
+            return Ok(vec![]);
+        }
+        let timer = Timer::start();
+
+        if self.sync_state.is_failed() {
+            return Err(self.sync_state.failure_error());
+        }
+        if self.sync_state.shutdown.load(Ordering::Relaxed) {
+            return Err(Error::Io(io::Error::other(
+                "event store is shutting down; append rejected",
+            )));
+        }
+
+        let target_epoch = if self.sync_state.enabled {
+            Some(self.sync_state.mark_pending())
+        } else {
+            None
+        };
+
+        let item_count = batch.len() as u64;
+        let results = {
+            let mut writer = self.writer.lock();
+            let mut results = Vec::with_capacity(batch.len());
+            for (request, applied) in &batch {
+                match self.append_locked(&mut writer, request, Some(*applied)) {
+                    Ok(resp) => results.push(Ok(resp)),
+                    Err(e @ Error::ConsistencyConditionViolated { .. }) => results.push(Err(e)),
+                    // Anything else is fatal for the whole batch: the writer
+                    // may hold partially-written earlier items whose fsync
+                    // outcome the caller must not assume.
+                    Err(fatal) => return Err(fatal),
+                }
+            }
+            // Strict mode: one explicit fsync for the whole batch.
+            if !self.sync_state.enabled {
+                writer.sync()?;
+            }
+            results
+        };
+
+        // Group-commit mode: NO wait. For consensus appends the client-ack
+        // durability guarantee comes from the raft LOG fsync (an entry is
+        // only committed once quorum-durable in the log), and the write is
+        // replayable: if the process dies before the segment fsync lands,
+        // the missing `RaftMarker` makes recovery re-apply these entries
+        // from the log (see `reconcile_with_log`). `mark_pending` above has
+        // already scheduled the fsync with the sync thread. Not blocking
+        // here keeps openraft's state-machine worker free to apply the next
+        // batch — waiting would cap consensus throughput at ~1 apply per
+        // group-commit interval regardless of concurrency.
+        let _ = target_epoch;
+
+        let per_item_us = timer.elapsed_us() / item_count.max(1);
+        for result in results.iter().flatten() {
+            self.metrics.record_append(result.count, per_item_us);
+        }
+        Ok(results)
+    }
+
+    /// Applies every item of ONE raft `AppendBatch` entry under a single
+    /// writer lock, a single raft marker, and (in group-commit mode) zero
+    /// fsync waits.
+    ///
+    /// Crash-safety shape: unlike `append_with_raft_batch` (independent
+    /// entries, marker per entry), all items here belong to one log entry —
+    /// a torn write must never leave a *prefix* of the entry durable with a
+    /// marker claiming the entry applied, or the tail would be lost without
+    /// replay. So the whole entry persists as ONE `RaftMarker` followed by
+    /// every accepted event: either the marker+events survive recovery
+    /// (entry fully applied) or they're truncated (entry replays from the
+    /// raft log).
+    ///
+    /// DCB checks run in a first pass with in-batch visibility: item K's
+    /// condition sees committed state plus the accepted events of items
+    /// 0..K. Rejections are deterministic per-item outcomes.
+    pub fn append_with_raft_entry_batch(
+        &self,
+        items: Vec<AppendRequest>,
+        applied: AppliedLogId,
+    ) -> Result<Vec<Result<AppendResponse, Error>>, Error> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+        let timer = Timer::start();
+
+        if self.sync_state.is_failed() {
+            return Err(self.sync_state.failure_error());
+        }
+        if self.sync_state.shutdown.load(Ordering::Relaxed) {
+            return Err(Error::Io(io::Error::other(
+                "event store is shutting down; append rejected",
+            )));
+        }
+
+        let item_count = items.len() as u64;
+        let results = {
+            let mut writer = self.writer.lock();
+            if self.sync_state.enabled {
+                // Register with the current group-commit wave (no wait below;
+                // durability comes from the raft log — see batch fn).
+                self.sync_state.mark_pending();
+            }
+
+            // Pass 1: per-item DCB with in-batch visibility. Provisional
+            // positions start at the current head; accepted events extend
+            // the in-batch view the next items are checked against.
+            let base = writer.head();
+            let mut outcomes: Vec<Result<Position, Error>> = Vec::with_capacity(items.len());
+            let mut accepted_events: Vec<&crate::event::AppendEvent> = Vec::new();
+            for request in &items {
+                if let Some(condition) = &request.condition {
+                    if let Some(pos) = self.check_dcb_locked(condition)? {
+                        outcomes.push(Err(Error::ConsistencyConditionViolated {
+                            conflicting_position: pos,
+                        }));
+                        continue;
+                    }
+                    // In-batch conflicts: earlier accepted items' events.
+                    let conflict = accepted_events.iter().enumerate().find(|(_, e)| {
+                        condition
+                            .criteria
+                            .criteria
+                            .iter()
+                            .any(|c| event_matches_criterion(c, &e.name, &e.tags))
+                    });
+                    if let Some((offset, _)) = conflict {
+                        self.metrics.record_dcb_violation();
+                        outcomes.push(Err(Error::ConsistencyConditionViolated {
+                            conflicting_position: Position(base.0 + offset as u64),
+                        }));
+                        continue;
+                    }
+                }
+                outcomes.push(Ok(Position(base.0 + accepted_events.len() as u64)));
+                accepted_events.extend(request.events.iter());
+            }
+
+            // Pass 2: one marker covering every accepted event, then the
+            // events themselves, all in one segment (write_raft_entry
+            // pre-rotates so marker+events never straddle a boundary).
+            let total = accepted_events.len();
+            if total > 0 {
+                let count_u16 = u16::try_from(total).map_err(|_| Error::Corrupted {
+                    message: "raft-marked batch exceeds u16::MAX events".into(),
+                })?;
+                let marker = crate::segment::format::RaftMarker::normal(
+                    applied.term,
+                    applied.index,
+                    count_u16,
+                );
+                let all_events: Vec<crate::event::AppendEvent> =
+                    accepted_events.iter().map(|e| (*e).clone()).collect();
+                let old_active_base = writer.active_base_position();
+                let (first_position, _count) = writer.write_raft_entry(&marker, &all_events)?;
+                debug_assert_eq!(first_position, base);
+                if !self.sync_state.enabled {
+                    writer.sync()?;
+                }
+
+                let new_active_base = writer.active_base_position();
+                if new_active_base != old_active_base {
+                    let mut seg_list = self.segments.write();
+                    seg_list.sealed_count += 1;
+                    seg_list.bases.push(new_active_base);
+                    self.metrics.record_segment_rotation();
+                }
+
+                let mut pos = first_position;
+                for event in &all_events {
+                    self.tag_index.index_event(pos, &event.name, &event.tags);
+                    pos = pos.next();
+                }
+                let new_head = first_position.0 + total as u64;
+                self.head_position.store(new_head, Ordering::Release);
+                let _ = self.commit_tx.send(CommitNotification {
+                    head_position: new_head,
+                });
+            }
+
+            let final_head = self.head_position.load(Ordering::Acquire);
+            items
+                .iter()
+                .zip(outcomes)
+                .map(|(request, outcome)| {
+                    outcome.map(|first_position| AppendResponse {
+                        first_position,
+                        count: request.events.len() as u32,
+                        consistency_marker: Position(final_head),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Group-commit mode: no fsync wait — same durability argument as
+        // `append_with_raft_batch` (raft log fsync + marker replay).
+        let per_item_us = timer.elapsed_us() / item_count.max(1);
+        for result in results.iter().flatten() {
+            self.metrics.record_append(result.count, per_item_us);
+        }
+        Ok(results)
+    }
+
     fn append_internal(
         &self,
         request: AppendRequest,
@@ -581,54 +844,85 @@ impl EventStoreEngine {
         let response = {
             // Lock the writer. DCB check + write + index update must be atomic.
             let mut writer = self.writer.lock();
+            let response = self.append_locked(&mut writer, &request, applied)?;
+            // Strict (non-group-commit) mode: make the write durable before
+            // acking. `append_locked` never fsyncs by itself.
+            if !self.sync_state.enabled && response.count > 0 {
+                writer.sync()?;
+            }
+            response
+        };
 
+        // Step 6: Wait for fsync (group commit only). A failed fsync surfaces
+        // here as an error — the caller must NOT treat the write as durable.
+        if let Some(epoch) = target_epoch {
+            self.sync_state.wait_for_sync(epoch)?;
+        }
+
+        self.metrics
+            .record_append(response.count, timer.elapsed_us());
+        Ok(response)
+    }
+
+    /// Checks a DCB condition against committed state (sealed segments +
+    /// active tag index). Must run under the writer lock so the answer can't
+    /// be invalidated by a concurrent append. Returns the conflicting
+    /// position, if any.
+    fn check_dcb_locked(&self, condition: &AppendCondition) -> Result<Option<Position>, Error> {
+        let marker = condition.consistency_marker.0;
+
+        // Check sealed segments whose events come after the marker.
+        // Uses the same bloom → index → bitmap path as source reads.
+        let seg_list = self.segments.read().clone();
+        for (i, &base) in seg_list.bases.iter().enumerate() {
+            if !seg_list.is_sealed(i) {
+                break; // Active segment checked below via tag index.
+            }
+            // Segment ends below the marker — all its events were
+            // already validated by the caller, skip. seg_end is the
+            // last position in the segment (next base - 1).
+            let seg_end = if i + 1 < seg_list.bases.len() {
+                seg_list.bases[i + 1] - 1
+            } else {
+                continue;
+            };
+            if seg_end < marker {
+                continue;
+            }
+
+            let seg_path = segment::segment_path(&self.dir, base);
+
+            // Bloom filter: skip segment if tag definitely not present.
+            if let Some(false) = self.cache.bloom_check(&seg_path, base, &condition.criteria) {
+                continue;
+            }
+
+            // Load index and check for any match after the marker.
+            let seg_index = self.cache.get_index(&seg_path, base)?;
+            if let Some(conflicting_pos) = seg_index.has_match_after(&condition.criteria, marker) {
+                self.metrics.record_dcb_violation();
+                return Ok(Some(conflicting_pos));
+            }
+        }
+
+        // Check the active segment via in-memory tag index.
+        // tag_index is internally sharded; no lock needed.
+        Ok(self.tag_index.check_condition(condition))
+    }
+
+    /// The atomic core of an append: DCB check + write + index/head update,
+    /// all under the caller-held writer lock. NEVER fsyncs — durability is
+    /// the caller's job (strict-mode sync or group-commit epoch wait).
+    fn append_locked(
+        &self,
+        writer: &mut SegmentWriter,
+        request: &AppendRequest,
+        applied: Option<AppliedLogId>,
+    ) -> Result<AppendResponse, Error> {
+        {
             // Step 1: Check DCB condition.
             if let Some(condition) = &request.condition {
-                let marker = condition.consistency_marker.0;
-
-                // Check sealed segments whose events come after the marker.
-                // Uses the same bloom → index → bitmap path as source reads.
-                let seg_list = self.segments.read().clone();
-                for (i, &base) in seg_list.bases.iter().enumerate() {
-                    if !seg_list.is_sealed(i) {
-                        break; // Active segment checked below via tag index.
-                    }
-                    // Segment ends below the marker — all its events were
-                    // already validated by the caller, skip. seg_end is the
-                    // last position in the segment (next base - 1).
-                    let seg_end = if i + 1 < seg_list.bases.len() {
-                        seg_list.bases[i + 1] - 1
-                    } else {
-                        continue;
-                    };
-                    if seg_end < marker {
-                        continue;
-                    }
-
-                    let seg_path = segment::segment_path(&self.dir, base);
-
-                    // Bloom filter: skip segment if tag definitely not present.
-                    if let Some(false) =
-                        self.cache.bloom_check(&seg_path, base, &condition.criteria)
-                    {
-                        continue;
-                    }
-
-                    // Load index and check for any match after the marker.
-                    let seg_index = self.cache.get_index(&seg_path, base)?;
-                    if let Some(conflicting_pos) =
-                        seg_index.has_match_after(&condition.criteria, marker)
-                    {
-                        self.metrics.record_dcb_violation();
-                        return Err(Error::ConsistencyConditionViolated {
-                            conflicting_position: conflicting_pos,
-                        });
-                    }
-                }
-
-                // Check the active segment via in-memory tag index.
-                // tag_index is internally sharded; no lock needed.
-                if let Some(conflicting_pos) = self.tag_index.check_condition(condition) {
+                if let Some(conflicting_pos) = self.check_dcb_locked(condition)? {
                     return Err(Error::ConsistencyConditionViolated {
                         conflicting_position: conflicting_pos,
                     });
@@ -665,19 +959,11 @@ impl EventStoreEngine {
                     log_id.index,
                     count_u16,
                 );
-                let result = writer.write_raft_entry(&marker, &request.events)?;
-                if !self.sync_state.enabled {
-                    // Immediate mode: the non-Raft `writer.append` does its own fsync,
-                    // but `write_raft_entry` does not. Preserve strict durability here.
-                    writer.sync()?;
-                }
-                result
-            } else if self.sync_state.enabled {
-                // Group commit: write without fsync. Sync thread handles it.
-                writer.write_events(&request.events)?
+                writer.write_raft_entry(&marker, &request.events)?
             } else {
-                // Immediate: write + fsync in one call.
-                writer.append(&request.events)?
+                // Write without fsync — durability is the caller's job
+                // (group-commit epoch wait, or an explicit strict-mode sync).
+                writer.write_events(&request.events)?
             };
 
             // Step 2b: Detect rotation and update cached segment list.
@@ -708,24 +994,12 @@ impl EventStoreEngine {
                 head_position: new_head,
             });
 
-            AppendResponse {
+            Ok(AppendResponse {
                 first_position,
                 count,
                 consistency_marker: Position(new_head),
-            }
-            // Writer lock released here — other appends can proceed
-            // and batch into the same upcoming fsync.
-        };
-
-        // Step 6: Wait for fsync (group commit only). A failed fsync surfaces
-        // here as an error — the caller must NOT treat the write as durable.
-        if let Some(epoch) = target_epoch {
-            self.sync_state.wait_for_sync(epoch)?;
+            })
         }
-
-        self.metrics
-            .record_append(response.count, timer.elapsed_us());
-        Ok(response)
     }
 
     /// Gets tags for an event at the given position by reading from the segment.
@@ -1287,7 +1561,8 @@ mod tests {
             std::thread::spawn(move || state.wait_for_sync(target))
         };
         std::thread::sleep(Duration::from_millis(20));
-        state.complete_sync();
+        let wave = state.seal_wave();
+        state.complete_wave(wave);
         assert!(waiter.join().unwrap().is_ok());
     }
 
