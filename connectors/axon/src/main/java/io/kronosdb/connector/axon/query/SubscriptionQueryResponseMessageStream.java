@@ -1,5 +1,6 @@
 package io.kronosdb.connector.axon.query;
 
+import io.kronosdb.connector.axon.KronosDbException;
 import io.kronosdb.connector.grpc.QueryChannel;
 import io.kronosdb.connector.grpc.ResultStream;
 import io.kronosdb.grpc.query.SubscriptionQueryResponse;
@@ -24,6 +25,10 @@ public class SubscriptionQueryResponseMessageStream implements MessageStream<Que
     private final QueryChannel.SubscriptionQueryResult queryResult;
     private final ResultStream<SubscriptionQueryResponse> stream;
     private final @Nullable Converter converter;
+
+    // Terminal state signalled by the handler via complete / complete_exceptionally.
+    private volatile boolean terminated;
+    private volatile @Nullable Throwable terminalError;
 
     public SubscriptionQueryResponseMessageStream(QueryChannel.SubscriptionQueryResult queryResult,
                                                    @Nullable Converter converter) {
@@ -66,6 +71,14 @@ public class SubscriptionQueryResponseMessageStream implements MessageStream<Que
             );
             return Optional.of(new SimpleEntry<>(
                     new GenericQueryResponseMessage(message).withConverter(converter)));
+        } else if (response.hasComplete()) {
+            terminated = true;
+        } else if (response.hasCompleteExceptionally()) {
+            var completeExceptionally = response.getCompleteExceptionally();
+            terminalError = new KronosDbException(
+                    completeExceptionally.getErrorCode(),
+                    completeExceptionally.getErrorMessage().getMessage());
+            terminated = true;
         }
         return Optional.empty();
     }
@@ -77,17 +90,21 @@ public class SubscriptionQueryResponseMessageStream implements MessageStream<Que
 
     @Override
     public Optional<Throwable> error() {
+        Throwable error = terminalError;
+        if (error != null) {
+            return Optional.of(error);
+        }
         return stream.getError();
     }
 
     @Override
     public boolean isCompleted() {
-        return stream.isClosed();
+        return terminated || stream.isClosed();
     }
 
     @Override
     public boolean hasNextAvailable() {
-        return stream.peek() != null;
+        return !terminated && stream.peek() != null;
     }
 
     @Override

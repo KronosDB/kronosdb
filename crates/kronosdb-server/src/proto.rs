@@ -1,6 +1,7 @@
-/// Generated protobuf types and gRPC service definitions.
+//! Generated protobuf types and gRPC service definitions.
 
 /// Common types shared across services (SerializedObject, MetadataValue, etc.)
+#[allow(clippy::enum_variant_names)]
 pub mod kronosdb {
     tonic::include_proto!("kronosdb");
 

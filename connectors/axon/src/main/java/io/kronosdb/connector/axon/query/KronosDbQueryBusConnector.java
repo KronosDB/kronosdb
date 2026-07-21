@@ -115,8 +115,7 @@ public class KronosDbQueryBusConnector implements QueryBusConnector {
         QueryChannel.SubscriptionQueryResult result = connection.queryChannel()
                 .subscriptionQuery(
                         QueryConverter.convertQueryMessage(query, clientId, componentName),
-                        updateBufferSize,
-                        Math.min(updateBufferSize / 4, 8)
+                        updateBufferSize
                 );
         return new SubscriptionQueryResponseMessageStream(result, converter);
     }

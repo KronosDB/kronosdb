@@ -6,6 +6,8 @@ use tonic::{Request, Status};
 /// If `token` is `None`, all requests are allowed (open access).
 /// If `token` is `Some`, every request must carry a matching `kronosdb-token`
 /// gRPC metadata value or the call is rejected with `UNAUTHENTICATED`.
+// tonic's interceptor signature fixes the error type to the large `Status`.
+#[allow(clippy::result_large_err)]
 pub fn make_auth_interceptor(
     token: Option<String>,
 ) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {

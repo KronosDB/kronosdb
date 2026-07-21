@@ -64,6 +64,16 @@ pub struct ClusterConfig {
     pub peer_transport: PeerTransportConfig,
 }
 
+/// One context's replication catch-up as seen from the claimed leader.
+#[derive(Debug, Clone)]
+pub struct LearnerCatchup {
+    pub context: String,
+    /// The leader's local durable tail (next-exclusive position).
+    pub leader_tail: u64,
+    /// The follower's last durably-acked cursor, if any ack was observed.
+    pub follower_position: Option<u64>,
+}
+
 /// Manages event store access — always backed by Raft consensus.
 ///
 /// Every node is a Raft node. A single-node deployment starts as a
@@ -426,7 +436,10 @@ impl ClusterManager {
             message: "add_learner called before init_raft".into(),
         })?;
 
-        raft.add_learner(id, BasicNode { addr: addr.clone() }, true)
+        // Non-blocking: waits only for the membership entry to commit on the
+        // existing quorum, never for the learner's own replication progress —
+        // a down or stalled learner must not hang the caller.
+        raft.add_learner(id, BasicNode { addr: addr.clone() }, false)
             .await
             .map_err(|e| Error::Corrupted {
                 message: format!("failed to add learner: {e}"),
@@ -434,6 +447,36 @@ impl ClusterManager {
         self.known_peers.write().insert(id, PeerConfig { id, addr });
 
         Ok(())
+    }
+
+    /// Per-context replication lag of one follower, measured from the claimed
+    /// leader's session progress. `follower_position` is `None` when no ack
+    /// from that follower has been observed for the context — an idle or
+    /// never-connected session, indistinguishable here.
+    pub fn replication_catchup_status(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<LearnerCatchup>, Error> {
+        let progress = self.control.progress_of(node_id);
+        let mut out = Vec::new();
+        for context in self.context_manager.list_contexts() {
+            let engine = self.context_manager.get_context(&context)?;
+            out.push(LearnerCatchup {
+                leader_tail: engine.local_tail().0,
+                follower_position: progress.get(&context).copied(),
+                context,
+            });
+        }
+        Ok(out)
+    }
+
+    /// True when this node holds the writable data-plane claim — the only
+    /// vantage point from which session progress is authoritative.
+    pub fn is_claimed_leader(&self) -> bool {
+        self.control
+            .claim()
+            .map(|claim| claim.writable && claim.leader_id == self.cluster_config.node_id)
+            .unwrap_or(false)
     }
 
     /// Changes both metadata consensus and native data-plane voter membership.
@@ -466,7 +509,7 @@ impl ClusterManager {
             message: "change_membership called before init_raft".into(),
         })?;
 
-        raft.change_membership(voter_ids.iter().copied().collect::<Vec<_>>(), false)
+        raft.change_membership(voter_ids.to_vec(), false)
             .await
             .map_err(|e| Error::Corrupted {
                 message: format!("failed to change membership: {e}"),

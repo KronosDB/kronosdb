@@ -41,16 +41,6 @@ impl MessagingEngine {
         }
     }
 
-    /// Returns command handler stats: command name → handler count.
-    pub fn command_stats(&self) -> Vec<(String, usize)> {
-        self.command_bus.handler_stats()
-    }
-
-    /// Returns query handler stats: query name → handler count.
-    pub fn query_stats(&self) -> Vec<(String, usize)> {
-        self.query_bus.handler_stats()
-    }
-
     /// Returns detailed command handler info + dispatch metrics per command type.
     pub fn command_details(&self) -> Vec<MessageTypeDetail> {
         self.command_bus.handler_details()
@@ -59,18 +49,6 @@ impl MessagingEngine {
     /// Returns detailed query handler info + dispatch metrics per query type.
     pub fn query_details(&self) -> Vec<MessageTypeDetail> {
         self.query_bus.handler_details()
-    }
-
-    /// Records a command completion for metrics tracking.
-    pub fn record_command_completion(&self, command_name: &str, is_error: bool, duration_us: u64) {
-        self.command_bus
-            .record_completion(command_name, is_error, duration_us);
-    }
-
-    /// Records a query completion for metrics tracking.
-    pub fn record_query_completion(&self, query_name: &str, is_error: bool, duration_us: u64) {
-        self.query_bus
-            .record_completion(query_name, is_error, duration_us);
     }
 
     /// Returns details of all active subscription queries.
@@ -121,10 +99,6 @@ impl CommandDispatcher for MessagingEngine {
     fn sweep_command_timeouts(&self, timeout: Duration) -> Vec<String> {
         self.command_bus.sweep_timeouts(timeout)
     }
-
-    fn in_flight_command_count(&self) -> usize {
-        self.command_bus.in_flight_count()
-    }
 }
 
 impl QueryDispatcher for MessagingEngine {
@@ -167,12 +141,16 @@ impl SubscriptionQueryDispatcher for MessagingEngine {
         self.subscriptions.send_update(subscription_id, update);
     }
 
+    fn grant_subscription_permits(&self, subscription_id: &str, permits: i64) {
+        self.subscriptions.grant_permits(subscription_id, permits);
+    }
+
     fn complete_subscription(&self, subscription_id: &str) {
         self.subscriptions.complete(subscription_id);
     }
 
-    fn cancel_subscription(&self, subscription_id: &str) {
-        self.subscriptions.cancel(subscription_id);
+    fn cancel_subscription(&self, subscription_id: &str) -> Option<ClientId> {
+        self.subscriptions.cancel(subscription_id)
     }
 }
 

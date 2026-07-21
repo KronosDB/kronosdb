@@ -1,5 +1,3 @@
-#![allow(clippy::all)]
-
 pub mod api;
 pub mod append;
 pub mod criteria;

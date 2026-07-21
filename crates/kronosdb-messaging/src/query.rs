@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use crate::handler::{HandlerRegistry, MessageTypeDetail, MessageTypeMetrics, MetricsSnapshot};
@@ -59,8 +59,6 @@ pub enum QueryError {
     NoHandlerAvailable { query_name: String },
     /// All handlers are at capacity.
     NoPermitsAvailable { query_name: String },
-    /// Timeout waiting for query response(s).
-    Timeout,
 }
 
 impl std::fmt::Display for QueryError {
@@ -72,7 +70,6 @@ impl std::fmt::Display for QueryError {
             Self::NoPermitsAvailable { query_name } => {
                 write!(f, "all handlers at capacity for query '{query_name}'")
             }
-            Self::Timeout => write!(f, "timeout waiting for query response"),
         }
     }
 }
@@ -92,8 +89,12 @@ pub struct PendingQuery {
 /// - **Scatter-gather**: query goes to all handlers (expected_results = -1)
 pub struct QueryBus {
     handlers: Arc<RwLock<HandlerRegistry>>,
-    /// Per-query-type dispatch metrics.
-    metrics: RwLock<HashMap<String, MessageTypeMetrics>>,
+    /// Round-robin counter distributing point-to-point queries across handlers.
+    dispatch_counter: AtomicU64,
+    /// Per-query-type dispatch metrics. Lock-free atomic counters inside the
+    /// value; DashMap shards key-level insert contention (same pattern as
+    /// CommandBus).
+    metrics: DashMap<String, MessageTypeMetrics>,
 }
 
 impl Default for QueryBus {
@@ -106,7 +107,8 @@ impl QueryBus {
     pub fn new() -> Self {
         Self {
             handlers: Arc::new(RwLock::new(HandlerRegistry::new())),
-            metrics: RwLock::new(HashMap::new()),
+            dispatch_counter: AtomicU64::new(0),
+            metrics: DashMap::new(),
         }
     }
 
@@ -146,21 +148,15 @@ impl QueryBus {
         handlers.grant_permits(client_id, permits);
     }
 
-    /// Returns stats: query name → handler count.
-    pub fn handler_stats(&self) -> Vec<(String, usize)> {
-        self.handlers.read().handler_stats()
-    }
-
     /// Returns detailed handler info + dispatch metrics per query type.
     pub fn handler_details(&self) -> Vec<MessageTypeDetail> {
         let handlers = self.handlers.read();
         let details = handlers.handler_details();
-        let metrics = self.metrics.read();
-
         details
             .into_iter()
             .map(|(name, handlers)| {
-                let snapshot = metrics
+                let snapshot = self
+                    .metrics
                     .get(&name)
                     .map(|m| m.snapshot())
                     .unwrap_or_else(MetricsSnapshot::empty);
@@ -171,20 +167,6 @@ impl QueryBus {
                 }
             })
             .collect()
-    }
-
-    /// Records a query completion from the gRPC layer.
-    pub fn record_completion(&self, query_name: &str, is_error: bool, duration_us: u64) {
-        self.get_or_create_metrics(query_name);
-        if let Some(m) = self.metrics.read().get(query_name) {
-            m.total_duration_us
-                .fetch_add(duration_us, Ordering::Relaxed);
-            if is_error {
-                m.failed.fetch_add(1, Ordering::Relaxed);
-            } else {
-                m.succeeded.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     /// Dispatches a query.
@@ -213,9 +195,12 @@ impl QueryBus {
         }
 
         let target_handlers = if query.expected_results == 1 {
-            // Point-to-point: find first handler with available permits.
-            let handler = handler_list
-                .iter()
+            // Point-to-point: round-robin start offset so load spreads across
+            // handlers instead of always hammering the first; walk the ring
+            // until one has a permit.
+            let start = self.dispatch_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let handler = (0..handler_list.len())
+                .map(|i| &handler_list[(start + i) % handler_list.len()])
                 .find(|h| h.handler.try_acquire_permit())
                 .ok_or_else(|| {
                     self.record_no_permits(&query_name);
@@ -252,32 +237,28 @@ impl QueryBus {
 
     // ── Metrics helpers ─────────────────────────────────────────────
 
-    fn get_or_create_metrics(&self, name: &str) {
-        if self.metrics.read().contains_key(name) {
-            return;
-        }
-        self.metrics.write().entry(name.to_string()).or_default();
-    }
-
     fn record_dispatched(&self, name: &str) {
-        self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.read().get(name) {
-            m.dispatched.fetch_add(1, Ordering::Relaxed);
-        }
+        self.metrics
+            .entry(name.to_string())
+            .or_default()
+            .dispatched
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_no_handler(&self, name: &str) {
-        self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.read().get(name) {
-            m.no_handler.fetch_add(1, Ordering::Relaxed);
-        }
+        self.metrics
+            .entry(name.to_string())
+            .or_default()
+            .no_handler
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_no_permits(&self, name: &str) {
-        self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.read().get(name) {
-            m.no_permits.fetch_add(1, Ordering::Relaxed);
-        }
+        self.metrics
+            .entry(name.to_string())
+            .or_default()
+            .no_permits
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

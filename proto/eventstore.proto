@@ -6,8 +6,9 @@ option java_multiple_files = true;
 /* The Event Store service. */
 service EventStore {
 
-  /* Appends new events to the store. */
-  rpc Append (stream AppendRequest) returns (AppendResponse);
+  /* Appends new events to the store. One request carries the whole
+     transaction: the repeated events field is the batch, all-or-nothing. */
+  rpc Append (AppendRequest) returns (AppendResponse);
 
   /* Provides a finite stream of events matching the given criteria. */
   rpc Source (SourceRequest) returns (stream SourceResponse);
@@ -70,7 +71,7 @@ message SequencedEvent {
   Event event = 2;
 }
 
-/* Request to append events. Sent as a stream to allow batching. */
+/* Request to append events. The repeated events field carries the batch. */
 message AppendRequest {
   /* Optional consistency condition. If omitted, events are appended unconditionally. */
   ConsistencyCondition condition = 1;
@@ -122,20 +123,22 @@ message SourceRequest {
 /* A batch of sequenced events, in ascending sequence order. */
 message SequencedEventBatch {
   repeated SequencedEvent events = 1;
+  /* Present on the FINAL batch of a Source stream: the next-exclusive
+     consistency marker for subsequent DCB-conditioned appends. A source
+     with no matching events still ends with one (empty) marker-carrying
+     batch. Absent on Stream responses and non-final Source batches. */
+  optional int64 consistency_marker = 2;
 }
 
-/* Response containing a batch of matching events or the final consistency marker. */
+/* Response containing a batch of matching events. The final batch carries
+   the consistency marker — there is no separate marker frame. */
 message SourceResponse {
-  /* Field 1 was a per-event `SequencedEvent event` in pre-0.5 servers. */
-  reserved 1;
-  reserved "event";
-  oneof result {
-    /* The consistency marker at the end of the stream.
-       Use this for subsequent appends related to the same criteria. */
-    int64 consistency_marker = 2;
-    /* A batch of matching events. */
-    SequencedEventBatch batch = 3;
-  }
+  /* Field 1 was a per-event `SequencedEvent event`; field 2 was a separate
+     terminal `consistency_marker` frame (pre-0.7 servers). */
+  reserved 1, 2;
+  reserved "event", "consistency_marker";
+  /* A batch of matching events. */
+  SequencedEventBatch batch = 3;
 }
 
 /* Client-to-server messages on the Stream RPC.

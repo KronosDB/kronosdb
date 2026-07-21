@@ -23,7 +23,6 @@ pub struct ConnectedClient {
     pub client_id: ClientId,
     pub component_name: ComponentName,
     pub version: String,
-    pub tags: HashMap<String, String>,
     pub connected_at: Instant,
     /// Last time a heartbeat response was received from this client.
     last_heartbeat: Mutex<Instant>,
@@ -32,18 +31,12 @@ pub struct ConnectedClient {
 }
 
 impl ConnectedClient {
-    fn new(
-        client_id: ClientId,
-        component_name: ComponentName,
-        version: String,
-        tags: HashMap<String, String>,
-    ) -> Self {
+    fn new(client_id: ClientId, component_name: ComponentName, version: String) -> Self {
         let now = Instant::now();
         Self {
             client_id,
             component_name,
             version,
-            tags,
             connected_at: now,
             last_heartbeat: Mutex::new(now),
             has_stream: AtomicBool::new(false),
@@ -94,14 +87,8 @@ impl ClientRegistry {
 
     /// Registers a new client. Replaces any existing entry with the same client_id
     /// (reconnect scenario).
-    pub fn register(
-        &self,
-        client_id: ClientId,
-        component_name: ComponentName,
-        version: String,
-        tags: HashMap<String, String>,
-    ) {
-        let client = ConnectedClient::new(client_id.clone(), component_name, version, tags);
+    pub fn register(&self, client_id: ClientId, component_name: ComponentName, version: String) {
+        let client = ConnectedClient::new(client_id.clone(), component_name, version);
         let mut clients = self.clients.write();
         clients.insert(client_id, client);
     }
@@ -144,15 +131,6 @@ impl ClientRegistry {
     pub fn get_component_name(&self, client_id: &ClientId) -> Option<String> {
         let clients = self.clients.read();
         clients.get(client_id).map(|c| c.component_name.0.clone())
-    }
-
-    /// Lists all connected client IDs with their component names.
-    pub fn list_clients(&self) -> Vec<(ClientId, ComponentName)> {
-        let clients = self.clients.read();
-        clients
-            .values()
-            .map(|c| (c.client_id.clone(), c.component_name.clone()))
-            .collect()
     }
 
     /// Lists all connected clients with detailed info.
@@ -206,12 +184,7 @@ mod tests {
     fn register_and_lookup() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("node-1"), component("order-service"), "1.0.0".into());
 
         assert!(registry.is_registered(&client("node-1")));
         assert!(!registry.is_registered(&client("node-2")));
@@ -222,12 +195,7 @@ mod tests {
     fn unregister() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("node-1"), component("order-service"), "1.0.0".into());
 
         assert!(registry.unregister(&client("node-1")));
         assert!(!registry.is_registered(&client("node-1")));
@@ -241,18 +209,8 @@ mod tests {
     fn reconnect_replaces() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "2.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("node-1"), component("order-service"), "1.0.0".into());
+        registry.register(client("node-1"), component("order-service"), "2.0.0".into());
 
         assert_eq!(registry.client_count(), 1);
     }
@@ -261,12 +219,7 @@ mod tests {
     fn heartbeat_updates_liveness() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("node-1"), component("order-service"), "1.0.0".into());
 
         // Immediately after registration, heartbeat should be very recent.
         registry.heartbeat(&client("node-1"));
@@ -280,18 +233,8 @@ mod tests {
     fn reap_dead_clients() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("alive"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
-        registry.register(
-            client("dead"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("alive"), component("order-service"), "1.0.0".into());
+        registry.register(client("dead"), component("order-service"), "1.0.0".into());
 
         // Manually set "dead" client's last heartbeat to the past.
         {
@@ -313,23 +256,17 @@ mod tests {
     }
 
     #[test]
-    fn list_clients() {
+    fn list_client_details() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("node-1"), component("order-service"), "1.0.0".into());
         registry.register(
             client("node-2"),
             component("payment-service"),
             "1.0.0".into(),
-            HashMap::new(),
         );
 
-        let list = registry.list_clients();
+        let list = registry.list_client_details();
         assert_eq!(list.len(), 2);
     }
 
@@ -337,12 +274,7 @@ mod tests {
     fn stream_active_tracking() {
         let registry = ClientRegistry::new();
 
-        registry.register(
-            client("node-1"),
-            component("order-service"),
-            "1.0.0".into(),
-            HashMap::new(),
-        );
+        registry.register(client("node-1"), component("order-service"), "1.0.0".into());
 
         {
             let clients = registry.clients.read();

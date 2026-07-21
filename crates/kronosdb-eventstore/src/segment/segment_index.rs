@@ -74,18 +74,12 @@ impl SegmentIndex {
 
         let type_key = make_forward_key(EVENT_TYPE_TAG_KEY, name.as_bytes());
         self.bloom.insert(&type_key);
-        self.bitmaps
-            .entry(type_key)
-            .or_insert_with(RoaringTreemap::new)
-            .insert(position);
+        self.bitmaps.entry(type_key).or_default().insert(position);
 
         for tag in tags {
             let key = make_forward_key(&tag.key, &tag.value);
             self.bloom.insert(&key);
-            self.bitmaps
-                .entry(key)
-                .or_insert_with(RoaringTreemap::new)
-                .insert(position);
+            self.bitmaps.entry(key).or_default().insert(position);
         }
     }
 
@@ -115,19 +109,13 @@ impl SegmentIndex {
             // Index event type name.
             let type_key = make_forward_key(EVENT_TYPE_TAG_KEY, event.name.as_bytes());
             bloom.insert(&type_key);
-            bitmaps
-                .entry(type_key)
-                .or_insert_with(RoaringTreemap::new)
-                .insert(pos);
+            bitmaps.entry(type_key).or_default().insert(pos);
 
             // Index each tag.
             for tag in &event.tags {
                 let key = make_forward_key(&tag.key, &tag.value);
                 bloom.insert(&key);
-                bitmaps
-                    .entry(key)
-                    .or_insert_with(RoaringTreemap::new)
-                    .insert(pos);
+                bitmaps.entry(key).or_default().insert(pos);
             }
         }
 
@@ -147,13 +135,16 @@ impl SegmentIndex {
     }
 
     /// Checks if a tag *might* exist in this segment (bloom filter check).
-    /// False positives are possible, false negatives are not.
+    /// False positives are possible, false negatives are not. Test-only —
+    /// the production bloom path goes through `cache::condition_might_match_bloom`.
+    #[cfg(test)]
     pub fn might_contain_tag(&self, key: &[u8], value: &[u8]) -> bool {
         let forward_key = make_forward_key(key, value);
         self.bloom.contains(&forward_key)
     }
 
-    /// Checks if an event type name might exist in this segment.
+    /// Checks if an event type name might exist in this segment. Test-only.
+    #[cfg(test)]
     pub fn might_contain_event_type(&self, name: &str) -> bool {
         let forward_key = make_forward_key(EVENT_TYPE_TAG_KEY, name.as_bytes());
         self.bloom.contains(&forward_key)
@@ -283,6 +274,9 @@ impl SegmentIndex {
     ///
     /// The bloom filter is NOT reconstructed here — bloom checks go through
     /// the separate `.bloom` file via the cache.
+    ///
+    /// Every read is bounds-checked: a truncated or corrupt file returns
+    /// `Error::Corrupted` instead of panicking on an out-of-range slice.
     pub fn read_idx(path: &Path) -> Result<Self, Error> {
         let data = fs::read(path)?;
 
@@ -297,52 +291,40 @@ impl SegmentIndex {
                 message: format!("unsupported .idx version: {}", data[4]),
             });
         }
-        let mut cursor = 5;
+        let mut reader = ByteReader::new(&data, 5);
 
-        let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
+        let count = reader.read_u32(".idx tag count")? as usize;
 
         let mut bitmaps = HashMap::with_capacity(count);
 
         for _ in 0..count {
-            let key_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-            let key = data[cursor..cursor + key_len].to_vec();
-            cursor += key_len;
+            let key_len = reader.read_u32(".idx key length")? as usize;
+            let key = reader.take(key_len, ".idx key")?.to_vec();
 
-            let bitmap_size =
-                u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-            let bitmap = RoaringTreemap::deserialize_from(&data[cursor..cursor + bitmap_size])
+            let bitmap_size = reader.read_u32(".idx bitmap size")? as usize;
+            let bitmap = RoaringTreemap::deserialize_from(reader.take(bitmap_size, ".idx bitmap")?)
                 .map_err(|e| Error::Corrupted {
                     message: format!("failed to deserialize bitmap: {e}"),
                 })?;
-            cursor += bitmap_size;
 
             bitmaps.insert(key, bitmap);
         }
 
         // Read all_positions bitmap.
-        let all_size = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let all_positions = RoaringTreemap::deserialize_from(&data[cursor..cursor + all_size])
-            .map_err(|e| Error::Corrupted {
-                message: format!("failed to deserialize all_positions bitmap: {e}"),
-            })?;
-        cursor += all_size;
+        let all_size = reader.read_u32(".idx all_positions size")? as usize;
+        let all_positions =
+            RoaringTreemap::deserialize_from(reader.take(all_size, ".idx all_positions")?)
+                .map_err(|e| Error::Corrupted {
+                    message: format!("failed to deserialize all_positions bitmap: {e}"),
+                })?;
 
         // Read position→offset table.
-        let base_position = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let offset_count =
-            u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
+        let base_position = reader.read_u64(".idx base position")?;
+        let offset_count = reader.read_u32(".idx offset count")? as usize;
 
-        let mut offsets = Vec::with_capacity(offset_count);
+        let mut offsets = Vec::with_capacity(offset_count.min(1 << 20));
         for _ in 0..offset_count {
-            let offset = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-            offsets.push(offset);
+            offsets.push(reader.read_u64(".idx offset entry")?);
         }
 
         // Empty bloom — the .bloom file is loaded separately via the cache.
@@ -394,9 +376,12 @@ impl SegmentIndex {
         }
 
         let payload_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+        let mut reader = ByteReader::new(&data, 9);
         let bloom: GrowableBloom =
-            bincode::deserialize(&data[9..9 + payload_len]).map_err(|e| Error::Corrupted {
-                message: format!("failed to deserialize bloom filter: {e}"),
+            bincode::deserialize(reader.take(payload_len, ".bloom payload")?).map_err(|e| {
+                Error::Corrupted {
+                    message: format!("failed to deserialize bloom filter: {e}"),
+                }
             })?;
 
         Ok(bloom)
@@ -426,6 +411,49 @@ fn make_forward_key(key: &[u8], value: &[u8]) -> Vec<u8> {
     k.extend_from_slice(key);
     k.extend_from_slice(value);
     k
+}
+
+/// Cursor over a fully-read file buffer with bounds-checked reads: a
+/// truncated or corrupt file surfaces as `Error::Corrupted` instead of an
+/// out-of-range slice panic.
+struct ByteReader<'a> {
+    data: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(data: &'a [u8], cursor: usize) -> Self {
+        Self { data, cursor }
+    }
+
+    fn take(&mut self, len: usize, what: &str) -> Result<&'a [u8], Error> {
+        let end = self
+            .cursor
+            .checked_add(len)
+            .filter(|&e| e <= self.data.len());
+        match end {
+            Some(end) => {
+                let slice = &self.data[self.cursor..end];
+                self.cursor = end;
+                Ok(slice)
+            }
+            None => Err(Error::Corrupted {
+                message: format!(
+                    "truncated file reading {what}: need {len} bytes at offset {}, file is {} bytes",
+                    self.cursor,
+                    self.data.len()
+                ),
+            }),
+        }
+    }
+
+    fn read_u32(&mut self, what: &str) -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(self.take(4, what)?.try_into().unwrap()))
+    }
+
+    fn read_u64(&mut self, what: &str) -> Result<u64, Error> {
+        Ok(u64::from_le_bytes(self.take(8, what)?.try_into().unwrap()))
+    }
 }
 
 #[cfg(test)]

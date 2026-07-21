@@ -44,6 +44,12 @@ pub struct TagIndex {
     all_positions: Mutex<RoaringTreemap>,
 }
 
+impl Default for TagIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TagIndex {
     pub fn new() -> Self {
         Self {
@@ -100,28 +106,6 @@ impl TagIndex {
         self.all_positions.lock().remove_range(from..);
     }
 
-    /// Adds tags to an existing event's index. Used by the AddTags RPC.
-    pub fn add_tags(&self, position: Position, tags: &[Tag]) {
-        let pos = position.0;
-
-        for tag in tags {
-            let forward_key = make_forward_key(&tag.key, &tag.value);
-            self.forward.entry(forward_key).or_default().insert(pos);
-        }
-    }
-
-    /// Removes tags from an existing event's index. Used by the RemoveTags RPC.
-    pub fn remove_tags(&self, position: Position, tags: &[Tag]) {
-        let pos = position.0;
-
-        for tag in tags {
-            let forward_key = make_forward_key(&tag.key, &tag.value);
-            if let Some(mut bitmap) = self.forward.get_mut(&forward_key) {
-                bitmap.remove(pos);
-            }
-        }
-    }
-
     /// Checks a DCB consistency condition.
     ///
     /// Returns `Some(position)` of the first conflicting event if the condition
@@ -131,9 +115,10 @@ impl TagIndex {
         self.find_matching_after(&condition.criteria, after)
     }
 
-    /// Finds event positions matching a query, starting from `from_position` (inclusive).
-    ///
-    /// Returns matching positions in ascending order.
+    /// Finds event positions matching a query, starting from `from_position`
+    /// (inclusive), in ascending order. Test-only assertion helper — the
+    /// production read path uses `matching_bitmap`.
+    #[cfg(test)]
     pub fn matching_positions(
         &self,
         condition: &SourcingCondition,
@@ -414,54 +399,6 @@ mod tests {
 
         let conflict = index.check_condition(&condition);
         assert_eq!(conflict, Some(Position(2)));
-    }
-
-    #[test]
-    fn add_tags_updates_forward_index() {
-        let index = TagIndex::new();
-
-        index.index_event(Position(1), "OrderPlaced", &[tag("orderId", "A")]);
-
-        let cond = SourcingCondition {
-            criteria: vec![Criterion {
-                names: vec![],
-                tags: vec![tag("region", "EU")],
-            }],
-        };
-        assert_eq!(index.matching_positions(&cond, Position(1)), vec![0u64; 0]);
-
-        index.add_tags(Position(1), &[tag("region", "EU")]);
-
-        assert_eq!(index.matching_positions(&cond, Position(1)), vec![1]);
-    }
-
-    #[test]
-    fn remove_tags_updates_forward_index() {
-        let index = TagIndex::new();
-
-        index.index_event(
-            Position(1),
-            "OrderPlaced",
-            &[tag("orderId", "A"), tag("region", "EU")],
-        );
-
-        index.remove_tags(Position(1), &[tag("region", "EU")]);
-
-        let cond = SourcingCondition {
-            criteria: vec![Criterion {
-                names: vec![],
-                tags: vec![tag("region", "EU")],
-            }],
-        };
-        assert_eq!(index.matching_positions(&cond, Position(1)), vec![0u64; 0]);
-
-        let cond = SourcingCondition {
-            criteria: vec![Criterion {
-                names: vec![],
-                tags: vec![tag("orderId", "A")],
-            }],
-        };
-        assert_eq!(index.matching_positions(&cond, Position(1)), vec![1]);
     }
 
     #[test]

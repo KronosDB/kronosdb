@@ -181,7 +181,10 @@ async fn run_tail(
                 if truncate.epoch != config.epoch {
                     return Err(stale_epoch(truncate.epoch, config.epoch));
                 }
-                engine.truncate_to(Position(truncate.position))?;
+                let expected_prev = truncate.has_boundary.then_some(
+                    (!truncate.prev_at_segment_start).then_some(truncate.prev_record_crc),
+                );
+                engine.truncate_to_matching(Position(truncate.position), expected_prev)?;
                 if stop_at
                     .map(|target| engine.local_tail().0 >= target.0)
                     .unwrap_or(false)

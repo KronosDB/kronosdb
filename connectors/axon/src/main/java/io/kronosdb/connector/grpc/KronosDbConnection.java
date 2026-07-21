@@ -64,9 +64,7 @@ public class KronosDbConnection {
                 if (snapshotChannel == null) {
                     snapshotChannel = new SnapshotChannel(
                             SnapshotStoreGrpc.newStub(channel),
-                            SnapshotStoreGrpc.newBlockingStub(channel),
-                            SnapshotStoreGrpc.newFutureStub(channel),
-                            context
+                            SnapshotStoreGrpc.newFutureStub(channel)
                     );
                 }
             }
@@ -83,7 +81,6 @@ public class KronosDbConnection {
                 if (commandChannel == null) {
                     commandChannel = new CommandChannel(
                             CommandServiceGrpc.newStub(channel),
-                            CommandServiceGrpc.newBlockingStub(channel),
                             CommandServiceGrpc.newFutureStub(channel),
                             context
                     );
@@ -102,8 +99,6 @@ public class KronosDbConnection {
                 if (queryChannel == null) {
                     queryChannel = new QueryChannel(
                             QueryServiceGrpc.newStub(channel),
-                            QueryServiceGrpc.newBlockingStub(channel),
-                            QueryServiceGrpc.newFutureStub(channel),
                             context
                     );
                 }
@@ -121,7 +116,6 @@ public class KronosDbConnection {
                 if (platformChannel == null) {
                     platformChannel = new PlatformChannel(
                             PlatformServiceGrpc.newStub(channel),
-                            PlatformServiceGrpc.newBlockingStub(channel),
                             PlatformServiceGrpc.newFutureStub(channel),
                             context
                     );

@@ -253,7 +253,7 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
     // and are contiguous: tail, tail+1, ..., head-1.
     let head = store.head().0;
     let tail = store.tail().0;
-    let total_events = if head > tail { head - tail } else { 0 };
+    let total_events = head.saturating_sub(tail);
 
     if total_events == 0 {
         return r#"<div class="text-center text-k-muted py-8 text-xs">No events in this context</div>"#.to_string();
@@ -282,7 +282,7 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
                 let skip = (page as usize - 1) * limit;
                 let page_events: Vec<StoredEvent> =
                     events.into_iter().skip(skip).take(limit).collect();
-                let total_pages = (total_matching + limit - 1) / limit;
+                let total_pages = total_matching.div_ceil(limit);
                 events_table_html(
                     &page_events,
                     head,
@@ -324,7 +324,7 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
         match store.source_stored(Position(page_bottom), &condition, fetch_count) {
             Ok(mut events) => {
                 events.reverse();
-                let total_pages = (total_events as usize + limit - 1) / limit;
+                let total_pages = (total_events as usize).div_ceil(limit);
                 events_table_html(
                     &events,
                     head,

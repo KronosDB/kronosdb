@@ -22,8 +22,16 @@ pub struct ActiveClaim {
 pub struct ReplicationControl {
     node_id: u64,
     voters: RwLock<Vec<u64>>,
+    /// Non-voting cluster members. Learners run full Tail sessions and ack
+    /// cursors, but never count toward the watermark quorum and never change
+    /// the voter generation or the write gate.
+    learners: RwLock<Vec<u64>>,
     voter_generation: std::sync::atomic::AtomicU64,
     claim: tokio::sync::watch::Sender<Option<ActiveClaim>>,
+    /// Latest durably-acked replication cursor per (context, follower),
+    /// recorded on the claimed leader for every session including learners.
+    /// Informational: promotion gating and operator visibility, never quorum.
+    progress: RwLock<std::collections::BTreeMap<(String, u64), u64>>,
 }
 
 impl ReplicationControl {
@@ -34,8 +42,10 @@ impl ReplicationControl {
         Arc::new(Self {
             node_id,
             voters: RwLock::new(voters),
+            learners: RwLock::new(Vec::new()),
             voter_generation: std::sync::atomic::AtomicU64::new(0),
             claim,
+            progress: RwLock::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -59,6 +69,46 @@ impl ReplicationControl {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         drop(current);
         self.close_gate();
+    }
+
+    pub fn learners(&self) -> Vec<u64> {
+        self.learners.read().clone()
+    }
+
+    /// Replaces the learner set. Unlike `set_voters` this neither bumps the
+    /// voter generation nor closes the write gate: learners are invisible to
+    /// quorum math, so their arrival or departure must not fence sessions.
+    pub fn set_learners(&self, mut learners: Vec<u64>) {
+        learners.sort_unstable();
+        learners.dedup();
+        let mut current = self.learners.write();
+        if *current == learners {
+            return;
+        }
+        *current = learners;
+    }
+
+    /// True when the node is a cluster member of either kind — the set
+    /// allowed to open Tail replication sessions.
+    pub fn is_replica(&self, node_id: u64) -> bool {
+        self.voters.read().contains(&node_id) || self.learners.read().contains(&node_id)
+    }
+
+    /// Records a follower's latest durably-acked cursor for one context.
+    pub fn record_progress(&self, context: &str, node_id: u64, position: u64) {
+        self.progress
+            .write()
+            .insert((context.to_string(), node_id), position);
+    }
+
+    /// The latest recorded cursor per context for one follower.
+    pub fn progress_of(&self, node_id: u64) -> std::collections::BTreeMap<String, u64> {
+        self.progress
+            .read()
+            .iter()
+            .filter(|((_, node), _)| *node == node_id)
+            .map(|((context, _), position)| (context.clone(), *position))
+            .collect()
     }
 
     pub fn voter_generation(&self) -> u64 {
@@ -178,5 +228,42 @@ mod tests {
         control.observe_claim(8, 1, 5);
         assert!(updates.has_changed().unwrap());
         assert_eq!(updates.borrow_and_update().as_ref().unwrap().epoch, 8);
+    }
+
+    #[test]
+    fn learners_are_replicas_but_never_fence_the_gate() {
+        let control = ReplicationControl::new(1, vec![1]);
+        let generation = control.voter_generation();
+        control.observe_claim(3, 1, 2);
+        assert!(control.activate_local(3, 2, vec![1], generation));
+
+        control.set_learners(vec![2, 4]);
+        assert!(control.is_replica(1), "voter is a replica");
+        assert!(control.is_replica(2), "learner is a replica");
+        assert!(!control.is_replica(3), "stranger is not a replica");
+        assert_eq!(
+            control.voter_generation(),
+            generation,
+            "learner changes must not bump the voter generation"
+        );
+        assert!(
+            control.is_local_writable(3, 1),
+            "learner changes must not close the write gate"
+        );
+    }
+
+    #[test]
+    fn progress_tracks_latest_cursor_per_context_and_node() {
+        let control = ReplicationControl::new(1, vec![1, 2]);
+        control.record_progress("orders", 2, 10);
+        control.record_progress("orders", 2, 25);
+        control.record_progress("billing", 2, 5);
+        control.record_progress("orders", 3, 99);
+
+        let progress = control.progress_of(2);
+        assert_eq!(progress.get("orders"), Some(&25));
+        assert_eq!(progress.get("billing"), Some(&5));
+        assert_eq!(progress.len(), 2);
+        assert_eq!(control.progress_of(4).len(), 0);
     }
 }

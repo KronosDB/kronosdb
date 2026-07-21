@@ -56,6 +56,7 @@ async fn run_one_iteration(iter: usize) {
         node_id: 1,
         peers: vec![],
         group_commit_ms: Some(2),
+        segment_size: None,
     };
 
     // First boot: append under load, then kill the server.
@@ -167,7 +168,7 @@ async fn run_one_iteration(iter: usize) {
     };
     let mut stream = client.source(req).await.expect("source rpc").into_inner();
     while let Some(resp) = stream.message().await.expect("stream msg") {
-        let Some(pb::source_response::Result::Batch(batch)) = resp.result else {
+        let Some(batch) = resp.batch else {
             continue;
         };
         for ev in batch.events {
@@ -306,9 +307,8 @@ async fn writer_loop(
             condition,
             events: vec![tagged],
         };
-        let stream = tokio_stream::iter(vec![req]);
         let out = tokio::select! {
-            res = client.append(stream) => res,
+            res = client.append(req) => res,
             _ = kill_rx.changed() => return,
         };
         match out {

@@ -9,15 +9,17 @@
 //! On a single node the quorum is one, so the watermark is simply the
 //! leader's own durable cursor through the same code path.
 //!
-//! Waiters block synchronously (the append path is synchronous and already
-//! blocks for group commit today); each waiter gets its own rendezvous
-//! channel so wakeups are exact — no thundering herd on every wave.
+//! Waiters come in two kinds, both exact-wakeup (no thundering herd):
+//! synchronous callers park on a rendezvous channel; the gRPC append path
+//! awaits a oneshot instead, so no thread is pinned for the fsync duration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
+
+use tokio::sync::oneshot;
 
 use crate::error::Error;
 
@@ -33,6 +35,28 @@ pub type Epoch = u64;
 /// shutdown) and the write must NOT be treated as durable.
 type WakeResult = Result<(), String>;
 
+/// One registered ack waiter. Both kinds receive exactly one verdict.
+enum Waiter {
+    /// A thread parked on a rendezvous channel (`wait_for`).
+    Sync(SyncSender<WakeResult>),
+    /// A task awaiting a oneshot (`wait_for_async`). A dropped receiver
+    /// (client went away) makes the send a no-op.
+    Async(oneshot::Sender<WakeResult>),
+}
+
+impl Waiter {
+    fn wake(self, verdict: WakeResult) {
+        match self {
+            Waiter::Sync(tx) => {
+                let _ = tx.send(verdict);
+            }
+            Waiter::Async(tx) => {
+                let _ = tx.send(verdict);
+            }
+        }
+    }
+}
+
 struct Inner {
     /// Epoch whose acknowledgements are eligible for quorum calculation.
     epoch: Epoch,
@@ -43,7 +67,7 @@ struct Inner {
     /// Durable cursor per voter in the current epoch.
     cursors: BTreeMap<NodeId, u64>,
     /// Waiters keyed by position: released when the watermark passes them.
-    ledger: BTreeMap<u64, Vec<SyncSender<WakeResult>>>,
+    ledger: BTreeMap<u64, Vec<Waiter>>,
     /// Latched for the current epoch on fsync failure / epoch loss / shutdown.
     /// `begin_epoch` clears it after aborting old waiters.
     poisoned: Option<String>,
@@ -168,9 +192,9 @@ impl WatermarkState {
         // watermark >= K.
         let still_waiting = inner.ledger.split_off(&(candidate + 1));
         let released = std::mem::replace(&mut inner.ledger, still_waiting);
-        for sender in released.into_values().flatten() {
-            // A send only fails if the waiter gave up (dropped); fine.
-            let _ = sender.send(Ok(()));
+        for waiter in released.into_values().flatten() {
+            // A wake only fails if the waiter gave up (dropped); fine.
+            waiter.wake(Ok(()));
         }
         Some(candidate)
     }
@@ -187,10 +211,34 @@ impl WatermarkState {
                 return Ok(());
             }
             let (tx, rx) = sync_channel(1);
-            inner.ledger.entry(pos).or_default().push(tx);
+            inner.ledger.entry(pos).or_default().push(Waiter::Sync(tx));
             rx
         };
         match rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(poison_error(&msg)),
+            // Sender dropped without a verdict — the state was torn down.
+            Err(_) => Err(poison_error("watermark state dropped")),
+        }
+    }
+
+    /// Awaits the watermark reaching `pos` without pinning a thread. Same
+    /// verdicts and poisoning semantics as `wait_for`; only where the caller
+    /// waits differs.
+    pub async fn wait_for_async(&self, pos: u64) -> Result<(), Error> {
+        let rx: oneshot::Receiver<WakeResult> = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(msg) = &inner.poisoned {
+                return Err(poison_error(msg));
+            }
+            if self.watermark.load(Ordering::Acquire) >= pos {
+                return Ok(());
+            }
+            let (tx, rx) = oneshot::channel();
+            inner.ledger.entry(pos).or_default().push(Waiter::Async(tx));
+            rx
+        };
+        match rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(poison_error(&msg)),
             // Sender dropped without a verdict — the state was torn down.
@@ -219,8 +267,8 @@ impl WatermarkState {
 fn abort_locked(inner: &mut Inner, reason: &str) {
     let msg = inner.poisoned.clone().unwrap_or_else(|| reason.to_string());
     let ledger = std::mem::take(&mut inner.ledger);
-    for sender in ledger.into_values().flatten() {
-        let _ = sender.send(Err(msg.clone()));
+    for waiter in ledger.into_values().flatten() {
+        waiter.wake(Err(msg.clone()));
     }
 }
 

@@ -186,9 +186,9 @@ impl SegmentReplication for SegmentReplicationService {
             .control
             .claim()
             .ok_or_else(|| Status::failed_precondition("no committed leader claim"))?;
-        if !self.control.voters().contains(&open.follower_id) {
+        if !self.control.is_replica(open.follower_id) {
             return Err(Status::permission_denied(
-                "Tail requester is not an active voter",
+                "Tail requester is not a cluster member",
             ));
         }
         if open.recovery_source {
@@ -233,7 +233,10 @@ impl SegmentReplication for SegmentReplicationService {
         }
         if open.from_position > leader_tail {
             catchup_from = leader_tail;
-            initial_truncate = Some(leader_tail);
+            let prev = engine
+                .replication_boundary_prev(Position(leader_tail))
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            initial_truncate = Some((leader_tail, prev));
         } else if engine
             .verify_replication_probe(open.segment_base, open.byte_offset, open.last_record_crc)
             .map_err(|error| Status::failed_precondition(error.to_string()))?
@@ -259,7 +262,10 @@ impl SegmentReplication for SegmentReplicationService {
                 return Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))));
             }
             catchup_from = open.watermark;
-            initial_truncate = Some(open.watermark);
+            let prev = engine
+                .replication_boundary_prev(Position(open.watermark))
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            initial_truncate = Some((open.watermark, prev));
         }
 
         // Subscribe before snapshotting catch-up ranges. Waves sealed after
@@ -359,6 +365,11 @@ impl SegmentReplication for SegmentReplicationService {
                                     acked_bytes.store(ack.durable_bytes, Ordering::Release);
                                 }
                                 if !recovery_source {
+                                    session_control.record_progress(
+                                        &context,
+                                        ack.follower_id,
+                                        ack.durable_position,
+                                    );
                                     if let Some(watermark) = leader_engine.acknowledge_replica(
                                         ack.follower_id,
                                         ack.epoch,
@@ -409,23 +420,27 @@ impl SegmentReplication for SegmentReplicationService {
                 return;
             }
 
-            if let Some(position) = initial_truncate {
-                if send_frame(
+            if let Some((position, prev)) = initial_truncate
+                && send_frame(
                     &out_tx,
-                    proto::tail_frame::Frame::Truncate(proto::Truncate { epoch, position }),
+                    proto::tail_frame::Frame::Truncate(proto::Truncate {
+                        epoch,
+                        position,
+                        has_boundary: true,
+                        prev_record_crc: prev.unwrap_or(0),
+                        prev_at_segment_start: prev.is_none(),
+                    }),
                 )
                 .await
                 .is_err()
-                {
-                    return;
-                }
+            {
+                return;
             }
 
             for slice in slices {
                 if current_base != Some(slice.segment_base)
                     && slice.first_position == slice.segment_base
-                {
-                    if send_frame(
+                    && send_frame(
                         &out_tx,
                         proto::tail_frame::Frame::Rotate(proto::Rotate {
                             epoch,
@@ -434,9 +449,8 @@ impl SegmentReplication for SegmentReplicationService {
                     )
                     .await
                     .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
                 current_base = Some(slice.segment_base);
 
@@ -700,6 +714,8 @@ fn retry_response(reason: impl Into<String>) -> proto::ForwardAppendResponse {
     }
 }
 
+// tonic's `Status` fixes the large error type.
+#[allow(clippy::result_large_err)]
 fn decode_forward_append(request: proto::ForwardAppendRequest) -> Result<AppendRequest, Status> {
     let events = request
         .events
@@ -770,6 +786,7 @@ async fn wait_for_window(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_records(
     tx: &mpsc::Sender<Result<proto::TailFrame, Status>>,
     epoch: u64,

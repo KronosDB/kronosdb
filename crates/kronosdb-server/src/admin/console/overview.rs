@@ -18,7 +18,7 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
             Ok(store) => (store.head().0, store.tail().0),
             Err(_) => (0, 0),
         };
-        let events = if head > tail { head - tail } else { 0 };
+        let events = head.saturating_sub(tail);
         total_events += events;
         context_rows.push_str(&format!(
             r#"<tr><td class="font-mono text-xs !text-k-text">{name}</td><td class="font-mono text-xs text-right">{events}</td><td class="font-mono text-xs text-right">{head}</td></tr>"#,

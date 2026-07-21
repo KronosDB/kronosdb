@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -44,6 +45,10 @@ pub struct SubscriptionUpdate {
     pub error_code: Option<String>,
     /// Full error detail preserving the complete error context.
     pub error: Option<ErrorDetail>,
+    /// Terminal marker: the handler completed this subscription and no
+    /// further updates will follow. With `error_code` set it maps to
+    /// CompleteExceptionally on the wire; without, to Complete.
+    pub complete: bool,
 }
 
 /// Error related to subscription queries.
@@ -55,6 +60,8 @@ pub enum SubscriptionError {
     NoPermitsAvailable { query_name: String },
     /// Subscription not found.
     SubscriptionNotFound { subscription_id: String },
+    /// A subscription with this id is already active.
+    DuplicateSubscription { subscription_id: String },
 }
 
 impl std::fmt::Display for SubscriptionError {
@@ -74,6 +81,9 @@ impl std::fmt::Display for SubscriptionError {
             }
             Self::SubscriptionNotFound { subscription_id } => {
                 write!(f, "subscription not found: '{subscription_id}'")
+            }
+            Self::DuplicateSubscription { subscription_id } => {
+                write!(f, "subscription '{subscription_id}' is already active")
             }
         }
     }
@@ -104,6 +114,11 @@ struct ActiveSubscription {
     opened_at: Instant,
     /// Channel to send updates to the subscriber.
     update_tx: mpsc::Sender<SubscriptionUpdate>,
+    /// Update credit: how many more updates the subscriber has asked for.
+    /// Seeded from `initial_permits`, replenished by FlowControl. Terminal
+    /// messages (complete / error) bypass the credit check — the subscriber
+    /// must always learn the subscription ended.
+    permits: AtomicI64,
 }
 
 /// Registry of active subscription queries.
@@ -116,6 +131,12 @@ pub struct SubscriptionRegistry {
     handlers: Arc<RwLock<HandlerRegistry>>,
     /// Active subscriptions, keyed by subscription_id.
     active: RwLock<HashMap<String, ActiveSubscription>>,
+}
+
+impl Default for SubscriptionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubscriptionRegistry {
@@ -157,6 +178,16 @@ impl SubscriptionRegistry {
         &self,
         query: SubscriptionQuery,
     ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError> {
+        // Reject duplicates before consuming a handler permit. Holding the
+        // write lock across handler selection also closes the check-then-act
+        // race between two opens with the same id.
+        let mut active = self.active.write();
+        if active.contains_key(&query.subscription_id) {
+            return Err(SubscriptionError::DuplicateSubscription {
+                subscription_id: query.subscription_id.clone(),
+            });
+        }
+
         let handlers = self.handlers.read();
         let handler_list = handlers.get_handlers(&query.query_name).ok_or_else(|| {
             SubscriptionError::NoHandlerAvailable {
@@ -180,8 +211,11 @@ impl SubscriptionRegistry {
 
         let handler_client_id = handler.handler.client_id.clone();
 
-        // Create the update channel.
-        let (update_tx, update_rx) = mpsc::channel(64);
+        // Create the update channel. The subscriber's requested permit count
+        // sizes the buffer (bounded to keep a hostile value from pinning memory)
+        // and seeds the update credit.
+        let initial_permits = query.initial_permits.clamp(1, 1024);
+        let (update_tx, update_rx) = mpsc::channel(initial_permits as usize);
 
         let subscription = ActiveSubscription {
             client_id: query.client_id.clone(),
@@ -190,6 +224,7 @@ impl SubscriptionRegistry {
             component_name: query.component_name.clone(),
             opened_at: Instant::now(),
             update_tx,
+            permits: AtomicI64::new(initial_permits),
         };
 
         let subscription_id = query.subscription_id.clone();
@@ -209,19 +244,52 @@ impl SubscriptionRegistry {
             target_handlers: vec![handler_client_id],
         };
 
-        // Register the active subscription.
-        let mut active = self.active.write();
+        // Register the active subscription (write lock held since the
+        // duplicate check above).
         active.insert(subscription_id, subscription);
 
         Ok((pending, update_rx))
     }
 
     /// Sends an update from a handler to a subscription query subscriber.
+    ///
+    /// Credit-based flow control: each non-terminal update consumes one permit
+    /// (seeded from `initial_permits`, replenished via [`grant_permits`]).
+    /// Out-of-credit updates are dropped with a warning — the subscriber
+    /// stopped refilling, so it is either gone or not keeping up. Terminal
+    /// updates (complete / error) bypass the credit check.
     pub fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate) {
         let active = self.active.read();
+        let Some(sub) = active.get(subscription_id) else {
+            return;
+        };
+
+        let terminal = update.complete || update.error_code.is_some();
+        if !terminal && sub.permits.fetch_sub(1, Ordering::Relaxed) <= 0 {
+            sub.permits.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                subscription_id = %subscription_id,
+                query = %sub.query_name,
+                "subscription update dropped: subscriber out of update permits"
+            );
+            return;
+        }
+
+        if let Err(e) = sub.update_tx.try_send(update) {
+            tracing::warn!(
+                subscription_id = %subscription_id,
+                query = %sub.query_name,
+                reason = %e,
+                "subscription update dropped: subscriber buffer full or closed"
+            );
+        }
+    }
+
+    /// Grants additional update permits to a subscription (FlowControl refill).
+    pub fn grant_permits(&self, subscription_id: &str, permits: i64) {
+        let active = self.active.read();
         if let Some(sub) = active.get(subscription_id) {
-            // Non-blocking send — if the subscriber's channel is full, drop the update.
-            let _ = sub.update_tx.try_send(update);
+            sub.permits.fetch_add(permits.max(0), Ordering::Relaxed);
         }
     }
 
@@ -234,20 +302,45 @@ impl SubscriptionRegistry {
     }
 
     /// Cancels a subscription query — subscriber is no longer interested.
-    pub fn cancel(&self, subscription_id: &str) {
+    /// Returns the handler's client id (if the subscription existed) so the
+    /// caller can notify the handler to stop emitting updates.
+    pub fn cancel(&self, subscription_id: &str) -> Option<ClientId> {
         let mut active = self.active.write();
-        active.remove(subscription_id);
+        active
+            .remove(subscription_id)
+            .map(|sub| sub.handler_client_id)
     }
 
     /// Removes all subscriptions for a disconnected client
     /// (both as subscriber and as handler).
     pub fn remove_client(&self, client_id: &ClientId) {
-        // Remove as subscriber.
         let mut active = self.active.write();
+
+        // Remove as subscriber — the subscriber is gone, nothing to notify.
         active.retain(|_, sub| &sub.client_id != client_id);
 
-        // Remove subscriptions where the handler disconnected.
-        active.retain(|_, sub| &sub.handler_client_id != client_id);
+        // Remove subscriptions whose HANDLER disconnected, telling each
+        // subscriber the stream ended abnormally — a bare channel close
+        // would look like normal completion.
+        active.retain(|sub_id, sub| {
+            if &sub.handler_client_id != client_id {
+                return true;
+            }
+            let _ = sub.update_tx.try_send(SubscriptionUpdate {
+                subscription_id: sub_id.clone(),
+                payload: None,
+                metadata: HashMap::new(),
+                error_code: Some(crate::error_codes::CONNECTION_TO_HANDLER_LOST.to_string()),
+                error: Some(crate::types::ErrorDetail {
+                    message: "the handler serving this subscription disconnected".to_string(),
+                    location: "kronosdb".to_string(),
+                    details: vec![],
+                    error_code: crate::error_codes::CONNECTION_TO_HANDLER_LOST.to_string(),
+                }),
+                complete: true,
+            });
+            false
+        });
 
         drop(active);
 
@@ -361,6 +454,7 @@ mod tests {
                 metadata: std::collections::HashMap::new(),
                 error_code: None,
                 error: None,
+                complete: false,
             },
         );
 

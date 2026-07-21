@@ -87,7 +87,19 @@ impl IndexCache {
 
         // Not cached — try to load from disk.
         let bloom_path = segment_path.with_extension("bloom");
-        let bloom = SegmentIndex::read_bloom(&bloom_path).ok()?;
+        let bloom = match SegmentIndex::read_bloom(&bloom_path) {
+            Ok(bloom) => bloom,
+            Err(e) => {
+                // Degrades to "always check the index" for this segment —
+                // correct but slower, so make the corruption visible.
+                tracing::warn!(
+                    path = %bloom_path.display(),
+                    error = %e,
+                    "failed to load .bloom file; falling back to index checks"
+                );
+                return None;
+            }
+        };
         let result = condition_might_match_bloom(&bloom, condition);
 
         // Cache it.

@@ -34,11 +34,12 @@ public class EventStoreChannel {
     }
 
     /**
-     * Starts an append transaction. Events are batched and sent as a stream.
-     * Call {@link AppendTransaction#commit()} to finalize.
+     * Starts an append transaction. Events are buffered locally and sent as
+     * one unary request on {@link AppendTransaction#commit()}; nothing is
+     * sent — and no stream is held open — before that.
      */
     public AppendTransaction startAppendTransaction() {
-        return new AppendTransaction(asyncStub);
+        return new AppendTransaction(futureStub);
     }
 
     /**
@@ -140,59 +141,62 @@ public class EventStoreChannel {
     }
 
     /**
-     * Represents an in-progress append transaction.
-     * Events are buffered and sent as a stream when committed.
+     * Represents an in-progress append transaction. Requests are merged
+     * locally; the wire sees a single unary Append at commit time, so a
+     * rolled-back transaction sends nothing at all.
      */
     public static class AppendTransaction {
 
-        private final CompletableFuture<AppendResponse> result = new CompletableFuture<>();
-        private final StreamObserver<AppendRequest> requestStream;
+        private final EventStoreGrpc.EventStoreFutureStub futureStub;
+        private AppendRequest.Builder pending;
+        private boolean closed;
 
-        AppendTransaction(EventStoreGrpc.EventStoreStub asyncStub) {
-            this.requestStream = asyncStub.append(new StreamObserver<>() {
-                @Override
-                public void onNext(AppendResponse value) {
-                    result.complete(value);
-                }
-
-                @Override
-                public void onError(Throwable t) {
-                    result.completeExceptionally(t);
-                }
-
-                @Override
-                public void onCompleted() {
-                    if (!result.isDone()) {
-                        result.completeExceptionally(
-                                new IllegalStateException("Append stream completed without a response.")
-                        );
-                    }
-                }
-            });
+        AppendTransaction(EventStoreGrpc.EventStoreFutureStub futureStub) {
+            this.futureStub = futureStub;
         }
 
         /**
          * Appends events to this transaction with an optional consistency condition.
+         * May be called more than once before commit; events accumulate and the
+         * first condition wins (matching the previous streaming semantics).
          */
-        public void append(AppendRequest request) {
-            requestStream.onNext(request);
+        public synchronized void append(AppendRequest request) {
+            if (closed) {
+                throw new IllegalStateException("Append transaction already committed or rolled back.");
+            }
+            if (pending == null) {
+                pending = request.toBuilder();
+            } else {
+                if (!pending.hasCondition() && request.hasCondition()) {
+                    pending.setCondition(request.getCondition());
+                }
+                pending.addAllEvents(request.getEventsList());
+            }
         }
 
         /**
-         * Commits the transaction by completing the request stream.
+         * Commits the transaction by sending the buffered request.
          *
          * @return a future that completes with the append response
          */
-        public CompletableFuture<AppendResponse> commit() {
-            requestStream.onCompleted();
-            return result;
+        public synchronized CompletableFuture<AppendResponse> commit() {
+            if (closed) {
+                throw new IllegalStateException("Append transaction already committed or rolled back.");
+            }
+            closed = true;
+            AppendRequest request = pending == null
+                    ? AppendRequest.getDefaultInstance()
+                    : pending.build();
+            return GrpcFutures.toCompletableFuture(futureStub.append(request));
         }
 
         /**
-         * Rolls back the transaction by cancelling the stream.
+         * Rolls back the transaction. Nothing was sent, so this only drops
+         * the buffered events.
          */
-        public void rollback() {
-            requestStream.onError(new RuntimeException("Transaction rolled back by client."));
+        public synchronized void rollback() {
+            closed = true;
+            pending = null;
         }
     }
 }

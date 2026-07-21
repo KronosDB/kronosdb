@@ -1,5 +1,3 @@
-#![allow(dead_code, clippy::all)]
-
 mod admin;
 mod auth;
 mod config;

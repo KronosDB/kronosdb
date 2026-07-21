@@ -172,7 +172,7 @@ async fn context_chart_fragment(State(state): State<AdminState>) -> axum::respon
             Ok(store) => {
                 let h = store.head().0;
                 let t = store.tail().0;
-                if h > t { h - t } else { 0 }
+                h.saturating_sub(t)
             }
             Err(_) => 0,
         };

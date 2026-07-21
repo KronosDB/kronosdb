@@ -114,6 +114,11 @@ impl ClusterManager {
             return Ok(false);
         }
 
+        // Learners are mirrored so the replication service admits their Tail
+        // sessions; they never enter quorum math or the voter generation.
+        let learner_ids: Vec<u64> = membership.learner_ids().collect();
+        self.control.set_learners(learner_ids);
+
         let _topology_guard = self.topology_lock.lock().await;
         if *self.active_voters.read() != voters {
             let voter_ids = voters.iter().map(|peer| peer.id).collect();
@@ -710,7 +715,7 @@ impl ClusterManager {
 }
 
 async fn abort_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
-    let tasks: Vec<_> = tasks.drain(..).collect();
+    let tasks: Vec<_> = std::mem::take(tasks);
     for task in &tasks {
         task.abort();
     }

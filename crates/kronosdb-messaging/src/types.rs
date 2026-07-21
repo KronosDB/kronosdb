@@ -40,6 +40,21 @@ pub enum ProcessingKey {
     NrOfResults,
 }
 
+/// Extracts a numeric processing-instruction value by key, if present.
+pub fn instruction_number(
+    instructions: &[ProcessingInstruction],
+    key: ProcessingKey,
+) -> Option<i64> {
+    instructions
+        .iter()
+        .find(|pi| pi.key == key)
+        .and_then(|pi| pi.value.as_ref())
+        .and_then(|v| match v {
+            MetadataValue::Number(n) => Some(*n),
+            _ => None,
+        })
+}
+
 /// Identifies a connected client instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientId(pub String);

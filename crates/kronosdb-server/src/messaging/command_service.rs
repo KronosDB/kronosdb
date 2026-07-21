@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,15 +8,15 @@ use tonic::{Request, Response, Status, Streaming};
 
 use kronosdb_messaging::command::{Command, CommandResult};
 use kronosdb_messaging::manager::MessagingManager;
-use kronosdb_messaging::types::{
-    ClientId, ComponentName, MetadataValue, Payload, ProcessingInstruction, ProcessingKey,
-    RoutingKey,
-};
+use kronosdb_messaging::types::{ClientId, ComponentName, Payload, RoutingKey};
 
+use super::convert::{
+    effective_timeout, internal_metadata_to_proto, internal_pi_to_proto,
+    proto_metadata_to_internal, proto_pi_to_internal,
+};
 use crate::handler_registry::HandlerStreamRegistry;
 use crate::platform::service::ClientChannelRegistry;
 use crate::proto::kronosdb::command as pb;
-use crate::proto::kronosdb::command::command_service_server::CommandServiceServer as GrpcCommandServiceServer;
 use crate::proto::kronosdb::platform as platform_pb;
 
 /// gRPC metadata header for context routing.
@@ -54,10 +53,6 @@ impl CommandServiceImpl {
             channel_registry,
             handler_stream_registry,
         }
-    }
-
-    pub fn into_server(self) -> GrpcCommandServiceServer<Self> {
-        GrpcCommandServiceServer::new(self)
     }
 }
 
@@ -296,7 +291,11 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         // Wait for the handler's response, with a per-request timeout. The
         // bus also runs a background sweep as a safety net, but the per-
         // request deadline is enforced here so callers see deadline_exceeded.
-        match tokio::time::timeout(self.command_timeout, response_rx).await {
+        let timeout = effective_timeout(
+            &pending_cmd.command.processing_instructions,
+            self.command_timeout,
+        );
+        match tokio::time::timeout(timeout, response_rx).await {
             Ok(Ok(result)) => Ok(Response::new(to_proto_command_response(result))),
             Ok(Err(_)) => {
                 // Sender dropped without sending — the bus extracted the entry
@@ -312,112 +311,6 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             }
         }
     }
-}
-
-// --- Proto conversions ---
-
-fn proto_mv_to_internal(v: crate::proto::kronosdb::MetadataValue) -> MetadataValue {
-    match v.data {
-        Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => MetadataValue::Text(s),
-        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => {
-            MetadataValue::Number(n)
-        }
-        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => {
-            MetadataValue::Boolean(b)
-        }
-        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => {
-            MetadataValue::Double(d)
-        }
-        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => {
-            MetadataValue::Bytes(Payload {
-                payload_type: obj.r#type,
-                revision: obj.revision,
-                data: obj.data,
-            })
-        }
-        None => MetadataValue::Text(String::new()),
-    }
-}
-
-fn internal_mv_to_proto(v: &MetadataValue) -> crate::proto::kronosdb::MetadataValue {
-    let data = match v {
-        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(
-            s.clone(),
-        )),
-        MetadataValue::Number(n) => Some(
-            crate::proto::kronosdb::metadata_value::Data::NumberValue(*n),
-        ),
-        MetadataValue::Boolean(b) => Some(
-            crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b),
-        ),
-        MetadataValue::Double(d) => Some(
-            crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d),
-        ),
-        MetadataValue::Bytes(p) => Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(
-            crate::proto::kronosdb::SerializedObject {
-                r#type: p.payload_type.clone(),
-                revision: p.revision.clone(),
-                data: p.data.clone(),
-            },
-        )),
-    };
-    crate::proto::kronosdb::MetadataValue { data }
-}
-
-fn proto_metadata_to_internal(
-    meta: HashMap<String, crate::proto::kronosdb::MetadataValue>,
-) -> kronosdb_messaging::types::Metadata {
-    meta.into_iter()
-        .map(|(k, v)| (k, proto_mv_to_internal(v)))
-        .collect()
-}
-
-fn internal_metadata_to_proto(
-    meta: &kronosdb_messaging::types::Metadata,
-) -> HashMap<String, crate::proto::kronosdb::MetadataValue> {
-    meta.iter()
-        .map(|(k, v)| (k.clone(), internal_mv_to_proto(v)))
-        .collect()
-}
-
-fn proto_pk_to_internal(key: i32) -> ProcessingKey {
-    match key {
-        1 => ProcessingKey::Priority,
-        2 => ProcessingKey::Timeout,
-        3 => ProcessingKey::NrOfResults,
-        _ => ProcessingKey::RoutingKey, // 0 and unknown
-    }
-}
-
-fn internal_pk_to_proto(key: ProcessingKey) -> i32 {
-    match key {
-        ProcessingKey::RoutingKey => 0,
-        ProcessingKey::Priority => 1,
-        ProcessingKey::Timeout => 2,
-        ProcessingKey::NrOfResults => 3,
-    }
-}
-
-fn proto_pi_to_internal(
-    pis: Vec<crate::proto::kronosdb::ProcessingInstruction>,
-) -> Vec<ProcessingInstruction> {
-    pis.into_iter()
-        .map(|pi| ProcessingInstruction {
-            key: proto_pk_to_internal(pi.key),
-            value: pi.value.map(proto_mv_to_internal),
-        })
-        .collect()
-}
-
-fn internal_pi_to_proto(
-    pis: &[ProcessingInstruction],
-) -> Vec<crate::proto::kronosdb::ProcessingInstruction> {
-    pis.iter()
-        .map(|pi| crate::proto::kronosdb::ProcessingInstruction {
-            key: internal_pk_to_proto(pi.key),
-            value: pi.value.as_ref().map(internal_mv_to_proto),
-        })
-        .collect()
 }
 
 fn from_proto_command(cmd: pb::Command) -> Command {

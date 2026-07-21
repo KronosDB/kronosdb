@@ -48,9 +48,6 @@ pub trait CommandDispatcher: Send + Sync {
     /// Sweeps in-flight commands older than `timeout`. Each receives a
     /// `KRONOSDB-4005` failure. Returns the swept message_ids.
     fn sweep_command_timeouts(&self, timeout: Duration) -> Vec<String>;
-
-    /// Returns the number of in-flight commands.
-    fn in_flight_command_count(&self) -> usize;
 }
 
 /// The query bus interface.
@@ -95,11 +92,16 @@ pub trait SubscriptionQueryDispatcher: Send + Sync {
     /// Sends an update from a handler to a subscription query subscriber.
     fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate);
 
+    /// Grants additional update permits to a subscription (FlowControl refill).
+    fn grant_subscription_permits(&self, subscription_id: &str, permits: i64);
+
     /// Completes a subscription query (no more updates).
     fn complete_subscription(&self, subscription_id: &str);
 
     /// Cancels a subscription query (subscriber no longer interested).
-    fn cancel_subscription(&self, subscription_id: &str);
+    /// Returns the handler's client id if the subscription existed, so the
+    /// caller can notify that handler to stop emitting updates.
+    fn cancel_subscription(&self, subscription_id: &str) -> Option<ClientId>;
 }
 
 /// Combined messaging platform interface.

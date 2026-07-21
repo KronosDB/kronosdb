@@ -52,7 +52,10 @@ impl SegmentList {
     }
 }
 
-/// Default group commit interval (0 = disabled, sync per write).
+/// Default extra coalescing window before sealing a commit wave (0 = seal as
+/// soon as the sync thread observes pending writes). Batching under load does
+/// not depend on this: writes arriving during an in-flight fdatasync always
+/// coalesce into the next wave, so the fsync duration itself is the window.
 const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 0;
 
 /// Default node id for direct engine use and tests. The server always
@@ -67,6 +70,11 @@ const INITIAL_EPOCH: crate::replication::watermark::Epoch = 0;
 /// Writers write events (no fsync), mark pending, release the writer lock,
 /// then wait for the sync thread to fsync and advance the epoch.
 /// Multiple writers share one fsync — that's the throughput win.
+///
+/// The sync thread is event-driven: the first write of a wave wakes it, and
+/// writes arriving while a wave's fdatasync is in flight accumulate into the
+/// next wave. A lone writer therefore pays only the fsync itself, while
+/// concurrent writers batch on the fsync duration — no polling interval.
 struct SyncState {
     /// Highest completed group-commit wave.
     completed: StdMutex<u64>,
@@ -77,8 +85,12 @@ struct SyncState {
     /// cover its bytes.
     wave: AtomicU64,
     pending_writes: AtomicU64,
-    enabled: bool,
     shutdown: AtomicBool,
+    /// Wakes the sync thread on a wave's first write and on shutdown. The
+    /// mutex pairs each notify with the thread's predicate re-check so a
+    /// wake landing between check and wait cannot be lost.
+    wake: StdMutex<()>,
+    wake_cv: Condvar,
     /// Latches when an fsync fails. A failed fsync means the dirty pages may
     /// already have been dropped by the kernel (fsyncgate semantics) — no
     /// retry can make those writes durable, so the engine is poisoned: every
@@ -90,25 +102,40 @@ struct SyncState {
 }
 
 impl SyncState {
-    fn new(enabled: bool) -> Self {
+    fn new() -> Self {
         Self {
             completed: StdMutex::new(0),
             synced: Condvar::new(),
             wave: AtomicU64::new(1),
             pending_writes: AtomicU64::new(0),
-            enabled,
             shutdown: AtomicBool::new(false),
+            wake: StdMutex::new(()),
+            wake_cv: Condvar::new(),
             failed: AtomicBool::new(false),
             failure_msg: StdMutex::new(None),
         }
     }
 
-    /// Registers a write with the current wave. MUST be called while holding
-    /// the writer lock — that's what orders it against the sync thread's
-    /// barrier.
+    /// Registers a write with the current wave and wakes the sync thread on
+    /// the wave's first write. MUST be called while holding the writer lock —
+    /// that's what orders it against the sync thread's barrier (which resets
+    /// the pending count under the same lock, so 0→1 happens once per wave).
     fn mark_pending(&self) -> u64 {
-        self.pending_writes.fetch_add(1, Ordering::Relaxed);
-        self.wave.load(Ordering::Acquire)
+        let first_of_wave = self.pending_writes.fetch_add(1, Ordering::Relaxed) == 0;
+        let wave = self.wave.load(Ordering::Acquire);
+        if first_of_wave {
+            let _wake = self.wake.lock().unwrap();
+            self.wake_cv.notify_one();
+        }
+        wave
+    }
+
+    /// Latches shutdown and wakes the sync thread so it runs its final fsync
+    /// pass immediately instead of waiting for a write that never comes.
+    fn begin_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _wake = self.wake.lock().unwrap();
+        self.wake_cv.notify_one();
     }
 
     /// Blocks until the given wave's fsync completed. Returns an error — the
@@ -179,6 +206,7 @@ impl SyncState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_sync_thread(
     dir: PathBuf,
     sync_state: Arc<SyncState>,
@@ -189,7 +217,7 @@ fn spawn_sync_thread(
     replication: Arc<WavePublisher>,
     watermark: Arc<WatermarkState>,
     commit_tx: broadcast::Sender<CommitNotification>,
-    interval: Duration,
+    coalesce_window: Duration,
 ) {
     std::thread::Builder::new()
         .name("kronosdb-sync".into())
@@ -203,7 +231,23 @@ fn spawn_sync_thread(
             };
 
             loop {
-                std::thread::sleep(interval);
+                // Sleep until a wave has its first write or shutdown begins.
+                // The wake mutex pairs this predicate check with the notify
+                // in mark_pending/begin_shutdown, so a signal landing between
+                // check and wait cannot be lost.
+                {
+                    let mut wake = sync_state.wake.lock().unwrap();
+                    while !sync_state.has_pending() && !sync_state.shutdown.load(Ordering::Relaxed)
+                    {
+                        wake = sync_state.wake_cv.wait(wake).unwrap();
+                    }
+                }
+                // Optional extra coalescing window. Off by default: writes
+                // arriving during the fdatasync below already join the next
+                // wave, so batching self-clocks on fsync duration.
+                if !coalesce_window.is_zero() {
+                    std::thread::sleep(coalesce_window);
+                }
                 // Read the flag BEFORE the final sync pass: writers that
                 // marked pending before shutdown still get their fsync (and
                 // their wakeup) instead of hanging on a dead thread.
@@ -364,9 +408,35 @@ pub struct ReplicationCursor {
 /// commit wave. The task waits for `wave` before acknowledging upstream.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplicatedWrite {
-    pub wave: Option<u64>,
+    pub wave: u64,
     pub durable_position: Position,
     pub byte_count: u64,
+}
+
+/// An append whose writer-lock section has completed but whose durability
+/// has not been awaited yet. Produced by `EventStoreEngine::append_stage`;
+/// resolved by `append_finish_async` (or the blocking `append`).
+pub struct StagedAppend {
+    /// The write's response, or the error the ack gate must cover (a DCB
+    /// rejection waits for the conflicting event's commit before surfacing).
+    outcome: Result<AppendResponse, Error>,
+    /// Started at stage entry; finalization records the full duration.
+    timer: Timer,
+}
+
+impl StagedAppend {
+    /// The watermark position the ack gate must reach before this append
+    /// resolves: the consistency marker on success, the conflicting
+    /// position's commit on a DCB rejection, nothing for immediate errors.
+    fn wait_pos(&self) -> Option<u64> {
+        match &self.outcome {
+            Ok(response) => Some(response.consistency_marker.0),
+            Err(Error::ConsistencyConditionViolated {
+                conflicting_position,
+            }) => Some(conflicting_position.0 + 1),
+            Err(_) => None,
+        }
+    }
 }
 
 /// Configuration options for an event store engine.
@@ -375,7 +445,10 @@ pub struct StoreOptions {
     pub max_segment_size: u64,
     pub index_cache_size: usize,
     pub bloom_cache_size: usize,
-    /// Group commit interval in milliseconds. 0 = disabled (sync per write).
+    /// Extra group-commit coalescing window in milliseconds. The sync thread
+    /// is woken by a wave's first write; with 0 (default) it seals and syncs
+    /// immediately, and concurrent writes batch on the fdatasync duration.
+    /// A positive value trades that much added latency for larger waves.
     pub group_commit_interval_ms: u64,
     /// This node's control-plane identity for durable-cursor acknowledgements.
     pub node_id: crate::replication::watermark::NodeId,
@@ -589,6 +662,14 @@ pub struct EventStoreEngine {
     /// Updated on rotation within the append path (under writer lock).
     segments: RwLock<SegmentList>,
 
+    /// Cached mmap of the active segment, keyed by its base position. The
+    /// active file is preallocated to `max_segment_size` at creation, so one
+    /// mapping covers the whole segment lifetime; callers clamp reads to
+    /// committed offsets. Rotation changes the base, which retires the entry
+    /// by key mismatch — in-flight readers keep their `Arc<Mmap>` and only
+    /// ever touch offsets that existed when they resolved positions.
+    active_mmap: parking_lot::Mutex<Option<(u64, Arc<memmap2::Mmap>)>>,
+
     /// Lock-free internal metrics. Shared via Arc for external access.
     metrics: Arc<StoreMetrics>,
 }
@@ -618,8 +699,7 @@ impl EventStoreEngine {
         let active_index = seg_writer.active_index_handle();
         let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
-        let gc_enabled = opts.group_commit_interval_ms > 0;
-        let sync_state = Arc::new(SyncState::new(gc_enabled));
+        let sync_state = Arc::new(SyncState::new());
         let writer = Arc::new(parking_lot::Mutex::new(seg_writer));
         let local_tail = Arc::new(AtomicU64::new(0));
         let durable_tail = Arc::new(AtomicU64::new(0));
@@ -632,20 +712,18 @@ impl EventStoreEngine {
         };
         let watermark = Arc::new(WatermarkState::new(INITIAL_EPOCH, voters, 0));
 
-        if gc_enabled {
-            spawn_sync_thread(
-                dir.to_path_buf(),
-                Arc::clone(&sync_state),
-                Arc::clone(&writer),
-                Arc::clone(&local_tail),
-                Arc::clone(&durable_tail),
-                opts.node_id,
-                Arc::clone(&replication),
-                Arc::clone(&watermark),
-                commit_tx.clone(),
-                Duration::from_millis(opts.group_commit_interval_ms),
-            );
-        }
+        spawn_sync_thread(
+            dir.to_path_buf(),
+            Arc::clone(&sync_state),
+            Arc::clone(&writer),
+            Arc::clone(&local_tail),
+            Arc::clone(&durable_tail),
+            opts.node_id,
+            Arc::clone(&replication),
+            Arc::clone(&watermark),
+            commit_tx.clone(),
+            Duration::from_millis(opts.group_commit_interval_ms),
+        );
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -667,6 +745,7 @@ impl EventStoreEngine {
                 bases: vec![active_base],
                 sealed_count: 0,
             }),
+            active_mmap: parking_lot::Mutex::new(None),
             metrics: Arc::new(StoreMetrics::new()),
         })
     }
@@ -708,8 +787,7 @@ impl EventStoreEngine {
         let head_pos = head.0;
         let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
 
-        let gc_enabled = opts.group_commit_interval_ms > 0;
-        let sync_state = Arc::new(SyncState::new(gc_enabled));
+        let sync_state = Arc::new(SyncState::new());
         let writer = Arc::new(parking_lot::Mutex::new(seg_writer));
         let local_tail = Arc::new(AtomicU64::new(head_pos));
         let durable_tail = Arc::new(AtomicU64::new(head_pos));
@@ -735,20 +813,18 @@ impl EventStoreEngine {
             recovered_watermark,
         ));
 
-        if gc_enabled {
-            spawn_sync_thread(
-                dir.to_path_buf(),
-                Arc::clone(&sync_state),
-                Arc::clone(&writer),
-                Arc::clone(&local_tail),
-                Arc::clone(&durable_tail),
-                opts.node_id,
-                Arc::clone(&replication),
-                Arc::clone(&watermark),
-                commit_tx.clone(),
-                Duration::from_millis(opts.group_commit_interval_ms),
-            );
-        }
+        spawn_sync_thread(
+            dir.to_path_buf(),
+            Arc::clone(&sync_state),
+            Arc::clone(&writer),
+            Arc::clone(&local_tail),
+            Arc::clone(&durable_tail),
+            opts.node_id,
+            Arc::clone(&replication),
+            Arc::clone(&watermark),
+            commit_tx.clone(),
+            Duration::from_millis(opts.group_commit_interval_ms),
+        );
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -770,6 +846,7 @@ impl EventStoreEngine {
                 bases: all_bases,
                 sealed_count,
             }),
+            active_mmap: parking_lot::Mutex::new(None),
             metrics: Arc::new(StoreMetrics::new()),
         })
     }
@@ -779,7 +856,26 @@ impl EventStoreEngine {
     /// commit sync thread performs one final fsync pass (releasing any
     /// in-flight writers) before exiting. Idempotent.
     pub fn shutdown(&self) {
-        self.sync_state.shutdown.store(true, Ordering::Release);
+        self.sync_state.begin_shutdown();
+    }
+
+    /// Reader over the active segment, backed by a cached mmap. The mapping
+    /// is created once per active segment (the file is preallocated to its
+    /// full size, so it never needs remapping) and retired when rotation
+    /// changes the base position.
+    fn active_segment_reader(&self, base: u64, path: &Path) -> Result<SegmentReader, Error> {
+        {
+            let cached = self.active_mmap.lock();
+            if let Some((cached_base, mmap)) = cached.as_ref()
+                && *cached_base == base
+            {
+                return SegmentReader::from_shared_mmap(Arc::clone(mmap));
+            }
+        }
+        let file = std::fs::File::open(path)?;
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+        *self.active_mmap.lock() = Some((base, Arc::clone(&mmap)));
+        SegmentReader::from_shared_mmap(mmap)
     }
 
     pub fn metrics(&self) -> &Arc<StoreMetrics> {
@@ -810,9 +906,6 @@ impl EventStoreEngine {
     /// their group-commit wave. The native write gate must be closed when this
     /// is used as a catch-up/truncation barrier.
     pub fn drain_pending(&self) -> Result<(), Error> {
-        if !self.sync_state.enabled {
-            return Ok(());
-        }
         let target = {
             let _writer = self.writer.lock();
             let wave = self.sync_state.wave.load(Ordering::Acquire);
@@ -1032,23 +1125,13 @@ impl EventStoreEngine {
                     ),
                 });
             }
-            let wave = self
-                .sync_state
-                .enabled
-                .then(|| self.sync_state.mark_pending());
+            let wave = self.sync_state.mark_pending();
             let result = writer.append_raw_replicated(bytes, first_position)?;
             self.local_tail
                 .store(result.durable_position.0, Ordering::Release);
-            if !self.sync_state.enabled {
-                writer.sync()?;
-            }
             (result, wave)
         };
 
-        if !self.sync_state.enabled {
-            self.durable_tail
-                .store(result.durable_position.0, Ordering::Release);
-        }
         for fields in &result.events {
             self.tag_index
                 .index_event(fields.position, &fields.name, &fields.tags);
@@ -1063,11 +1146,7 @@ impl EventStoreEngine {
 
     /// Waits until a replicated frame's local segment bytes are fdatasync'd.
     pub fn wait_replicated_durable(&self, write: ReplicatedWrite) -> Result<(), Error> {
-        if let Some(wave) = write.wave {
-            self.sync_state.wait_for_sync(wave)
-        } else {
-            Ok(())
-        }
+        self.sync_state.wait_for_sync(write.wave)
     }
 
     /// Applies an explicit leader-decided rotation. This is the only way a
@@ -1096,6 +1175,30 @@ impl EventStoreEngine {
     /// sole destructive entry point and will crash rather than cross the
     /// watermark invariant.
     pub fn truncate_to(&self, pos: Position) -> Result<(), Error> {
+        self.truncate_to_matching(pos, None)
+    }
+
+    /// Truncates to `pos` and, when the leader supplied its byte-exact
+    /// boundary, heals trailing divergence that position-granular truncation
+    /// cannot see: control records (watermark checkpoints, epoch changes)
+    /// written locally by a deposed leader but never replicated sit *below*
+    /// the position boundary and would otherwise survive forever, leaving the
+    /// node byte-divergent from the cluster.
+    ///
+    /// `expected_prev` is the leader's view of the record immediately before
+    /// the truncation boundary: `None` = no boundary info (legacy behavior),
+    /// `Some(None)` = the boundary is the segment start, `Some(Some(crc))` =
+    /// the CRC of the leader's preceding record. Mismatching trailing
+    /// *control* records are dropped — they carry no client data and no
+    /// position, so the watermark invariant (no committed event is ever lost)
+    /// holds even though bytes below the position boundary are removed. A
+    /// mismatching *event* record means the committed prefix itself diverges,
+    /// which is unrecoverable here and fails loudly.
+    pub fn truncate_to_matching(
+        &self,
+        pos: Position,
+        expected_prev: Option<Option<u32>>,
+    ) -> Result<(), Error> {
         self.drain_pending()?;
         let watermark = self.watermark.get();
         assert!(
@@ -1110,7 +1213,7 @@ impl EventStoreEngine {
                 message: format!("truncate target {} exceeds local tail {old_tail}", pos.0),
             });
         }
-        if pos.0 == old_tail {
+        if pos.0 == old_tail && expected_prev.is_none() {
             return Ok(());
         }
 
@@ -1127,7 +1230,78 @@ impl EventStoreEngine {
         };
         let target_base = seg_list.bases[target_index];
         let target_path = segment::segment_path(&self.dir, target_base);
-        let truncate_offset = find_replication_start(&target_path, pos)?;
+        let (position_offset, mut preceding) = scan_replication_boundary(&target_path, pos)?;
+        let mut truncate_offset = position_offset;
+
+        // Byte-exact healing: walk backward over trailing control records
+        // until this node's boundary agrees with the leader's.
+        if let Some(expected) = expected_prev {
+            loop {
+                match (expected, preceding.last().copied()) {
+                    (None, None) if target_index == 0 => break,
+                    (Some(crc), Some(last)) if last.crc == crc => break,
+                    (_, Some(last)) if !last.is_event => {
+                        truncate_offset = last.start_offset;
+                        preceding.pop();
+                    }
+                    (_, None) => {
+                        // The boundary reached this segment's start; the true
+                        // preceding record is the last record of the prior
+                        // segment (comparison only — healing across a sealed
+                        // segment edge is not supported and fails loudly).
+                        let prev_last = if target_index == 0 {
+                            None
+                        } else {
+                            let prev_path =
+                                segment::segment_path(&self.dir, seg_list.bases[target_index - 1]);
+                            scan_replication_boundary(&prev_path, Position(u64::MAX))?
+                                .1
+                                .pop()
+                        };
+                        match (expected, prev_last) {
+                            (None, None) => break,
+                            (Some(crc), Some(last)) if last.crc == crc => break,
+                            (_, Some(last)) if !last.is_event => {
+                                return Err(Error::Corrupted {
+                                    message: format!(
+                                        "trailing control record at the end of sealed \
+                                         segment {} diverges from the leader; sealed-\
+                                         segment healing is not supported — full resync \
+                                         required",
+                                        seg_list.bases[target_index - 1]
+                                    ),
+                                });
+                            }
+                            _ => {
+                                return Err(Error::Corrupted {
+                                    message: format!(
+                                        "committed prefix diverges from leader at \
+                                         position {} (segment base {target_base}) — the \
+                                         record before the boundary does not match the \
+                                         leader's history",
+                                        pos.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    (None, Some(_)) | (Some(_), Some(_)) => {
+                        return Err(Error::Corrupted {
+                            message: format!(
+                                "committed prefix diverges from leader at position {} \
+                                 (segment base {target_base}) — an event record below the \
+                                 watermark does not match the leader's history",
+                                pos.0
+                            ),
+                        });
+                    }
+                }
+            }
+            if pos.0 == old_tail && truncate_offset == position_offset {
+                // Boundary already byte-identical: nothing to heal.
+                return Ok(());
+            }
+        }
 
         for &base in &seg_list.bases[target_index + 1..] {
             let path = segment::segment_path(&self.dir, base);
@@ -1147,6 +1321,9 @@ impl EventStoreEngine {
         seg_list.sealed_count = target_index;
         self.local_tail.store(pos.0, Ordering::Release);
         self.durable_tail.store(pos.0, Ordering::Release);
+        // The reopened segment may keep its base position, so the cached
+        // active mapping cannot be trusted across a truncation — drop it.
+        *self.active_mmap.lock() = None;
         drop(seg_list);
         drop(writer);
 
@@ -1155,6 +1332,40 @@ impl EventStoreEngine {
         // retained prefix to the active TagIndex.
         rebuild_active_segment_index(&self.dir, &self.tag_index)?;
         Ok(())
+    }
+
+    /// The leader's view of the record immediately before position `pos` in
+    /// its own byte layout: `None` when the boundary is the segment start,
+    /// otherwise the stored CRC of the preceding record. Sent with Truncate
+    /// frames so followers can verify — and heal — their boundary byte-exactly.
+    pub fn replication_boundary_prev(&self, pos: Position) -> Result<Option<u32>, Error> {
+        let (target_index, bases) = {
+            let seg_list = self.segments.read();
+            let index = match seg_list.bases.binary_search(&pos.0) {
+                Ok(index) => index,
+                Err(0) => {
+                    return Err(Error::Corrupted {
+                        message: format!("no segment contains boundary position {}", pos.0),
+                    });
+                }
+                Err(index) => index - 1,
+            };
+            (index, seg_list.bases.clone())
+        };
+        let path = segment::segment_path(&self.dir, bases[target_index]);
+        let (_, preceding) = scan_replication_boundary(&path, pos)?;
+        if let Some(record) = preceding.last() {
+            return Ok(Some(record.crc));
+        }
+        // Boundary at a segment start (e.g. the leader sealed at its claim):
+        // the true preceding record is the last record of the prior segment.
+        // Only the very first segment has no predecessor at all.
+        if target_index == 0 {
+            return Ok(None);
+        }
+        let prev_path = segment::segment_path(&self.dir, bases[target_index - 1]);
+        let (_, prev_records) = scan_replication_boundary(&prev_path, Position(u64::MAX))?;
+        Ok(prev_records.last().map(|record| record.crc))
     }
 
     /// Installs a claimed epoch and exact voter set, aborting all prior-epoch
@@ -1179,13 +1390,6 @@ impl EventStoreEngine {
         }
         let wave = {
             let mut writer = self.writer.lock();
-            let strict_start = (!self.sync_state.enabled).then(|| {
-                (
-                    writer.active_base_position(),
-                    writer.write_offset(),
-                    writer.head().0,
-                )
-            });
             if writer.has_records() {
                 let new_base = writer.head();
                 writer.rotate_replicated(new_base)?;
@@ -1194,38 +1398,16 @@ impl EventStoreEngine {
                 seg_list.bases.push(new_base.0);
                 self.metrics.record_segment_rotation();
             }
-            let wave = self
-                .sync_state
-                .enabled
-                .then(|| self.sync_state.mark_pending());
+            let wave = self.sync_state.mark_pending();
             let start_position = writer.head().0;
             writer.write_control(&crate::segment::format::ControlRecord::EpochChange {
                 epoch,
                 leader_id,
                 start_position,
             })?;
-            if let Some((base, offset, position)) = strict_start {
-                if self.replication.has_subscribers() {
-                    self.replication.try_publish(build_wave_descriptor(
-                        &self.dir,
-                        epoch,
-                        epoch,
-                        base,
-                        offset,
-                        position,
-                        writer.active_base_position(),
-                        writer.write_offset(),
-                        writer.head().0,
-                    )?);
-                }
-                writer.sync()?;
-            }
             wave
         };
-        if let Some(wave) = wave {
-            self.sync_state.wait_for_sync(wave)?;
-        }
-        Ok(())
+        self.sync_state.wait_for_sync(wave)
     }
 
     /// Persists a coarse committed-watermark floor in the authoritative segment
@@ -1236,42 +1418,13 @@ impl EventStoreEngine {
         let position = self.watermark.get();
         let wave = {
             let mut writer = self.writer.lock();
-            let strict_start = (!self.sync_state.enabled).then(|| {
-                (
-                    writer.active_base_position(),
-                    writer.write_offset(),
-                    writer.head().0,
-                )
-            });
-            let wave = self
-                .sync_state
-                .enabled
-                .then(|| self.sync_state.mark_pending());
+            let wave = self.sync_state.mark_pending();
             writer.write_control(
                 &crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position },
             )?;
-            if let Some((base, offset, first_position)) = strict_start {
-                if self.replication.has_subscribers() {
-                    self.replication.try_publish(build_wave_descriptor(
-                        &self.dir,
-                        position,
-                        epoch,
-                        base,
-                        offset,
-                        first_position,
-                        writer.active_base_position(),
-                        writer.write_offset(),
-                        writer.head().0,
-                    )?);
-                }
-                writer.sync()?;
-            }
             wave
         };
-        if let Some(wave) = wave {
-            self.sync_state.wait_for_sync(wave)?;
-        }
-        Ok(())
+        self.sync_state.wait_for_sync(wave)
     }
 
     /// Waits until the current epoch's quorum watermark reaches `pos`.
@@ -1314,11 +1467,25 @@ impl EventStoreEngine {
     /// 2. Writes events to the active segment (tags included on disk)
     /// 3. Updates the in-memory tag index
     /// 4. Advances the head position (next-exclusive)
+    ///
+    /// Blocks until the write is quorum-durable. The gRPC path uses
+    /// `append_stage` + `append_finish_async` instead so no thread is pinned
+    /// during the wait.
     pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
-        self.append_internal(request)
+        let staged = self.append_stage(request)?;
+        let wait = match staged.wait_pos() {
+            Some(pos) => self.watermark.wait_for(pos),
+            None => Ok(()),
+        };
+        self.append_finalize(staged, wait)
     }
 
-    fn append_internal(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+    /// The synchronous half of an append: fail-fast checks plus the atomic
+    /// writer-lock section (DCB check, write, index). On return the write —
+    /// or the DCB verdict justifying its rejection — is registered in the
+    /// current commit wave, but durability has NOT been awaited. Finish with
+    /// `append_finish_async` (or the blocking `append` wrapper).
+    pub fn append_stage(&self, request: AppendRequest) -> Result<StagedAppend, Error> {
         let timer = Timer::start();
 
         // Fail fast once poisoned: after an fsync failure nothing written
@@ -1338,87 +1505,41 @@ impl EventStoreEngine {
         let outcome = {
             // Lock the writer. DCB check + write + index update must be atomic.
             let mut writer = self.writer.lock();
-            let strict_start = (!self.sync_state.enabled).then(|| {
-                (
-                    writer.active_base_position(),
-                    writer.write_offset(),
-                    writer.head().0,
-                )
-            });
-            if self.sync_state.enabled {
-                self.sync_state.mark_pending();
-            }
-            match self.append_locked(&mut writer, &request) {
-                Ok(response) => {
-                    // Strict mode still publishes the raw wave before entering
-                    // fdatasync, preserving replication/fsync overlap.
-                    if let Some((base, offset, position)) = strict_start
-                        && response.count > 0
-                    {
-                        if self.replication.has_subscribers() {
-                            let descriptor = build_wave_descriptor(
-                                &self.dir,
-                                response.consistency_marker.0,
-                                self.watermark.epoch(),
-                                base,
-                                offset,
-                                position,
-                                writer.active_base_position(),
-                                writer.write_offset(),
-                                response.consistency_marker.0,
-                            )?;
-                            self.replication.try_publish(descriptor);
-                        }
-                        writer.sync()?;
-                        self.durable_tail
-                            .store(response.consistency_marker.0, Ordering::Release);
-                    }
-                    Ok(response)
-                }
-                Err(error) => Err(error),
-            }
+            self.sync_state.mark_pending();
+            self.append_locked(&mut writer, &request)
         };
 
-        let response = match outcome {
-            Ok(response) => response,
-            Err(
-                error @ Error::ConsistencyConditionViolated {
-                    conflicting_position,
-                },
-            ) => {
-                // A local conflict above the watermark may still be truncated
-                // on epoch loss. Do not expose a rejection until the event
-                // justifying it is quorum-committed. Waiting happens after the
-                // writer lock is released so the sync thread can seal its wave.
-                self.watermark.wait_for(conflicting_position.0 + 1)?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+        Ok(StagedAppend { outcome, timer })
+    }
 
-        // Step 6: Ack gate. The consistency marker is the append's covering
-        // tail (its own last position + 1, or — for condition-only appends —
-        // everything the DCB check read), so `watermark >= marker` means the
-        // write is quorum-committed and externally visible.
-        if !self.sync_state.enabled && response.count > 0 {
-            // Strict mode fsynced inline above; that advances only this node's
-            // durable cursor. A clustered leader still waits for follower
-            // cursors to form a quorum.
-            if let Some(watermark) = self.watermark.advance(
-                self.node_id,
-                self.watermark.epoch(),
-                response.consistency_marker.0,
-            ) {
-                let _ = self.commit_tx.send(CommitNotification { watermark });
+    /// Awaits a staged append's durability without pinning a thread, then
+    /// resolves it exactly like the blocking path.
+    pub async fn append_finish_async(&self, staged: StagedAppend) -> Result<AppendResponse, Error> {
+        let wait = match staged.wait_pos() {
+            Some(pos) => self.watermark.wait_for_async(pos).await,
+            None => Ok(()),
+        };
+        self.append_finalize(staged, wait)
+    }
+
+    /// Applies the ack gate's verdict to a staged outcome. A poisoned wait
+    /// (fsync failure, epoch loss, shutdown) overrides everything — the
+    /// caller must never treat the write as durable, and a DCB rejection may
+    /// not be exposed until the event justifying it is quorum-committed.
+    fn append_finalize(
+        &self,
+        staged: StagedAppend,
+        wait: Result<(), Error>,
+    ) -> Result<AppendResponse, Error> {
+        wait?;
+        match staged.outcome {
+            Ok(response) => {
+                self.metrics
+                    .record_append(response.count, staged.timer.elapsed_us());
+                Ok(response)
             }
+            Err(error) => Err(error),
         }
-        // Group commit: the sync thread advances this node after fdatasync.
-        // Both modes share the same quorum ack gate.
-        self.watermark.wait_for(response.consistency_marker.0)?;
-
-        self.metrics
-            .record_append(response.count, timer.elapsed_us());
-        Ok(response)
     }
 
     /// Prunes sealed-segment positions from the in-memory tag index on a
@@ -1483,7 +1604,7 @@ impl EventStoreEngine {
 
     /// The atomic core of an append: DCB check + write + index/head update,
     /// all under the caller-held writer lock. NEVER fsyncs — durability is
-    /// the caller's job (strict-mode sync or group-commit epoch wait).
+    /// the sync thread's job after the wave seals.
     fn append_locked(
         &self,
         writer: &mut SegmentWriter,
@@ -1491,12 +1612,12 @@ impl EventStoreEngine {
     ) -> Result<AppendResponse, Error> {
         {
             // Step 1: Check DCB condition.
-            if let Some(condition) = &request.condition {
-                if let Some(conflicting_pos) = self.check_dcb_locked(condition)? {
-                    return Err(Error::ConsistencyConditionViolated {
-                        conflicting_position: conflicting_pos,
-                    });
-                }
+            if let Some(condition) = &request.condition
+                && let Some(conflicting_pos) = self.check_dcb_locked(condition)?
+            {
+                return Err(Error::ConsistencyConditionViolated {
+                    conflicting_position: conflicting_pos,
+                });
             }
 
             if request.events.is_empty() {
@@ -1510,8 +1631,8 @@ impl EventStoreEngine {
 
             let old_active_base = writer.active_base_position();
 
-            // Step 2: Write events without fsync. Durability is the caller's
-            // group-commit wave wait or explicit strict-mode sync.
+            // Step 2: Write events without fsync. Durability is the sync
+            // thread's wave fsync; callers wait on the watermark.
             let (first_position, count) = writer.write_events(&request.events)?;
 
             // Step 2b: Detect rotation and update cached segment list.
@@ -1537,8 +1658,7 @@ impl EventStoreEngine {
             // Step 4: Advance the local tail (next-exclusive: first event's
             // position + count = position the next event will land at).
             // Watermark publication — and with it the subscriber wakeup —
-            // is the caller's job at its commit point: the sync thread after
-            // the wave fsync (group commit) or the inline fsync (strict mode).
+            // happens on the sync thread after the wave's fsync.
             let new_head = first_position.0 + count as u64;
             self.local_tail.store(new_head, Ordering::Release);
 
@@ -1579,7 +1699,7 @@ impl EventStoreEngine {
             let mmap = self.cache.get_mmap(&seg_path, base)?;
             SegmentReader::from_shared_mmap(mmap)?
         } else {
-            SegmentReader::open(&seg_path)?
+            self.active_segment_reader(base, &seg_path)?
         };
 
         for result in reader.iter(None) {
@@ -1623,7 +1743,7 @@ impl EventStoreEngine {
                 let mmap = self.cache.get_mmap(&seg_path, base)?;
                 SegmentReader::from_shared_mmap(mmap)?
             } else {
-                SegmentReader::open(&seg_path)?
+                self.active_segment_reader(base, &seg_path)?
             };
 
             for result in reader.iter(Some(Position(head))) {
@@ -1737,12 +1857,13 @@ impl EventStoreEngine {
                 None => continue, // No matches in this segment.
             };
 
-            // Use cached mmap for sealed segments, fresh open for active.
+            // Sealed segments come from the LRU cache; the active segment from
+            // its own cached mapping.
             let reader = if seg_list.is_sealed(i) {
                 let mmap = self.cache.get_mmap(&seg_path, base)?;
                 SegmentReader::from_shared_mmap(mmap)?
             } else {
-                SegmentReader::open(&seg_path)?
+                self.active_segment_reader(base, &seg_path)?
             };
 
             if let Some(idx) = &seg_index {
@@ -1874,10 +1995,10 @@ impl EventStoreEngine {
                 // Drop already-consumed positions up front so chunked callers
                 // (cursor advancing through the log) don't re-skip the prefix
                 // one position at a time on every call.
-                if from_position.0 > base {
-                    if let Some(bm) = &mut bm {
-                        bm.remove_range(0..from_position.0);
-                    }
+                if from_position.0 > base
+                    && let Some(bm) = &mut bm
+                {
+                    bm.remove_range(0..from_position.0);
                 }
                 (bm.filter(|bm| !bm.is_empty()), Some(idx))
             } else {
@@ -1896,7 +2017,7 @@ impl EventStoreEngine {
                 let mmap = self.cache.get_mmap(&seg_path, base)?;
                 SegmentReader::from_shared_mmap(mmap)?
             } else {
-                SegmentReader::open(&seg_path)?
+                self.active_segment_reader(base, &seg_path)?
             };
 
             if let Some(idx) = &seg_index {
@@ -2109,7 +2230,29 @@ fn last_physical_record_crc(path: &Path, byte_end: u64) -> Result<u32, Error> {
 /// Control records before the requested event position remain behind the
 /// cursor; control records at the current physical cursor are preserved by the
 /// exact `(segment_base, byte_offset, crc)` resume path.
+/// One physical record preceding a replication boundary, retained so
+/// byte-exact truncation can walk trailing control records backward.
+#[derive(Clone, Copy)]
+struct BoundaryRecord {
+    start_offset: u64,
+    crc: u32,
+    is_event: bool,
+}
+
 fn find_replication_start(path: &Path, from: Position) -> Result<u64, Error> {
+    Ok(scan_replication_boundary(path, from)?.0)
+}
+
+/// Locates the byte offset where position `from` starts and returns every
+/// valid record before that boundary (offset, stored CRC, kind). The boundary
+/// is the first event record with position >= `from`; when no such event
+/// exists the boundary is the end of the valid prefix — trailing control
+/// records are then part of `preceding`, which is exactly what byte-exact
+/// truncation needs to heal them.
+fn scan_replication_boundary(
+    path: &Path,
+    from: Position,
+) -> Result<(u64, Vec<BoundaryRecord>), Error> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
@@ -2117,20 +2260,23 @@ fn find_replication_start(path: &Path, from: Position) -> Result<u64, Error> {
     file.read_exact(&mut segment_header)?;
     let base = u64::from_le_bytes(segment_header[5..13].try_into().unwrap());
     if from.0 <= base {
-        return Ok(segment::SEGMENT_HEADER_SIZE as u64);
+        return Ok((segment::SEGMENT_HEADER_SIZE as u64, Vec::new()));
     }
 
     let mut offset = segment::SEGMENT_HEADER_SIZE as u64;
+    let mut preceding = Vec::new();
     loop {
         let mut header = [0u8; segment::RECORD_HEADER_SIZE];
         match file.read_exact(&mut header) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(offset),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok((offset, preceding));
+            }
             Err(error) => return Err(error.into()),
         }
         let header = match crate::segment::record::parse_header(&header)? {
             Some(header) => header,
-            None => return Ok(offset),
+            None => return Ok((offset, preceding)),
         };
         let record_end = offset + header.total_len() as u64;
         let mut payload = vec![0u8; header.payload_len];
@@ -2140,13 +2286,20 @@ fn find_replication_start(path: &Path, from: Position) -> Result<u64, Error> {
                 message: format!("CRC mismatch in replication source at byte {offset}"),
             });
         }
-        match crate::segment::record::decode_native(header, &payload)? {
-            crate::segment::record::NativeRecord::Event { position } if position >= from.0 => {
-                return Ok(offset);
+        let is_event = match crate::segment::record::decode_native(header, &payload)? {
+            crate::segment::record::NativeRecord::Event { position } => {
+                if position >= from.0 {
+                    return Ok((offset, preceding));
+                }
+                true
             }
-            crate::segment::record::NativeRecord::Event { .. }
-            | crate::segment::record::NativeRecord::Control(_) => {}
-        }
+            crate::segment::record::NativeRecord::Control(_) => false,
+        };
+        preceding.push(BoundaryRecord {
+            start_offset: offset,
+            crc: header.stored_crc,
+            is_event,
+        });
         offset = record_end;
     }
 }
@@ -2283,7 +2436,7 @@ mod tests {
     /// never as a silent durability ack — and must poison future appends.
     #[test]
     fn sync_failure_propagates_to_waiters_and_poisons() {
-        let state = Arc::new(SyncState::new(true));
+        let state = Arc::new(SyncState::new());
 
         let target = state.mark_pending();
         let waiter = {
@@ -2307,7 +2460,7 @@ mod tests {
     /// The happy path is unchanged: complete_sync releases waiters with Ok.
     #[test]
     fn sync_success_releases_waiters_ok() {
-        let state = Arc::new(SyncState::new(true));
+        let state = Arc::new(SyncState::new());
         let target = state.mark_pending();
         let waiter = {
             let state = Arc::clone(&state);

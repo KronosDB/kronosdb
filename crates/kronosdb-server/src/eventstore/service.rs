@@ -12,7 +12,6 @@ use kronosdb_eventstore::event::{AppendEvent, Position, Tag};
 use kronosdb_eventstore::raft::cluster::ClusterManager;
 
 use crate::proto::kronosdb::eventstore as pb;
-use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer as GrpcEventStoreServer;
 
 /// Default context name when no `kronosdb-context` header is provided.
 const DEFAULT_CONTEXT: &str = "default";
@@ -67,10 +66,6 @@ impl EventStoreService {
         }
     }
 
-    pub fn into_server(self) -> GrpcEventStoreServer<Self> {
-        GrpcEventStoreServer::new(self)
-    }
-
     /// Extracts the context name from gRPC request metadata.
     fn extract_context<T>(request: &Request<T>) -> &str {
         request
@@ -81,6 +76,8 @@ impl EventStoreService {
     }
 
     /// Gets an event store for the context (raw engine or Raft decorator).
+    // tonic's `Status` fixes the large error type.
+    #[allow(clippy::result_large_err)]
     fn get_store(&self, context_name: &str) -> Result<Arc<dyn EventStore>, Status> {
         self.cluster.get_store(context_name).map_err(to_status)
     }
@@ -181,25 +178,18 @@ impl pb::event_store_server::EventStore for EventStoreService {
 
     async fn append(
         &self,
-        request: Request<Streaming<pb::AppendRequest>>,
+        request: Request<pb::AppendRequest>,
     ) -> Result<Response<pb::AppendResponse>, Status> {
         let context_name = Self::extract_context(&request).to_string();
-        let mut stream = request.into_inner();
-        let mut all_events = Vec::new();
-        let mut condition = None;
-
-        while let Some(msg) = stream.message().await? {
-            if msg.condition.is_some() && condition.is_none() {
-                condition = msg.condition.map(|c| from_proto_condition(c));
-            }
-            for tagged_event in msg.events {
-                all_events.push(from_proto_tagged_event(tagged_event));
-            }
-        }
+        let msg = request.into_inner();
 
         let request = AppendRequest {
-            condition,
-            events: all_events,
+            condition: msg.condition.map(from_proto_condition),
+            events: msg
+                .events
+                .into_iter()
+                .map(from_proto_tagged_event)
+                .collect(),
         };
 
         let store = self.get_store(&context_name)?;
@@ -224,7 +214,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
             n => n,
         };
         let condition = from_proto_read_criteria(req.criteria);
-        tracing::info!(
+        // Per-request logging stays below the default level; the criteria
+        // strings are only formatted when debug logging is enabled.
+        tracing::debug!(
             from = from_position.0,
             criteria_count = condition.criteria.len(),
             criteria = ?condition.criteria.iter().map(|c| format!(
@@ -247,6 +239,36 @@ impl pb::event_store_server::EventStore for EventStoreService {
         // no writer-lock contention on the read path.
         let marker = store.head().0;
 
+        const PAGE: usize = 8192;
+
+        // Fast path for the common shallow read (aggregate rehydration):
+        // read the first page inline and, if it both completes the result
+        // and fits one message, answer with a single marker-carrying batch —
+        // no pager task, no channel round-trips, no extra frames.
+        let first_page = {
+            let store_page = Arc::clone(&store);
+            let condition_page = condition.clone();
+            tokio::task::spawn_blocking(move || {
+                store_page.source_page(from_position, &condition_page, Position(marker), PAGE)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?
+            .map_err(to_status)?
+        };
+
+        if first_page.len() < PAGE && first_page.len() <= batch_size {
+            let (tx, rx) = mpsc::channel(1);
+            let response = pb::SourceResponse {
+                batch: Some(pb::SequencedEventBatch {
+                    events: first_page.iter().map(to_proto_sequenced_event).collect(),
+                    consistency_marker: Some(marker as i64),
+                }),
+            };
+            // Capacity 1 and exactly one message: this send cannot block.
+            let _ = tx.send(Ok(response)).await;
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+
         // Bound in-flight memory by EVENTS, not messages: a message is a
         // whole batch, so a fixed message count would let a slow client pin
         // capacity × batch_size events (~250MB at batch 5000) per stream.
@@ -259,12 +281,50 @@ impl pb::event_store_server::EventStore for EventStoreService {
         // the stream stops the remaining work at the next page boundary
         // (an abandoned whole-log scan can't keep burning CPU).
         tokio::spawn(async move {
-            const PAGE: usize = 8192;
-            let mut cursor = from_position;
+            let mut page = first_page;
             loop {
+                let next_cursor = page.last().map(|e| Position(e.position.0 + 1));
+                let page_len = page.len();
+                let is_final = page_len < PAGE;
+                // Pack what we already have in hand into up-to-batch_size
+                // messages. A short batch at the end of a page is sent
+                // immediately — never held back for fill. The last chunk of
+                // the final page carries the consistency marker; an empty
+                // final page sends one empty marker-carrying batch.
+                let mut chunks = page.chunks(batch_size).peekable();
+                if is_final && chunks.peek().is_none() {
+                    let response = pb::SourceResponse {
+                        batch: Some(pb::SequencedEventBatch {
+                            events: Vec::new(),
+                            consistency_marker: Some(marker as i64),
+                        }),
+                    };
+                    let _ = tx.send(Ok(response)).await;
+                    return;
+                }
+                while let Some(chunk) = chunks.next() {
+                    let last_of_stream = is_final && chunks.peek().is_none();
+                    let response = pb::SourceResponse {
+                        batch: Some(pb::SequencedEventBatch {
+                            events: chunk.iter().map(to_proto_sequenced_event).collect(),
+                            consistency_marker: last_of_stream.then_some(marker as i64),
+                        }),
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        return; // Client went away — stop reading further pages.
+                    }
+                }
+                if is_final {
+                    return;
+                }
+
+                let cursor = match next_cursor {
+                    Some(next) => next,
+                    None => return, // Unreachable: a full page has a last event.
+                };
                 let store_page = Arc::clone(&store);
                 let condition_page = condition.clone();
-                let page = match tokio::task::spawn_blocking(move || {
+                page = match tokio::task::spawn_blocking(move || {
                     store_page.source_page(cursor, &condition_page, Position(marker), PAGE)
                 })
                 .await
@@ -281,37 +341,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         return;
                     }
                 };
-
-                let next_cursor = page.last().map(|e| Position(e.position.0 + 1));
-                let page_len = page.len();
-                // Pack what we already have in hand into up-to-batch_size
-                // messages. A short batch at the end of a page is sent
-                // immediately — never held back for fill.
-                for chunk in page.chunks(batch_size) {
-                    let response = pb::SourceResponse {
-                        result: Some(pb::source_response::Result::Batch(
-                            pb::SequencedEventBatch {
-                                events: chunk.iter().map(to_proto_sequenced_event).collect(),
-                            },
-                        )),
-                    };
-                    if tx.send(Ok(response)).await.is_err() {
-                        return; // Client went away — stop reading further pages.
-                    }
-                }
-
-                match next_cursor {
-                    Some(next) if page_len == PAGE => cursor = next,
-                    _ => break, // Short (or empty) page — nothing left below the bound.
-                }
             }
-
-            let response = pb::SourceResponse {
-                result: Some(pb::source_response::Result::ConsistencyMarker(
-                    marker as i64,
-                )),
-            };
-            let _ = tx.send(Ok(response)).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -465,6 +495,8 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         result: Some(pb::stream_response::Result::Batch(
                             pb::SequencedEventBatch {
                                 events: protos[i..i + n].to_vec(),
+                                // Only final Source batches carry a marker.
+                                consistency_marker: None,
                             },
                         )),
                     };
