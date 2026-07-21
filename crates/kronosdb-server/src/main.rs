@@ -57,6 +57,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = ServerConfig::parse()?;
+    match config.ack_mode.as_str() {
+        // "replicated" is a deprecated alias from the mode's prototype era.
+        "written" | "replicated" => kronosdb_eventstore::configure_ack_mode(true),
+        "durable" => kronosdb_eventstore::configure_ack_mode(false),
+        other => {
+            return Err(
+                format!("invalid ack-mode {other:?}: expected \"written\" or \"durable\"").into(),
+            );
+        }
     }
 
     // Native segment quorum topology is required before contexts open: it

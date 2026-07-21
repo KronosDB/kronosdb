@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
@@ -91,6 +91,52 @@ async fn run_tail(
     let response = client.tail(request).await.map_err(status_error)?;
     let mut frames = response.into_inner();
 
+    // Acknowledgements are decoupled from frame processing. Applying frames
+    // stays serial (ordering matters), but the durability wait + ack runs in
+    // its own task fed latest-wins, so acks coalesce to durability waves
+    // instead of gating the stream on one wait+ack round-trip per frame —
+    // at high wave rates that serial loop saturates and every frame queues.
+    let (pending_tx, mut pending_rx) = watch::channel::<Option<PendingAck>>(None);
+    let (acked_tx, mut acked_rx) = watch::channel::<u64>(0);
+    let mut ack_task = {
+        let engine = Arc::clone(&engine);
+        let request_tx = request_tx.clone();
+        let context = config.context.clone();
+        let (follower_id, epoch) = (config.follower_id, config.epoch);
+        tokio::spawn(async move {
+            while pending_rx.changed().await.is_ok() {
+                let Some(ack) = *pending_rx.borrow_and_update() else {
+                    continue;
+                };
+                if let Some(write) = ack.write
+                    && (!crate::relaxed_acks()
+                        || ack.position.saturating_sub(engine.durable_tail().0)
+                            > crate::ack_lag_limit())
+                {
+                    // Durable mode always waits; replicated mode waits only
+                    // when acks have run past the lag limit (disk-stall
+                    // backpressure — the leader then sees follower cursors
+                    // advance at fsync pace until the disk catches up).
+                    wait_durable(Arc::clone(&engine), write).await?;
+                }
+                request_tx
+                    .send(proto::TailRequest {
+                        request: Some(proto::tail_request::Request::Ack(proto::TailAck {
+                            context: context.clone(),
+                            follower_id,
+                            epoch,
+                            durable_position: ack.position,
+                            durable_bytes: ack.bytes,
+                        })),
+                    })
+                    .await
+                    .map_err(|_| Error::Io(std::io::Error::other("Tail request channel closed")))?;
+                let _ = acked_tx.send(ack.position);
+            }
+            Ok::<(), Error>(())
+        })
+    };
+
     while let Some(frame) = frames.message().await.map_err(status_error)? {
         match frame.frame {
             Some(proto::tail_frame::Frame::EpochChange(change)) => {
@@ -121,11 +167,16 @@ async fn run_tail(
                 {
                     // Fully duplicated catch-up/live overlap. Bytes are
                     // already durable; acknowledge this session byte cursor.
-                    send_ack(&request_tx, &config, local_tail, records.stream_bytes_end).await?;
+                    pending_tx.send_replace(Some(PendingAck {
+                        write: None,
+                        position: local_tail,
+                        bytes: records.stream_bytes_end,
+                    }));
                     if stop_at
                         .map(|target| local_tail >= target.0)
                         .unwrap_or(false)
                     {
+                        flush_acks(&mut acked_rx, local_tail).await?;
                         return Ok(());
                     }
                     continue;
@@ -151,18 +202,25 @@ async fn run_tail(
                         ),
                     });
                 }
-                wait_durable(Arc::clone(&engine), write).await?;
-                send_ack(
-                    &request_tx,
-                    &config,
-                    write.durable_position.0,
-                    records.stream_bytes_end,
-                )
-                .await?;
+                if ack_task.is_finished() {
+                    return match (&mut ack_task).await {
+                        Ok(Ok(())) => Err(Error::Io(std::io::Error::other(
+                            "Tail ack task stopped unexpectedly",
+                        ))),
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(Error::Io(std::io::Error::other(error.to_string()))),
+                    };
+                }
+                pending_tx.send_replace(Some(PendingAck {
+                    write: Some(write),
+                    position: write.durable_position.0,
+                    bytes: records.stream_bytes_end,
+                }));
                 if stop_at
                     .map(|target| write.durable_position.0 >= target.0)
                     .unwrap_or(false)
                 {
+                    flush_acks(&mut acked_rx, write.durable_position.0).await?;
                     return Ok(());
                 }
             }
@@ -215,6 +273,28 @@ async fn wait_durable(engine: Arc<EventStoreEngine>, write: ReplicatedWrite) -> 
         .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
 }
 
+/// Latest-wins ack handed to the ack task. `write` is None when the acked
+/// range is already durable locally (duplicated catch-up/live overlap).
+#[derive(Clone, Copy)]
+struct PendingAck {
+    write: Option<ReplicatedWrite>,
+    position: u64,
+    bytes: u64,
+}
+
+/// Blocks a stopping Tail until the ack task has acknowledged `target`, so
+/// recovery sessions never return before their final cursor is on the wire.
+async fn flush_acks(acked_rx: &mut watch::Receiver<u64>, target: u64) -> Result<(), Error> {
+    while *acked_rx.borrow() < target {
+        acked_rx
+            .changed()
+            .await
+            .map_err(|_| Error::Io(std::io::Error::other("Tail ack task stopped")))?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 async fn send_ack(
     tx: &mpsc::Sender<proto::TailRequest>,
     config: &TailClientConfig,

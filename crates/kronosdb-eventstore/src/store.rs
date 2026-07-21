@@ -302,6 +302,21 @@ fn spawn_sync_thread(
                         // Queue before fsync: the dispatcher preads on its own
                         // thread while this thread enters fdatasync.
                         replication.try_publish(descriptor);
+                        if crate::relaxed_acks()
+                            && durable.saturating_sub(durable_tail.load(Ordering::Acquire))
+                                <= crate::ack_lag_limit()
+                        {
+                            // Replicated-ack mode: the append path already
+                            // advanced this node's cursor at write, so this
+                            // bump is usually a no-op — but subscribers are
+                            // woken per wave, so notify unconditionally.
+                            // Past the lag limit the pre-fsync advance is
+                            // skipped (disk-stall backpressure).
+                            let wm = watermark
+                                .advance(node_id, watermark.epoch(), durable)
+                                .unwrap_or_else(|| watermark.get());
+                            let _ = commit_tx.send(CommitNotification { watermark: wm });
+                        }
                         crate::segment::writer::sync_file(&file)?;
                         Ok((wave, durable))
                     });
@@ -1368,6 +1383,29 @@ impl EventStoreEngine {
         Ok(prev_records.last().map(|record| record.crc))
     }
 
+    /// Sealed segments fully covered by the quorum watermark — the archival
+    /// units for tiered storage (ADR-0002). Such segments are immutable:
+    /// failover truncation never reaches below the watermark, so their bytes
+    /// are final on every node.
+    pub fn archivable_segments(&self) -> Vec<ArchivableSegment> {
+        let watermark = self.watermark.get();
+        let seg_list = self.segments.read();
+        let bases = &seg_list.bases;
+        let mut out = Vec::new();
+        // The last base is the active segment; every earlier one is sealed.
+        for window in bases.windows(2) {
+            let (base, end) = (window[0], window[1]);
+            if end <= watermark {
+                out.push(ArchivableSegment {
+                    base,
+                    end,
+                    path: segment::segment_path(&self.dir, base),
+                });
+            }
+        }
+        out
+    }
+
     /// Installs a claimed epoch and exact voter set, aborting all prior-epoch
     /// append waiters. The caller must durably append the leader's EpochChange
     /// before opening its write gate.
@@ -1509,7 +1547,23 @@ impl EventStoreEngine {
             self.append_locked(&mut writer, &request)
         };
 
-        Ok(StagedAppend { outcome, timer })
+        let staged = StagedAppend { outcome, timer };
+        if crate::relaxed_acks()
+            && let Some(pos) = staged.wait_pos()
+            && pos.saturating_sub(self.durable_tail.load(Ordering::Acquire))
+                <= crate::ack_lag_limit()
+        {
+            // Replicated-ack fast path: this node's cursor advances at write
+            // (bytes are already pread-visible — the writer write_alls into
+            // the file). Quorum-of-one opens the ack gate inline; with more
+            // voters the follower cursors still gate the quorum math. Past
+            // the lag limit the advance is skipped and release waits on the
+            // sync loop — durable-mode behavior until the disk catches up.
+            let _ = self
+                .watermark
+                .advance(self.node_id, self.watermark.epoch(), pos);
+        }
+        Ok(staged)
     }
 
     /// Awaits a staged append's durability without pinning a thread, then
@@ -2230,6 +2284,17 @@ fn last_physical_record_crc(path: &Path, byte_end: u64) -> Result<u32, Error> {
 /// Control records before the requested event position remain behind the
 /// cursor; control records at the current physical cursor are preserved by the
 /// exact `(segment_base, byte_offset, crc)` resume path.
+/// One sealed, watermark-covered segment eligible for archival (ADR-0002).
+#[derive(Debug, Clone)]
+pub struct ArchivableSegment {
+    /// First position in the segment (also its filename base).
+    pub base: u64,
+    /// End position (exclusive) — the next segment's base.
+    pub end: u64,
+    /// Local path of the `.seg` file.
+    pub path: PathBuf,
+}
+
 /// One physical record preceding a replication boundary, retained so
 /// byte-exact truncation can walk trailing control records backward.
 #[derive(Clone, Copy)]
