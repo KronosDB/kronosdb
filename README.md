@@ -30,6 +30,16 @@ name = "payments"
 
 Point the server at it with `--manifest`, `KRONOSDB_MANIFEST`, or a `manifest = "..."` key in `kronosdb.toml`; a `kronosdb-manifest.toml` in the working directory is picked up automatically. In a cluster, give every node the same manifest (on Kubernetes: mount one ConfigMap into each pod). Contexts can still be created at runtime through the admin console or API — those are replicated to all nodes through consensus.
 
+## Performance
+
+Measured against PostgreSQL 16 and Axon Server at strictly equal durability
+(every append fsync'd and quorum-acknowledged before the response): faster
+single-event appends, 2× at batch 10, 2.4–3.3× on wide DCB command
+handling, 300k+ durable events/s bulk ingest on one node via multi-context
+scaling, and hard-kill restart to ready in under 0.4 seconds. Full numbers,
+methodology, raw data locations, and an honest limitations section:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Ready to use
 
 Start using it today with:
