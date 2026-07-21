@@ -39,6 +39,50 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Starts the ADR-0002 stage-1 backup loop. Runs on every node but only
+    /// the claimed leader uploads; after failover the new leader continues
+    /// from the shared manifest. Object-store failures are logged and
+    /// retried next interval — they can never touch the write path.
+    pub fn start_backup(self: &Arc<Self>, config: crate::tier::TierConfig) -> Result<(), Error> {
+        let archiver = crate::tier::Archiver::from_url(&config.url)?;
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.run_backup_loop(archiver, config.interval).await;
+        });
+        Ok(())
+    }
+
+    async fn run_backup_loop(self: Arc<Self>, archiver: crate::tier::Archiver, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(claim) = self.control.claim() else {
+                continue;
+            };
+            if !claim.writable || claim.leader_id != self.cluster_config.node_id {
+                continue;
+            }
+            for context in self.context_manager.list_contexts() {
+                let Ok(engine) = self.context_manager.get_context(&context) else {
+                    continue;
+                };
+                match archiver.run_backup_pass(&context, &engine).await {
+                    Ok(report) if report.uploaded > 0 => {
+                        tracing::info!(
+                            context,
+                            uploaded = report.uploaded,
+                            archived_total = report.uploaded + report.already_archived,
+                            "backup pass shipped sealed segments"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, context, "backup pass failed; retrying next interval");
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_watermark_checkpoints(self: Arc<Self>) {
         let mut last = HashMap::new();
         loop {

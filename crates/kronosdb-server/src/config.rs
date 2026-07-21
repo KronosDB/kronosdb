@@ -43,6 +43,15 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_GROUP_COMMIT_MS")]
     group_commit_ms: Option<u64>,
 
+    /// Object-store URL for sealed-segment backup (ADR-0002 stage 1), e.g.
+    /// file:///backups/kronosdb or s3://bucket/prefix. Unset = backups off.
+    #[arg(long, env = "KRONOSDB_BACKUP_URL")]
+    backup_url: Option<String>,
+
+    /// Seconds between backup passes on the claimed leader (default 30).
+    #[arg(long, env = "KRONOSDB_BACKUP_INTERVAL_SECS")]
+    backup_interval_secs: Option<u64>,
+
     /// Command dispatch timeout in seconds.
     #[arg(long, env = "KRONOSDB_COMMAND_TIMEOUT")]
     command_timeout: Option<u64>,
@@ -171,6 +180,9 @@ struct ConfigFile {
     storage: StorageConfig,
 
     #[serde(default)]
+    backup: BackupFileConfig,
+
+    #[serde(default)]
     timeouts: TimeoutConfig,
 
     #[serde(default)]
@@ -188,6 +200,13 @@ struct StorageConfig {
     index_cache_size: Option<usize>,
     #[serde(rename = "bloom-cache-size")]
     bloom_cache_size: Option<usize>,
+}
+
+#[derive(Deserialize, Default, Debug)]
+struct BackupFileConfig {
+    url: Option<String>,
+    #[serde(rename = "interval-secs")]
+    interval_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -319,6 +338,9 @@ pub struct ServerConfig {
     pub index_cache_size: usize,
     pub bloom_cache_size: usize,
     pub group_commit_ms: u64,
+    /// Object-store URL for sealed-segment backup; None = backups disabled.
+    pub backup_url: Option<String>,
+    pub backup_interval_secs: u64,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
     pub heartbeat_interval_secs: u64,
@@ -373,6 +395,7 @@ impl ServerConfig {
         const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
         const DEFAULT_INDEX_CACHE_SIZE: usize = 50;
         const DEFAULT_BLOOM_CACHE_SIZE: usize = 200;
+        const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 30;
         const DEFAULT_COMMAND_TIMEOUT: u64 = 30;
         const DEFAULT_QUERY_TIMEOUT: u64 = 30;
         const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5;
@@ -438,6 +461,11 @@ impl ServerConfig {
                 .or(file_config.storage.bloom_cache_size)
                 .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
             group_commit_ms: cli.group_commit_ms.unwrap_or(0),
+            backup_url: cli.backup_url.or(file_config.backup.url),
+            backup_interval_secs: cli
+                .backup_interval_secs
+                .or(file_config.backup.interval_secs)
+                .unwrap_or(DEFAULT_BACKUP_INTERVAL_SECS),
             command_timeout_secs: cli
                 .command_timeout
                 .or(file_config.timeouts.command_timeout)

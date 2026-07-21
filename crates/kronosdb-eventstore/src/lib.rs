@@ -14,3 +14,5 @@ pub mod segment;
 pub mod snapshot;
 pub mod store;
 pub mod stream;
+pub mod tier;
+
