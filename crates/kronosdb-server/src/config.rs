@@ -36,6 +36,13 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_BLOOM_CACHE_SIZE")]
     bloom_cache_size: Option<usize>,
 
+    /// Append acknowledgement mode: "written" (default) acks once a quorum
+    /// has written the events to its log (fsync trails by one group-commit
+    /// wave); "durable" acks only once a quorum has fsynced. On a single
+    /// node "written" acks survive process crashes but not power loss.
+    #[arg(long, env = "KRONOSDB_ACK_MODE")]
+    ack_mode: Option<String>,
+
     /// Extra group-commit coalescing window in milliseconds. Commits are
     /// event-driven: 0 (default) fsyncs as soon as writes are pending, and
     /// concurrent writes batch on the fsync duration. A positive value adds
@@ -200,6 +207,8 @@ struct StorageConfig {
     index_cache_size: Option<usize>,
     #[serde(rename = "bloom-cache-size")]
     bloom_cache_size: Option<usize>,
+    #[serde(rename = "ack-mode")]
+    ack_mode: Option<String>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -336,6 +345,8 @@ pub struct ServerConfig {
     pub admin_listen_addr: SocketAddr,
     pub segment_size: u64,
     pub index_cache_size: usize,
+    /// "written" (default) or "durable"; see the CLI flag docs.
+    pub ack_mode: String,
     pub bloom_cache_size: usize,
     pub group_commit_ms: u64,
     /// Object-store URL for sealed-segment backup; None = backups disabled.
@@ -460,6 +471,10 @@ impl ServerConfig {
                 .bloom_cache_size
                 .or(file_config.storage.bloom_cache_size)
                 .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
+            ack_mode: cli
+                .ack_mode
+                .or(file_config.storage.ack_mode)
+                .unwrap_or_else(|| "written".to_string()),
             group_commit_ms: cli.group_commit_ms.unwrap_or(0),
             backup_url: cli.backup_url.or(file_config.backup.url),
             backup_interval_secs: cli
