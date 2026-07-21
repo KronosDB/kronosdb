@@ -888,6 +888,30 @@ mod tests {
     }
 
     #[test]
+    fn sweep_honors_client_timeout_override() {
+        let bus = CommandBus::new();
+        bus.subscribe(
+            "SlowCommand".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        bus.grant_permits(&client("node-1"), 10);
+
+        let mut cmd = make_command("SlowCommand");
+        cmd.processing_instructions = vec![ProcessingInstruction {
+            key: ProcessingKey::Timeout,
+            value: Some(MetadataValue::Number(3_600_000)),
+        }];
+        let (_pending, _rx) = bus.dispatch(cmd).unwrap();
+
+        // Sweep with a zero default: the override must keep the entry alive.
+        let swept = bus.sweep_timeouts(Duration::from_secs(0));
+        assert!(swept.is_empty());
+        assert_eq!(bus.in_flight_count(), 1);
+    }
+
+    #[test]
     fn sweep_timeouts_drains_old_entries() {
         let bus = CommandBus::new();
         bus.subscribe(

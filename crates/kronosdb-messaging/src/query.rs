@@ -360,6 +360,58 @@ mod tests {
     }
 
     #[test]
+    fn resubscribe_does_not_duplicate_handler() {
+        let bus = QueryBus::new();
+        bus.subscribe(
+            "GetOrders".into(),
+            client("node-1"),
+            component("order-service"),
+        );
+        bus.subscribe(
+            "GetOrders".into(),
+            client("node-1"),
+            component("order-service"),
+        );
+        bus.grant_permits(&client("node-1"), 10);
+
+        let pending = bus.dispatch(make_query("GetOrders", -1)).unwrap();
+        assert_eq!(pending.target_handlers.len(), 1);
+
+        let details = bus.handler_details();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].handlers.len(), 1);
+    }
+
+    #[test]
+    fn point_to_point_round_robins_across_handlers() {
+        let bus = QueryBus::new();
+        bus.subscribe(
+            "GetOrder".into(),
+            client("node-1"),
+            component("order-service"),
+        );
+        bus.subscribe(
+            "GetOrder".into(),
+            client("node-2"),
+            component("order-service"),
+        );
+        bus.grant_permits(&client("node-1"), 100);
+        bus.grant_permits(&client("node-2"), 100);
+
+        let mut hits = std::collections::HashMap::new();
+        for _ in 0..10 {
+            let pending = bus.dispatch(make_query("GetOrder", 1)).unwrap();
+            *hits
+                .entry(pending.target_handlers[0].0.clone())
+                .or_insert(0) += 1;
+        }
+        // Both handlers must receive traffic (strict alternation with 2 handlers).
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits["node-1"], 5);
+        assert_eq!(hits["node-2"], 5);
+    }
+
+    #[test]
     fn remove_client_cleans_up() {
         let bus = QueryBus::new();
         bus.subscribe(

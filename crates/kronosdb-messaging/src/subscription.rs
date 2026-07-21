@@ -212,10 +212,12 @@ impl SubscriptionRegistry {
         let handler_client_id = handler.handler.client_id.clone();
 
         // Create the update channel. The subscriber's requested permit count
-        // sizes the buffer (bounded to keep a hostile value from pinning memory)
-        // and seeds the update credit.
+        // sizes the buffer (bounded to keep a hostile value from pinning
+        // memory) and seeds the update credit. One extra slot is reserved so
+        // a terminal message still fits when the credit budget's worth of
+        // updates is sitting unconsumed in the buffer.
         let initial_permits = query.initial_permits.clamp(1, 1024);
-        let (update_tx, update_rx) = mpsc::channel(initial_permits as usize);
+        let (update_tx, update_rx) = mpsc::channel(initial_permits as usize + 1);
 
         let subscription = ActiveSubscription {
             client_id: query.client_id.clone(),
@@ -503,6 +505,129 @@ mod tests {
         let (_pending, _rx) = registry.open(sub).unwrap();
 
         registry.cancel("sub-1");
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_subscription_id_rejected() {
+        let registry = SubscriptionRegistry::new();
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
+        {
+            let handlers = registry.handlers.read();
+            handlers.grant_permits(&client("handler-1"), 10);
+        }
+
+        let (_pending, _rx) = registry
+            .open(make_subscription("sub-1", "GetOrderCount"))
+            .unwrap();
+        let result = registry.open(make_subscription("sub-1", "GetOrderCount"));
+        assert!(matches!(
+            result,
+            Err(SubscriptionError::DuplicateSubscription { .. })
+        ));
+        // The duplicate must not have consumed a handler permit.
+        let handlers = registry.handlers.read();
+        let list = handlers.get_handlers("GetOrderCount").unwrap();
+        assert_eq!(list[0].handler.available_permits(), 9);
+    }
+
+    fn update(sub_id: &str) -> SubscriptionUpdate {
+        SubscriptionUpdate {
+            subscription_id: sub_id.into(),
+            payload: None,
+            metadata: std::collections::HashMap::new(),
+            error_code: None,
+            error: None,
+            complete: false,
+        }
+    }
+
+    #[test]
+    fn updates_stop_when_credit_exhausted_and_resume_on_grant() {
+        let registry = SubscriptionRegistry::new();
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
+        {
+            let handlers = registry.handlers.read();
+            handlers.grant_permits(&client("handler-1"), 10);
+        }
+
+        let mut sub = make_subscription("sub-1", "GetOrderCount");
+        sub.initial_permits = 2;
+        let (_pending, mut rx) = registry.open(sub).unwrap();
+
+        registry.send_update("sub-1", update("sub-1"));
+        registry.send_update("sub-1", update("sub-1"));
+        registry.send_update("sub-1", update("sub-1")); // out of credit — dropped
+
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+
+        registry.grant_permits("sub-1", 1);
+        registry.send_update("sub-1", update("sub-1"));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn terminal_update_bypasses_credit() {
+        let registry = SubscriptionRegistry::new();
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
+        {
+            let handlers = registry.handlers.read();
+            handlers.grant_permits(&client("handler-1"), 10);
+        }
+
+        let mut sub = make_subscription("sub-1", "GetOrderCount");
+        sub.initial_permits = 1;
+        let (_pending, mut rx) = registry.open(sub).unwrap();
+
+        registry.send_update("sub-1", update("sub-1")); // consumes the only credit
+        let mut terminal = update("sub-1");
+        terminal.complete = true;
+        registry.send_update("sub-1", terminal);
+
+        assert!(rx.try_recv().is_ok());
+        let last = rx.try_recv().unwrap();
+        assert!(last.complete);
+    }
+
+    #[test]
+    fn handler_disconnect_sends_terminal_error() {
+        let registry = SubscriptionRegistry::new();
+        registry.subscribe_handler(
+            "GetOrderCount".into(),
+            client("handler-1"),
+            component("order-service"),
+        );
+        {
+            let handlers = registry.handlers.read();
+            handlers.grant_permits(&client("handler-1"), 10);
+        }
+
+        let (_pending, mut rx) = registry
+            .open(make_subscription("sub-1", "GetOrderCount"))
+            .unwrap();
+
+        registry.remove_client(&client("handler-1"));
+
+        let last = rx.try_recv().unwrap();
+        assert!(last.complete);
+        assert_eq!(
+            last.error_code.as_deref(),
+            Some(crate::error_codes::CONNECTION_TO_HANDLER_LOST)
+        );
         assert_eq!(registry.active_count(), 0);
     }
 
