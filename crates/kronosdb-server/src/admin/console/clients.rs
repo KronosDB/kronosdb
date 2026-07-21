@@ -11,15 +11,15 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     let table_html = clients_table_html(&clients);
 
     let content = format!(
-        r##"<div class="flex flex-col flex-1" id="page-clients">
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col flex-1">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold flex items-center gap-2">
+        r##"<div class="flex flex-col flex-1 gap-4" id="page-clients">
+  <div class="card gap-0 py-0 overflow-hidden flex-1">
+    <header class="items-center border-b border-k-subtle px-[18px] py-3">
+      <h2 class="text-[13px] font-semibold flex items-center gap-2">
         Connected Clients
-        <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{count}</span>
-      </div>
-    </div>
-    <div class="flex-1 overflow-auto" hx-get="/fragments/clients" hx-trigger="every 5s" hx-swap="innerHTML">
+        <span class="badge font-mono text-k-text2" data-variant="secondary">{count}</span>
+      </h2>
+    </header>
+    <div class="flex-1 overflow-auto" hx-get="/fragments/clients" hx-trigger="every 10s, sse-clients from:body" hx-swap="morph:innerHTML">
       {table}
     </div>
   </div>
@@ -53,6 +53,14 @@ pub async fn clients_mini_fragment(State(state): State<AdminState>) -> Html<Stri
 
 use kronosdb_messaging::client::ClientInfo;
 
+/// Sanitize a natural key into a DOM id fragment so idiomorph can match
+/// rows across refreshes.
+fn dom_id(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 fn clients_table_html(clients: &[ClientInfo]) -> String {
     if clients.is_empty() {
         return r#"<div class="text-center text-k-muted py-8 text-xs">No clients connected</div>"#
@@ -61,28 +69,29 @@ fn clients_table_html(clients: &[ClientInfo]) -> String {
     let mut rows = String::new();
     for c in clients {
         let hb_secs = c.since_last_heartbeat.as_secs();
-        let (badge_cls, badge_text, dot_cls) = if hb_secs > 15 {
-            ("bg-k-red-d text-k-red", "stale", "bg-k-red")
+        let (badge_tint, badge_text, dot_cls) = if hb_secs > 15 {
+            ("text-k-red", "stale", "bg-k-red")
         } else if hb_secs > 5 {
-            ("bg-k-amber-d text-k-amber", "slow", "bg-k-amber")
+            ("text-k-amber", "slow", "bg-k-amber")
         } else {
-            ("bg-k-teal-d text-k-teal", "healthy", "bg-k-teal")
+            ("text-k-teal", "healthy", "bg-k-teal")
         };
         let stream_badge = if c.has_active_stream {
-            r#"<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-teal-d text-k-teal"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>active</span>"#
+            r#"<span class="badge font-mono text-k-teal" data-variant="outline"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>active</span>"#
         } else {
             r#"<span class="text-k-muted text-xs">-</span>"#
         };
         rows.push_str(&format!(
-            r#"<tr>
+            r#"<tr id="client-{row_id}">
   <td class="font-mono text-xs !text-k-text">{client_id}</td>
   <td class="!text-k-text">{component}</td>
   <td class="font-mono text-xs">{version}</td>
   <td class="font-mono text-xs">{connected}</td>
   <td class="font-mono text-xs">{heartbeat}</td>
-  <td><span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono {badge_cls}"><span class="w-1.5 h-1.5 rounded-full {dot_cls}"></span>{badge_text}</span></td>
+  <td><span class="badge font-mono {badge_tint}" data-variant="outline"><span class="w-1.5 h-1.5 rounded-full {dot_cls}"></span>{badge_text}</span></td>
   <td class="text-center">{stream_badge}</td>
 </tr>"#,
+            row_id = dom_id(&c.client_id.0),
             client_id = html_escape(&c.client_id.0),
             component = html_escape(&c.component_name.0),
             version = if c.version.is_empty() { "-" } else { &c.version },
@@ -95,7 +104,9 @@ fn clients_table_html(clients: &[ClientInfo]) -> String {
     )
 }
 
-fn clients_table_mini_html(clients: &[ClientInfo]) -> String {
+/// Compact client table shared by the overview page and its refresh
+/// fragment — one source of truth so idiomorph sees identical markup.
+pub(crate) fn clients_table_mini_html(clients: &[ClientInfo]) -> String {
     if clients.is_empty() {
         return r#"<div class="text-center text-k-muted py-8 text-xs">No clients connected</div>"#
             .to_string();
@@ -104,18 +115,14 @@ fn clients_table_mini_html(clients: &[ClientInfo]) -> String {
     for c in clients.iter().take(4) {
         let hb = format_uptime_short(c.since_last_heartbeat);
         let connected = format_duration_connected(c.connected_since);
-        let (badge_cls, badge_text) = if c.since_last_heartbeat.as_secs() > 15 {
-            ("bg-k-amber-d text-k-amber", "slow")
+        let (badge_tint, badge_text, dot_cls) = if c.since_last_heartbeat.as_secs() > 15 {
+            ("text-k-amber", "slow", "bg-k-amber")
         } else {
-            ("bg-k-gold-d text-k-gold", "ok")
-        };
-        let dot_cls = if c.since_last_heartbeat.as_secs() > 15 {
-            "bg-k-amber"
-        } else {
-            "bg-k-gold"
+            ("text-k-gold", "ok", "bg-k-gold")
         };
         rows.push_str(&format!(
-            r#"<tr><td class="!text-k-text">{component}</td><td class="font-mono text-xs">{client_id}</td><td class="font-mono text-xs">{connected}</td><td class="font-mono text-xs">{hb}</td><td><span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono {badge_cls}"><span class="w-1.5 h-1.5 rounded-full {dot_cls}"></span>{badge_text}</span></td></tr>"#,
+            r#"<tr id="client-mini-{row_id}"><td class="!text-k-text">{component}</td><td class="font-mono text-xs">{client_id}</td><td class="font-mono text-xs">{connected}</td><td class="font-mono text-xs">{hb}</td><td><span class="badge font-mono {badge_tint}" data-variant="outline"><span class="w-1.5 h-1.5 rounded-full {dot_cls}"></span>{badge_text}</span></td></tr>"#,
+            row_id = dom_id(&c.client_id.0),
             component = html_escape(&c.component_name.0),
             client_id = html_escape(&c.client_id.0),
         ));

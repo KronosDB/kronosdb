@@ -18,23 +18,23 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     let clustering_enabled = config.cluster_node_id.is_some();
 
     let status_badge = if clustering_enabled {
-        r#"<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-teal-d text-k-teal"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>enabled</span>"#
+        r#"<span class="badge font-mono bg-k-teal-d text-k-teal" data-variant="secondary"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>enabled</span>"#
     } else {
-        r#"<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-amber-d text-k-amber"><span class="w-1.5 h-1.5 rounded-full bg-k-amber"></span>standalone</span>"#
+        r#"<span class="badge font-mono bg-k-amber-d text-k-amber" data-variant="secondary"><span class="w-1.5 h-1.5 rounded-full bg-k-amber"></span>standalone</span>"#
     };
 
     // Peer info from config
     let mut peer_rows = String::new();
     for peer in &config.cluster_peers {
         peer_rows.push_str(&format!(
-            r#"<tr><td class="font-mono text-xs !text-k-text">{id}</td><td class="font-mono text-xs">{addr}</td><td><span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-blue-d text-k-blue">voter</span></td></tr>"#,
+            r#"<tr id="peer-{id}"><td class="font-mono text-xs !text-k-text">{id}</td><td class="font-mono text-xs">{addr}</td><td><span class="badge font-mono bg-k-blue-d text-k-blue" data-variant="secondary">voter</span></td></tr>"#,
             id = peer.id,
             addr = html_escape(&peer.addr),
         ));
     }
     for peer in &config.cluster_learners {
         peer_rows.push_str(&format!(
-            r#"<tr><td class="font-mono text-xs !text-k-text">{id}</td><td class="font-mono text-xs">{addr}</td><td><span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-overlay text-k-text2">learner</span></td></tr>"#,
+            r#"<tr id="peer-{id}"><td class="font-mono text-xs !text-k-text">{id}</td><td class="font-mono text-xs">{addr}</td><td><span class="badge font-mono bg-k-overlay text-k-text2" data-variant="secondary">learner</span></td></tr>"#,
             id = peer.id,
             addr = html_escape(&peer.addr),
         ));
@@ -51,25 +51,26 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 
     let management_section = if clustering_enabled {
         r##"<!-- Cluster management -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden mt-4">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold">Membership Management</div>
-    </div>
-    <div class="p-4">
+  <div class="card gap-0 py-0 mt-4">
+    <header class="py-3 border-b border-k-subtle">
+      <h2 class="text-[13px] font-semibold">Membership Management</h2>
+    </header>
+    <section class="py-4">
       <div class="flex flex-wrap gap-4">
         <!-- Add Learner -->
         <div class="flex-1 min-w-[280px]">
           <div class="text-[11px] font-semibold uppercase tracking-[0.6px] text-k-muted mb-2">Add Learner</div>
-          <form id="add-learner-form" class="flex flex-col gap-2"
+          <form id="add-learner-form" class="flex flex-col gap-3"
             onsubmit="event.preventDefault(); clusterAction('/api/cluster/add-learner', 'add-learner-form', 'add-learner-result');">
-            <input type="number" name="id" placeholder="Node ID" required min="1"
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <input type="text" name="addr" placeholder="host:port" required
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <input type="text" name="context" value="default" placeholder="context"
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <button type="submit"
-              class="px-3 py-1.5 rounded-[5px] border border-k-blue bg-k-blue-d text-k-blue text-xs font-medium cursor-pointer hover:bg-k-blue hover:text-k-inv transition-colors w-fit">
+            <div class="flex flex-col gap-1.5">
+              <label class="label" for="add-learner-id">Node ID</label>
+              <input id="add-learner-id" class="input font-mono" type="number" name="id" placeholder="Node ID" required min="1">
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <label class="label" for="add-learner-addr">Address</label>
+              <input id="add-learner-addr" class="input font-mono" type="text" name="addr" placeholder="host:port" required>
+            </div>
+            <button type="submit" class="btn w-fit" data-variant="outline" data-size="sm">
               Add Learner
             </button>
             <span id="add-learner-result" class="text-xs"></span>
@@ -78,16 +79,17 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
         <!-- Add Voter -->
         <div class="flex-1 min-w-[280px]">
           <div class="text-[11px] font-semibold uppercase tracking-[0.6px] text-k-muted mb-2">Promote to Voter</div>
-          <form id="add-voter-form" class="flex flex-col gap-2"
+          <form id="add-voter-form" class="flex flex-col gap-3"
             onsubmit="event.preventDefault(); clusterAction('/api/cluster/add-voter', 'add-voter-form', 'add-voter-result');">
-            <input type="number" name="id" placeholder="Node ID" required min="1"
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <input type="text" name="addr" placeholder="host:port" required
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <input type="text" name="context" value="default" placeholder="context"
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <button type="submit"
-              class="px-3 py-1.5 rounded-[5px] border border-k-blue bg-k-blue-d text-k-blue text-xs font-medium cursor-pointer hover:bg-k-blue hover:text-k-inv transition-colors w-fit">
+            <div class="flex flex-col gap-1.5">
+              <label class="label" for="add-voter-id">Node ID</label>
+              <input id="add-voter-id" class="input font-mono" type="number" name="id" placeholder="Node ID" required min="1">
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <label class="label" for="add-voter-addr">Address</label>
+              <input id="add-voter-addr" class="input font-mono" type="text" name="addr" placeholder="host:port" required>
+            </div>
+            <button type="submit" class="btn w-fit" data-variant="outline" data-size="sm">
               Promote to Voter
             </button>
             <span id="add-voter-result" class="text-xs"></span>
@@ -96,21 +98,20 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
         <!-- Remove Node -->
         <div class="flex-1 min-w-[280px]">
           <div class="text-[11px] font-semibold uppercase tracking-[0.6px] text-k-muted mb-2">Remove Node</div>
-          <form id="remove-node-form" class="flex flex-col gap-2"
+          <form id="remove-node-form" class="flex flex-col gap-3"
             onsubmit="event.preventDefault(); clusterAction('/api/cluster/remove-node', 'remove-node-form', 'remove-node-result');">
-            <input type="number" name="id" placeholder="Node ID" required min="1"
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <input type="text" name="context" value="default" placeholder="context"
-              class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none">
-            <button type="submit"
-              class="px-3 py-1.5 rounded-[5px] border border-k-red bg-k-red-d text-k-red text-xs font-medium cursor-pointer hover:bg-k-red hover:text-k-inv transition-colors w-fit">
+            <div class="flex flex-col gap-1.5">
+              <label class="label" for="remove-node-id">Node ID</label>
+              <input id="remove-node-id" class="input font-mono" type="number" name="id" placeholder="Node ID" required min="1">
+            </div>
+            <button type="submit" class="btn w-fit" data-variant="destructive" data-size="sm">
               Remove Node
             </button>
             <span id="remove-node-result" class="text-xs"></span>
           </form>
         </div>
       </div>
-    </div>
+    </section>
   </div>
 
   <script>
@@ -144,28 +145,28 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
         r##"<div class="flex flex-col flex-1" id="page-cluster">
   <!-- Node info -->
   <div class="flex flex-wrap gap-3 mb-4">
-    <div class="flex-1 min-w-[170px] bg-k-surface border border-k-subtle rounded-lg p-4 pl-5 relative flex flex-col overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-gold before:rounded-l-lg">
-      <div class="text-[11px] font-medium uppercase tracking-wider text-k-muted mb-2">Node ID</div>
+    <div class="card flex-1 min-w-[170px] gap-2 py-4 pl-5 pr-4 relative overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-gold">
+      <div class="text-[11px] font-medium uppercase tracking-wider text-k-muted">Node ID</div>
       <div class="font-mono text-[26px] font-semibold leading-none">{node_id}</div>
     </div>
-    <div class="flex-1 min-w-[170px] bg-k-surface border border-k-subtle rounded-lg p-4 pl-5 relative flex flex-col overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-blue before:rounded-l-lg">
-      <div class="text-[11px] font-medium uppercase tracking-wider text-k-muted mb-2">Node Type</div>
+    <div class="card flex-1 min-w-[170px] gap-2 py-4 pl-5 pr-4 relative overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-blue">
+      <div class="text-[11px] font-medium uppercase tracking-wider text-k-muted">Node Type</div>
       <div class="font-mono text-[26px] font-semibold leading-none">{node_type}</div>
     </div>
-    <div class="flex-1 min-w-[170px] bg-k-surface border border-k-subtle rounded-lg p-4 pl-5 relative flex flex-col overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-teal before:rounded-l-lg">
-      <div class="text-[11px] font-medium uppercase tracking-wider text-k-muted mb-2">Clustering</div>
-      <div class="mt-1">{status_badge}</div>
+    <div class="card flex-1 min-w-[170px] gap-2 py-4 pl-5 pr-4 relative overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-teal">
+      <div class="text-[11px] font-medium uppercase tracking-wider text-k-muted">Clustering</div>
+      <div>{status_badge}</div>
     </div>
   </div>
 
   <!-- Configured peers -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold flex items-center gap-2">
+  <div class="card gap-0 py-0 overflow-hidden">
+    <header class="py-3 border-b border-k-subtle">
+      <h2 class="text-[13px] font-semibold flex items-center gap-2">
         Configured Peers
-        <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{peer_count}</span>
-      </div>
-    </div>
+        <span class="badge font-mono" data-variant="secondary">{peer_count}</span>
+      </h2>
+    </header>
     <div class="overflow-auto">
       {peers_table}
     </div>

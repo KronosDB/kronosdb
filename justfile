@@ -56,3 +56,8 @@ build-all: build connector-install
 # Inspect a .seg file (dumps events or summary)
 inspect-segment *ARGS:
     cargo run -q -p kronosdb-eventstore --bin inspect_segment -- {{ARGS}}
+
+# Rebuild the embedded admin console stylesheet (requires bun).
+# Run after changing Tailwind classes in crates/kronosdb-server/src/admin.
+css:
+    cd crates/kronosdb-server/assets && bun install && bun x @tailwindcss/cli -i app.css -o ../static/css/app.min.css --minify

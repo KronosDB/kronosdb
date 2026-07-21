@@ -24,36 +24,39 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     let table_html = contexts_table_html(&rows);
 
     let content = format!(
-        r##"<div class="flex flex-col flex-1" id="page-contexts">
+        r##"<div class="flex flex-col flex-1 gap-4" id="page-contexts">
   <!-- Create context form -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg p-4 mb-4 flex items-end gap-3">
-    <form class="flex items-end gap-3" id="create-context-form">
-      <div class="flex flex-col gap-1">
-        <label class="text-[10px] font-semibold tracking-[0.6px] uppercase text-k-muted">New Context</label>
-        <input type="text" name="name" placeholder="e.g. orders" required pattern="[a-zA-Z0-9_\-]+"
-          class="font-mono text-xs px-2.5 py-1.5 border border-k-border rounded-[5px] bg-k-base text-k-text outline-none focus:border-k-gold min-w-[200px]">
-      </div>
-      <button type="submit"
-        class="px-3 py-1.5 rounded-[5px] border border-k-gold bg-k-gold-d text-k-gold text-xs font-medium cursor-pointer hover:bg-k-gold hover:text-k-inv transition-colors"
-        hx-post="/fragments/create-context"
-        hx-include="#create-context-form"
-        hx-target="#context-feedback"
-        hx-swap="innerHTML">
-        Create
-      </button>
-    </form>
-    <span id="context-feedback" class="text-xs"></span>
+  <div class="card" data-size="sm">
+    <section class="flex items-end gap-3">
+      <form class="flex items-end gap-3" id="create-context-form">
+        <div class="flex flex-col gap-1.5">
+          <label class="label text-[11px] uppercase tracking-wider text-k-muted" for="new-context-name">New Context</label>
+          <input id="new-context-name" type="text" name="name" placeholder="e.g. orders" required pattern="[a-zA-Z0-9_\-]+"
+            class="input font-mono text-xs flex-none min-w-[200px]">
+        </div>
+        <button type="submit"
+          class="btn"
+          data-variant="primary"
+          hx-post="/fragments/create-context"
+          hx-include="#create-context-form"
+          hx-target="#context-feedback"
+          hx-swap="innerHTML">
+          Create
+        </button>
+      </form>
+      <span id="context-feedback" class="text-xs self-center"></span>
+    </section>
   </div>
 
   <!-- Contexts table -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col flex-1">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold flex items-center gap-2">
+  <div class="card gap-0 py-0 overflow-hidden flex-1">
+    <header class="items-center border-b border-k-subtle px-[18px] py-3">
+      <h2 class="text-[13px] font-semibold flex items-center gap-2">
         Event Store Contexts
-        <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{count}</span>
-      </div>
-    </div>
-    <div class="flex-1 overflow-auto" hx-get="/fragments/contexts" hx-trigger="every 5s, refreshContexts from:body" hx-swap="innerHTML">
+        <span class="badge font-mono text-k-text2" data-variant="secondary">{count}</span>
+      </h2>
+    </header>
+    <div class="flex-1 overflow-auto" hx-get="/fragments/contexts" hx-trigger="every 60s, sse-contexts from:body, refreshContexts from:body" hx-swap="morph:innerHTML">
       {table}
     </div>
   </div>
@@ -98,7 +101,7 @@ pub async fn contexts_mini_fragment(State(state): State<AdminState>) -> Html<Str
             Err(_) => (0, 0),
         };
         let events = head.saturating_sub(tail);
-        data.push((name.clone(), events));
+        data.push((name.clone(), events, head));
     }
     Html(contexts_table_mini_html(&data))
 }
@@ -119,7 +122,7 @@ pub async fn create_context_fragment(
             StatusCode::OK,
             [("HX-Trigger", "refreshContexts")],
             Html(format!(
-                r#"<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-teal-d text-k-teal"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>Created '{}'</span>"#,
+                r#"<span class="badge font-mono text-k-teal" data-variant="outline"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>Created '{}'</span>"#,
                 html_escape(&req.name),
             )),
         )
@@ -127,7 +130,7 @@ pub async fn create_context_fragment(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Html(format!(
-                r#"<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-red-d text-k-red"><span class="w-1.5 h-1.5 rounded-full bg-k-red"></span>{}</span>"#,
+                r#"<span class="badge font-mono text-k-red" data-variant="outline"><span class="w-1.5 h-1.5 rounded-full bg-k-red"></span>{}</span>"#,
                 html_escape(&e.to_string()),
             )),
         )
@@ -153,6 +156,14 @@ pub async fn api_create_context(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+/// Sanitize a natural key into a DOM id fragment so idiomorph can match
+/// rows across refreshes.
+fn dom_id(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 fn contexts_table_html(rows: &[(String, u64, u64, u64)]) -> String {
     if rows.is_empty() {
         return r#"<div class="text-center text-k-muted py-8 text-xs">No contexts created yet</div>"#.to_string();
@@ -161,13 +172,14 @@ fn contexts_table_html(rows: &[(String, u64, u64, u64)]) -> String {
     for (name, head, tail, event_count) in rows {
         let escaped = html_escape(name);
         html.push_str(&format!(
-            r#"<tr>
+            r#"<tr id="ctx-{row_id}">
   <td class="font-mono text-xs !text-k-text"><a href="/events?context={escaped}" class="text-k-gold no-underline hover:underline">{escaped}</a></td>
   <td class="font-mono text-xs text-right">{head}</td>
   <td class="font-mono text-xs text-right">{tail}</td>
   <td class="font-mono text-xs text-right">{events}</td>
-  <td class="text-right"><span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-teal-d text-k-teal"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>active</span></td>
+  <td class="text-right"><span class="badge font-mono text-k-teal" data-variant="outline"><span class="w-1.5 h-1.5 rounded-full bg-k-teal"></span>active</span></td>
 </tr>"#,
+            row_id = dom_id(name),
             head = format_number(*head),
             tail = format_number(*tail),
             events = format_number(*event_count),
@@ -178,19 +190,24 @@ fn contexts_table_html(rows: &[(String, u64, u64, u64)]) -> String {
     )
 }
 
-fn contexts_table_mini_html(data: &[(String, u64)]) -> String {
+/// Compact context table shared by the overview page and its refresh
+/// fragment — one source of truth so idiomorph sees identical markup.
+/// Rows are `(name, events, head)`.
+pub(crate) fn contexts_table_mini_html(data: &[(String, u64, u64)]) -> String {
     if data.is_empty() {
         return r#"<div class="text-center text-k-muted py-8 text-xs">No contexts created yet</div>"#.to_string();
     }
     let mut rows = String::new();
-    for (name, events) in data {
+    for (name, events, head) in data {
         rows.push_str(&format!(
-            r#"<tr><td class="font-mono text-xs !text-k-text">{name}</td><td class="font-mono text-xs text-right">{events}</td></tr>"#,
+            r#"<tr id="ctx-mini-{row_id}"><td class="font-mono text-xs !text-k-text">{name}</td><td class="font-mono text-xs text-right">{events}</td><td class="font-mono text-xs text-right">{head}</td></tr>"#,
+            row_id = dom_id(name),
             name = html_escape(name),
             events = format_number(*events),
+            head = format_number(*head),
         ));
     }
     format!(
-        r#"<table><thead><tr><th>Name</th><th class="text-right">Events</th></tr></thead><tbody>{rows}</tbody></table>"#
+        r#"<table><thead><tr><th>Name</th><th class="text-right">Events</th><th class="text-right">Head</th></tr></thead><tbody>{rows}</tbody></table>"#
     )
 }

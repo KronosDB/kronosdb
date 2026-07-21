@@ -1,0 +1,382 @@
+/* Admin console stylesheet source.
+ *
+ * Compiled to static/css/app.min.css by `just css` (Tailwind v4 CLI +
+ * basecoat-css). The generated file is checked in so `cargo build` never
+ * needs a JS toolchain — rerun `just css` after changing UI classes.
+ */
+
+@import "tailwindcss";
+@import "basecoat-css";
+
+/* Utility classes are scanned out of the admin console Rust sources. */
+@source "../src/admin";
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* KronosDB design tokens, exposed as Tailwind color utilities (k-*). */
+  --color-k-base: var(--c-base);
+  --color-k-surface: var(--c-surface);
+  --color-k-elevated: var(--c-elevated);
+  --color-k-overlay: var(--c-overlay);
+  --color-k-hover: var(--c-hover);
+  --color-k-border: var(--c-border);
+  --color-k-subtle: var(--c-subtle);
+  --color-k-text: var(--c-text);
+  --color-k-text2: var(--c-text2);
+  --color-k-muted: var(--c-muted);
+  --color-k-inv: var(--c-inv);
+  --color-k-gold: var(--c-gold);
+  --color-k-gold-d: var(--c-gold-dim);
+  --color-k-blue: var(--c-blue);
+  --color-k-blue-d: var(--c-blue-dim);
+  --color-k-amber: var(--c-amber);
+  --color-k-amber-d: var(--c-amber-dim);
+  --color-k-red: var(--c-red);
+  --color-k-red-d: var(--c-red-dim);
+  --color-k-teal: var(--c-teal);
+  --color-k-teal-d: var(--c-teal-dim);
+}
+
+/* ── Self-hosted fonts ─────────────────────────────────────────── */
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("/static/fonts/outfit-300.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/outfit-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/outfit-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/outfit-600.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/static/fonts/outfit-700.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-600.woff2") format("woff2");
+}
+
+/* ── KronosDB theme tokens ─────────────────────────────────────── */
+
+:root {
+  --c-base: #08080b;
+  --c-surface: #0d0d11;
+  --c-elevated: #131318;
+  --c-overlay: #1a1a21;
+  --c-hover: #1f1f28;
+  --c-border: #232330;
+  --c-subtle: #191922;
+  --c-text: #e9e9ec;
+  --c-text2: #86868f;
+  --c-muted: #4e4e58;
+  --c-inv: #08080b;
+  --c-gold: #c8a44e;
+  --c-gold-dim: rgba(200, 164, 78, 0.12);
+  --c-blue: #6b8fd4;
+  --c-blue-dim: rgba(107, 143, 212, 0.1);
+  --c-amber: #fbbf24;
+  --c-amber-dim: rgba(251, 191, 36, 0.1);
+  --c-red: #f87171;
+  --c-red-dim: rgba(248, 113, 113, 0.1);
+  --c-teal: #5eead4;
+  --c-teal-dim: rgba(94, 234, 212, 0.08);
+  --chart-op: 0.4;
+  --chart-hop: 0.8;
+}
+
+[data-theme="light"] {
+  --c-base: #f5f4f1;
+  --c-surface: #ffffff;
+  --c-elevated: #f9f8f6;
+  --c-overlay: #eeece8;
+  --c-hover: #f0eeea;
+  --c-border: #d8d5ce;
+  --c-subtle: #e5e2db;
+  --c-text: #1a1917;
+  --c-text2: #5c5a54;
+  --c-muted: #94918a;
+  --c-inv: #ffffff;
+  --c-gold: #9a7b2e;
+  --c-gold-dim: rgba(154, 123, 46, 0.1);
+  --c-blue: #4a6ba8;
+  --c-blue-dim: rgba(74, 107, 168, 0.08);
+  --c-amber: #b88a0a;
+  --c-amber-dim: rgba(184, 138, 10, 0.1);
+  --c-red: #d94444;
+  --c-red-dim: rgba(217, 68, 68, 0.08);
+  --c-teal: #2a9d8f;
+  --c-teal-dim: rgba(42, 157, 143, 0.08);
+  --chart-op: 0.35;
+  --chart-hop: 0.7;
+}
+
+/* ── Basecoat re-skin: map shadcn-style component variables onto the
+ *    KronosDB tokens. Both themes come for free because the k-vars flip
+ *    with [data-theme]. Declared after the import so it wins by order. ── */
+
+:root,
+[data-theme="light"] {
+  --radius: 0.4375rem; /* radius-md = 5px, matching the existing corners */
+  --background: var(--c-base);
+  --foreground: var(--c-text);
+  --card: var(--c-surface);
+  --card-foreground: var(--c-text);
+  --popover: var(--c-surface);
+  --popover-foreground: var(--c-text);
+  --primary: var(--c-gold);
+  --primary-foreground: var(--c-inv);
+  --secondary: var(--c-elevated);
+  --secondary-foreground: var(--c-text);
+  --muted: var(--c-overlay);
+  --muted-foreground: var(--c-text2);
+  --accent: var(--c-hover);
+  --accent-foreground: var(--c-text);
+  --destructive: var(--c-red);
+  --border: var(--c-border);
+  --input: var(--c-border);
+  --ring: var(--c-gold);
+  --sidebar: var(--c-surface);
+  --sidebar-foreground: var(--c-text);
+  --sidebar-primary: var(--c-gold);
+  --sidebar-primary-foreground: var(--c-inv);
+  --sidebar-accent: var(--c-hover);
+  --sidebar-accent-foreground: var(--c-text);
+  --sidebar-border: var(--c-subtle);
+  --sidebar-ring: var(--c-gold);
+  --scrollbar-thumb: var(--c-border);
+  --scrollbar-width: 0.3125rem;
+  --scrollbar-sm-width: 0.3125rem;
+}
+
+/* ── Console chrome (moved from the old inline THEME_CSS) ──────── */
+
+/* Layered as components so Tailwind utilities (text-right, !text-k-text, …)
+ * override these element-level defaults — unlayered CSS would beat every
+ * layered utility regardless of specificity. */
+@layer components {
+
+::selection {
+  background: rgba(200, 164, 78, 0.3);
+  color: #fff;
+}
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--c-border);
+  border-radius: 3px;
+}
+
+table {
+  width: 100%;
+  border-spacing: 0;
+}
+thead {
+  background: var(--c-elevated);
+  box-shadow: inset 0 -1px 0 var(--c-border);
+}
+thead th {
+  text-align: left;
+  padding: 9px 18px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--c-muted);
+  white-space: nowrap;
+}
+tbody td {
+  padding: 9px 18px;
+  border-bottom: 1px solid var(--c-subtle);
+  color: var(--c-text2);
+  vertical-align: middle;
+}
+tbody tr {
+  transition: background 0.08s;
+}
+tbody tr:hover {
+  background: var(--c-hover);
+}
+tbody tr:last-child td {
+  border-bottom: none;
+}
+tbody td:first-child {
+  border-left: 2px solid transparent;
+}
+tbody tr:hover td:first-child {
+  border-left-color: var(--c-gold);
+}
+
+.chart-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  flex: 1;
+  min-height: 80px;
+  padding: 14px 18px;
+  background-image: linear-gradient(var(--c-subtle) 1px, transparent 1px);
+  background-size: 100% 25%;
+}
+.chart-bar {
+  flex: 1;
+  border-radius: 2px 2px 0 0;
+  background: var(--c-gold);
+  opacity: var(--chart-op);
+  min-width: 3px;
+  transition: opacity 0.15s;
+}
+.chart-bar:hover {
+  opacity: var(--chart-hop);
+}
+.chart-bar.blue {
+  background: var(--c-blue);
+}
+
+@keyframes pulse-flow {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+.pulse-bar {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--c-gold) 30%,
+    rgba(200, 164, 78, 0.2) 50%,
+    var(--c-gold) 70%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: pulse-flow 6s linear infinite;
+  opacity: 0.3;
+}
+.brand-pulse {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--c-gold), transparent);
+  opacity: 0.3;
+}
+
+.chart-tooltip {
+  position: fixed;
+  pointer-events: none;
+  z-index: 60;
+  display: none;
+  transform: translateX(-50%);
+}
+.chart-tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: var(--c-border);
+}
+
+.dd-arrow::after {
+  content: "";
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 4px solid var(--c-muted);
+  transition: transform 0.15s;
+}
+.ctx-dropdown.open .dd-arrow::after {
+  transform: translateY(-50%) rotate(180deg);
+}
+
+.icon-sun {
+  display: block;
+}
+.icon-moon {
+  display: none;
+}
+[data-theme="light"] .icon-sun {
+  display: none;
+}
+[data-theme="light"] .icon-moon {
+  display: block;
+}
+[data-theme="light"] .panel {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 2px;
+}
+
+.master-item.active {
+  background: var(--c-gold-dim);
+  border-left: 2px solid var(--c-gold);
+}
+.master-item.active .mi-name {
+  color: var(--c-gold);
+}
+
+body,
+.panel,
+thead {
+  transition:
+    background-color 0.2s,
+    border-color 0.2s,
+    color 0.2s;
+}
+.htmx-settling {
+  opacity: 0.6;
+}
+}

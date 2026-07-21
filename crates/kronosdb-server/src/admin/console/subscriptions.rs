@@ -15,14 +15,14 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 
     let content = format!(
         r##"<div class="flex flex-col flex-1" id="page-subscriptions">
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col flex-1">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold flex items-center gap-2">
+  <div class="card flex-1 gap-0 py-0 overflow-hidden">
+    <header class="py-3 border-b border-k-subtle">
+      <h2 class="text-[13px] font-semibold flex items-center gap-2">
         Subscription Queries
-        <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{count}</span>
-      </div>
-    </div>
-    <div class="flex-1 overflow-auto" hx-get="/fragments/subscriptions" hx-trigger="every 5s" hx-swap="innerHTML">
+        <span class="badge font-mono" data-variant="secondary">{count}</span>
+      </h2>
+    </header>
+    <div class="flex-1 overflow-auto" hx-get="/fragments/subscriptions" hx-trigger="every 10s, sse-subscriptions from:body" hx-swap="morph:innerHTML">
       {table}
     </div>
   </div>
@@ -58,13 +58,13 @@ fn subscriptions_table_html(subs: &[SubscriptionInfo]) -> String {
     for sub in subs {
         let duration = format_duration_connected(sub.since_opened);
         rows.push_str(&format!(
-            r#"<tr>
+            r#"<tr id="sub-{id}">
   <td class="font-mono text-xs !text-k-text">{id}</td>
   <td class="font-mono text-xs">{query}</td>
   <td class="text-xs">{component} <span class="text-k-muted">({client})</span></td>
   <td class="text-xs">{handler}</td>
   <td class="text-right text-xs text-k-muted">{duration}</td>
-  <td class="text-right"><span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-mono bg-k-teal-d text-k-teal">active</span></td>
+  <td class="text-right"><span class="badge font-mono bg-k-teal-d text-k-teal" data-variant="secondary">active</span></td>
 </tr>"#,
             id = html_escape(&sub.subscription_id),
             query = html_escape(&sub.query_name),

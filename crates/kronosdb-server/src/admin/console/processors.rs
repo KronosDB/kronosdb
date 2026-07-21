@@ -13,14 +13,14 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 
     let content = format!(
         r##"<div class="flex flex-col flex-1" id="page-processors">
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col flex-1">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold flex items-center gap-2">
+  <div class="card flex-1 gap-0 py-0 overflow-hidden">
+    <header class="py-3 border-b border-k-subtle">
+      <h2 class="text-[13px] font-semibold flex items-center gap-2">
         Event Processors
-        <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{count}</span>
-      </div>
-    </div>
-    <div class="flex-1 overflow-auto" hx-get="/fragments/processors" hx-trigger="every 5s" hx-swap="innerHTML">
+        <span class="badge font-mono" data-variant="secondary">{count}</span>
+      </h2>
+    </header>
+    <div class="flex-1 overflow-auto" hx-get="/fragments/processors" hx-trigger="every 60s, sse-processors from:body" hx-swap="morph:innerHTML">
       {table}
     </div>
   </div>
@@ -83,8 +83,8 @@ fn processors_table_html(views: &[ProcessorView], _state: &AdminState) -> String
         let any_replaying = all_segments.iter().any(|s| s.replaying);
         let any_seg_error = all_segments.iter().any(|s| !s.error_state.is_empty());
 
-        // Status badge.
-        let (status_text, status_color) = if !any_running {
+        // Status badge tint (k-* utilities override the badge variant colors).
+        let (status_text, status_tint) = if !any_running {
             ("stopped", "text-k-muted bg-k-overlay")
         } else if any_error || any_seg_error {
             ("error", "text-k-red bg-k-red-d")
@@ -121,8 +121,8 @@ fn processors_table_html(views: &[ProcessorView], _state: &AdminState) -> String
         // Instances count.
         let instances_count = view.instances.len();
 
-        // Mode badge.
-        let mode_color = match view.mode.as_str() {
+        // Mode badge tint.
+        let mode_tint = match view.mode.as_str() {
             "Tracking" => "text-k-blue bg-k-blue-d",
             "Subscribing" => "text-k-teal bg-k-teal-d",
             _ => "text-k-muted bg-k-overlay",
@@ -133,16 +133,16 @@ fn processors_table_html(views: &[ProcessorView], _state: &AdminState) -> String
             let name = html_escape(&view.processor_name);
             if any_running {
                 format!(
-                    r#"<div class="flex gap-1 justify-end">
-  <button class="px-2 py-0.5 rounded text-[11px] font-mono bg-k-overlay text-k-muted hover:text-k-text transition-colors" onclick="processorAction('{name}','pause')">pause</button>
-  <button class="px-2 py-0.5 rounded text-[11px] font-mono bg-k-overlay text-k-muted hover:text-k-text transition-colors" onclick="processorAction('{name}','split')">split</button>
-  <button class="px-2 py-0.5 rounded text-[11px] font-mono bg-k-overlay text-k-muted hover:text-k-text transition-colors" onclick="processorAction('{name}','merge')">merge</button>
+                    r#"<div class="flex gap-1.5 justify-end">
+  <button class="btn" data-variant="outline" data-size="sm" onclick="processorAction('{name}','pause')">Pause</button>
+  <button class="btn" data-variant="outline" data-size="sm" onclick="processorAction('{name}','split')">Split</button>
+  <button class="btn" data-variant="outline" data-size="sm" onclick="processorAction('{name}','merge')">Merge</button>
 </div>"#
                 )
             } else {
                 format!(
-                    r#"<div class="flex gap-1 justify-end">
-  <button class="px-2 py-0.5 rounded text-[11px] font-mono bg-k-overlay text-k-muted hover:text-k-text transition-colors" onclick="processorAction('{name}','start')">start</button>
+                    r#"<div class="flex gap-1.5 justify-end">
+  <button class="btn" data-variant="primary" data-size="sm" onclick="processorAction('{name}','start')">Start</button>
 </div>"#
                 )
             }
@@ -151,14 +151,14 @@ fn processors_table_html(views: &[ProcessorView], _state: &AdminState) -> String
         };
 
         rows.push_str(&format!(
-            r#"<tr>
+            r#"<tr id="proc-{name}">
   <td>
     <div class="font-mono text-xs !text-k-text">{name}</div>
-    <div class="text-[11px] text-k-muted mt-0.5">{instances} instance{inst_s} · <span class="inline-flex items-center px-1.5 py-px rounded text-[10px] font-mono {mode_color}">{mode}</span></div>
+    <div class="text-[11px] text-k-muted mt-0.5">{instances} instance{inst_s} · <span class="badge font-mono {mode_tint}" data-variant="secondary">{mode}</span></div>
   </td>
   <td class="text-xs font-mono">{segments}</td>
   <td class="text-right font-mono text-xs">{position}</td>
-  <td class="text-right"><span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-mono {status_color}">{status}</span></td>
+  <td class="text-right"><span class="badge font-mono {status_tint}" data-variant="secondary">{status}</span></td>
   <td class="text-right text-xs">{actions}</td>
 </tr>"#,
             name = html_escape(&view.processor_name),
