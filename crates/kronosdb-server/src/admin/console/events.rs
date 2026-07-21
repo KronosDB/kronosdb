@@ -54,40 +54,37 @@ pub async fn page(
     let tag_val = params.tag.as_deref().unwrap_or("");
 
     let content = format!(
-        r##"<div class="flex flex-col flex-1" id="page-events">
+        r##"<div class="flex flex-col flex-1 gap-4" id="page-events">
   <!-- Filter toolbar -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden mb-4">
-    <div class="flex items-center gap-2.5 px-[18px] py-2.5 flex-wrap">
-      <span class="text-[11px] font-medium text-k-muted uppercase tracking-[0.5px]">Filter</span>
+  <div class="card" data-size="sm">
+    <section class="flex items-center gap-3 flex-wrap">
+      <label class="label text-[11px] uppercase tracking-wider text-k-muted" for="ev-name">Filter</label>
       <input id="ev-name" type="text" value="{name_val}" placeholder="Event name..."
-        class="font-mono text-xs px-3 py-[7px] border border-k-border rounded-[5px] bg-k-base text-k-text outline-none focus:border-k-gold w-[180px]">
+        class="input font-mono text-xs flex-none w-[180px]">
       <input id="ev-tag" type="text" value="{tag_val}" placeholder="tag=value"
-        class="font-mono text-xs px-3 py-[7px] border border-k-border rounded-[5px] bg-k-base text-k-text outline-none focus:border-k-gold w-[180px]">
+        class="input font-mono text-xs flex-none w-[180px]">
       <div class="w-px h-5 bg-k-border mx-1"></div>
-      <span class="text-[11px] font-medium text-k-muted uppercase tracking-[0.5px]">Context</span>
-      <select id="ev-context"
-        class="font-mono text-xs px-2.5 py-[7px] border border-k-border rounded-[5px] bg-k-base text-k-text outline-none cursor-pointer">
+      <label class="label text-[11px] uppercase tracking-wider text-k-muted" for="ev-context">Context</label>
+      <select id="ev-context" class="select font-mono text-xs">
         {context_options}
       </select>
       <div class="w-px h-5 bg-k-border mx-1"></div>
-      <span class="text-[11px] font-medium text-k-muted uppercase tracking-[0.5px]">Limit</span>
-      <select id="ev-limit"
-        class="font-mono text-xs px-2.5 py-[7px] border border-k-border rounded-[5px] bg-k-base text-k-text outline-none cursor-pointer">
+      <label class="label text-[11px] uppercase tracking-wider text-k-muted" for="ev-limit">Limit</label>
+      <select id="ev-limit" class="select font-mono text-xs">
         <option value="25">25</option>
         <option value="50" selected>50</option>
         <option value="100">100</option>
         <option value="200">200</option>
       </select>
-      <button onclick="evQuery(1)"
-        class="ml-auto flex items-center gap-1.5 text-xs font-medium px-3 py-[7px] rounded-[5px] bg-k-gold text-k-inv border border-k-gold cursor-pointer hover:brightness-110 transition-all">
+      <button onclick="evQuery(1)" class="btn ml-auto" data-variant="primary">
         <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7" cy="7" r="5"/><line x1="11" y1="11" x2="14" y2="14"/></svg>
         Query
       </button>
-    </div>
+    </section>
   </div>
 
   <!-- Events results -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col flex-1">
+  <div class="card gap-0 py-0 overflow-hidden flex-1">
     <div id="events-results" class="flex-1 overflow-auto">
       {initial_html}
     </div>
@@ -183,13 +180,13 @@ function evSetLive(on) {{
     clearInterval(evLiveInterval);
     evLiveInterval = null;
   }}
+  // The button is a Basecoat outline btn; the teal utilities override its
+  // variant styling while live is on.
   if (on) {{
     btn.classList.add('bg-k-teal', 'text-k-inv', 'border-k-teal');
-    btn.classList.remove('bg-k-overlay', 'text-k-text2', 'border-k-border');
     btn.textContent = 'Live ●';
   }} else {{
     btn.classList.remove('bg-k-teal', 'text-k-inv', 'border-k-teal');
-    btn.classList.add('bg-k-overlay', 'text-k-text2', 'border-k-border');
     btn.textContent = 'Live';
   }}
 }}
@@ -359,12 +356,13 @@ fn events_table_html(
     for event in events {
         // Main row (collapsed view)
         rows.push_str(&format!(
-            r#"<tr class="cursor-pointer hover:bg-k-hover transition-colors" onclick="evToggle(this)">
+            r#"<tr id="ev-{pos}" class="cursor-pointer hover:bg-k-hover transition-colors" onclick="evToggle(this)">
   <td class="font-mono text-xs text-k-gold font-medium">{position}</td>
   <td class="font-mono text-xs !text-k-text">{name}</td>
   <td class="font-mono text-xs text-k-text2">{version}</td>
   <td class="font-mono text-xs text-k-text2">{timestamp}</td>
 </tr>"#,
+            pos = event.position.0,
             position = format_number(event.position.0),
             name = html_escape(&event.name),
             version = html_escape(&event.version),
@@ -381,7 +379,7 @@ fn events_table_html(
                     let pretty = serde_json::to_string_pretty(&val)
                         .unwrap_or_else(|_| String::from_utf8_lossy(&event.payload).into_owned());
                     format!(
-                        r#"<div class="bg-k-elevated border border-k-subtle rounded-[5px] p-3.5 font-mono text-xs leading-relaxed overflow-auto max-h-[400px] whitespace-pre-wrap break-words">{}</div>"#,
+                        r#"<div class="bg-k-elevated border border-k-subtle rounded-md p-3.5 font-mono text-xs leading-relaxed overflow-auto max-h-[400px] whitespace-pre-wrap break-words">{}</div>"#,
                         html_escape_content(&pretty),
                     )
                 }
@@ -402,7 +400,7 @@ fn events_table_html(
             let val = String::from_utf8_lossy(&tag.value);
             let tag_filter = format!("{}={}", key, val);
             tags_html.push_str(&format!(
-                r#"<span class="inline-flex items-center gap-0.5 px-2 py-0.5 bg-k-overlay rounded text-[11px] font-mono text-k-text2 cursor-pointer hover:bg-k-hover transition-colors" onclick="event.stopPropagation();evAddFilter('tag','{filter}')"><span class="text-k-gold">{key}</span><span class="text-k-muted">=</span>{val}</span>"#,
+                r#"<span class="badge font-mono text-k-text2 gap-0.5 cursor-pointer hover:bg-k-hover transition-colors" data-variant="secondary" onclick="event.stopPropagation();evAddFilter('tag','{filter}')"><span class="text-k-gold">{key}</span><span class="text-k-muted">=</span>{val}</span>"#,
                 filter = html_escape(&tag_filter),
                 key = html_escape(&key),
                 val = html_escape(&val),
@@ -432,7 +430,7 @@ fn events_table_html(
         );
 
         rows.push_str(&format!(
-            r#"<tr class="ev-detail hidden"><td colspan="4" class="!p-0">
+            r#"<tr id="ev-{pos}-detail" class="ev-detail hidden"><td colspan="4" class="!p-0">
   <div class="flex flex-wrap gap-4 p-4 bg-k-base">
     <div class="min-w-[220px]" style="flex: 0 0 280px;">
       <div class="text-[11px] font-semibold uppercase tracking-wider text-k-muted mb-2.5">Event Details</div>
@@ -458,6 +456,7 @@ fn events_table_html(
     </div>
   </div>
 </td></tr>"#,
+            pos = event.position.0,
             payload = payload_html,
             position = format_number(event.position.0),
             identifier = html_escape(&event.identifier),
@@ -476,7 +475,7 @@ fn events_table_html(
         // Previous
         if current_page > 1 {
             pages.push_str(&format!(
-                r#"<button onclick="evPage({})" class="px-2.5 py-1 rounded text-xs font-mono bg-k-overlay text-k-text2 hover:bg-k-hover hover:text-k-text transition-colors cursor-pointer">&larr; Newer</button>"#,
+                r#"<button onclick="evPage({})" class="btn font-mono" data-variant="ghost" data-size="xs">&larr; Newer</button>"#,
                 current_page - 1,
             ));
         }
@@ -487,11 +486,11 @@ fn events_table_html(
         for p in start..=end {
             if p == current_page {
                 pages.push_str(&format!(
-                    r#"<span class="px-2.5 py-1 rounded text-xs font-mono bg-k-gold-d text-k-gold">{p}</span>"#
+                    r#"<span class="btn font-mono bg-k-gold-d text-k-gold pointer-events-none" data-variant="ghost" data-size="xs">{p}</span>"#
                 ));
             } else {
                 pages.push_str(&format!(
-                    r#"<button onclick="evPage({p})" class="px-2.5 py-1 rounded text-xs font-mono bg-k-overlay text-k-text2 hover:bg-k-hover hover:text-k-text transition-colors cursor-pointer">{p}</button>"#
+                    r#"<button onclick="evPage({p})" class="btn font-mono" data-variant="ghost" data-size="xs">{p}</button>"#
                 ));
             }
         }
@@ -499,7 +498,7 @@ fn events_table_html(
         // Next
         if current_page < total_pages {
             pages.push_str(&format!(
-                r#"<button onclick="evPage({})" class="px-2.5 py-1 rounded text-xs font-mono bg-k-overlay text-k-text2 hover:bg-k-hover hover:text-k-text transition-colors cursor-pointer">Older &rarr;</button>"#,
+                r#"<button onclick="evPage({})" class="btn font-mono" data-variant="ghost" data-size="xs">Older &rarr;</button>"#,
                 current_page + 1,
             ));
         }
@@ -524,8 +523,7 @@ fn events_table_html(
   <div class="text-[11px] text-k-muted font-mono">
     Showing {count} events ({first_pos} – {last_pos}) · {total} total · page {current_page} of {total_pages}
   </div>
-  <button id="ev-live-btn" onclick="evToggleLive()"
-    class="px-2.5 py-1 rounded text-[11px] font-medium border bg-k-overlay text-k-text2 border-k-border cursor-pointer hover:bg-k-hover transition-colors">
+  <button id="ev-live-btn" onclick="evToggleLive()" class="btn" data-variant="outline" data-size="xs">
     Live
   </button>
 </div>

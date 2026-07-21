@@ -1,7 +1,9 @@
+pub mod activity;
 pub mod auth;
 mod console;
 pub mod layout;
 mod metrics;
+mod sse;
 
 use std::sync::Arc;
 
@@ -37,6 +39,7 @@ pub struct AdminState {
     pub channel_registry: Arc<ClientChannelRegistry>,
     pub started_at: std::time::Instant,
     pub auth: Arc<auth::AuthRuntime>,
+    pub activity: Arc<activity::ActivityTracker>,
 }
 
 /// Starts the admin HTTP server on the configured address.
@@ -44,6 +47,9 @@ pub async fn start_admin_server(
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = state.config.admin_listen_addr;
+
+    // Once-a-minute head sampler feeding the 24h activity chart.
+    activity::spawn_sampler(state.clone());
 
     let app = Router::new()
         // Page routes — each served by its console module
@@ -106,8 +112,16 @@ pub async fn start_admin_server(
             get(console::commands::commands_fragment),
         )
         .route(
+            "/fragments/commands/detail",
+            get(console::commands::command_detail_fragment),
+        )
+        .route(
             "/fragments/queries",
             get(console::queries::queries_fragment),
+        )
+        .route(
+            "/fragments/queries/detail",
+            get(console::queries::query_detail_fragment),
         )
         .route(
             "/fragments/subscriptions",
@@ -118,6 +132,8 @@ pub async fn start_admin_server(
             get(console::processors::processors_fragment),
         )
         .route("/fragments/context-chart", get(context_chart_fragment))
+        // Server-sent events: per-topic change ticks replacing fragment polling.
+        .route("/sse", get(sse::sse_handler))
         // Processor control API
         .route("/api/processors/{name}/pause", post(processor_action_pause))
         .route("/api/processors/{name}/start", post(processor_action_start))
@@ -125,7 +141,8 @@ pub async fn start_admin_server(
         .route("/api/processors/{name}/merge", post(processor_action_merge))
         .route("/static/{*path}", get(static_handler))
         // Auth gate for everything above except /health, /ready, /metrics,
-        // and /auth/* (see auth::is_public). Mode comes from [admin.auth].
+        // /auth/*, and /static/* (see auth::is_public). Mode comes from
+        // [admin.auth].
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -162,33 +179,21 @@ async fn ready(State(state): State<AdminState>) -> (StatusCode, &'static str) {
 
 // Context chart fragment — returns bar chart HTML for the overview
 async fn context_chart_fragment(State(state): State<AdminState>) -> axum::response::Html<String> {
-    let contexts = state.contexts.list_contexts();
+    let totals = state.activity.hourly_totals();
+    let max = totals.iter().copied().max().unwrap_or(0).max(1);
+
     let mut bars = String::new();
-    let mut max_events: u64 = 1;
-
-    let mut data = Vec::new();
-    for name in &contexts {
-        let events = match state.contexts.get_context(name) {
-            Ok(store) => {
-                let h = store.head().0;
-                let t = store.tail().0;
-                h.saturating_sub(t)
-            }
-            Err(_) => 0,
+    for (i, count) in totals.iter().enumerate() {
+        let pct = (*count as f64 / max as f64 * 100.0) as u32;
+        let hours_ago = activity::HOURS - 1 - i;
+        let label = if hours_ago == 0 {
+            "this hour".to_string()
+        } else {
+            format!("{hours_ago}h ago")
         };
-        if events > max_events {
-            max_events = events;
-        }
-        data.push((name.clone(), events));
-    }
-
-    for (name, events) in &data {
-        let pct = (*events as f64 / max_events as f64 * 100.0) as u32;
         bars.push_str(&format!(
-            r#"<div class="chart-bar" style="height:{pct}%" data-events="{events}" data-time="{name}" onmouseenter="showTooltip(this,this.dataset.time,this.dataset.events+' events')" onmouseleave="hideTooltip()"></div>"#,
-            pct = pct.max(2),
-            events = events,
-            name = layout::html_escape(name),
+            r#"<div class="chart-bar" style="height:{pct}%" data-events="{count}" data-time="{label}" onmouseenter="showTooltip(this,this.dataset.time,this.dataset.events+' events')" onmouseleave="hideTooltip()"></div>"#,
+            pct = if *count == 0 { 2 } else { pct.max(4) },
         ));
     }
 

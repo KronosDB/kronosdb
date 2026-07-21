@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::response::Html;
 
 use crate::admin::AdminState;
-use crate::admin::layout::{self, format_number, format_uptime, html_escape};
+use crate::admin::layout::{self, format_number, format_uptime};
 
 // ── Page handler ───────────────────────────────────────────────────
 
@@ -12,7 +12,7 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     let clients = state.client_registry.list_client_details();
 
     let mut total_events: u64 = 0;
-    let mut context_rows = String::new();
+    let mut ctx_data = Vec::new();
     for name in &contexts {
         let (head, tail) = match state.contexts.get_context(name) {
             Ok(store) => (store.head().0, store.tail().0),
@@ -20,78 +20,57 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
         };
         let events = head.saturating_sub(tail);
         total_events += events;
-        context_rows.push_str(&format!(
-            r#"<tr><td class="font-mono text-xs !text-k-text">{name}</td><td class="font-mono text-xs text-right">{events}</td><td class="font-mono text-xs text-right">{head}</td></tr>"#,
-            name = html_escape(name),
-            events = format_number(events),
-            head = format_number(head),
-        ));
+        ctx_data.push((name.clone(), events, head));
     }
 
-    let mut client_rows = String::new();
-    for c in clients.iter().take(4) {
-        let hb = layout::format_uptime_short(c.since_last_heartbeat);
-        let connected = layout::format_duration_connected(c.connected_since);
-        let (badge_cls, badge_text) = if c.since_last_heartbeat.as_secs() > 15 {
-            ("bg-k-amber-d text-k-amber", "slow")
-        } else {
-            ("bg-k-gold-d text-k-gold", "ok")
-        };
-        let dot_cls = if c.since_last_heartbeat.as_secs() > 15 {
-            "bg-k-amber"
-        } else {
-            "bg-k-gold"
-        };
-        client_rows.push_str(&format!(
-            r#"<tr><td class="!text-k-text">{component}</td><td class="font-mono text-xs">{client_id}</td><td class="font-mono text-xs">{connected}</td><td class="font-mono text-xs">{hb}</td><td><span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-mono {badge_cls}"><span class="w-1.5 h-1.5 rounded-full {dot_cls}"></span>{badge_text}</span></td></tr>"#,
-            component = html_escape(&c.component_name.0),
-            client_id = html_escape(&c.client_id.0),
-        ));
-    }
+    // Reuse the fragment renderers so the initial page markup is identical
+    // to what the SSE-driven refreshes morph in.
+    let context_table = super::contexts::contexts_table_mini_html(&ctx_data);
+    let client_table = super::clients::clients_table_mini_html(&clients);
 
     let content = format!(
-        r##"<div class="flex flex-col flex-1" id="page-overview">
+        r##"<div class="flex flex-col flex-1 gap-4" id="page-overview">
   <!-- Stat cards -->
-  <div class="flex flex-wrap gap-3 mb-6" hx-get="/fragments/stats" hx-trigger="every 5s" hx-swap="innerHTML">
+  <div class="flex flex-wrap gap-3" hx-get="/fragments/stats" hx-trigger="every 10s, sse-stats from:body" hx-swap="morph:innerHTML">
     {stats}
   </div>
 
   <!-- Chart + Contexts -->
-  <div class="flex gap-4 flex-1 min-h-0 mb-4">
-    <div class="flex-1 bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col">
-      <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-        <div class="text-[13px] font-semibold flex items-center gap-2">Event Activity <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">24h</span></div>
-      </div>
-      <div class="chart-bars" id="activity-chart" hx-get="/fragments/context-chart" hx-trigger="every 30s" hx-swap="innerHTML"></div>
-      <div class="flex justify-between px-[18px] pb-3 text-[11px] text-k-muted font-mono"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>now</span></div>
+  <div class="flex gap-4 flex-1 min-h-0">
+    <div class="card flex-1 gap-0 py-0 overflow-hidden">
+      <header class="items-center border-b border-k-subtle px-[18px] py-3">
+        <h2 class="text-[13px] font-semibold flex items-center gap-2">Event Activity <span class="badge font-mono text-k-text2" data-variant="secondary">24h</span></h2>
+      </header>
+      <div class="chart-bars" id="activity-chart" hx-get="/fragments/context-chart" hx-trigger="load, every 30s, sse-events from:body" hx-swap="morph:innerHTML"></div>
+      <div class="flex justify-between px-[18px] pb-3 text-[11px] text-k-muted font-mono"><span>24h ago</span><span>18h</span><span>12h</span><span>6h</span><span>now</span></div>
     </div>
-    <div class="flex-1 bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col">
-      <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-        <div class="text-[13px] font-semibold flex items-center gap-2">Contexts <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{ctx_count}</span></div>
-        <a href="/contexts" class="text-xs font-medium px-2.5 py-1 rounded-[5px] border border-k-border bg-k-elevated text-k-text2 no-underline hover:bg-k-hover hover:text-k-text transition-colors">View All</a>
-      </div>
-      <div class="flex-1 overflow-auto" hx-get="/fragments/contexts-mini" hx-trigger="every 5s" hx-swap="innerHTML">
-        <table><thead><tr><th>Name</th><th class="text-right">Events</th><th class="text-right">Head</th></tr></thead><tbody>{context_rows}</tbody></table>
+    <div class="card flex-1 gap-0 py-0 overflow-hidden">
+      <header class="items-center border-b border-k-subtle px-[18px] py-3">
+        <h2 class="text-[13px] font-semibold flex items-center gap-2">Contexts <span class="badge font-mono text-k-text2" data-variant="secondary">{ctx_count}</span></h2>
+        <a href="/contexts" class="btn card-action" data-variant="outline" data-size="xs">View All</a>
+      </header>
+      <div class="flex-1 overflow-auto" hx-get="/fragments/contexts-mini" hx-trigger="every 60s, sse-contexts from:body" hx-swap="morph:innerHTML">
+        {context_table}
       </div>
     </div>
   </div>
 
   <!-- Connected Clients -->
-  <div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden flex flex-col shrink-0">
-    <div class="flex items-center justify-between px-[18px] py-3 border-b border-k-subtle">
-      <div class="text-[13px] font-semibold flex items-center gap-2">Connected Clients <span class="font-mono text-[11px] bg-k-overlay px-[7px] py-px rounded-full text-k-text2">{client_count}</span></div>
-      <a href="/clients" class="text-xs font-medium px-2.5 py-1 rounded-[5px] border border-k-border bg-k-elevated text-k-text2 no-underline hover:bg-k-hover hover:text-k-text transition-colors">View All</a>
-    </div>
-    <div hx-get="/fragments/clients-mini" hx-trigger="every 5s" hx-swap="innerHTML">
-      <table><thead><tr><th>Component</th><th>Client ID</th><th>Connected</th><th>Heartbeat</th><th>Status</th></tr></thead><tbody>{client_rows}</tbody></table>
+  <div class="card gap-0 py-0 overflow-hidden shrink-0">
+    <header class="items-center border-b border-k-subtle px-[18px] py-3">
+      <h2 class="text-[13px] font-semibold flex items-center gap-2">Connected Clients <span class="badge font-mono text-k-text2" data-variant="secondary">{client_count}</span></h2>
+      <a href="/clients" class="btn card-action" data-variant="outline" data-size="xs">View All</a>
+    </header>
+    <div hx-get="/fragments/clients-mini" hx-trigger="every 10s, sse-clients from:body" hx-swap="morph:innerHTML">
+      {client_table}
     </div>
   </div>
 </div>"##,
         stats = stats_cards_html(uptime, contexts.len(), total_events, clients.len()),
         ctx_count = contexts.len(),
-        context_rows = context_rows,
+        context_table = context_table,
         client_count = clients.len(),
-        client_rows = client_rows,
+        client_table = client_table,
     );
 
     Html(layout::layout(
@@ -135,26 +114,38 @@ fn stats_cards_html(
     total_events: u64,
     client_count: usize,
 ) -> String {
-    let card = |color: &str, label: &str, value: &str, detail: &str| -> String {
+    // `accent` must be a literal Tailwind class so the CSS build's source
+    // scan picks it up (no interpolated class names).
+    let tile = |id: &str, accent: &str, label: &str, value: &str| -> String {
         format!(
-            r#"<div class="flex-1 min-w-[170px] bg-k-surface border border-k-subtle rounded-lg p-4 pl-5 relative flex flex-col overflow-hidden before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] before:bg-k-{color} before:rounded-l-lg"><div class="text-[11px] font-medium uppercase tracking-wider text-k-muted mb-2">{label}</div><div class="font-mono text-[26px] font-semibold leading-none">{value}</div><div class="font-mono text-[11px] text-k-muted mt-auto pt-2">{detail}</div></div>"#,
+            r#"<div id="stat-{id}" class="card relative flex-1 min-w-[170px] gap-0 before:absolute before:left-0 before:top-0 before:bottom-0 before:w-[3px] {accent}" data-size="sm"><section class="flex flex-col gap-2"><div class="text-[11px] font-medium uppercase tracking-wider text-k-muted">{label}</div><div class="font-mono text-[26px] font-semibold leading-none">{value}</div></section></div>"#,
         )
     };
 
     let mut html = String::new();
-    html.push_str(&card("gold", "Uptime", &format_uptime(uptime), ""));
-    html.push_str(&card("blue", "Contexts", &ctx_count.to_string(), ""));
-    html.push_str(&card(
-        "gold",
+    html.push_str(&tile(
+        "uptime",
+        "before:bg-k-gold",
+        "Uptime",
+        &format_uptime(uptime),
+    ));
+    html.push_str(&tile(
+        "contexts",
+        "before:bg-k-blue",
+        "Contexts",
+        &ctx_count.to_string(),
+    ));
+    html.push_str(&tile(
+        "events",
+        "before:bg-k-gold",
         "Total Events",
         &format_number(total_events),
-        "",
     ));
-    html.push_str(&card(
-        "blue",
+    html.push_str(&tile(
+        "clients",
+        "before:bg-k-blue",
         "Connected Clients",
         &client_count.to_string(),
-        "",
     ));
     html
 }

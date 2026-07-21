@@ -1,0 +1,10 @@
+{
+  "name": "kronosdb-admin-css",
+  "private": true,
+  "description": "CSS build for the embedded admin console. Run `just css` after changing admin UI classes.",
+  "dependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "basecoat-css": "^1.0.2",
+    "tailwindcss": "^4.1.0"
+  }
+}

@@ -11,22 +11,22 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 
     let setting = |key: &str, val: &str| -> String {
         format!(
-            r#"<div class="flex justify-between items-center py-2 border-b border-k-subtle last:border-0">
+            r#"<div class="flex justify-between items-center gap-3 py-2 border-b border-k-subtle last:border-0">
   <span class="text-xs text-k-muted">{key}</span>
-  <span class="font-mono text-xs !text-k-text">{val}</span>
+  <span class="font-mono text-xs !text-k-text text-right">{val}</span>
 </div>"#,
         )
     };
 
     let card = |title: &str, rows: &str| -> String {
         format!(
-            r#"<div class="bg-k-surface border border-k-subtle rounded-lg overflow-hidden">
-  <div class="px-[18px] py-3 border-b border-k-subtle">
-    <div class="text-[13px] font-semibold">{title}</div>
-  </div>
-  <div class="px-[18px] py-1">
+            r#"<div class="card gap-0 py-0 overflow-hidden">
+  <header class="py-3 border-b border-k-subtle">
+    <h2 class="text-[13px] font-semibold">{title}</h2>
+  </header>
+  <section class="py-1">
     {rows}
-  </div>
+  </section>
 </div>"#,
         )
     };

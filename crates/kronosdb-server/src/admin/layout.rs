@@ -141,38 +141,13 @@ pub fn layout(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>KronosDB — {title}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%2308080b'/><path d='M4 3v10M4 8l5-5M4.5 8.5 10 13' stroke='%23c8a44e' stroke-width='1.8' fill='none' stroke-linecap='round'/></svg>">
+<link rel="stylesheet" href="/static/css/app.min.css">
 <script src="/static/js/htmx.min.js"></script>
-<script src="/static/js/tailwind.js"></script>
-<script>
-tailwind.config = {{
-  theme: {{
-    extend: {{
-      colors: {{
-        k: {{
-          base: 'var(--c-base)', surface: 'var(--c-surface)', elevated: 'var(--c-elevated)',
-          overlay: 'var(--c-overlay)', hover: 'var(--c-hover)',
-          border: 'var(--c-border)', subtle: 'var(--c-subtle)',
-          text: 'var(--c-text)', text2: 'var(--c-text2)', muted: 'var(--c-muted)', inv: 'var(--c-inv)',
-          gold: 'var(--c-gold)', 'gold-d': 'var(--c-gold-dim)',
-          blue: 'var(--c-blue)', 'blue-d': 'var(--c-blue-dim)',
-          amber: 'var(--c-amber)', 'amber-d': 'var(--c-amber-dim)',
-          red: 'var(--c-red)', 'red-d': 'var(--c-red-dim)',
-          teal: 'var(--c-teal)', 'teal-d': 'var(--c-teal-dim)',
-        }}
-      }},
-      fontFamily: {{
-        sans: ['Outfit', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'SF Mono', 'monospace'],
-      }},
-    }}
-  }}
-}}
-</script>
-{THEME_CSS}
+<script src="/static/js/idiomorph-ext.min.js"></script>
+<script src="/static/js/basecoat.min.js" defer></script>
 </head>
-<body class="bg-k-base text-k-text font-sans text-sm antialiased overflow-hidden h-screen">
+<body class="bg-k-base text-k-text font-sans text-sm antialiased overflow-hidden h-screen" hx-ext="morph">
 <div class="flex h-screen">
 
   <!-- Sidebar -->
@@ -197,10 +172,10 @@ tailwind.config = {{
       <div class="flex items-center gap-4">
         <div class="flex items-center gap-2">
           <span class="text-[11px] font-medium uppercase tracking-[0.5px] text-k-muted">Context</span>
-          <div class="dropdown relative inline-flex" id="context-dropdown">
+          <div class="ctx-dropdown relative inline-flex" id="context-dropdown">
             <div class="dd-arrow font-mono text-xs px-2.5 py-1.5 pr-7 border border-k-border rounded-[5px] bg-k-base text-k-text cursor-pointer whitespace-nowrap relative select-none" onclick="toggleDropdown('context-dropdown')">All Contexts</div>
-            <div class="dropdown-menu hidden absolute top-[calc(100%+4px)] right-0 min-w-full bg-k-surface border border-k-border rounded-[5px] shadow-lg z-50 p-1 max-h-60 overflow-y-auto">
-              <button class="dropdown-item active block w-full px-2.5 py-1.5 font-mono text-xs text-k-gold bg-k-gold-d border-none rounded-[3px] cursor-pointer text-left whitespace-nowrap" onclick="selectContext('all','All Contexts')">All Contexts</button>
+            <div class="ctx-dropdown-menu hidden absolute top-[calc(100%+4px)] right-0 min-w-full bg-k-surface border border-k-border rounded-[5px] shadow-lg z-50 p-1 max-h-60 overflow-y-auto">
+              <button class="ctx-dropdown-item active block w-full px-2.5 py-1.5 font-mono text-xs text-k-gold bg-k-gold-d border-none rounded-[3px] cursor-pointer text-left whitespace-nowrap" onclick="selectContext('all','All Contexts')">All Contexts</button>
               {context_options}
             </div>
           </div>
@@ -235,7 +210,6 @@ tailwind.config = {{
         node_name = html_escape(node_name),
         version = env!("CARGO_PKG_VERSION"),
         content = content,
-        THEME_CSS = THEME_CSS,
         SHARED_JS = SHARED_JS,
     )
 }
@@ -302,7 +276,7 @@ fn context_dropdown_items(contexts: &[String]) -> String {
         .iter()
         .map(|c| {
             format!(
-                r#"<button class="dropdown-item block w-full px-2.5 py-1.5 font-mono text-xs text-k-text2 bg-transparent border-none rounded-[3px] cursor-pointer text-left whitespace-nowrap hover:bg-k-hover hover:text-k-text transition-colors" onclick="selectContext('{c}','{c}')">{c}</button>"#,
+                r#"<button class="ctx-dropdown-item block w-full px-2.5 py-1.5 font-mono text-xs text-k-text2 bg-transparent border-none rounded-[3px] cursor-pointer text-left whitespace-nowrap hover:bg-k-hover hover:text-k-text transition-colors" onclick="selectContext('{c}','{c}')">{c}</button>"#,
                 c = html_escape(c),
             )
         })
@@ -327,68 +301,6 @@ const ICON_PROCESSORS: &str =
 const ICON_CLUSTER: &str = r#"<circle cx="10" cy="4" r="2.5"/><circle cx="4" cy="16" r="2.5"/><circle cx="16" cy="16" r="2.5"/><line x1="10" y1="6.5" x2="4" y2="13.5"/><line x1="10" y1="6.5" x2="16" y2="13.5"/><line x1="6.5" y1="16" x2="13.5" y2="16"/>"#;
 const ICON_SETTINGS: &str = r#"<circle cx="10" cy="10" r="2.5"/><path d="M10 2v2.5M10 15.5V18M2 10h2.5M15.5 10H18M4.2 4.2l1.8 1.8M14 14l1.8 1.8M15.8 4.2L14 6M6 14l-1.8 1.8"/>"#;
 
-// ── Inline CSS (theme variables + minimal custom styles) ───────────
-
-const THEME_CSS: &str = r##"<style>
-:root {
-  --c-base:#08080b;--c-surface:#0d0d11;--c-elevated:#131318;
-  --c-overlay:#1a1a21;--c-hover:#1f1f28;
-  --c-border:#232330;--c-subtle:#191922;
-  --c-text:#e9e9ec;--c-text2:#86868f;--c-muted:#4e4e58;--c-inv:#08080b;
-  --c-gold:#c8a44e;--c-gold-dim:rgba(200,164,78,0.12);
-  --c-blue:#6b8fd4;--c-blue-dim:rgba(107,143,212,0.10);
-  --c-amber:#fbbf24;--c-amber-dim:rgba(251,191,36,0.10);
-  --c-red:#f87171;--c-red-dim:rgba(248,113,113,0.10);
-  --c-teal:#5eead4;--c-teal-dim:rgba(94,234,212,0.08);
-  --chart-op:0.4;--chart-hop:0.8;
-}
-[data-theme="light"] {
-  --c-base:#f5f4f1;--c-surface:#ffffff;--c-elevated:#f9f8f6;
-  --c-overlay:#eeece8;--c-hover:#f0eeea;
-  --c-border:#d8d5ce;--c-subtle:#e5e2db;
-  --c-text:#1a1917;--c-text2:#5c5a54;--c-muted:#94918a;--c-inv:#ffffff;
-  --c-gold:#9a7b2e;--c-gold-dim:rgba(154,123,46,0.10);
-  --c-blue:#4a6ba8;--c-blue-dim:rgba(74,107,168,0.08);
-  --c-amber:#b88a0a;--c-amber-dim:rgba(184,138,10,0.10);
-  --c-red:#d94444;--c-red-dim:rgba(217,68,68,0.08);
-  --c-teal:#2a9d8f;--c-teal-dim:rgba(42,157,143,0.08);
-  --chart-op:0.35;--chart-hop:0.7;
-}
-::selection{background:rgba(200,164,78,0.3);color:#fff}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--c-border);border-radius:3px}
-table{width:100%;border-spacing:0}
-thead{background:var(--c-elevated);box-shadow:inset 0 -1px 0 var(--c-border)}
-thead th{text-align:left;padding:9px 18px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px;color:var(--c-muted);white-space:nowrap}
-tbody td{padding:9px 18px;border-bottom:1px solid var(--c-subtle);color:var(--c-text2);vertical-align:middle}
-tbody tr{transition:background 0.08s}
-tbody tr:hover{background:var(--c-hover)}
-tbody tr:last-child td{border-bottom:none}
-tbody td:first-child{border-left:2px solid transparent}
-tbody tr:hover td:first-child{border-left-color:var(--c-gold)}
-.chart-bars{display:flex;align-items:flex-end;gap:3px;flex:1;min-height:80px;padding:14px 18px;background-image:linear-gradient(var(--c-subtle) 1px,transparent 1px);background-size:100% 25%}
-.chart-bar{flex:1;border-radius:2px 2px 0 0;background:var(--c-gold);opacity:var(--chart-op);min-width:3px;transition:opacity 0.15s}
-.chart-bar:hover{opacity:var(--chart-hop)}
-.chart-bar.blue{background:var(--c-blue)}
-@keyframes pulse-flow{0%{background-position:200% 0}100%{background-position:-200% 0}}
-.pulse-bar{background:linear-gradient(90deg,transparent 0%,var(--c-gold) 30%,rgba(200,164,78,0.2) 50%,var(--c-gold) 70%,transparent 100%);background-size:200% 100%;animation:pulse-flow 6s linear infinite;opacity:0.3}
-.brand-pulse{height:1px;background:linear-gradient(90deg,transparent,var(--c-gold),transparent);opacity:0.3}
-.dd-arrow::after{content:'';position:absolute;right:10px;top:50%;transform:translateY(-50%);width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:4px solid var(--c-muted);transition:transform 0.15s}
-.dropdown.open .dd-arrow::after{transform:translateY(-50%) rotate(180deg)}
-.chart-tooltip{position:fixed;pointer-events:none;z-index:60;display:none;transform:translateX(-50%)}
-.chart-tooltip::after{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);border:5px solid transparent;border-top-color:var(--c-border)}
-.icon-sun{display:block}.icon-moon{display:none}
-[data-theme="light"] .icon-sun{display:none}
-[data-theme="light"] .icon-moon{display:block}
-[data-theme="light"] .panel{box-shadow:0 1px 3px rgba(0,0,0,0.06)}
-.progress-fill{height:100%;border-radius:2px}
-.master-item.active{background:var(--c-gold-dim);border-left:2px solid var(--c-gold)}
-.master-item.active .mi-name{color:var(--c-gold)}
-body,.panel,thead{transition:background-color 0.2s,border-color 0.2s,color 0.2s}
-.htmx-settling{opacity:0.6}
-</style>"##;
-
 // ── Shared JS ──────────────────────────────────────────────────────
 
 const SHARED_JS: &str = r##"<script>
@@ -397,9 +309,9 @@ function toggleTheme(){var t=document.documentElement.getAttribute('data-theme')
 (function(){if(localStorage.getItem('kronosdb-theme')==='light')document.documentElement.setAttribute('data-theme','light')})();
 
 // Dropdowns
-function toggleDropdown(id){var dd=document.getElementById(id),w=dd.classList.contains('open');document.querySelectorAll('.dropdown.open').forEach(function(d){d.classList.remove('open');d.querySelector('.dropdown-menu').classList.add('hidden')});if(!w){dd.classList.add('open');dd.querySelector('.dropdown-menu').classList.remove('hidden')}}
-function selectContext(val,label){var dd=document.getElementById('context-dropdown');dd.querySelector('.dd-arrow').textContent=label;dd.querySelectorAll('.dropdown-item').forEach(function(i){var a=i.textContent.trim()===label;i.className='dropdown-item block w-full px-2.5 py-1.5 font-mono text-xs border-none rounded-[3px] cursor-pointer text-left whitespace-nowrap transition-colors '+(a?'active text-k-gold bg-k-gold-d':'text-k-text2 bg-transparent hover:bg-k-hover hover:text-k-text')});dd.classList.remove('open');dd.querySelector('.dropdown-menu').classList.add('hidden')}
-document.addEventListener('click',function(e){if(!e.target.closest('.dropdown')){document.querySelectorAll('.dropdown.open').forEach(function(d){d.classList.remove('open');d.querySelector('.dropdown-menu').classList.add('hidden')})}});
+function toggleDropdown(id){var dd=document.getElementById(id),w=dd.classList.contains('open');document.querySelectorAll('.ctx-dropdown.open').forEach(function(d){d.classList.remove('open');d.querySelector('.ctx-dropdown-menu').classList.add('hidden')});if(!w){dd.classList.add('open');dd.querySelector('.ctx-dropdown-menu').classList.remove('hidden')}}
+function selectContext(val,label){var dd=document.getElementById('context-dropdown');dd.querySelector('.dd-arrow').textContent=label;dd.querySelectorAll('.ctx-dropdown-item').forEach(function(i){var a=i.textContent.trim()===label;i.className='ctx-dropdown-item block w-full px-2.5 py-1.5 font-mono text-xs border-none rounded-[3px] cursor-pointer text-left whitespace-nowrap transition-colors '+(a?'active text-k-gold bg-k-gold-d':'text-k-text2 bg-transparent hover:bg-k-hover hover:text-k-text')});dd.classList.remove('open');dd.querySelector('.ctx-dropdown-menu').classList.add('hidden')}
+document.addEventListener('click',function(e){if(!e.target.closest('.ctx-dropdown')){document.querySelectorAll('.ctx-dropdown.open').forEach(function(d){d.classList.remove('open');d.querySelector('.ctx-dropdown-menu').classList.add('hidden')})}});
 
 // Chart tooltip
 var tooltip=document.getElementById('chart-tooltip');
@@ -408,4 +320,11 @@ function hideTooltip(){tooltip.style.display='none'}
 
 // Master-detail
 function selectMaster(el){el.parentElement.querySelectorAll('.master-item').forEach(function(i){i.classList.remove('active');var n=i.querySelector('.mi-name');if(n){n.classList.remove('text-k-gold');n.classList.add('text-k-text')}});el.classList.add('active');var nm=el.querySelector('.mi-name');if(nm){nm.classList.add('text-k-gold');nm.classList.remove('text-k-text')}}
+
+// SSE change ticks -> htmx triggers. Fragments listen with
+// hx-trigger="sse-<topic> from:body"; EventSource reconnects on its own.
+(function(){
+  var es=new EventSource('/sse');
+  es.addEventListener('tick',function(e){htmx.trigger(document.body,'sse-'+e.data)});
+})();
 </script>"##;

@@ -6,25 +6,26 @@
 //!
 //! Modes (config `[admin.auth] mode`, `--admin-auth-mode`, `KRONOSDB_ADMIN_AUTH_MODE`):
 //! - `none`  — no auth (default; a prominent warning is logged at startup).
-//! - `token` — static bearer token, constant-time compared. Browsers may
-//!   bootstrap a session with `?access_token=<token>` once; APIs send
-//!   `Authorization: Bearer <token>`.
+//! - `token` — static bearer token, constant-time compared. Browsers sign
+//!   in through a login form at `/auth/login` (or bootstrap a session with
+//!   `?access_token=<token>` once); APIs send `Authorization: Bearer <token>`.
 //! - `oidc`  — OpenID Connect against an "admin realm" (Keycloak, Auth0,
 //!   Entra ID, ...). The console uses the authorization-code flow with PKCE
 //!   and an HMAC-signed session cookie; API calls send a JWT access token as
 //!   `Authorization: Bearer`, validated against the IdP's JWKS (issuer, exp,
 //!   optional audience, optional required role).
 //!
-//! `/health`, `/ready`, `/metrics`, and `/auth/*` are always reachable —
-//! probes and scrapers don't authenticate.
+//! `/health`, `/ready`, `/metrics`, `/auth/*`, and `/static/*` are always
+//! reachable — probes and scrapers don't authenticate, and the login page
+//! needs its stylesheet before a session exists.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Form, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum_extra::extract::cookie::{Cookie, Key, SameSite, SignedCookieJar};
 use base64::Engine as _;
@@ -38,6 +39,7 @@ use tokio::sync::RwLock;
 use crate::config::{AdminAuthConfig, AdminAuthMode, OidcConfig};
 
 use super::AdminState;
+use super::layout::html_escape;
 
 const SESSION_COOKIE: &str = "kdb_session";
 const FLOW_COOKIE: &str = "kdb_auth_flow";
@@ -138,6 +140,17 @@ fn session_cookie(auth: &AuthRuntime, session: &Session) -> SignedCookieJar {
     )
 }
 
+/// The synthetic session established by a valid static token (either the
+/// `?access_token=` bootstrap or the login form).
+fn token_admin_session(auth: &AuthRuntime) -> Session {
+    Session {
+        sub: "token-admin".into(),
+        name: "token-admin".into(),
+        roles: vec![],
+        exp: now_unix() + auth.session_ttl.as_secs(),
+    }
+}
+
 fn clear_session(auth: &AuthRuntime, headers: &HeaderMap) -> SignedCookieJar {
     // The jar must be built from the request so the session cookie exists as
     // an "original" — cookie-jar removal only emits a removal Set-Cookie for
@@ -149,7 +162,11 @@ fn clear_session(auth: &AuthRuntime, headers: &HeaderMap) -> SignedCookieJar {
 // ─────────────────────────── middleware ────────────────────────────
 
 fn is_public(path: &str) -> bool {
-    matches!(path, "/health" | "/ready" | "/metrics") || path.starts_with("/auth/")
+    matches!(path, "/health" | "/ready" | "/metrics")
+        || path.starts_with("/auth/")
+        // Static assets (css/js/fonts) — nothing sensitive, and the login
+        // page needs the stylesheet before any session exists.
+        || path.starts_with("/static/")
 }
 
 fn wants_html(headers: &HeaderMap) -> bool {
@@ -176,6 +193,25 @@ fn unauthorized(msg: &str) -> Response {
         .into_response()
 }
 
+/// Token-mode auth failure, shaped for the caller: htmx requests get a 401
+/// with `HX-Redirect` (htmx performs a full-page navigation to the login
+/// form), browser page loads are redirected to `/auth/login` with the
+/// original path as `rd`, and API clients keep the JSON 401.
+fn token_unauthorized(headers: &HeaderMap, original: &str, msg: &str) -> Response {
+    if headers.contains_key("hx-request") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("hx-redirect", "/auth/login")],
+            "unauthorized — redirecting to login",
+        )
+            .into_response();
+    }
+    if wants_html(headers) {
+        return Redirect::to(&format!("/auth/login?rd={}", urlencode(original))).into_response();
+    }
+    unauthorized(msg)
+}
+
 pub async fn require_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     let auth = &state.auth;
     let path = req.uri().path().to_string();
@@ -191,28 +227,27 @@ pub async fn require_auth(State(state): State<AdminState>, req: Request, next: N
 
     match auth.mode {
         AdminAuthMode::Token => {
+            let original = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
             if let Some(token) = bearer(req.headers()) {
                 if auth.token_matches(token) {
                     return next.run(req).await;
                 }
-                return unauthorized("invalid token");
+                return token_unauthorized(req.headers(), &original, "invalid token");
             }
             // Browser bootstrap: GET ...?access_token=<token> once, then a
             // session cookie carries the rest of the visit.
             if let Some(presented) = query_param(req.uri().query(), "access_token") {
                 if auth.token_matches(&presented) {
-                    let session = Session {
-                        sub: "token-admin".into(),
-                        name: "token-admin".into(),
-                        roles: vec![],
-                        exp: now_unix() + auth.session_ttl.as_secs(),
-                    };
-                    let jar = session_cookie(auth, &session);
+                    let jar = session_cookie(auth, &token_admin_session(auth));
                     return (jar, Redirect::to(&path)).into_response();
                 }
-                return unauthorized("invalid token");
+                return token_unauthorized(req.headers(), &original, "invalid token");
             }
-            unauthorized("missing bearer token")
+            token_unauthorized(req.headers(), &original, "missing bearer token")
         }
         AdminAuthMode::Oidc => {
             let Some(oidc) = &auth.oidc else {
@@ -241,7 +276,7 @@ pub async fn require_auth(State(state): State<AdminState>, req: Request, next: N
 /// Registers the `/auth/*` routes on the admin router.
 pub fn routes() -> Router<AdminState> {
     Router::new()
-        .route("/auth/login", get(login))
+        .route("/auth/login", get(login).post(login_post))
         .route("/auth/callback", get(callback))
         .route("/auth/logout", get(logout))
 }
@@ -445,6 +480,16 @@ fn redirect_url(cfg: &OidcConfig, headers: &HeaderMap) -> String {
 #[derive(Deserialize)]
 struct LoginParams {
     rd: Option<String>,
+    err: Option<String>,
+}
+
+/// Open-redirect guard: only local absolute paths survive; anything else
+/// (absolute URLs, protocol-relative `//host`) collapses to `/`.
+fn sanitize_rd(rd: Option<&str>) -> String {
+    match rd {
+        Some(rd) if rd.starts_with('/') && !rd.starts_with("//") => rd.to_string(),
+        _ => "/".to_string(),
+    }
 }
 
 async fn login(
@@ -452,6 +497,90 @@ async fn login(
     Query(params): Query<LoginParams>,
     headers: HeaderMap,
 ) -> Response {
+    let rd = sanitize_rd(params.rd.as_deref());
+    match state.auth.mode {
+        AdminAuthMode::None => Redirect::to("/").into_response(),
+        AdminAuthMode::Token => token_login_page(&rd, params.err.as_deref() == Some("1")),
+        AdminAuthMode::Oidc => oidc_login(&state, rd, &headers).await,
+    }
+}
+
+/// Standalone login form for token mode. Deliberately NOT the sidebar
+/// layout — it must render without any authenticated data.
+fn token_login_page(rd: &str, show_error: bool) -> Response {
+    let error = if show_error {
+        r#"<div class="alert" data-variant="destructive"><h2>Invalid access token</h2></div>"#
+    } else {
+        ""
+    };
+    let rd_attr = html_escape(rd);
+    Html(format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KronosDB — Sign in</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%2308080b'/><path d='M4 3v10M4 8l5-5M4.5 8.5 10 13' stroke='%23c8a44e' stroke-width='1.8' fill='none' stroke-linecap='round'/></svg>">
+<link rel="stylesheet" href="/static/css/app.min.css">
+<script>(function(){{if(localStorage.getItem('kronosdb-theme')==='light')document.documentElement.setAttribute('data-theme','light')}})();</script>
+</head>
+<body class="bg-k-base text-k-text font-sans text-sm antialiased">
+<div class="min-h-screen flex flex-col items-center justify-center gap-6 p-6">
+  <div class="font-semibold text-xl tracking-[3px] uppercase text-k-text">Kronos<span class="text-k-gold">DB</span></div>
+  <div class="w-full max-w-sm flex flex-col gap-4">
+    {error}
+    <div class="card">
+      <header>
+        <h2 class="text-[13px] font-semibold">Sign in</h2>
+        <p class="text-xs text-k-muted">Enter the admin access token to continue.</p>
+      </header>
+      <section>
+        <form method="post" action="/auth/login" class="flex flex-col gap-4">
+          <input type="hidden" name="rd" value="{rd_attr}">
+          <input type="password" name="token" class="input" autofocus autocomplete="current-password" placeholder="Access token">
+          <button type="submit" class="btn w-full" data-variant="primary">Sign in</button>
+        </form>
+      </section>
+    </div>
+  </div>
+</div>
+</body>
+</html>"##
+    ))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    #[serde(default)]
+    token: String,
+    rd: Option<String>,
+}
+
+async fn login_post(State(state): State<AdminState>, Form(form): Form<LoginForm>) -> Response {
+    let auth = &state.auth;
+    if auth.mode != AdminAuthMode::Token {
+        return Redirect::to("/auth/login").into_response();
+    }
+    token_login_attempt(auth, &form.token, form.rd.as_deref())
+}
+
+/// Core of `POST /auth/login`: on a matching token, establish the same
+/// session the `?access_token=` bootstrap builds and follow `rd`; otherwise
+/// bounce back to the form. Split from the handler so it is unit-testable.
+fn token_login_attempt(auth: &AuthRuntime, token: &str, rd: Option<&str>) -> Response {
+    let rd = sanitize_rd(rd);
+    if auth.token_matches(token) {
+        tracing::info!("admin console login (token)");
+        let jar = session_cookie(auth, &token_admin_session(auth));
+        (jar, Redirect::to(&rd)).into_response()
+    } else {
+        Redirect::to(&format!("/auth/login?err=1&rd={}", urlencode(&rd))).into_response()
+    }
+}
+
+async fn oidc_login(state: &AdminState, rd: String, headers: &HeaderMap) -> Response {
     let auth = &state.auth;
     let Some(oidc) = &auth.oidc else {
         return unauthorized("oidc not configured");
@@ -461,11 +590,6 @@ async fn login(
         Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
     };
 
-    // Only ever redirect back to a local path — never an absolute URL.
-    let rd = params
-        .rd
-        .filter(|rd| rd.starts_with('/') && !rd.starts_with("//"))
-        .unwrap_or_else(|| "/".to_string());
     let flow = AuthFlow {
         state: random_urlsafe(24),
         nonce: random_urlsafe(24),
@@ -479,7 +603,7 @@ async fn login(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
         discovery.authorization_endpoint,
         urlencode(&oidc.cfg.client_id),
-        urlencode(&redirect_url(&oidc.cfg, &headers)),
+        urlencode(&redirect_url(&oidc.cfg, headers)),
         urlencode(&oidc.cfg.scopes.join(" ")),
         flow.state,
         flow.nonce,
@@ -758,5 +882,116 @@ mod tests {
         assert!(!auth.token_matches("correct-horsf"));
         assert!(!auth.token_matches("correct-hors"));
         assert!(!auth.token_matches(""));
+    }
+
+    fn token_auth() -> AuthRuntime {
+        AuthRuntime::new(&AdminAuthConfig {
+            mode: AdminAuthMode::Token,
+            token: Some("secret".into()),
+            oidc: None,
+        })
+    }
+
+    #[test]
+    fn public_paths() {
+        assert!(is_public("/health"));
+        assert!(is_public("/auth/login"));
+        assert!(is_public("/static/css/app.min.css"));
+        assert!(!is_public("/overview"));
+        assert!(!is_public("/api/contexts"));
+    }
+
+    #[test]
+    fn sanitize_rd_guards_open_redirects() {
+        assert_eq!(
+            sanitize_rd(Some("/events?ctx=default")),
+            "/events?ctx=default"
+        );
+        assert_eq!(sanitize_rd(Some("//evil.example")), "/");
+        assert_eq!(sanitize_rd(Some("https://evil.example")), "/");
+        assert_eq!(sanitize_rd(Some("")), "/");
+        assert_eq!(sanitize_rd(None), "/");
+    }
+
+    #[test]
+    fn token_failure_browser_redirects_to_login() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml".parse().unwrap(),
+        );
+        let resp = token_unauthorized(&headers, "/events?ctx=default", "missing bearer token");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/auth/login?rd=%2Fevents%3Fctx%3Ddefault"
+        );
+    }
+
+    #[test]
+    fn token_failure_htmx_gets_401_with_hx_redirect() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "text/html".parse().unwrap());
+        headers.insert("hx-request", "true".parse().unwrap());
+        let resp = token_unauthorized(&headers, "/fragments/stats", "missing bearer token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers().get("hx-redirect").unwrap(), "/auth/login");
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
+
+    #[test]
+    fn token_failure_api_keeps_json_401() {
+        let resp = token_unauthorized(&HeaderMap::new(), "/api/contexts", "missing bearer token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert!(resp.headers().get("hx-redirect").is_none());
+    }
+
+    #[test]
+    fn login_post_correct_token_sets_session_and_redirects() {
+        let auth = token_auth();
+        let resp = token_login_attempt(&auth, "secret", Some("/events?ctx=default"));
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/events?ctx=default"
+        );
+
+        // The Set-Cookie round-trips into a valid session.
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session cookie set")
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE}=")));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            set_cookie.split(';').next().unwrap().parse().unwrap(),
+        );
+        let session = read_session(&auth, &headers).expect("session valid");
+        assert_eq!(session.sub, "token-admin");
+    }
+
+    #[test]
+    fn login_post_wrong_token_redirects_with_err() {
+        let resp = token_login_attempt(&token_auth(), "wrong", Some("/events"));
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/auth/login?err=1&rd=%2Fevents"
+        );
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[test]
+    fn login_post_rejects_protocol_relative_rd() {
+        let resp = token_login_attempt(&token_auth(), "secret", Some("//evil.example"));
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/");
     }
 }
