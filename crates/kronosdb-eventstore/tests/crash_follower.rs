@@ -67,6 +67,7 @@ async fn run_one_iteration(iter: usize) {
                 peers: peers.clone(),
                 group_commit_ms: Some(2),
                 segment_size: None,
+                backup: None,
             })
             .expect("spawn node"),
         );
@@ -148,6 +149,7 @@ async fn run_one_iteration(iter: usize) {
         peers: peers.clone(),
         group_commit_ms: Some(2),
         segment_size: None,
+        backup: None,
     })
     .expect("respawn follower");
     wait_until_ready(

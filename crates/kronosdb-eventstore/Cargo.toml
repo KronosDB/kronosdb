@@ -34,6 +34,12 @@ bytes = "1"
 tracing = "0.1"
 fs2 = "0.4"
 
+# Tiered storage (ADR-0002): sealed-segment backup to object storage
+object_store = { version = "0.14", features = ["aws"] }
+url = "2"
+serde_json = "1"
+blake3 = "1"
+
 [build-dependencies]
 tonic-build = "0.13"
 

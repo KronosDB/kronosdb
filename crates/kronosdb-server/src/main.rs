@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = ServerConfig::parse()?;
+    }
 
     // Native segment quorum topology is required before contexts open: it
     // determines recovery's initial watermark (a clustered node may not treat
@@ -265,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel_registry: Arc::clone(&channel_registry),
         started_at: std::time::Instant::now(),
         auth: admin_auth,
+        activity: Arc::new(admin::activity::ActivityTracker::new()),
     };
     tokio::spawn(async move {
         if let Err(e) = admin::start_admin_server(admin_state).await {
@@ -484,6 +486,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
     cluster.start_replication()?;
+    if let Some(backup_url) = &config.backup_url {
+        cluster.start_backup(kronosdb_eventstore::tier::TierConfig {
+            url: backup_url.clone(),
+            interval: Duration::from_secs(config.backup_interval_secs),
+        })?;
+        info!(url = %backup_url, interval_secs = config.backup_interval_secs, "segment backup enabled");
+    }
     router
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;

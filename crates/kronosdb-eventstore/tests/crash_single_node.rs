@@ -57,6 +57,7 @@ async fn run_one_iteration(iter: usize) {
         peers: vec![],
         group_commit_ms: Some(2),
         segment_size: None,
+        backup: None,
     };
 
     // First boot: append under load, then kill the server.
