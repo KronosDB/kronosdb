@@ -58,6 +58,12 @@ pub struct StoreMetrics {
     pub sequential_scan_reads: AtomicU64,
 }
 
+impl Default for StoreMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StoreMetrics {
     pub fn new() -> Self {
         Self {
@@ -125,31 +131,11 @@ impl StoreMetrics {
     }
 
     #[inline]
-    pub fn record_index_cache_hit(&self) {
-        self.index_cache_hits.fetch_add(1, ORD);
-    }
-
-    #[inline]
-    pub fn record_index_cache_miss(&self) {
-        self.index_cache_misses.fetch_add(1, ORD);
-    }
-
-    #[inline]
     pub fn record_bloom_check(&self, rejected: bool) {
         self.bloom_checks.fetch_add(1, ORD);
         if rejected {
             self.bloom_rejections.fetch_add(1, ORD);
         }
-    }
-
-    #[inline]
-    pub fn record_mmap_cache_hit(&self) {
-        self.mmap_cache_hits.fetch_add(1, ORD);
-    }
-
-    #[inline]
-    pub fn record_mmap_cache_miss(&self) {
-        self.mmap_cache_misses.fetch_add(1, ORD);
     }
 
     #[inline]
@@ -188,65 +174,6 @@ pub struct MetricsSnapshot {
     pub segment_rotations: u64,
     pub direct_seek_reads: u64,
     pub sequential_scan_reads: u64,
-}
-
-impl MetricsSnapshot {
-    /// Average append latency in microseconds, or 0 if no appends.
-    pub fn avg_append_us(&self) -> u64 {
-        if self.appends == 0 {
-            0
-        } else {
-            self.append_duration_us / self.appends
-        }
-    }
-
-    /// Average source latency in microseconds, or 0 if no queries.
-    pub fn avg_source_us(&self) -> u64 {
-        if self.source_queries == 0 {
-            0
-        } else {
-            self.source_duration_us / self.source_queries
-        }
-    }
-
-    /// Index cache hit rate as a percentage (0.0 - 100.0).
-    pub fn index_cache_hit_rate(&self) -> f64 {
-        let total = self.index_cache_hits + self.index_cache_misses;
-        if total == 0 {
-            0.0
-        } else {
-            (self.index_cache_hits as f64 / total as f64) * 100.0
-        }
-    }
-
-    /// Bloom filter rejection rate as a percentage.
-    pub fn bloom_rejection_rate(&self) -> f64 {
-        if self.bloom_checks == 0 {
-            0.0
-        } else {
-            (self.bloom_rejections as f64 / self.bloom_checks as f64) * 100.0
-        }
-    }
-
-    /// Mmap cache hit rate as a percentage.
-    pub fn mmap_cache_hit_rate(&self) -> f64 {
-        let total = self.mmap_cache_hits + self.mmap_cache_misses;
-        if total == 0 {
-            0.0
-        } else {
-            (self.mmap_cache_hits as f64 / total as f64) * 100.0
-        }
-    }
-
-    /// Fraction of reads using direct seeks vs sequential scans.
-    pub fn direct_seek_rate(&self) -> f64 {
-        let total = self.direct_seek_reads + self.sequential_scan_reads;
-        if total == 0 {
-            0.0
-        } else {
-            (self.direct_seek_reads as f64 / total as f64) * 100.0
-        }
-    }
 }
 
 /// Utility for timing operations. Usage:

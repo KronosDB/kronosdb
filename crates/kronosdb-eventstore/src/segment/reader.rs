@@ -198,12 +198,13 @@ impl<'a> Iterator for SegmentIterator<'a> {
             // bound must read as end-of-data, not as corruption. The
             // position is the first field of an event payload and is written
             // in the same buffered write as the rest of the record.
-            if let Some(up_to) = self.up_to {
-                if flags::is_event(flags_byte) && payload.len() >= 8 {
-                    let position = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-                    if position >= up_to.0 {
-                        return None;
-                    }
+            if let Some(up_to) = self.up_to
+                && flags::is_event(flags_byte)
+                && payload.len() >= 8
+            {
+                let position = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                if position >= up_to.0 {
+                    return None;
                 }
             }
 
@@ -233,10 +234,10 @@ impl<'a> Iterator for SegmentIterator<'a> {
                 Ok((event, _)) => {
                     // Check position limit (redundant with the pre-CRC check
                     // above, kept as the authoritative post-deserialize bound).
-                    if let Some(up_to) = self.up_to {
-                        if event.position >= up_to {
-                            return None;
-                        }
+                    if let Some(up_to) = self.up_to
+                        && event.position >= up_to
+                    {
+                        return None;
                     }
                     return Some(Ok(event));
                 }
@@ -313,10 +314,10 @@ impl<'a> Iterator for OffsetTrackingIterator<'a> {
 
             match format::deserialize_event(payload) {
                 Ok((event, _)) => {
-                    if let Some(up_to) = self.up_to {
-                        if event.position >= up_to {
-                            return None;
-                        }
+                    if let Some(up_to) = self.up_to
+                        && event.position >= up_to
+                    {
+                        return None;
                     }
                     return Some((header_start, Ok(event)));
                 }

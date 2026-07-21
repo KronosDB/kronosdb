@@ -35,7 +35,6 @@ public class CommandChannel {
     private static final double REFILL_THRESHOLD = 0.25;
 
     private final CommandServiceGrpc.CommandServiceStub asyncStub;
-    private final CommandServiceGrpc.CommandServiceBlockingStub blockingStub;
     private final CommandServiceGrpc.CommandServiceFutureStub futureStub;
     private final String context;
 
@@ -56,11 +55,9 @@ public class CommandChannel {
     private volatile long currentPermitBatch = INITIAL_PERMITS;
 
     CommandChannel(CommandServiceGrpc.CommandServiceStub asyncStub,
-                   CommandServiceGrpc.CommandServiceBlockingStub blockingStub,
                    CommandServiceGrpc.CommandServiceFutureStub futureStub,
                    String context) {
         this.asyncStub = asyncStub;
-        this.blockingStub = blockingStub;
         this.futureStub = futureStub;
         this.context = context;
     }
@@ -156,8 +153,9 @@ public class CommandChannel {
                     .setInstructionId(instructionId)
                     .build());
 
-            // Time out the ack after 5 seconds so we don't block forever
-            ackFuture.orTimeout(5, TimeUnit.SECONDS)
+            // Time out the ack after 5 seconds so we don't block forever; the timeout
+            // is converted into a synthetic success ack so registration proceeds.
+            return ackFuture.orTimeout(5, TimeUnit.SECONDS)
                     .exceptionally(ex -> {
                         pendingAcks.remove(instructionId);
                         logger.debug("Ack timeout for command subscription [{}] instruction [{}].",
@@ -167,7 +165,6 @@ public class CommandChannel {
                                 .setSuccess(true)
                                 .build();
                     });
-            return ackFuture;
         }
         return null;
     }

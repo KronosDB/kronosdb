@@ -49,6 +49,28 @@ impl ServerHandle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// SIGSTOP the child: the process freezes mid-flight without dying. Its
+    /// sockets stay bound but nothing answers — the closest a process-level
+    /// harness gets to a "stale leader that doesn't know it was deposed".
+    pub fn pause(&self) {
+        signal_child(self.child.id(), "STOP");
+    }
+
+    /// SIGCONT a paused child. It resumes exactly where it froze, with its
+    /// pre-pause view of the cluster — and must discover it is stale.
+    pub fn resume(&self) {
+        signal_child(self.child.id(), "CONT");
+    }
+}
+
+fn signal_child(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("invoke kill");
+    assert!(status.success(), "kill -{signal} {pid} failed");
 }
 
 impl Drop for ServerHandle {
@@ -75,6 +97,9 @@ pub struct SpawnConfig {
     pub node_id: u64,
     pub peers: Vec<(u64, String)>, // (id, addr); empty = single-node
     pub group_commit_ms: Option<u64>,
+    /// Event segment cap in bytes. Small values let tests seal many segments
+    /// quickly (cold-join catch-up). `None` keeps the 256 MB default.
+    pub segment_size: Option<u64>,
 }
 
 /// Ensures the kronosdb-server binary is built once before any crash test runs it.
@@ -90,13 +115,20 @@ fn ensure_server_built() {
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap();
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .current_dir(workspace_root)
+    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cmd.current_dir(workspace_root)
         .arg("build")
         .arg("-p")
         .arg("kronosdb-server")
         .arg("--bin")
-        .arg("kronosdb-server")
+        .arg("kronosdb-server");
+    // Build the profile this test binary will spawn (KRONOSDB_SERVER_BIN
+    // points into target/<profile>/) — otherwise release-mode tests run a
+    // stale release server while only the debug binary gets rebuilt.
+    if !cfg!(debug_assertions) {
+        cmd.arg("--release");
+    }
+    let status = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -140,6 +172,9 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     }
     if let Some(ms) = cfg.group_commit_ms {
         cmd.env("KRONOSDB_GROUP_COMMIT_MS", ms.to_string());
+    }
+    if let Some(bytes) = cfg.segment_size {
+        cmd.env("KRONOSDB_SEGMENT_SIZE", bytes.to_string());
     }
 
     let child = cmd.spawn()?;
@@ -188,6 +223,44 @@ async fn admin_reports_ready(addr: SocketAddr) -> bool {
     stream.read_to_end(&mut response).await.is_ok() && response.starts_with(b"HTTP/1.1 200")
 }
 
+/// Minimal HTTP/1.1 JSON POST against a node's admin listener. Returns
+/// (status code, response body). Used for cluster-membership calls; the test
+/// servers run with admin auth `none`.
+pub async fn admin_post(
+    addr: SocketAddr,
+    path: &str,
+    json_body: &str,
+) -> Result<(u16, String), String> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{json_body}",
+        json_body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write {path}: {e}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|e| format!("read {path}: {e}"))?;
+    let response = String::from_utf8_lossy(&response);
+    let status: u16 = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("malformed response from {path}: {response}"))?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
 pub async fn wait_for_raft_leader(
     servers: &[ServerHandle],
     timeout: Duration,
@@ -196,21 +269,27 @@ pub async fn wait_for_raft_leader(
     loop {
         let mut leaders = Vec::new();
         for (index, server) in servers.iter().enumerate() {
-            let Ok(mut stream) = tokio::net::TcpStream::connect(server.admin).await else {
+            // Per-probe timeout: a SIGSTOP'd node accepts the TCP connection
+            // (kernel backlog) but never answers, which would otherwise hang
+            // the poll loop on read_to_end forever.
+            let probe = tokio::time::timeout(Duration::from_millis(500), async {
+                let mut stream = tokio::net::TcpStream::connect(server.admin).await.ok()?;
+                stream
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .ok()?;
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.ok()?;
+                Some(response)
+            });
+            let Ok(Some(response)) = probe.await else {
                 continue;
             };
-            if stream
-                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            let mut response = Vec::new();
-            if stream.read_to_end(&mut response).await.is_ok()
-                && String::from_utf8_lossy(&response)
-                    .lines()
-                    .any(|line| line == "kronosdb_raft_is_leader 1")
+            if String::from_utf8_lossy(&response)
+                .lines()
+                .any(|line| line == "kronosdb_raft_is_leader 1")
             {
                 leaders.push(index);
             }
@@ -334,17 +413,57 @@ pub fn read_ack_sidecar(path: &Path) -> std::io::Result<Vec<AckRecord>> {
     Ok(out)
 }
 
-/// Simple time-seeded xorshift — no rand crate needed. Returns integer in [lo, hi].
+/// Global xorshift state, seeded once per test-binary process. The seed is
+/// taken from `KRONOSDB_CRASH_SEED` when set (reproduction) or from the clock
+/// (exploration), and is printed either way so a CI failure can be replayed:
+///
+/// ```text
+/// KRONOSDB_CRASH_SEED=<seed> cargo test -p kronosdb-eventstore --test crash_three_node
+/// ```
+///
+/// OS scheduling still varies between runs, so a replay is best-effort — but
+/// the kill delays and any other harness randomness become identical.
+fn rng_state() -> &'static AtomicU64 {
+    static STATE: OnceLock<AtomicU64> = OnceLock::new();
+    STATE.get_or_init(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = match std::env::var("KRONOSDB_CRASH_SEED")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(seed) => {
+                eprintln!("crash harness: replaying KRONOSDB_CRASH_SEED={seed}");
+                seed
+            }
+            None => {
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
+                eprintln!("crash harness: seed={seed} (set KRONOSDB_CRASH_SEED={seed} to replay)");
+                seed
+            }
+        };
+        // xorshift must never be seeded with 0.
+        AtomicU64::new(seed.max(1))
+    })
+}
+
+/// Seeded xorshift — no rand crate needed. Returns integer in [lo, hi].
 pub fn rand_in(lo: u64, hi: u64) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut x = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    lo + (x % (hi - lo + 1))
+    use std::sync::atomic::Ordering;
+    let state = rng_state();
+    let mut x = state.load(Ordering::Relaxed);
+    loop {
+        let mut next = x;
+        next ^= next << 13;
+        next ^= next >> 7;
+        next ^= next << 17;
+        match state.compare_exchange_weak(x, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return lo + (next % (hi - lo + 1)),
+            Err(actual) => x = actual,
+        }
+    }
 }
 
 /// Raw CRC scan result for one segment file.

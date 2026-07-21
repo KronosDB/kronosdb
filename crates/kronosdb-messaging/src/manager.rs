@@ -60,26 +60,6 @@ impl MessagingManager {
         names
     }
 
-    /// Returns aggregate stats across all contexts.
-    pub fn all_command_stats(&self) -> Vec<(String, usize)> {
-        let engines = self.engines.read();
-        let mut stats = Vec::new();
-        for engine in engines.values() {
-            stats.extend(engine.command_stats());
-        }
-        stats
-    }
-
-    /// Returns aggregate stats across all contexts.
-    pub fn all_query_stats(&self) -> Vec<(String, usize)> {
-        let engines = self.engines.read();
-        let mut stats = Vec::new();
-        for engine in engines.values() {
-            stats.extend(engine.query_stats());
-        }
-        stats
-    }
-
     /// Returns detailed command handler info + dispatch metrics, aggregated across all contexts.
     pub fn all_command_details(&self) -> Vec<MessageTypeDetail> {
         let engines = self.engines.read();
@@ -133,10 +113,10 @@ mod tests {
         );
 
         // Orders should have the handler.
-        assert_eq!(orders.command_stats().len(), 1);
+        assert_eq!(orders.command_details().len(), 1);
 
         // Payments should be empty.
-        assert_eq!(payments.command_stats().len(), 0);
+        assert_eq!(payments.command_details().len(), 0);
     }
 
     #[test]

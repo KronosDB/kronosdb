@@ -143,7 +143,7 @@ fn encode_forward_append(
             name: event.name,
             version: event.version,
             timestamp: event.timestamp,
-            payload: event.payload.into(),
+            payload: event.payload,
             metadata: event
                 .metadata
                 .into_iter()
@@ -153,8 +153,8 @@ fn encode_forward_append(
                 .tags
                 .into_iter()
                 .map(|tag| replication_proto::ForwardTag {
-                    key: tag.key.into(),
-                    value: tag.value.into(),
+                    key: tag.key,
+                    value: tag.value,
                 })
                 .collect(),
         })
@@ -173,8 +173,8 @@ fn encode_forward_append(
                         .tags
                         .into_iter()
                         .map(|tag| replication_proto::ForwardTag {
-                            key: tag.key.into(),
-                            value: tag.value.into(),
+                            key: tag.key,
+                            value: tag.value,
                         })
                         .collect(),
                 })
@@ -203,12 +203,19 @@ impl EventStore for NativeEngine {
                     message: "native append unavailable: context is not installed in the active leader epoch".into(),
                 });
             }
+            // The writer-lock section runs on the blocking pool (it holds a
+            // lock for microseconds); the durability wait is awaited here so
+            // no thread is pinned for the fsync duration.
             let engine = Arc::clone(&self.local_engine);
-            let result = tokio::task::spawn_blocking(move || engine.append(request))
+            let staged = tokio::task::spawn_blocking(move || engine.append_stage(request))
                 .await
                 .map_err(|error| Error::Corrupted {
                     message: format!("native append worker panicked: {error}"),
                 })?;
+            let result = match staged {
+                Ok(staged) => self.local_engine.append_finish_async(staged).await,
+                Err(error) => Err(error),
+            };
             if !self.control.is_local_writable(claim.epoch, claim.leader_id) {
                 return Err(Error::Corrupted {
                     message: "native append lost its leader fence before acknowledgement".into(),

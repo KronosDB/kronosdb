@@ -148,14 +148,13 @@ impl SnapshotStore {
         for entry in fs::read_dir(key_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "snap") {
-                if let Some(seq) = path
+            if path.extension().is_some_and(|ext| ext == "snap")
+                && let Some(seq) = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<i64>().ok())
-                {
-                    sequences.push(seq);
-                }
+            {
+                sequences.push(seq);
             }
         }
         sequences.sort();
@@ -225,26 +224,26 @@ fn read_snapshot(path: &Path) -> Result<Snapshot, Error> {
     }
     let mut cursor = 5;
 
-    let name_len = read_u16(&data, &mut cursor) as usize;
+    let name_len = read_u16(&data, &mut cursor)? as usize;
     let name = read_string(&data, &mut cursor, name_len)?;
 
-    let version_len = read_u16(&data, &mut cursor) as usize;
+    let version_len = read_u16(&data, &mut cursor)? as usize;
     let version = read_string(&data, &mut cursor, version_len)?;
 
-    let timestamp = read_i64(&data, &mut cursor);
+    let timestamp = read_i64(&data, &mut cursor)?;
 
-    let meta_count = read_u16(&data, &mut cursor) as usize;
+    let meta_count = read_u16(&data, &mut cursor)? as usize;
     let mut metadata = HashMap::with_capacity(meta_count);
     for _ in 0..meta_count {
-        let k_len = read_u16(&data, &mut cursor) as usize;
+        let k_len = read_u16(&data, &mut cursor)? as usize;
         let k = read_string(&data, &mut cursor, k_len)?;
-        let v_len = read_u16(&data, &mut cursor) as usize;
+        let v_len = read_u16(&data, &mut cursor)? as usize;
         let v = read_string(&data, &mut cursor, v_len)?;
         metadata.insert(k, v);
     }
 
-    let payload_len = read_u32(&data, &mut cursor) as usize;
-    let payload = data[cursor..cursor + payload_len].to_vec();
+    let payload_len = read_u32(&data, &mut cursor)? as usize;
+    let payload = take(&data, &mut cursor, payload_len)?.to_vec();
 
     Ok(Snapshot {
         name,
@@ -255,29 +254,47 @@ fn read_snapshot(path: &Path) -> Result<Snapshot, Error> {
     })
 }
 
-fn read_u16(data: &[u8], cursor: &mut usize) -> u16 {
-    let val = u16::from_le_bytes([data[*cursor], data[*cursor + 1]]);
-    *cursor += 2;
-    val
+/// Bounds-checked take: corrupt/truncated files must surface as
+/// `Error::Corrupted`, never as an out-of-range slice panic.
+fn take<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8], Error> {
+    let end = cursor.checked_add(len).filter(|&e| e <= data.len());
+    match end {
+        Some(end) => {
+            let slice = &data[*cursor..end];
+            *cursor = end;
+            Ok(slice)
+        }
+        None => Err(Error::Corrupted {
+            message: format!(
+                "snapshot file truncated: need {len} bytes at offset {cursor}, file is {} bytes",
+                data.len()
+            ),
+        }),
+    }
 }
 
-fn read_u32(data: &[u8], cursor: &mut usize) -> u32 {
-    let val = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().unwrap());
-    *cursor += 4;
-    val
+fn read_u16(data: &[u8], cursor: &mut usize) -> Result<u16, Error> {
+    Ok(u16::from_le_bytes(
+        take(data, cursor, 2)?.try_into().unwrap(),
+    ))
 }
 
-fn read_i64(data: &[u8], cursor: &mut usize) -> i64 {
-    let val = i64::from_le_bytes(data[*cursor..*cursor + 8].try_into().unwrap());
-    *cursor += 8;
-    val
+fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, Error> {
+    Ok(u32::from_le_bytes(
+        take(data, cursor, 4)?.try_into().unwrap(),
+    ))
+}
+
+fn read_i64(data: &[u8], cursor: &mut usize) -> Result<i64, Error> {
+    Ok(i64::from_le_bytes(
+        take(data, cursor, 8)?.try_into().unwrap(),
+    ))
 }
 
 fn read_string(data: &[u8], cursor: &mut usize, len: usize) -> Result<String, Error> {
-    let s = std::str::from_utf8(&data[*cursor..*cursor + len]).map_err(|e| Error::Corrupted {
+    let s = std::str::from_utf8(take(data, cursor, len)?).map_err(|e| Error::Corrupted {
         message: format!("invalid UTF-8 in snapshot: {e}"),
     })?;
-    *cursor += len;
     Ok(s.to_string())
 }
 

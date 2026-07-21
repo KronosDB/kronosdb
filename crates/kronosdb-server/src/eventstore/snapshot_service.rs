@@ -8,7 +8,6 @@ use kronosdb_eventstore::raft::cluster::ClusterManager;
 use kronosdb_eventstore::snapshot::{Snapshot, SnapshotStore};
 
 use crate::proto::kronosdb::snapshot as pb;
-use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer as GrpcSnapshotStoreServer;
 
 /// Default context when no `kronosdb-context` header is provided.
 const DEFAULT_CONTEXT: &str = "default";
@@ -26,10 +25,6 @@ impl SnapshotServiceImpl {
         Self { cluster }
     }
 
-    pub fn into_server(self) -> GrpcSnapshotStoreServer<Self> {
-        GrpcSnapshotStoreServer::new(self)
-    }
-
     fn extract_context<T>(request: &Request<T>) -> &str {
         request
             .metadata()
@@ -38,6 +33,8 @@ impl SnapshotServiceImpl {
             .unwrap_or(DEFAULT_CONTEXT)
     }
 
+    // tonic's `Status` fixes the large error type.
+    #[allow(clippy::result_large_err)]
     fn get_store(&self, context_name: &str) -> Result<Arc<SnapshotStore>, Status> {
         self.cluster
             .context_manager()

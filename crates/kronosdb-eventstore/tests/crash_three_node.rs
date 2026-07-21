@@ -67,6 +67,7 @@ async fn run_one_iteration(iter: usize) {
             node_id: (i + 1) as u64,
             peers: peers_str.clone(),
             group_commit_ms: Some(2),
+            segment_size: None,
         };
         srvs.push(spawn_server(&cfg).expect("spawn node"));
     }
@@ -240,9 +241,8 @@ async fn writer_loop(
             condition,
             events: vec![tagged],
         };
-        let stream = tokio_stream::iter(vec![req]);
         let out = tokio::select! {
-            res = client.append(stream) => res,
+            res = client.append(req) => res,
             _ = kill_rx.changed() => return,
         };
         match out {
@@ -293,6 +293,7 @@ async fn post_restart_verify(
         node_id: (leader_idx + 1) as u64,
         peers: peers_str.clone(),
         group_commit_ms: Some(2),
+        segment_size: None,
     };
     srvs[leader_idx] = spawn_server(&cfg).expect("respawn killed node");
     wait_until_ready(
@@ -464,7 +465,7 @@ async fn post_restart_verify(
                 })
                 .expect("stream msg");
             let Some(resp) = msg else { break };
-            if let Some(pb::source_response::Result::Batch(batch)) = resp.result {
+            if let Some(batch) = resp.batch {
                 for ev in batch.events {
                     let payload = ev.event.map(|e| e.payload).unwrap_or_default();
                     events.insert(ev.sequence, payload);
@@ -575,11 +576,7 @@ async fn post_restart_verify(
             tags: vec![],
         }],
     };
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.append(tokio_stream::iter([request])),
-    )
-    .await;
+    let result = tokio::time::timeout(Duration::from_secs(2), client.append(request)).await;
     assert!(
         !matches!(result, Ok(Ok(_))),
         "iter {iter}: isolated leader acknowledged without a quorum"

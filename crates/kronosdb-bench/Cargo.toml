@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-kronosdb-eventstore = { path = "../kronosdb-eventstore", features = ["bench-instrumentation"] }
+kronosdb-eventstore = { path = "../kronosdb-eventstore" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"

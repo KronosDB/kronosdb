@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
@@ -19,15 +18,11 @@ pub struct ProcessorEntry {
     pub processor_name: String,
     pub mode: String,
     pub client_id: String,
-    pub component_name: String,
-    pub active_threads: i32,
-    pub available_threads: i32,
     pub running: bool,
     pub error: bool,
     pub is_streaming: bool,
     pub token_store_identifier: String,
     pub segments: Vec<SegmentInfo>,
-    pub last_reported: Instant,
 }
 
 /// Status of a single segment within a streaming event processor.
@@ -46,7 +41,6 @@ pub struct SegmentInfo {
 pub struct ProcessorView {
     pub processor_name: String,
     pub mode: String,
-    pub token_store_identifier: String,
     pub is_streaming: bool,
     pub instances: Vec<ProcessorInstanceView>,
 }
@@ -54,14 +48,9 @@ pub struct ProcessorView {
 /// One client instance's contribution to a processor (for admin display).
 #[derive(Debug, Clone)]
 pub struct ProcessorInstanceView {
-    pub client_id: String,
-    pub component_name: String,
     pub running: bool,
     pub error: bool,
-    pub active_threads: i32,
-    pub available_threads: i32,
     pub segments: Vec<SegmentInfo>,
-    pub since_last_report: Duration,
 }
 
 impl ProcessorRegistry {
@@ -75,7 +64,6 @@ impl ProcessorRegistry {
     pub fn report(
         &self,
         client_id: &str,
-        component_name: &str,
         info: &crate::proto::kronosdb::platform::EventProcessorInfo,
     ) {
         let segments: Vec<SegmentInfo> = info
@@ -95,15 +83,11 @@ impl ProcessorRegistry {
             processor_name: info.processor_name.clone(),
             mode: info.mode.clone(),
             client_id: client_id.to_string(),
-            component_name: component_name.to_string(),
-            active_threads: info.active_threads,
-            available_threads: info.available_threads,
             running: info.running,
             error: info.error,
             is_streaming: info.is_streaming_processor,
             token_store_identifier: info.token_store_identifier.clone(),
             segments,
-            last_reported: Instant::now(),
         };
 
         let key = (info.processor_name.clone(), client_id.to_string());
@@ -126,7 +110,6 @@ impl ProcessorRegistry {
     /// Returns processors aggregated by (processor_name, token_store_identifier),
     /// with per-instance details grouped together.
     pub fn list_aggregated(&self) -> Vec<ProcessorView> {
-        let now = Instant::now();
         let entries = self.entries.read();
 
         // Group by (processor_name, token_store_identifier).
@@ -141,24 +124,18 @@ impl ProcessorRegistry {
 
         let mut views: Vec<ProcessorView> = groups
             .into_iter()
-            .map(|((name, token_store), instances)| {
+            .map(|((name, _token_store), instances)| {
                 let first = &instances[0];
                 ProcessorView {
                     processor_name: name,
                     mode: first.mode.clone(),
-                    token_store_identifier: token_store,
                     is_streaming: first.is_streaming,
                     instances: instances
                         .into_iter()
                         .map(|e| ProcessorInstanceView {
-                            client_id: e.client_id.clone(),
-                            component_name: e.component_name.clone(),
                             running: e.running,
                             error: e.error,
-                            active_threads: e.active_threads,
-                            available_threads: e.available_threads,
                             segments: e.segments.clone(),
-                            since_last_report: now.duration_since(e.last_reported),
                         })
                         .collect(),
                 }
@@ -201,16 +178,8 @@ mod tests {
     #[test]
     fn report_and_list() {
         let registry = ProcessorRegistry::new();
-        registry.report(
-            "client-1",
-            "order-service",
-            &make_info("OrderProjection", true, 50),
-        );
-        registry.report(
-            "client-2",
-            "order-service",
-            &make_info("OrderProjection", true, 45),
-        );
+        registry.report("client-1", &make_info("OrderProjection", true, 50));
+        registry.report("client-2", &make_info("OrderProjection", true, 45));
 
         let entries = registry.list();
         assert_eq!(entries.len(), 2);
@@ -224,8 +193,8 @@ mod tests {
     #[test]
     fn remove_client() {
         let registry = ProcessorRegistry::new();
-        registry.report("client-1", "svc", &make_info("Proc1", true, 10));
-        registry.report("client-2", "svc", &make_info("Proc1", true, 20));
+        registry.report("client-1", &make_info("Proc1", true, 10));
+        registry.report("client-2", &make_info("Proc1", true, 20));
 
         registry.remove_client("client-1");
         assert_eq!(registry.list().len(), 1);
@@ -235,8 +204,8 @@ mod tests {
     #[test]
     fn upsert_overwrites() {
         let registry = ProcessorRegistry::new();
-        registry.report("client-1", "svc", &make_info("Proc1", true, 10));
-        registry.report("client-1", "svc", &make_info("Proc1", true, 50));
+        registry.report("client-1", &make_info("Proc1", true, 10));
+        registry.report("client-1", &make_info("Proc1", true, 50));
 
         let entries = registry.list();
         assert_eq!(entries.len(), 1);

@@ -24,11 +24,12 @@ public class PlatformChannel {
     private static final double BACKOFF_JITTER_FACTOR = 0.25;
 
     private final PlatformServiceGrpc.PlatformServiceStub asyncStub;
-    private final PlatformServiceGrpc.PlatformServiceBlockingStub blockingStub;
     private final PlatformServiceGrpc.PlatformServiceFutureStub futureStub;
     private final String context;
 
     private volatile StreamObserver<PlatformInbound> platformStream;
+    // Guards all platformStream.onNext() calls — StreamObserver is NOT thread-safe.
+    private final Object streamWriteLock = new Object();
     private ScheduledExecutorService heartbeatExecutor;
     private volatile ClientIdentification lastIdentification;
     private volatile Runnable lastReconnectCallback;
@@ -46,11 +47,9 @@ public class PlatformChannel {
     private volatile InstructionHandler instructionHandler;
 
     PlatformChannel(PlatformServiceGrpc.PlatformServiceStub asyncStub,
-                    PlatformServiceGrpc.PlatformServiceBlockingStub blockingStub,
                     PlatformServiceGrpc.PlatformServiceFutureStub futureStub,
                     String context) {
         this.asyncStub = asyncStub;
-        this.blockingStub = blockingStub;
         this.futureStub = futureStub;
         this.context = context;
     }
@@ -146,26 +145,36 @@ public class PlatformChannel {
         });
 
         // Send initial registration
-        platformStream.onNext(PlatformInbound.newBuilder()
+        sendToStream(PlatformInbound.newBuilder()
                 .setRegister(identification)
                 .build());
+    }
+
+    /**
+     * Thread-safe write to the platform stream.
+     */
+    private void sendToStream(PlatformInbound message) {
+        StreamObserver<PlatformInbound> stream = platformStream;
+        if (stream != null) {
+            synchronized (streamWriteLock) {
+                stream.onNext(message);
+            }
+        }
     }
 
     /**
      * Sends an event processor info report to the server.
      */
     public void sendEventProcessorInfo(EventProcessorInfo info) {
-        if (platformStream != null) {
-            platformStream.onNext(PlatformInbound.newBuilder()
-                    .setEventProcessorInfo(info)
-                    .build());
-        }
+        sendToStream(PlatformInbound.newBuilder()
+                .setEventProcessorInfo(info)
+                .build());
     }
 
     /**
      * Enables periodic heartbeat messages.
      */
-    public void enableHeartbeat(long intervalMillis, long timeoutMillis) {
+    public void enableHeartbeat(long intervalMillis) {
         if (heartbeatExecutor != null) {
             heartbeatExecutor.shutdown();
         }
@@ -178,39 +187,39 @@ public class PlatformChannel {
     }
 
     private void sendHeartbeat() {
-        if (platformStream != null) {
-            platformStream.onNext(PlatformInbound.newBuilder()
+        // Never let an exception escape — a throw from a scheduled task cancels
+        // all future runs, silently killing the heartbeat.
+        try {
+            sendToStream(PlatformInbound.newBuilder()
                     .setHeartbeat(Heartbeat.getDefaultInstance())
                     .build());
+        } catch (Exception e) {
+            logger.warn("Failed to send heartbeat for context [{}]: {}.", context, e.getMessage());
         }
     }
 
     private void sendAck(String instructionId, boolean success, String errorMessage) {
-        if (platformStream != null) {
-            var ackBuilder = InstructionAck.newBuilder()
-                    .setInstructionId(instructionId)
-                    .setSuccess(success);
-            if (errorMessage != null) {
-                ackBuilder.setError(ErrorMessage.newBuilder().setMessage(errorMessage).build());
-            }
-            platformStream.onNext(PlatformInbound.newBuilder()
-                    .setAck(ackBuilder.build())
-                    .build());
+        var ackBuilder = InstructionAck.newBuilder()
+                .setInstructionId(instructionId)
+                .setSuccess(success);
+        if (errorMessage != null) {
+            ackBuilder.setError(ErrorMessage.newBuilder().setMessage(errorMessage).build());
         }
+        sendToStream(PlatformInbound.newBuilder()
+                .setAck(ackBuilder.build())
+                .build());
     }
 
     private void sendInstructionResult(String instructionId, boolean success, String errorMessage) {
-        if (platformStream != null) {
-            var resultBuilder = InstructionResult.newBuilder()
-                    .setInstructionId(instructionId)
-                    .setSuccess(success);
-            if (errorMessage != null) {
-                resultBuilder.setError(ErrorMessage.newBuilder().setMessage(errorMessage).build());
-            }
-            platformStream.onNext(PlatformInbound.newBuilder()
-                    .setResult(resultBuilder.build())
-                    .build());
+        var resultBuilder = InstructionResult.newBuilder()
+                .setInstructionId(instructionId)
+                .setSuccess(success);
+        if (errorMessage != null) {
+            resultBuilder.setError(ErrorMessage.newBuilder().setMessage(errorMessage).build());
         }
+        sendToStream(PlatformInbound.newBuilder()
+                .setResult(resultBuilder.build())
+                .build());
     }
 
     private void handleProcessorInstruction(String instructionId, ProcessorInstruction instruction) {
@@ -308,9 +317,10 @@ public class PlatformChannel {
         if (heartbeatExecutor != null) {
             heartbeatExecutor.shutdown();
         }
-        if (platformStream != null) {
-            platformStream.onCompleted();
-            platformStream = null;
+        StreamObserver<PlatformInbound> stream = platformStream;
+        platformStream = null;
+        if (stream != null) {
+            stream.onCompleted();
         }
     }
 

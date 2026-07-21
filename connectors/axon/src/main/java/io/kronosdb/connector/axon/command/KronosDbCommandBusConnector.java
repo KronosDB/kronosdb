@@ -82,8 +82,8 @@ public class KronosDbCommandBusConnector implements CommandBusConnector {
     private CompletableFuture<CommandResponse> handle(Command command) {
         logger.debug("Received incoming command [{}].", command.getName());
         try {
-            CompletableFuture<CommandResponse> result = new CompletableFuture<CommandResponse>()
-                    .whenComplete((r, e) -> commandsInProgress.remove(command.getMessageIdentifier()));
+            CompletableFuture<CommandResponse> result = new CompletableFuture<>();
+            result.whenComplete((r, e) -> commandsInProgress.remove(command.getMessageIdentifier()));
             commandsInProgress.put(command.getMessageIdentifier(), result);
 
             requireNonNull(incomingHandler, "incomingHandler not configured")

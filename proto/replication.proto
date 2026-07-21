@@ -128,6 +128,16 @@ message TailFrame {
 message Truncate {
   uint64 epoch = 1;
   uint64 position = 2;
+  // Byte-exact boundary negotiation. Position-granular truncation cannot see
+  // control records a deposed leader wrote locally but never replicated: they
+  // sit below the position boundary and would leave the follower permanently
+  // byte-divergent. When has_boundary is set, the follower must verify that
+  // the record immediately before its truncation boundary matches the
+  // leader's (prev_record_crc, or segment start), healing trailing control
+  // records backward until it does.
+  bool has_boundary = 3;
+  uint32 prev_record_crc = 4;
+  bool prev_at_segment_start = 5;
 }
 
 message Records {

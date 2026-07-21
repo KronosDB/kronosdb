@@ -603,21 +603,20 @@ async fn callback(
     // JWKS; audience differs per IdP so it isn't enforced here), fall back
     // to ID-token claims for IdPs that map roles there.
     let mut roles = extract_roles(&claims, oidc.cfg.role_claim.as_deref());
-    if roles.is_empty() {
-        if let Some(access_token) = &token_response.access_token {
-            if let Ok(access_claims) = oidc.validate_jwt(access_token, None, None).await {
-                roles = extract_roles(&access_claims, oidc.cfg.role_claim.as_deref());
-            }
-        }
+    if roles.is_empty()
+        && let Some(access_token) = &token_response.access_token
+        && let Ok(access_claims) = oidc.validate_jwt(access_token, None, None).await
+    {
+        roles = extract_roles(&access_claims, oidc.cfg.role_claim.as_deref());
     }
-    if let Some(required) = &oidc.cfg.required_role {
-        if !roles.contains(required) {
-            return (
-                StatusCode::FORBIDDEN,
-                format!("required role '{required}' not present"),
-            )
-                .into_response();
-        }
+    if let Some(required) = &oidc.cfg.required_role
+        && !roles.contains(required)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("required role '{required}' not present"),
+        )
+            .into_response();
     }
 
     let session = Session {

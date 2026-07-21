@@ -30,12 +30,7 @@ public class QueryChannel {
     private static final long INITIAL_PERMITS = 500;
     private static final double REFILL_THRESHOLD = 0.25;
 
-    // Keep-alive interval
-
-
     private final QueryServiceGrpc.QueryServiceStub asyncStub;
-    private final QueryServiceGrpc.QueryServiceBlockingStub blockingStub;
-    private final QueryServiceGrpc.QueryServiceFutureStub futureStub;
     private final String context;
 
     private volatile StreamObserver<QueryHandlerOutbound> handlerStream;
@@ -56,17 +51,13 @@ public class QueryChannel {
     private final AtomicLong permitsRemaining = new AtomicLong(0);
     private volatile long currentPermitBatch = INITIAL_PERMITS;
 
-    // Keep-alive scheduler
-    // Keep-alive is handled by gRPC HTTP/2 PING frames (configured on the ManagedChannel).
-    // No application-level keep-alive needed on handler streams.
+    // Axon update handler registrations for server-forwarded subscription queries,
+    // keyed by subscription identifier.
+    private final Map<String, Registration> subscriptionQueryRegistrations = new ConcurrentHashMap<>();
 
     QueryChannel(QueryServiceGrpc.QueryServiceStub asyncStub,
-                 QueryServiceGrpc.QueryServiceBlockingStub blockingStub,
-                 QueryServiceGrpc.QueryServiceFutureStub futureStub,
                  String context) {
         this.asyncStub = asyncStub;
-        this.blockingStub = blockingStub;
-        this.futureStub = futureStub;
         this.context = context;
     }
 
@@ -83,7 +74,7 @@ public class QueryChannel {
     /**
      * Opens a subscription query for initial result plus live updates.
      */
-    public SubscriptionQueryResult subscriptionQuery(QueryRequest queryRequest, int bufferSize, int refillBatch) {
+    public SubscriptionQueryResult subscriptionQuery(QueryRequest queryRequest, int bufferSize) {
         CompletableFuture<Void> completionFuture = new CompletableFuture<>();
         CollectingStreamObserver<SubscriptionQueryResponse> observer = new CollectingStreamObserver<>(completionFuture);
 
@@ -133,9 +124,6 @@ public class QueryChannel {
         permitsRemaining.set(INITIAL_PERMITS);
         currentPermitBatch = INITIAL_PERMITS;
 
-        // Start keep-alive
-
-
         // Build the registration ack future from the subscription ack
         CompletableFuture<Void> registrationAck;
         if (ackFuture != null) {
@@ -149,9 +137,6 @@ public class QueryChannel {
             sendToStream(QueryHandlerOutbound.newBuilder()
                     .setUnsubscribe(subscription)
                     .build());
-            if (activeSubscriptions.isEmpty()) {
-
-            }
         }, registrationAck);
     }
 
@@ -178,8 +163,9 @@ public class QueryChannel {
                     .setInstructionId(instructionId)
                     .build());
 
-            // Time out the ack after 5 seconds
-            ackFuture.orTimeout(5, TimeUnit.SECONDS)
+            // Time out the ack after 5 seconds; the timeout is converted into a
+            // synthetic success ack so registration proceeds.
+            return ackFuture.orTimeout(5, TimeUnit.SECONDS)
                     .exceptionally(ex -> {
                         pendingAcks.remove(instructionId);
                         logger.debug("Ack timeout for query subscription [{}] instruction [{}].",
@@ -189,7 +175,6 @@ public class QueryChannel {
                                 .setSuccess(true)
                                 .build();
                     });
-            return ackFuture;
         }
         return null;
     }
@@ -246,7 +231,7 @@ public class QueryChannel {
             public void onError(Throwable t) {
                 logger.warn("Query handler stream error for context [{}]: {}.", context, t.getMessage());
                 handlerStream = null;
-
+                cancelSubscriptionQueryRegistrations();
                 scheduleReconnect();
             }
 
@@ -254,7 +239,7 @@ public class QueryChannel {
             public void onCompleted() {
                 logger.info("Query handler stream completed for context [{}].", context);
                 handlerStream = null;
-
+                cancelSubscriptionQueryRegistrations();
                 scheduleReconnect();
             }
         });
@@ -360,23 +345,37 @@ public class QueryChannel {
     }
 
     private void handleSubscriptionQuery(SubscriptionQueryRequest request) {
-        if (queryHandler == null || !request.hasSubscribe()) {
+        if (queryHandler == null) {
             return;
         }
 
-        SubscriptionQuery sub = request.getSubscribe();
-        String subscriptionId = sub.getSubscriptionIdentifier();
+        if (request.hasSubscribe()) {
+            SubscriptionQuery sub = request.getSubscribe();
+            String subscriptionId = sub.getSubscriptionIdentifier();
 
-        // 1. Register for updates — the handler will push SubscriptionQueryResponse
-        //    messages back through the handlerStream when projections emit updates.
-        UpdateSender updateSender = new UpdateSender(subscriptionId);
-        queryHandler.registerSubscriptionQuery(sub, updateSender);
+            // 1. Register for updates — the handler will push SubscriptionQueryResponse
+            //    messages back through the handlerStream when projections emit updates.
+            UpdateSender updateSender = new UpdateSender(subscriptionId);
+            Registration registration = queryHandler.registerSubscriptionQuery(sub, updateSender);
+            subscriptionQueryRegistrations.put(subscriptionId, registration);
 
-        // 2. Handle the initial query — send the result back as a regular query response.
-        //    KronosDB server will forward this as the initial_result to the subscriber.
-        if (sub.hasQueryRequest()) {
-            handleIncomingQuery(sub.getQueryRequest(), "");
+            // 2. Handle the initial query — send the result back as a regular query response.
+            //    KronosDB server will forward this as the initial_result to the subscriber.
+            if (sub.hasQueryRequest()) {
+                handleIncomingQuery(sub.getQueryRequest(), "");
+            }
+        } else if (request.hasUnsubscribe()) {
+            String subscriptionId = request.getUnsubscribe().getSubscriptionIdentifier();
+            Registration registration = subscriptionQueryRegistrations.remove(subscriptionId);
+            if (registration != null) {
+                registration.cancel();
+            }
         }
+    }
+
+    private void cancelSubscriptionQueryRegistrations() {
+        subscriptionQueryRegistrations.values().forEach(Registration::cancel);
+        subscriptionQueryRegistrations.clear();
     }
 
     /**
@@ -412,10 +411,12 @@ public class QueryChannel {
      * Prepares for disconnect by completing the handler stream.
      */
     public void prepareDisconnect() {
-        if (handlerStream != null) {
-            handlerStream.onCompleted();
-            handlerStream = null;
+        StreamObserver<QueryHandlerOutbound> stream = handlerStream;
+        handlerStream = null;
+        if (stream != null) {
+            stream.onCompleted();
         }
+        cancelSubscriptionQueryRegistrations();
     }
 
     /**

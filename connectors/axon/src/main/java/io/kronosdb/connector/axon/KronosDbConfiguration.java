@@ -18,11 +18,6 @@ public class KronosDbConfiguration {
     private @Nullable String token;
     private boolean sslEnabled = false;
     private @Nullable String certFile;
-    private int commandLoadFactor = 100;
-
-    // Flow control
-    private int commandFlowControlPermits = 5000;
-    private int queryFlowControlPermits = 5000;
 
     // Keep-alive
     private long keepAliveTime = 1000;
@@ -32,10 +27,6 @@ public class KronosDbConfiguration {
     private boolean heartbeatEnabled = true;
     private long heartbeatInterval = 5000;
     private long heartbeatTimeout = 15000;
-
-    // Connection
-    private long connectTimeout = 5000;
-    private long reconnectInterval = 2000;
 
     // Message size
     private int maxMessageSize = 4 * 1024 * 1024; // 4MB
@@ -103,30 +94,6 @@ public class KronosDbConfiguration {
         this.certFile = certFile;
     }
 
-    public int getCommandLoadFactor() {
-        return commandLoadFactor;
-    }
-
-    public void setCommandLoadFactor(int commandLoadFactor) {
-        this.commandLoadFactor = commandLoadFactor;
-    }
-
-    public int getCommandFlowControlPermits() {
-        return commandFlowControlPermits;
-    }
-
-    public void setCommandFlowControlPermits(int commandFlowControlPermits) {
-        this.commandFlowControlPermits = commandFlowControlPermits;
-    }
-
-    public int getQueryFlowControlPermits() {
-        return queryFlowControlPermits;
-    }
-
-    public void setQueryFlowControlPermits(int queryFlowControlPermits) {
-        this.queryFlowControlPermits = queryFlowControlPermits;
-    }
-
     public long getKeepAliveTime() {
         return keepAliveTime;
     }
@@ -165,22 +132,6 @@ public class KronosDbConfiguration {
 
     public void setHeartbeatTimeout(long heartbeatTimeout) {
         this.heartbeatTimeout = heartbeatTimeout;
-    }
-
-    public long getConnectTimeout() {
-        return connectTimeout;
-    }
-
-    public void setConnectTimeout(long connectTimeout) {
-        this.connectTimeout = connectTimeout;
-    }
-
-    public long getReconnectInterval() {
-        return reconnectInterval;
-    }
-
-    public void setReconnectInterval(long reconnectInterval) {
-        this.reconnectInterval = reconnectInterval;
     }
 
     public int getMaxMessageSize() {
@@ -234,11 +185,6 @@ public class KronosDbConfiguration {
 
         public Builder certFile(String certFile) {
             config.setCertFile(certFile);
-            return this;
-        }
-
-        public Builder commandLoadFactor(int loadFactor) {
-            config.setCommandLoadFactor(loadFactor);
             return this;
         }
 

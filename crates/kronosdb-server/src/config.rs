@@ -8,21 +8,21 @@ use serde::Deserialize;
 #[derive(Parser, Debug)]
 #[command(name = "kronosdb", version, about)]
 struct Cli {
-    /// gRPC listen address.
-    #[arg(long, default_value = "127.0.0.1:50051", env = "KRONOSDB_LISTEN")]
-    listen: SocketAddr,
+    /// gRPC listen address (default 127.0.0.1:50051).
+    #[arg(long, env = "KRONOSDB_LISTEN")]
+    listen: Option<SocketAddr>,
 
-    /// Data directory for event store contexts.
-    #[arg(long, default_value = "data", env = "KRONOSDB_DATA_DIR")]
-    data_dir: PathBuf,
+    /// Data directory for event store contexts (default "data").
+    #[arg(long, env = "KRONOSDB_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 
-    /// Server node name.
-    #[arg(long, default_value = "kronosdb-0", env = "KRONOSDB_NODE_NAME")]
-    node_name: String,
+    /// Server node name (default "kronosdb-0").
+    #[arg(long, env = "KRONOSDB_NODE_NAME")]
+    node_name: Option<String>,
 
-    /// Admin HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:9240", env = "KRONOSDB_ADMIN_LISTEN")]
-    admin_listen: SocketAddr,
+    /// Admin HTTP listen address (default 127.0.0.1:9240).
+    #[arg(long, env = "KRONOSDB_ADMIN_LISTEN")]
+    admin_listen: Option<SocketAddr>,
 
     /// Segment size in bytes (e.g. 268435456 for 256MB).
     #[arg(long, env = "KRONOSDB_SEGMENT_SIZE")]
@@ -36,8 +36,10 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_BLOOM_CACHE_SIZE")]
     bloom_cache_size: Option<usize>,
 
-    /// Group commit interval in milliseconds. Batches fsyncs for higher throughput.
-    /// 0 = disabled (fsync per write). Default: 2ms.
+    /// Extra group-commit coalescing window in milliseconds. Commits are
+    /// event-driven: 0 (default) fsyncs as soon as writes are pending, and
+    /// concurrent writes batch on the fsync duration. A positive value adds
+    /// that much latency in exchange for larger waves.
     #[arg(long, env = "KRONOSDB_GROUP_COMMIT_MS")]
     group_commit_ms: Option<u64>,
 
@@ -155,7 +157,6 @@ struct Cli {
 
 /// TOML config file structure.
 #[derive(Deserialize, Default, Debug)]
-#[allow(dead_code)]
 struct ConfigFile {
     listen: Option<String>,
     #[serde(rename = "data-dir")]
@@ -202,7 +203,6 @@ struct TimeoutConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
-#[allow(dead_code)]
 struct AdminConfig {
     listen: Option<String>,
     #[serde(default)]
@@ -358,9 +358,12 @@ impl ServerConfig {
             toml::from_str::<ConfigFile>(&contents)
                 .map_err(|e| format!("failed to parse config file '{}': {e}", path.display()))?
         } else {
-            // Try default location.
+            // Try default location. A malformed file is an error, not a
+            // silent fallback to defaults — a typo'd config must not boot
+            // the server with settings the operator didn't choose.
             if let Ok(contents) = std::fs::read_to_string("kronosdb.toml") {
-                toml::from_str::<ConfigFile>(&contents).unwrap_or_default()
+                toml::from_str::<ConfigFile>(&contents)
+                    .map_err(|e| format!("failed to parse config file 'kronosdb.toml': {e}"))?
             } else {
                 ConfigFile::default()
             }
@@ -376,18 +379,52 @@ impl ServerConfig {
         const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 15;
 
         // CLI overrides file config. clap already handles env vars.
-        // For values that clap has defaults (listen, data_dir, etc.), CLI always wins.
-        // For Optional values, use CLI if present, then file, then default.
+        // Every value resolves CLI/env > file > default.
 
         let cluster_peers = parse_peer_list(&cli.cluster_peers)?;
         let cluster_learners = parse_peer_list(&cli.cluster_learners)?;
         let admin_auth = resolve_admin_auth(&cli, &file_config)?;
 
+        let listen_addr = match cli.listen {
+            Some(addr) => addr,
+            None => match file_config.listen {
+                Some(ref s) => s
+                    .parse()
+                    .map_err(|e| format!("invalid `listen` address '{s}' in config file: {e}"))?,
+                None => "127.0.0.1:50051".parse().unwrap(),
+            },
+        };
+        let admin_listen_addr = match cli.admin_listen {
+            Some(addr) => addr,
+            None => match file_config.admin.listen {
+                Some(ref s) => s.parse().map_err(|e| {
+                    format!("invalid `[admin] listen` address '{s}' in config file: {e}")
+                })?,
+                None => "127.0.0.1:9240".parse().unwrap(),
+            },
+        };
+
+        match cli.cluster_node_type.as_str() {
+            "standard" | "passive-backup" => {}
+            other => {
+                return Err(format!(
+                    "invalid --cluster-node-type '{other}': expected \"standard\" or \"passive-backup\""
+                )
+                .into());
+            }
+        }
+
         Ok(Self {
-            listen_addr: cli.listen,
-            data_dir: cli.data_dir,
-            node_name: cli.node_name,
-            admin_listen_addr: cli.admin_listen,
+            listen_addr,
+            data_dir: cli
+                .data_dir
+                .or(file_config.data_dir.map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("data")),
+            node_name: cli
+                .node_name
+                .or(file_config.node_name)
+                .unwrap_or_else(|| "kronosdb-0".to_string()),
+            admin_listen_addr,
             segment_size: cli
                 .segment_size
                 .or(file_config.storage.segment_size)
@@ -400,7 +437,7 @@ impl ServerConfig {
                 .bloom_cache_size
                 .or(file_config.storage.bloom_cache_size)
                 .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
-            group_commit_ms: cli.group_commit_ms.unwrap_or(2),
+            group_commit_ms: cli.group_commit_ms.unwrap_or(0),
             command_timeout_secs: cli
                 .command_timeout
                 .or(file_config.timeouts.command_timeout)
@@ -446,11 +483,6 @@ impl ServerConfig {
                 }),
             admin_auth,
         })
-    }
-
-    /// Returns true if clustering is enabled.
-    pub fn is_clustered(&self) -> bool {
-        self.cluster_node_id.is_some()
     }
 }
 
@@ -665,75 +697,5 @@ tls-ca = "/etc/kronosdb/ca.pem"
             config.security.tls_ca.as_deref(),
             Some("/etc/kronosdb/ca.pem")
         );
-    }
-
-    #[test]
-    fn is_clustered_when_node_id_set() {
-        let config = ServerConfig {
-            listen_addr: "127.0.0.1:50051".parse().unwrap(),
-            data_dir: "data".into(),
-            node_name: "test".into(),
-            admin_listen_addr: "127.0.0.1:9240".parse().unwrap(),
-            segment_size: 256 * 1024 * 1024,
-            index_cache_size: 50,
-            bloom_cache_size: 200,
-            group_commit_ms: 2,
-            command_timeout_secs: 30,
-            query_timeout_secs: 30,
-            heartbeat_interval_secs: 5,
-            heartbeat_timeout_secs: 15,
-            drain_deadline_secs: 20,
-            cluster_node_id: Some(1),
-            cluster_node_type: "standard".into(),
-            cluster_peers: vec![],
-            cluster_learners: vec![],
-            access_token: None,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca: None,
-            manifest: None,
-            admin_auth: AdminAuthConfig {
-                mode: AdminAuthMode::None,
-                token: None,
-                oidc: None,
-            },
-            replication_inflight_bytes: 64 * 1024 * 1024,
-        };
-        assert!(config.is_clustered());
-    }
-
-    #[test]
-    fn not_clustered_when_node_id_absent() {
-        let config = ServerConfig {
-            listen_addr: "127.0.0.1:50051".parse().unwrap(),
-            data_dir: "data".into(),
-            node_name: "test".into(),
-            admin_listen_addr: "127.0.0.1:9240".parse().unwrap(),
-            segment_size: 256 * 1024 * 1024,
-            index_cache_size: 50,
-            bloom_cache_size: 200,
-            group_commit_ms: 2,
-            command_timeout_secs: 30,
-            query_timeout_secs: 30,
-            heartbeat_interval_secs: 5,
-            heartbeat_timeout_secs: 15,
-            drain_deadline_secs: 20,
-            cluster_node_id: None,
-            cluster_node_type: "standard".into(),
-            cluster_peers: vec![],
-            cluster_learners: vec![],
-            access_token: None,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca: None,
-            manifest: None,
-            admin_auth: AdminAuthConfig {
-                mode: AdminAuthMode::None,
-                token: None,
-                oidc: None,
-            },
-            replication_inflight_bytes: 64 * 1024 * 1024,
-        };
-        assert!(!config.is_clustered());
     }
 }

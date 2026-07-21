@@ -101,10 +101,4 @@ impl HandlerStreamRegistry {
             }
         }
     }
-
-    /// Removes a specific client's streams without closing them (clean disconnect).
-    pub fn unregister(&self, client_id: &str) {
-        let mut streams = self.streams.lock();
-        streams.remove(client_id);
-    }
 }

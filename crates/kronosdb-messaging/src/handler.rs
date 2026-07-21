@@ -109,7 +109,8 @@ pub struct Handler {
     /// Component/application name.
     pub component_name: ComponentName,
     /// Relative load capacity. Higher = more messages routed here.
-    /// 0 is treated as 100 (default).
+    /// Non-positive values (unset or bogus wire input) are treated as
+    /// 100 (default) — dispatch arithmetic requires every weight >= 1.
     pub load_factor: i32,
     /// Available permits — how many messages the server can send.
     /// Decremented when a message is dispatched, incremented when
@@ -122,7 +123,7 @@ impl Handler {
         Self {
             client_id,
             component_name,
-            load_factor: if load_factor == 0 { 100 } else { load_factor },
+            load_factor: if load_factor <= 0 { 100 } else { load_factor },
             permits: AtomicI64::new(0),
         }
     }
@@ -186,6 +187,12 @@ impl HandlerRegistry {
     }
 
     /// Registers a handler for a message type.
+    ///
+    /// Re-subscribing the same (message_type, client_id) replaces the old
+    /// entry instead of accumulating a duplicate — duplicates would double
+    /// the client's round-robin weight and split its permit accounting.
+    /// The fresh entry starts with zero permits (the client re-grants via
+    /// FlowControl after re-subscribing), matching reconnect semantics.
     pub fn subscribe(
         &mut self,
         message_type: String,
@@ -196,15 +203,20 @@ impl HandlerRegistry {
         let handler = Handler::new(client_id.clone(), component_name, load_factor);
         let entry = HandlerEntry { handler };
 
-        self.subscriptions
-            .entry(message_type.clone())
-            .or_default()
-            .push(entry);
+        let handlers = self.subscriptions.entry(message_type.clone()).or_default();
+        if let Some(existing) = handlers
+            .iter_mut()
+            .find(|e| e.handler.client_id == client_id)
+        {
+            *existing = entry;
+        } else {
+            handlers.push(entry);
+        }
 
-        self.client_subscriptions
-            .entry(client_id)
-            .or_default()
-            .push(message_type);
+        let types = self.client_subscriptions.entry(client_id).or_default();
+        if !types.contains(&message_type) {
+            types.push(message_type);
+        }
     }
 
     /// Unregisters a handler for a message type.
@@ -252,24 +264,6 @@ impl HandlerRegistry {
                 }
             }
         }
-    }
-
-    /// Returns all registered message types.
-    pub fn registered_types(&self) -> Vec<&str> {
-        self.subscriptions.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Returns all connected client IDs.
-    pub fn connected_clients(&self) -> Vec<&ClientId> {
-        self.client_subscriptions.keys().collect()
-    }
-
-    /// Returns stats: message type name → handler count.
-    pub fn handler_stats(&self) -> Vec<(String, usize)> {
-        self.subscriptions
-            .iter()
-            .map(|(name, entries)| (name.clone(), entries.len()))
-            .collect()
     }
 
     /// Returns detailed handler info per message type, for admin display.

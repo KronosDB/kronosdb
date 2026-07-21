@@ -17,7 +17,7 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
             Ok(store) => (store.head().0, store.tail().0),
             Err(_) => (0, 0),
         };
-        let event_count = if head > tail { head - tail } else { 0 };
+        let event_count = head.saturating_sub(tail);
         rows.push((name.clone(), head, tail, event_count));
     }
 
@@ -82,7 +82,7 @@ pub async fn contexts_fragment(State(state): State<AdminState>) -> Html<String> 
             Ok(store) => (store.head().0, store.tail().0),
             Err(_) => (0, 0),
         };
-        let event_count = if head > tail { head - tail } else { 0 };
+        let event_count = head.saturating_sub(tail);
         rows.push((name.clone(), head, tail, event_count));
     }
 
@@ -97,7 +97,7 @@ pub async fn contexts_mini_fragment(State(state): State<AdminState>) -> Html<Str
             Ok(store) => (store.head().0, store.tail().0),
             Err(_) => (0, 0),
         };
-        let events = if head > tail { head - tail } else { 0 };
+        let events = head.saturating_sub(tail);
         data.push((name.clone(), events));
     }
     Html(contexts_table_mini_html(&data))

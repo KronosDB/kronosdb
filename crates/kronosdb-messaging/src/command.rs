@@ -8,8 +8,8 @@ use tokio::sync::oneshot;
 use crate::error_codes;
 use crate::handler::{HandlerRegistry, MessageTypeDetail, MessageTypeMetrics, MetricsSnapshot};
 use crate::types::{
-    ClientId, ComponentName, ErrorDetail, Metadata, MetadataValue, Payload, ProcessingInstruction,
-    ProcessingKey, RoutingKey,
+    ClientId, ComponentName, ErrorDetail, Metadata, Payload, ProcessingInstruction, ProcessingKey,
+    RoutingKey,
 };
 
 /// A command to be dispatched.
@@ -61,10 +61,6 @@ pub enum CommandError {
     NoHandlerAvailable { command_name: String },
     /// All handlers are at capacity (no permits).
     NoPermitsAvailable { command_name: String },
-    /// The handler disconnected before responding.
-    HandlerDisconnected,
-    /// Timeout waiting for response.
-    Timeout,
     /// A command with the same message_id is already in-flight.
     Duplicate { message_id: String },
     /// The in-flight command buffer is full.
@@ -80,8 +76,6 @@ impl std::fmt::Display for CommandError {
             Self::NoPermitsAvailable { command_name } => {
                 write!(f, "all handlers at capacity for command '{command_name}'")
             }
-            Self::HandlerDisconnected => write!(f, "handler disconnected before responding"),
-            Self::Timeout => write!(f, "timeout waiting for command response"),
             Self::Duplicate { message_id } => {
                 write!(f, "command '{message_id}' is already in-flight")
             }
@@ -142,6 +136,10 @@ struct InFlightEntry {
     dispatched_at: Instant,
     /// The command name (for metrics on cancel/timeout paths).
     command_name: String,
+    /// Client-requested timeout (Timeout processing instruction), clamped.
+    /// The sweep uses this instead of its default when present, so a client
+    /// asking for a longer deadline isn't killed by the global sweep.
+    timeout_override: Option<Duration>,
 }
 
 /// The command bus. Routes commands to registered handlers.
@@ -283,7 +281,13 @@ impl CommandBus {
             &handler_list[idx]
         } else {
             let counter = self.dispatch_counter.fetch_add(1, Ordering::Relaxed);
-            let total_weight: i32 = handler_list.iter().map(|h| h.handler.load_factor).sum();
+            // Weights are >= 1 (Handler::new clamps), but guard the sum
+            // anyway: a zero/negative total would panic the remainder op.
+            let total_weight: i32 = handler_list
+                .iter()
+                .map(|h| h.handler.load_factor)
+                .sum::<i32>()
+                .max(1);
             let target = (counter % total_weight as u64) as i32;
 
             let mut cumulative = 0;
@@ -330,6 +334,7 @@ impl CommandBus {
                 target_handler: target_handler.clone(),
                 dispatched_at: now,
                 command_name: command_name.clone(),
+                timeout_override: extract_timeout(&command.processing_instructions),
             },
         );
 
@@ -340,11 +345,6 @@ impl CommandBus {
         };
 
         Ok((pending, response_rx))
-    }
-
-    /// Returns stats: command name → handler count.
-    pub fn handler_stats(&self) -> Vec<(String, usize)> {
-        self.handlers.read().handler_stats()
     }
 
     /// Returns detailed handler info + dispatch metrics per command type.
@@ -438,7 +438,10 @@ impl CommandBus {
         let to_sweep: Vec<String> = self
             .in_flight
             .iter()
-            .filter(|e| e.value().dispatched_at.elapsed() > timeout)
+            .filter(|e| {
+                let effective = e.value().timeout_override.unwrap_or(timeout);
+                e.value().dispatched_at.elapsed() > effective
+            })
             .map(|e| e.key().clone())
             .collect();
 
@@ -486,22 +489,6 @@ impl CommandBus {
         let _ = entry.response_tx.send(result);
     }
 
-    /// Records a command completion from the gRPC layer (success/failure + latency).
-    /// Called when a response comes back from a handler — used for the
-    /// connector-side dispatch path that doesn't go through `complete`.
-    pub fn record_completion(&self, command_name: &str, is_error: bool, duration_us: u64) {
-        self.get_or_create_metrics(command_name);
-        if let Some(m) = self.metrics.get(command_name) {
-            m.total_duration_us
-                .fetch_add(duration_us, Ordering::Relaxed);
-            if is_error {
-                m.failed.fetch_add(1, Ordering::Relaxed);
-            } else {
-                m.succeeded.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
     // ── Metrics helpers (cheap — just atomic increments) ────────────
 
     fn get_or_create_metrics(&self, name: &str) {
@@ -532,15 +519,14 @@ impl CommandBus {
 
 /// Extracts the priority value from processing instructions. Returns 0 if not set.
 fn extract_priority(instructions: &[ProcessingInstruction]) -> i64 {
-    instructions
-        .iter()
-        .find(|pi| pi.key == ProcessingKey::Priority)
-        .and_then(|pi| pi.value.as_ref())
-        .map(|v| match v {
-            MetadataValue::Number(n) => *n,
-            _ => 0,
-        })
-        .unwrap_or(0)
+    crate::types::instruction_number(instructions, ProcessingKey::Priority).unwrap_or(0)
+}
+
+/// Extracts the client-requested timeout from processing instructions,
+/// clamped to [1s, 1h]. None if absent or non-numeric.
+fn extract_timeout(instructions: &[ProcessingInstruction]) -> Option<Duration> {
+    crate::types::instruction_number(instructions, ProcessingKey::Timeout)
+        .map(|ms| Duration::from_millis(ms.clamp(1_000, 3_600_000) as u64))
 }
 
 /// Simple hash function for routing key consistent hashing.
@@ -555,6 +541,7 @@ fn simple_hash(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MetadataValue;
 
     fn client(id: &str) -> ClientId {
         ClientId(id.to_string())

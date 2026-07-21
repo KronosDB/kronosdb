@@ -1,3 +1,6 @@
+// openraft's `StorageError` is the trait-fixed error type for this module.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
@@ -472,15 +475,17 @@ struct LogStoreInner {
 /// format change). Phase-7 PERF-04 can strip the CRC step on sealed segments
 /// per the D-15 optimization if startup-scan time becomes a concern — see the
 /// `TODO(phase 7)` inside `scan_sealed_segment`.
-fn rebuild_index(
-    dir: &Path,
-    config: &LogStoreConfig,
-) -> io::Result<(
+/// Result of a startup index rebuild: sealed segment metas, the reopened
+/// active segment, the (log_index -> (segment_first, offset, crc)) index,
+/// and the last log id found.
+type RebuiltIndex = (
     Vec<SegmentMeta>,
     Option<Segment>,
     BTreeMap<u64, (u64, u64, u32)>,
     Option<LogId<NodeId>>,
-)> {
+);
+
+fn rebuild_index(dir: &Path, config: &LogStoreConfig) -> io::Result<RebuiltIndex> {
     #[cfg(feature = "bench-instrumentation")]
     let _t = Timer::new(Region::LogIndexRebuild);
 
@@ -777,7 +782,14 @@ impl LogStore {
         // simplification — see `rebuild_index` for the Phase-7 optimization
         // note); the active (highest-indexed) segment gets per-record CRC
         // validation and torn-tail truncation to satisfy CRASH-01.
-        let (sealed, active, index, last_log_id) = rebuild_index(dir, &config)?;
+        let (sealed, active, mut index, last_log_id) = rebuild_index(dir, &config)?;
+
+        // Purged entries whose segment file was not dropped (partial cover)
+        // are rebuilt by the scan; re-hide them so a restart cannot resurrect
+        // indices below last_purged.
+        if let Some(purged) = last_purged {
+            index = index.split_off(&(purged.index + 1));
+        }
 
         tracing::info!(
             target: "raft.recovery",
@@ -914,7 +926,7 @@ fn io_err(e: io::Error) -> StorageError<NodeId> {
 }
 
 fn bincode_err<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// Look up the segment path for a given `segment_id` (= `first_index`). The
@@ -923,10 +935,10 @@ fn bincode_err<E: std::fmt::Display>(e: E) -> io::Error {
 /// in practice the active segment's first_index is strictly greater than
 /// any sealed segment's `first_index`, so the disambiguation is defensive.
 fn resolve_segment_path(inner: &LogStoreInner, segment_id: u64) -> Option<PathBuf> {
-    if let Some(active) = inner.active.as_ref() {
-        if active.first_index == segment_id {
-            return Some(active.path.clone());
-        }
+    if let Some(active) = inner.active.as_ref()
+        && active.first_index == segment_id
+    {
+        return Some(active.path.clone());
     }
     inner
         .sealed
@@ -1278,7 +1290,7 @@ fn drive_group_commit_now(inner_mutex: &Mutex<LogStoreInner>) -> Result<(), Stor
                 // `StorageError`; openraft re-wraps it on its side.
                 let err_str = format!("{e}");
                 for cb in callbacks {
-                    let io_e = io::Error::new(io::ErrorKind::Other, err_str.clone());
+                    let io_e = io::Error::other(err_str.clone());
                     cb.log_io_completed(Err(io_e));
                 }
                 Err(e)
@@ -1464,7 +1476,20 @@ fn purge_inner(inner: &mut LogStoreInner, log_id: LogId<NodeId>) -> io::Result<(
         }
     }
 
+    // Entries <= cut inside a partially-covered segment (or the active
+    // segment) keep their bytes on disk, but must become unreadable: openraft
+    // requires try_get_log_entries to never return purged indices.
+    let retained = inner.index.split_off(&(cut + 1));
+    inner.index = retained;
+
     inner.last_purged = Some(log_id);
+
+    // Purging may legally advance past the last present entry (e.g. after
+    // installing a snapshot that outruns the local log). The log's logical
+    // end then becomes the purge point itself.
+    if inner.last_log_id.is_none_or(|last| last.index < cut) {
+        inner.last_log_id = Some(log_id);
+    }
 
     // D-12: purged.bin on atomic_write (crash-safety matters; perf does not).
     let data = bincode::serialize(&log_id).map_err(bincode_err)?;
@@ -1523,12 +1548,12 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), io::Error> {
     std::fs::rename(&tmp, path)?;
 
     // Fsync the directory to ensure the rename is durable.
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-            #[cfg(feature = "bench-instrumentation")]
-            bi::bump_fsync();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+        #[cfg(feature = "bench-instrumentation")]
+        bi::bump_fsync();
     }
 
     Ok(())

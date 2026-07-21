@@ -10,18 +10,12 @@ import java.util.concurrent.CompletableFuture;
 public class SnapshotChannel {
 
     private final SnapshotStoreGrpc.SnapshotStoreStub asyncStub;
-    private final SnapshotStoreGrpc.SnapshotStoreBlockingStub blockingStub;
     private final SnapshotStoreGrpc.SnapshotStoreFutureStub futureStub;
-    private final String context;
 
     SnapshotChannel(SnapshotStoreGrpc.SnapshotStoreStub asyncStub,
-                    SnapshotStoreGrpc.SnapshotStoreBlockingStub blockingStub,
-                    SnapshotStoreGrpc.SnapshotStoreFutureStub futureStub,
-                    String context) {
+                    SnapshotStoreGrpc.SnapshotStoreFutureStub futureStub) {
         this.asyncStub = asyncStub;
-        this.blockingStub = blockingStub;
         this.futureStub = futureStub;
-        this.context = context;
     }
 
     /**

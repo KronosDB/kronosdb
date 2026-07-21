@@ -1,5 +1,3 @@
-#![allow(clippy::all)]
-
 //! Shared helpers for KronosDB benchmarks.
 //!
 //! Models a realistic e-commerce domain with orders, payments, and shipments.
@@ -53,7 +51,7 @@ pub fn create_ecommerce_store(
 
     // Phase 1: Place all orders (OrderPlaced events come first).
     // Phase 2-8: Subsequent lifecycle events arrive interleaved.
-    for phase in 0..events_per_order {
+    for &phase_event_type in ORDER_EVENT_TYPES {
         let mut remaining = num_orders;
         while remaining > 0 {
             let current = remaining.min(batch_size);
@@ -62,7 +60,7 @@ pub fn create_ecommerce_store(
             for _ in 0..current {
                 let order_id = num_orders - remaining;
                 let customer_id = order_id % num_customers;
-                let event_type = ORDER_EVENT_TYPES[phase];
+                let event_type = phase_event_type;
 
                 events.push(AppendEvent {
                     identifier: format!("evt-{event_idx}"),

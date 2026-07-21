@@ -137,10 +137,7 @@ public class KronosDbConnectionManager {
                 logger.info("KronosDB requested reconnect for context [{}].", conn.context()));
 
         if (configuration.isHeartbeatEnabled()) {
-            conn.platformChannel().enableHeartbeat(
-                    configuration.getHeartbeatInterval(),
-                    configuration.getHeartbeatTimeout()
-            );
+            conn.platformChannel().enableHeartbeat(configuration.getHeartbeatInterval());
         }
     }
 

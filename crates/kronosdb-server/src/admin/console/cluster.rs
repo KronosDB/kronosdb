@@ -121,14 +121,18 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     new FormData(form).forEach(function(v, k) { data[k] = k === 'id' ? parseInt(v) : v; });
     try {
       var resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
-      var json = await resp.json();
+      var text = await resp.text();
+      var json = null;
+      try { json = JSON.parse(text); } catch (ignored) {}
       if (resp.ok) {
-        result.innerHTML = '<span class="text-k-teal">Success: ' + json.action + '</span>';
+        result.innerHTML = '<span class="text-k-teal">Success: ' + (json && json.action || 'ok') + '</span>';
       } else {
-        result.innerHTML = '<span class="text-k-red">Error: ' + (json.message || resp.statusText) + '</span>';
+        result.innerHTML = '<span class="text-k-red"></span>';
+        result.firstChild.textContent = 'Error: ' + ((json && json.message) || text || resp.statusText);
       }
     } catch (e) {
-      result.innerHTML = '<span class="text-k-red">Error: ' + e.message + '</span>';
+      result.innerHTML = '<span class="text-k-red"></span>';
+      result.firstChild.textContent = 'Error: ' + e.message;
     }
   }
   </script>"##
@@ -189,7 +193,17 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 pub struct AddNodeRequest {
     id: u64,
     addr: String,
+    /// Promote even when the node's replication lag exceeds the safe
+    /// threshold. A cold voter joins the watermark quorum immediately, so
+    /// commit acknowledgements stall until it catches up.
+    #[serde(default)]
+    force: bool,
 }
+
+/// Maximum per-context position lag at which promotion is considered safe.
+/// The residual gap closes within one replication round-trip, so quorum
+/// commit latency is unaffected by the new voter.
+const PROMOTE_MAX_LAG: u64 = 1024;
 
 #[derive(Deserialize)]
 pub struct RemoveNodeRequest {
@@ -218,14 +232,6 @@ pub async fn api_add_voter(
     State(state): State<AdminState>,
     Json(req): Json<AddNodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // First add as learner, then promote to voter.
-    state
-        .cluster
-        .add_learner(req.id, req.addr.clone())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Get current voter IDs and add the new one.
     let raft = state
         .cluster
         .raft_node()
@@ -233,7 +239,80 @@ pub async fn api_add_voter(
 
     let metrics = raft.metrics().borrow().clone();
     let mut voter_ids: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+    let already_member = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .any(|(id, _)| *id == req.id);
+
     if !voter_ids.contains(&req.id) {
+        // Gate BEFORE any membership mutation. A voter joins the watermark
+        // quorum the moment membership changes, so promoting a node that is
+        // still catching up stalls every commit acknowledgement until its
+        // cursor reaches the tail — and change_membership itself would block
+        // on a down or frozen node (joint consensus needs the new quorum).
+        // Refuse unless the node is within one replication round of caught-up;
+        // a node with no recorded progress (never added as learner, or never
+        // connected) is refused without touching membership at all.
+        if !req.force {
+            if !state.cluster.is_claimed_leader() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "this node does not hold the data-plane leader claim, so \
+                     replication progress is unknown here; call the leader's \
+                     admin API, or pass force=true to promote anyway"
+                        .to_string(),
+                ));
+            }
+            let status = state
+                .cluster
+                .replication_catchup_status(req.id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let lagging: Vec<String> = status
+                .iter()
+                .filter_map(|ctx| {
+                    if ctx.leader_tail == 0 {
+                        return None;
+                    }
+                    match ctx.follower_position {
+                        Some(pos) if ctx.leader_tail.saturating_sub(pos) <= PROMOTE_MAX_LAG => None,
+                        Some(pos) => Some(format!(
+                            "{}: {}/{} ({} behind)",
+                            ctx.context,
+                            pos,
+                            ctx.leader_tail,
+                            ctx.leader_tail - pos
+                        )),
+                        None => Some(format!(
+                            "{}: no replication acknowledgement observed (leader tail {})",
+                            ctx.context, ctx.leader_tail
+                        )),
+                    }
+                })
+                .collect();
+            if !lagging.is_empty() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "node {} is not caught up — promoting now would stall \
+                         commit acknowledgements until it is. Lagging contexts: \
+                         [{}]. Wait for catch-up and retry, or pass force=true.",
+                        req.id,
+                        lagging.join(", ")
+                    ),
+                ));
+            }
+        }
+        // Gate passed (or forced): register as learner first if needed, then
+        // promote. add_learner is non-blocking, so a forced promotion of a
+        // down node fails in change_membership rather than hanging here.
+        if !already_member {
+            state
+                .cluster
+                .add_learner(req.id, req.addr.clone())
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
         voter_ids.push(req.id);
     }
 

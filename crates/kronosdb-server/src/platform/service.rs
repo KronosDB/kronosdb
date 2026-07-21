@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -15,22 +15,6 @@ use kronosdb_messaging::types::{ClientId, ComponentName};
 use crate::handler_registry::HandlerStreamRegistry;
 use crate::processor::ProcessorRegistry;
 use crate::proto::kronosdb::platform as pb;
-use crate::proto::kronosdb::platform::platform_service_server::PlatformServiceServer as GrpcPlatformServiceServer;
-
-/// Timeout for unacknowledged instructions.
-const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A pending instruction awaiting acknowledgement from a client.
-struct PendingInstruction {
-    sent_at: Instant,
-    ack_tx: oneshot::Sender<InstructionAckResult>,
-}
-
-/// Result of an instruction ack.
-pub struct InstructionAckResult {
-    pub success: bool,
-    pub error: Option<String>,
-}
 
 /// Registry of outbound channels for connected platform clients.
 ///
@@ -39,16 +23,12 @@ pub struct InstructionAckResult {
 /// or broadcast to all connected clients.
 pub struct ClientChannelRegistry {
     channels: RwLock<HashMap<String, mpsc::Sender<Result<pb::PlatformOutbound, Status>>>>,
-    pending_instructions: RwLock<HashMap<String, PendingInstruction>>,
-    instruction_counter: std::sync::atomic::AtomicU64,
 }
 
 impl ClientChannelRegistry {
     pub fn new() -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
-            pending_instructions: RwLock::new(HashMap::new()),
-            instruction_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -58,49 +38,6 @@ impl ClientChannelRegistry {
 
     fn unregister(&self, client_id: &str) {
         self.channels.write().remove(client_id);
-    }
-
-    fn next_instruction_id(&self) -> String {
-        let id = self
-            .instruction_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("instr-{id}")
-    }
-
-    /// Resolves a pending instruction ack. Returns true if found.
-    fn resolve_ack(&self, instruction_id: &str, success: bool, error: Option<String>) -> bool {
-        let pending = self.pending_instructions.write().remove(instruction_id);
-        if let Some(entry) = pending {
-            let _ = entry.ack_tx.send(InstructionAckResult { success, error });
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Drops senders whose deadline has passed; the caller observes RecvError.
-    fn sweep_timed_out_instructions(&self) {
-        let mut pending = self.pending_instructions.write();
-        pending.retain(|_id, entry| entry.sent_at.elapsed() <= INSTRUCTION_ACK_TIMEOUT);
-    }
-
-    /// Sends a `RequestReconnect` to a specific client. Returns true if sent.
-    pub async fn request_reconnect(&self, client_id: &str) -> bool {
-        let tx = {
-            let channels = self.channels.read();
-            channels.get(client_id).cloned()
-        };
-        if let Some(tx) = tx {
-            let msg = pb::PlatformOutbound {
-                request: Some(pb::platform_outbound::Request::RequestReconnect(
-                    pb::RequestReconnect {},
-                )),
-                instruction_id: String::new(),
-            };
-            tx.send(Ok(msg)).await.is_ok()
-        } else {
-            false
-        }
     }
 
     /// Sends `RequestReconnect` to all connected clients (e.g. graceful shutdown).
@@ -141,40 +78,6 @@ impl ClientChannelRegistry {
         } else {
             false
         }
-    }
-
-    /// Sends a processor control instruction that requires an ack.
-    /// Returns a receiver for the ack result, or None if the client is not connected.
-    /// The instruction will time out after `INSTRUCTION_ACK_TIMEOUT`.
-    pub async fn send_tracked_instruction(
-        &self,
-        client_id: &str,
-        request: pb::platform_outbound::Request,
-    ) -> Option<oneshot::Receiver<InstructionAckResult>> {
-        let instruction_id = self.next_instruction_id();
-        let (ack_tx, ack_rx) = oneshot::channel();
-
-        // Register pending before sending so an immediate ack can't race us.
-        {
-            let mut pending = self.pending_instructions.write();
-            pending.insert(
-                instruction_id.clone(),
-                PendingInstruction {
-                    sent_at: Instant::now(),
-                    ack_tx,
-                },
-            );
-        }
-
-        let sent = self
-            .send_instruction(client_id, instruction_id.clone(), request)
-            .await;
-        if !sent {
-            self.pending_instructions.write().remove(&instruction_id);
-            return None;
-        }
-
-        Some(ack_rx)
     }
 
     /// Broadcasts a topology notification to all connected platform clients.
@@ -237,10 +140,6 @@ impl PlatformServiceImpl {
         }
     }
 
-    pub fn into_server(self) -> GrpcPlatformServiceServer<Self> {
-        GrpcPlatformServiceServer::new(self)
-    }
-
     fn make_platform_info(&self) -> pb::PlatformInfo {
         pb::PlatformInfo {
             node_name: self.node_name.clone(),
@@ -271,7 +170,6 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
             ClientId(id.client_id.clone()),
             ComponentName(id.component_name),
             id.version,
-            id.tags,
         );
 
         Ok(Response::new(self.make_platform_info()))
@@ -310,7 +208,6 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
                             ClientId(id.client_id.clone()),
                             ComponentName(id.component_name),
                             id.version,
-                            id.tags,
                         );
                         client_registry.set_stream_active(&ClientId(id.client_id.clone()), true);
 
@@ -357,18 +254,6 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
                 }
             });
 
-            // Spawn instruction ack timeout sweeper.
-            let sweep_registry = Arc::clone(&channel_registry);
-            let sweep_handle = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
-                loop {
-                    interval.tick().await;
-                    sweep_registry.sweep_timed_out_instructions();
-                }
-            });
-
-            let component_name = client_registry.get_component_name(&cid).unwrap_or_default();
-
             loop {
                 match tokio::time::timeout(heartbeat_timeout, inbound.message()).await {
                     Ok(Ok(Some(msg))) => match msg.request {
@@ -376,25 +261,25 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
                             client_registry.heartbeat(&cid);
                         }
                         Some(pb::platform_inbound::Request::Ack(ack)) => {
-                            let error_msg = ack.error.map(|e| e.message);
-                            channel_registry.resolve_ack(
-                                &ack.instruction_id,
-                                ack.success,
-                                error_msg,
+                            tracing::debug!(
+                                client_id = %client_id,
+                                instruction_id = %ack.instruction_id,
+                                success = ack.success,
+                                "platform stream: instruction ack"
                             );
                         }
                         Some(pb::platform_inbound::Request::Register(_)) => {
                             client_registry.heartbeat(&cid);
                         }
                         Some(pb::platform_inbound::Request::EventProcessorInfo(info)) => {
-                            processor_registry.report(&client_id, &component_name, &info);
+                            processor_registry.report(&client_id, &info);
                         }
                         Some(pb::platform_inbound::Request::Result(result)) => {
-                            let error_msg = result.error.map(|e| e.message);
-                            channel_registry.resolve_ack(
-                                &result.instruction_id,
-                                result.success,
-                                error_msg,
+                            tracing::debug!(
+                                client_id = %client_id,
+                                instruction_id = %result.instruction_id,
+                                success = result.success,
+                                "platform stream: instruction result"
                             );
                         }
                         None => {}
@@ -421,7 +306,6 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
             // Cascade disconnect to all handler streams: cancels server-side
             // handler tasks and surfaces CANCELLED to clients so they reconnect.
             heartbeat_handle.abort();
-            sweep_handle.abort();
             handler_stream_registry.close_client_streams(&client_id);
 
             channel_registry.unregister(&client_id);

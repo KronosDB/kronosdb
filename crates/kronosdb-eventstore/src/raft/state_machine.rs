@@ -1,3 +1,6 @@
+// openraft's `StorageError` is the trait-fixed error type for this module.
+#![allow(clippy::result_large_err)]
+
 use std::io::{BufReader, BufWriter, Seek, SeekFrom};
 use std::sync::Arc;
 

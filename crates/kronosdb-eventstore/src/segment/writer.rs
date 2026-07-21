@@ -768,7 +768,7 @@ mod tests {
 
         // Write events until we get a rotation.
         for i in 0..5 {
-            let event = make_event(&format!("Event{i}"), &vec![0u8; 50]);
+            let event = make_event(&format!("Event{i}"), &[0u8; 50]);
             writer.append(&[event]).unwrap();
         }
 

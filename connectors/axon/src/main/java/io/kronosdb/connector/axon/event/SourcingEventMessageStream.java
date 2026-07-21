@@ -59,11 +59,14 @@ public class SourcingEventMessageStream implements MessageStream<EventMessage> {
             if (next == null) {
                 return;
             }
-            if (next.hasConsistencyMarker()) {
-                logger.debug("Reached consistency marker [{}].", next.getConsistencyMarker());
-                pendingMarker = next.getConsistencyMarker();
-            } else if (next.hasBatch()) {
+            if (next.hasBatch()) {
                 buffer.addAll(next.getBatch().getEventsList());
+                // The final batch of the stream carries the marker.
+                if (next.getBatch().hasConsistencyMarker()) {
+                    logger.debug("Reached consistency marker [{}].",
+                            next.getBatch().getConsistencyMarker());
+                    pendingMarker = next.getBatch().getConsistencyMarker();
+                }
             }
         }
     }

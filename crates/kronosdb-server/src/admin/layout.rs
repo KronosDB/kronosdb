@@ -100,7 +100,7 @@ fn epoch_to_datetime(epoch: i64) -> (i64, u32, u32, u32, u32, u32) {
     let h = s / 3600;
     let min = (s % 3600) / 60;
     let sec = s % 60;
-    let days = (epoch.div_euclid(86400)) as i64;
+    let days = epoch.div_euclid(86400);
     let (y, m, d) = days_to_ymd(days + 719_468);
     (y, m, d, h, min, sec)
 }
@@ -116,27 +116,6 @@ fn days_to_ymd(g: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
-}
-
-/// Try to decode payload bytes as UTF-8 for display, falling back to hex preview.
-pub fn try_utf8_preview(data: &[u8], max_len: usize) -> String {
-    match std::str::from_utf8(data) {
-        Ok(s) => {
-            if s.len() <= max_len {
-                html_escape(s)
-            } else {
-                format!("{}...", html_escape(&s[..max_len]))
-            }
-        }
-        Err(_) => {
-            let hex: String = data
-                .iter()
-                .take(max_len / 2)
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            format!("{hex}...")
-        }
-    }
 }
 
 // ── Shared layout ──────────────────────────────────────────────────

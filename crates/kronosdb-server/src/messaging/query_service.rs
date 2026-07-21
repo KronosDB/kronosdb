@@ -10,16 +10,16 @@ use tonic::{Request, Response, Status, Streaming};
 use kronosdb_messaging::manager::MessagingManager;
 use kronosdb_messaging::query::Query;
 use kronosdb_messaging::subscription::{SubscriptionQuery, SubscriptionUpdate};
-use kronosdb_messaging::types::{
-    ClientId, ComponentName, ErrorDetail, MetadataValue, Payload, ProcessingInstruction,
-    ProcessingKey,
-};
+use kronosdb_messaging::types::{ClientId, ComponentName, Payload};
 
+use super::convert::{
+    detail_to_proto_error, effective_timeout, expected_results, internal_metadata_to_proto,
+    internal_pi_to_proto, proto_error_to_detail, proto_metadata_to_internal, proto_pi_to_internal,
+};
 use crate::handler_registry::HandlerStreamRegistry;
 use crate::platform::service::ClientChannelRegistry;
 use crate::proto::kronosdb::platform as platform_pb;
 use crate::proto::kronosdb::query as pb;
-use crate::proto::kronosdb::query::query_service_server::QueryServiceServer as GrpcQueryServiceServer;
 
 const CONTEXT_HEADER: &str = "kronosdb-context";
 const DEFAULT_CONTEXT: &str = "default";
@@ -68,10 +68,6 @@ impl QueryServiceImpl {
             channel_registry,
             handler_stream_registry,
         }
-    }
-
-    pub fn into_server(self) -> GrpcQueryServiceServer<Self> {
-        GrpcQueryServiceServer::new(self)
     }
 }
 
@@ -218,7 +214,13 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                         // First try regular pending queries.
                         let routed = if let Some(entry) = pending_queries.get(&request_id) {
-                            let _ = entry.value().try_send(resp.clone());
+                            if let Err(e) = entry.value().try_send(resp.clone()) {
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    reason = %e,
+                                    "query response dropped: caller buffer full or closed"
+                                );
+                            }
                             true
                         } else {
                             false
@@ -244,7 +246,13 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                                     ),
                                 ),
                             };
-                            let _ = entry.value().try_send(Ok(initial_result));
+                            if let Err(e) = entry.value().try_send(Ok(initial_result)) {
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    reason = %e,
+                                    "subscription initial result dropped: subscriber buffer full or closed"
+                                );
+                            }
                         }
                     }
                     Some(pb::query_handler_outbound::Request::QueryComplete(complete)) => {
@@ -255,7 +263,15 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                     Some(pb::query_handler_outbound::Request::SubscriptionQueryResponse(resp)) => {
                         let sub_id = resp.subscription_identifier.clone();
                         let update = proto_subscription_response_to_update(resp);
+                        let terminal = update.complete || update.error_code.is_some();
                         platform.send_update(&sub_id, update);
+                        if terminal {
+                            // Handler signalled Complete/CompleteExceptionally:
+                            // the terminal message is in the subscriber's buffer,
+                            // now retire the subscription so the update channel
+                            // closes and nothing leaks.
+                            platform.complete_subscription(&sub_id);
+                        }
                     }
                     Some(pb::query_handler_outbound::Request::Ack(_)) => {}
                     None => {}
@@ -316,6 +332,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let req = request.into_inner();
         let message_id = req.message_identifier.clone();
 
+        let processing_instructions = proto_pi_to_internal(req.processing_instructions);
         let query = Query {
             message_id: req.message_identifier,
             name: req.query.clone(),
@@ -334,10 +351,12 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                 data: req.payload.map(|p| p.data).unwrap_or_default(),
             },
             metadata: proto_metadata_to_internal(req.metadata),
-            processing_instructions: proto_pi_to_internal(req.processing_instructions),
             client_id: ClientId(req.client_id),
             component_name: ComponentName(req.component_name),
-            expected_results: -1,
+            // NrOfResults == 1 selects point-to-point routing; everything
+            // else is scatter-gather.
+            expected_results: expected_results(&processing_instructions),
+            processing_instructions,
         };
 
         let query_name = query.name.clone();
@@ -388,7 +407,8 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let (caller_tx, caller_rx) = mpsc::channel(64);
         let pending_queries = Arc::clone(&self.pending_queries);
         let msg_id = message_id.clone();
-        let query_timeout = self.query_timeout;
+        let query_timeout =
+            effective_timeout(&pending.query.processing_instructions, self.query_timeout);
 
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + query_timeout;
@@ -434,6 +454,10 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let pending_sub_initials = Arc::clone(&self.pending_sub_initials);
 
         tokio::spawn(async move {
+            // Subscriptions opened on THIS gRPC stream — cancelled when the
+            // subscriber's stream closes, so handler-side registrations and
+            // pending-initial entries don't outlive the subscriber.
+            let mut stream_subs: Vec<String> = Vec::new();
             while let Ok(Some(msg)) = inbound.message().await {
                 match msg.request {
                     Some(pb::subscription_query_request::Request::Subscribe(sub)) => {
@@ -490,6 +514,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                         match platform.subscribe(subscription) {
                             Ok((pending, mut update_rx)) => {
+                                stream_subs.push(sub_id.clone());
                                 // Register so the initial QueryResponse from the handler
                                 // can be re-routed onto this subscription stream as
                                 // SubscriptionQueryResponse::InitialResult.
@@ -538,9 +563,14 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                                 let sub_tx = sub_tx.clone();
                                 tokio::spawn(async move {
                                     while let Some(update) = update_rx.recv().await {
+                                        let terminal =
+                                            update.complete || update.error_code.is_some();
                                         let resp = subscription_update_to_proto(update);
                                         if sub_tx.send(Ok(resp)).await.is_err() {
                                             break; // Subscriber disconnected.
+                                        }
+                                        if terminal {
+                                            break; // Complete/CompleteExceptionally sent.
                                         }
                                     }
                                 });
@@ -552,36 +582,35 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                     }
                     Some(pb::subscription_query_request::Request::Unsubscribe(sub)) => {
                         let sub_id = sub.subscription_identifier;
-                        platform.cancel_subscription(&sub_id);
+                        stream_subs.retain(|s| s != &sub_id);
+                        pending_sub_initials.remove(&sub_id);
+                        if let Some(handler_id) = platform.cancel_subscription(&sub_id) {
+                            notify_handler_unsubscribe(&handler_streams, &handler_id.0, &sub_id)
+                                .await;
+                        }
                     }
-                    Some(pb::subscription_query_request::Request::FlowControl(_fc)) => {
-                        // Grant more update permits — currently unused since we
-                        // use channel backpressure instead.
+                    Some(pb::subscription_query_request::Request::FlowControl(fc)) => {
+                        platform.grant_subscription_permits(
+                            &fc.subscription_identifier,
+                            fc.number_of_permits,
+                        );
                     }
                     None => {}
+                }
+            }
+
+            // Subscriber stream closed: retire everything it opened so the
+            // handler stops emitting into a void and no pending-initial
+            // senders leak.
+            for sub_id in stream_subs {
+                pending_sub_initials.remove(&sub_id);
+                if let Some(handler_id) = platform.cancel_subscription(&sub_id) {
+                    notify_handler_unsubscribe(&handler_streams, &handler_id.0, &sub_id).await;
                 }
             }
         });
 
         Ok(Response::new(ReceiverStream::new(sub_rx)))
-    }
-}
-
-fn proto_error_to_detail(e: crate::proto::kronosdb::ErrorMessage) -> ErrorDetail {
-    ErrorDetail {
-        message: e.message,
-        location: e.location,
-        details: e.details,
-        error_code: e.error_code,
-    }
-}
-
-fn detail_to_proto_error(e: &ErrorDetail) -> crate::proto::kronosdb::ErrorMessage {
-    crate::proto::kronosdb::ErrorMessage {
-        message: e.message.clone(),
-        location: e.location.clone(),
-        details: e.details.clone(),
-        error_code: e.error_code.clone(),
     }
 }
 
@@ -604,6 +633,7 @@ fn proto_subscription_response_to_update(
                 Some(upd.error_code)
             },
             error: upd.error_message.map(proto_error_to_detail),
+            complete: false,
         },
         Some(pb::subscription_query_response::Response::InitialResult(result)) => {
             SubscriptionUpdate {
@@ -620,6 +650,7 @@ fn proto_subscription_response_to_update(
                     Some(result.error_code)
                 },
                 error: result.error_message.map(proto_error_to_detail),
+                complete: false,
             }
         }
         Some(pb::subscription_query_response::Response::CompleteExceptionally(err)) => {
@@ -629,14 +660,24 @@ fn proto_subscription_response_to_update(
                 metadata: HashMap::new(),
                 error_code: Some(err.error_code),
                 error: err.error_message.map(proto_error_to_detail),
+                complete: true,
             }
         }
-        Some(pb::subscription_query_response::Response::Complete(_)) | None => SubscriptionUpdate {
+        Some(pb::subscription_query_response::Response::Complete(_)) => SubscriptionUpdate {
             subscription_id: sub_id,
             payload: None,
             metadata: HashMap::new(),
             error_code: None,
             error: None,
+            complete: true,
+        },
+        None => SubscriptionUpdate {
+            subscription_id: sub_id,
+            payload: None,
+            metadata: HashMap::new(),
+            error_code: None,
+            error: None,
+            complete: false,
         },
     }
 }
@@ -653,6 +694,13 @@ fn subscription_update_to_proto(update: SubscriptionUpdate) -> pb::SubscriptionQ
                 },
             ),
         )
+    } else if update.complete {
+        Some(pb::subscription_query_response::Response::Complete(
+            pb::QueryUpdateComplete {
+                client_id: String::new(),
+                component_name: String::new(),
+            },
+        ))
     } else {
         Some(pb::subscription_query_response::Response::Update(
             pb::QueryUpdate {
@@ -680,108 +728,33 @@ fn subscription_update_to_proto(update: SubscriptionUpdate) -> pb::SubscriptionQ
     }
 }
 
-// --- Proto conversion helpers ---
-
-fn proto_mv_to_internal(v: crate::proto::kronosdb::MetadataValue) -> MetadataValue {
-    match v.data {
-        Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => MetadataValue::Text(s),
-        Some(crate::proto::kronosdb::metadata_value::Data::NumberValue(n)) => {
-            MetadataValue::Number(n)
-        }
-        Some(crate::proto::kronosdb::metadata_value::Data::BooleanValue(b)) => {
-            MetadataValue::Boolean(b)
-        }
-        Some(crate::proto::kronosdb::metadata_value::Data::DoubleValue(d)) => {
-            MetadataValue::Double(d)
-        }
-        Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(obj)) => {
-            MetadataValue::Bytes(Payload {
-                payload_type: obj.r#type,
-                revision: obj.revision,
-                data: obj.data,
-            })
-        }
-        None => MetadataValue::Text(String::new()),
+/// Forwards an Unsubscribe to the handler's open stream so its Axon-side
+/// update-emitter registration can be closed (the subscriber is gone).
+async fn notify_handler_unsubscribe(
+    handler_streams: &DashMap<String, mpsc::Sender<Result<pb::QueryHandlerInbound, Status>>>,
+    handler_client_id: &str,
+    subscription_id: &str,
+) {
+    let tx = handler_streams
+        .get(handler_client_id)
+        .map(|r| r.value().clone());
+    if let Some(tx) = tx {
+        let msg = pb::QueryHandlerInbound {
+            request: Some(
+                pb::query_handler_inbound::Request::SubscriptionQueryRequest(
+                    pb::SubscriptionQueryRequest {
+                        request: Some(pb::subscription_query_request::Request::Unsubscribe(
+                            pb::SubscriptionQuery {
+                                subscription_identifier: subscription_id.to_string(),
+                                number_of_permits: 0,
+                                query_request: None,
+                            },
+                        )),
+                    },
+                ),
+            ),
+            instruction_id: String::new(),
+        };
+        let _ = tx.send(Ok(msg)).await;
     }
-}
-
-fn internal_mv_to_proto(v: &MetadataValue) -> crate::proto::kronosdb::MetadataValue {
-    let data = match v {
-        MetadataValue::Text(s) => Some(crate::proto::kronosdb::metadata_value::Data::TextValue(
-            s.clone(),
-        )),
-        MetadataValue::Number(n) => Some(
-            crate::proto::kronosdb::metadata_value::Data::NumberValue(*n),
-        ),
-        MetadataValue::Boolean(b) => Some(
-            crate::proto::kronosdb::metadata_value::Data::BooleanValue(*b),
-        ),
-        MetadataValue::Double(d) => Some(
-            crate::proto::kronosdb::metadata_value::Data::DoubleValue(*d),
-        ),
-        MetadataValue::Bytes(p) => Some(crate::proto::kronosdb::metadata_value::Data::BytesValue(
-            crate::proto::kronosdb::SerializedObject {
-                r#type: p.payload_type.clone(),
-                revision: p.revision.clone(),
-                data: p.data.clone(),
-            },
-        )),
-    };
-    crate::proto::kronosdb::MetadataValue { data }
-}
-
-fn proto_metadata_to_internal(
-    meta: HashMap<String, crate::proto::kronosdb::MetadataValue>,
-) -> kronosdb_messaging::types::Metadata {
-    meta.into_iter()
-        .map(|(k, v)| (k, proto_mv_to_internal(v)))
-        .collect()
-}
-
-fn internal_metadata_to_proto(
-    meta: &kronosdb_messaging::types::Metadata,
-) -> HashMap<String, crate::proto::kronosdb::MetadataValue> {
-    meta.iter()
-        .map(|(k, v)| (k.clone(), internal_mv_to_proto(v)))
-        .collect()
-}
-
-fn proto_pk_to_internal(key: i32) -> ProcessingKey {
-    match key {
-        1 => ProcessingKey::Priority,
-        2 => ProcessingKey::Timeout,
-        3 => ProcessingKey::NrOfResults,
-        _ => ProcessingKey::RoutingKey,
-    }
-}
-
-fn internal_pk_to_proto(key: ProcessingKey) -> i32 {
-    match key {
-        ProcessingKey::RoutingKey => 0,
-        ProcessingKey::Priority => 1,
-        ProcessingKey::Timeout => 2,
-        ProcessingKey::NrOfResults => 3,
-    }
-}
-
-fn proto_pi_to_internal(
-    pis: Vec<crate::proto::kronosdb::ProcessingInstruction>,
-) -> Vec<ProcessingInstruction> {
-    pis.into_iter()
-        .map(|pi| ProcessingInstruction {
-            key: proto_pk_to_internal(pi.key),
-            value: pi.value.map(proto_mv_to_internal),
-        })
-        .collect()
-}
-
-fn internal_pi_to_proto(
-    pis: &[ProcessingInstruction],
-) -> Vec<crate::proto::kronosdb::ProcessingInstruction> {
-    pis.iter()
-        .map(|pi| crate::proto::kronosdb::ProcessingInstruction {
-            key: internal_pk_to_proto(pi.key),
-            value: pi.value.as_ref().map(internal_mv_to_proto),
-        })
-        .collect()
 }
