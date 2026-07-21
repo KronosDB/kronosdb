@@ -14,6 +14,7 @@ import org.axonframework.messaging.queryhandling.QueryResponseMessage;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A {@link MessageStream} that wraps a KronosDB subscription query result,
@@ -30,11 +31,16 @@ public class SubscriptionQueryResponseMessageStream implements MessageStream<Que
     private volatile boolean terminated;
     private volatile @Nullable Throwable terminalError;
 
+    // Update flow control: refill the server-side credit in batches as updates are consumed.
+    private final long refillBatch;
+    private final AtomicLong consumedSinceRefill = new AtomicLong(0);
+
     public SubscriptionQueryResponseMessageStream(QueryChannel.SubscriptionQueryResult queryResult,
                                                    @Nullable Converter converter) {
         this.queryResult = queryResult;
         this.stream = queryResult.results();
         this.converter = converter;
+        this.refillBatch = Math.max(1, queryResult.initialPermits() / 4);
     }
 
     @Override
@@ -43,7 +49,21 @@ public class SubscriptionQueryResponseMessageStream implements MessageStream<Que
         if (response == null) {
             return Optional.empty();
         }
-        return convertResponse(response);
+        Optional<Entry<QueryResponseMessage>> entry = convertResponse(response);
+        if (response.hasUpdate()) {
+            onUpdateConsumed();
+        }
+        return entry;
+    }
+
+    private void onUpdateConsumed() {
+        if (terminated || stream.isClosed()) {
+            return;
+        }
+        if (consumedSinceRefill.incrementAndGet() >= refillBatch) {
+            consumedSinceRefill.addAndGet(-refillBatch);
+            queryResult.sendFlowControl(refillBatch);
+        }
     }
 
     @Override

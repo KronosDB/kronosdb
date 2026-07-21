@@ -29,6 +29,7 @@ public class QueryChannel {
     // Flow control constants
     private static final long INITIAL_PERMITS = 500;
     private static final double REFILL_THRESHOLD = 0.25;
+    private static final long DEFAULT_SUBSCRIPTION_PERMITS = 64;
 
     private final QueryServiceGrpc.QueryServiceStub asyncStub;
     private final String context;
@@ -80,21 +81,16 @@ public class QueryChannel {
 
         String subscriptionId = UUID.randomUUID().toString();
         StreamObserver<SubscriptionQueryRequest> requestStream = asyncStub.subscription(observer);
+        long permits = bufferSize > 0 ? bufferSize : DEFAULT_SUBSCRIPTION_PERMITS;
 
-        // Send subscribe message
-        requestStream.onNext(SubscriptionQueryRequest.newBuilder()
-                .setSubscribe(SubscriptionQuery.newBuilder()
-                        .setSubscriptionIdentifier(subscriptionId)
-                        .setNumberOfPermits(bufferSize)
-                        .setQueryRequest(queryRequest)
-                        .build())
-                .build());
-
-        return new SubscriptionQueryResult(
+        SubscriptionQueryResult result = new SubscriptionQueryResult(
                 new ResultStream<>(observer, completionFuture),
                 requestStream,
-                subscriptionId
+                subscriptionId,
+                permits
         );
+        result.sendSubscribe(queryRequest);
+        return result;
     }
 
     /**
@@ -447,21 +443,87 @@ public class QueryChannel {
      * Result of a subscription query, providing both a result stream and the ability
      * to send flow control / unsubscribe messages.
      */
-    public record SubscriptionQueryResult(
-            ResultStream<SubscriptionQueryResponse> results,
-            StreamObserver<SubscriptionQueryRequest> requestStream,
-            String subscriptionId
-    ) {
-        public void close() {
-            try {
+    public static final class SubscriptionQueryResult {
+
+        private final ResultStream<SubscriptionQueryResponse> results;
+        private final StreamObserver<SubscriptionQueryRequest> requestStream;
+        private final String subscriptionId;
+        private final long initialPermits;
+        // Guards all requestStream.onNext() calls — StreamObserver is NOT thread-safe.
+        private final Object requestWriteLock = new Object();
+        private volatile boolean closed;
+
+        SubscriptionQueryResult(ResultStream<SubscriptionQueryResponse> results,
+                                StreamObserver<SubscriptionQueryRequest> requestStream,
+                                String subscriptionId,
+                                long initialPermits) {
+            this.results = results;
+            this.requestStream = requestStream;
+            this.subscriptionId = subscriptionId;
+            this.initialPermits = initialPermits;
+        }
+
+        public ResultStream<SubscriptionQueryResponse> results() {
+            return results;
+        }
+
+        public String subscriptionId() {
+            return subscriptionId;
+        }
+
+        public long initialPermits() {
+            return initialPermits;
+        }
+
+        void sendSubscribe(QueryRequest queryRequest) {
+            synchronized (requestWriteLock) {
                 requestStream.onNext(SubscriptionQueryRequest.newBuilder()
-                        .setUnsubscribe(SubscriptionQuery.newBuilder()
+                        .setSubscribe(SubscriptionQuery.newBuilder()
                                 .setSubscriptionIdentifier(subscriptionId)
+                                .setNumberOfPermits(initialPermits)
+                                .setQueryRequest(queryRequest)
                                 .build())
                         .build());
-                requestStream.onCompleted();
-            } catch (IllegalStateException e) {
-                // Stream already completed (server closed or errored) — safe to ignore.
+            }
+        }
+
+        public void sendFlowControl(long permits) {
+            if (closed) {
+                return;
+            }
+            synchronized (requestWriteLock) {
+                if (closed) {
+                    return;
+                }
+                try {
+                    requestStream.onNext(SubscriptionQueryRequest.newBuilder()
+                            .setFlowControl(SubscriptionQuery.newBuilder()
+                                    .setSubscriptionIdentifier(subscriptionId)
+                                    .setNumberOfPermits(permits)
+                                    .build())
+                            .build());
+                } catch (IllegalStateException e) {
+                    // Stream already completed (server closed or errored) — safe to ignore.
+                }
+            }
+        }
+
+        public void close() {
+            synchronized (requestWriteLock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                try {
+                    requestStream.onNext(SubscriptionQueryRequest.newBuilder()
+                            .setUnsubscribe(SubscriptionQuery.newBuilder()
+                                    .setSubscriptionIdentifier(subscriptionId)
+                                    .build())
+                            .build());
+                    requestStream.onCompleted();
+                } catch (IllegalStateException e) {
+                    // Stream already completed (server closed or errored) — safe to ignore.
+                }
             }
         }
     }
