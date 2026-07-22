@@ -58,13 +58,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse()?;
     match config.ack_mode.as_str() {
+        "auto" => kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Auto),
         // "replicated" is a deprecated alias from the mode's prototype era.
-        "written" | "replicated" => kronosdb_eventstore::configure_ack_mode(true),
-        "durable" => kronosdb_eventstore::configure_ack_mode(false),
+        "written" | "replicated" => {
+            kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Written)
+        }
+        "durable" => kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Durable),
         other => {
-            return Err(
-                format!("invalid ack-mode {other:?}: expected \"written\" or \"durable\"").into(),
-            );
+            return Err(format!(
+                "invalid ack-mode {other:?}: expected \"auto\", \"written\", or \"durable\""
+            )
+            .into());
         }
     }
 

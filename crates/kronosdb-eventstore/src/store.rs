@@ -302,7 +302,7 @@ fn spawn_sync_thread(
                         // Queue before fsync: the dispatcher preads on its own
                         // thread while this thread enters fdatasync.
                         replication.try_publish(descriptor);
-                        if crate::relaxed_acks()
+                        if crate::written_acks(watermark.voter_count())
                             && durable.saturating_sub(durable_tail.load(Ordering::Acquire))
                                 <= crate::ack_lag_limit()
                         {
@@ -913,6 +913,11 @@ impl EventStoreEngine {
     }
 
     /// Local next-exclusive cursor that has completed fdatasync.
+    /// Size of the current quorum voter set (lock-free).
+    pub fn voter_count(&self) -> u64 {
+        self.watermark.voter_count()
+    }
+
     pub fn durable_tail(&self) -> Position {
         Position(self.durable_tail.load(Ordering::Acquire))
     }
@@ -1548,7 +1553,7 @@ impl EventStoreEngine {
         };
 
         let staged = StagedAppend { outcome, timer };
-        if crate::relaxed_acks()
+        if crate::written_acks(self.watermark.voter_count())
             && let Some(pos) = staged.wait_pos()
             && pos.saturating_sub(self.durable_tail.load(Ordering::Acquire))
                 <= crate::ack_lag_limit()
