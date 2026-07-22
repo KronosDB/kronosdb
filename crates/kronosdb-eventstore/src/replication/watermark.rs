@@ -80,6 +80,9 @@ pub struct WatermarkState {
     /// read paths and event streams; every write happens under `inner` so
     /// ledger drains can never miss a bump.
     watermark: Arc<AtomicU64>,
+    /// Current voter-set size, updated atomically with epoch changes.
+    /// Lock-free read for the per-append ack-mode decision (`auto`).
+    voter_count: AtomicU64,
     inner: Mutex<Inner>,
 }
 
@@ -92,6 +95,7 @@ impl WatermarkState {
         let quorum = voters.len() / 2 + 1;
         Self {
             watermark: Arc::new(AtomicU64::new(initial)),
+            voter_count: AtomicU64::new(voters.len() as u64),
             inner: Mutex::new(Inner {
                 epoch,
                 voters,
@@ -125,10 +129,17 @@ impl WatermarkState {
         abort_locked(&mut inner, &format!("leadership epoch advanced to {epoch}"));
         inner.epoch = epoch;
         inner.quorum = voters.len() / 2 + 1;
+        self.voter_count
+            .store(voters.len() as u64, Ordering::Release);
         inner.voters = voters;
         inner.cursors.clear();
         inner.poisoned = None;
         Ok(())
+    }
+
+    /// Size of the current voter set. Lock-free; updated with the epoch.
+    pub fn voter_count(&self) -> u64 {
+        self.voter_count.load(Ordering::Acquire)
     }
 
     pub fn epoch(&self) -> Epoch {

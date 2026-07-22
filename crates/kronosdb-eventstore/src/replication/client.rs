@@ -109,7 +109,7 @@ async fn run_tail(
                     continue;
                 };
                 if let Some(write) = ack.write
-                    && (!crate::relaxed_acks()
+                    && (!crate::written_acks(engine.voter_count())
                         || ack.position.saturating_sub(engine.durable_tail().0)
                             > crate::ack_lag_limit())
                 {
