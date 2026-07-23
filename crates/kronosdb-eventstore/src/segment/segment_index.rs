@@ -179,10 +179,7 @@ impl SegmentIndex {
 
         for tag in &criterion.tags {
             let key = make_forward_key(&tag.key, &tag.value);
-            match self.bitmaps.get(&key) {
-                Some(bitmap) => parts.push(bitmap),
-                None => return None,
-            }
+            parts.push(self.bitmaps.get(&key)?);
         }
 
         let name_bitmap;
@@ -197,13 +194,8 @@ impl SegmentIndex {
                     }
                 }
             }
-            match names_combined {
-                Some(bitmap) => {
-                    name_bitmap = bitmap;
-                    parts.push(&name_bitmap);
-                }
-                None => return None,
-            }
+            name_bitmap = names_combined?;
+            parts.push(&name_bitmap);
         }
 
         if parts.is_empty() {

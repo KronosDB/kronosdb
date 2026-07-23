@@ -196,17 +196,13 @@ impl TagIndex {
 
         for tag in &criterion.tags {
             let key = make_forward_key(&tag.key, &tag.value);
-            match self.forward.get(&key) {
-                Some(entry) => {
-                    let bitmap = entry.value();
-                    match &mut result {
-                        Some(existing) => *existing &= bitmap,
-                        None => result = Some(bitmap.clone()),
-                    }
-                }
-                None => return None,
+            let entry = self.forward.get(&key)?;
+            let bitmap = entry.value();
+            match &mut result {
+                Some(existing) => *existing &= bitmap,
+                None => result = Some(bitmap.clone()),
             }
-            // Shard Ref dropped here.
+            drop(entry); // Shard Ref dropped here.
         }
 
         if !criterion.names.is_empty() {
@@ -223,12 +219,10 @@ impl TagIndex {
                     }
                 }
             }
-            match names_combined {
-                Some(names_bitmap) => match &mut result {
-                    Some(existing) => *existing &= &names_bitmap,
-                    None => result = Some(names_bitmap),
-                },
-                None => return None,
+            let names_bitmap = names_combined?;
+            match &mut result {
+                Some(existing) => *existing &= &names_bitmap,
+                None => result = Some(names_bitmap),
             }
         }
 

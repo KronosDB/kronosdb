@@ -584,22 +584,21 @@ fn try_detect_cgroup_memory() -> Option<usize> {
     // cgroup v2: single file, plain number or "max".
     if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         let trimmed = content.trim();
-        if trimmed != "max" {
-            if let Ok(bytes) = trimmed.parse::<usize>() {
-                return Some(bytes);
-            }
+        if trimmed != "max"
+            && let Ok(bytes) = trimmed.parse::<usize>()
+        {
+            return Some(bytes);
         }
         return None; // "max" = no limit, fall through to system RAM.
     }
 
     // cgroup v1: different path, large sentinel value means unlimited.
-    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(bytes) = content.trim().parse::<usize>() {
-            // cgroup v1 uses a very large number (close to usize::MAX) for "no limit".
-            if bytes < 1 << 62 {
-                return Some(bytes);
-            }
-        }
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        && let Ok(bytes) = content.trim().parse::<usize>()
+        // cgroup v1 uses a very large number (close to usize::MAX) for "no limit".
+        && bytes < 1 << 62
+    {
+        return Some(bytes);
     }
 
     None
