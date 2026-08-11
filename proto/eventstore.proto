@@ -20,7 +20,14 @@ service EventStore {
      additional permits. The server only sends events when permits > 0. */
   rpc Stream (stream StreamControl) returns (stream StreamResponse);
 
-  /* Gets the current head of the event store (next position to be assigned). */
+  /* Gets the current head of the event store: the position just past the last
+     readable event.
+
+     A cursor that has drained the store equals this value, so `head - cursor`
+     is a valid measure of how far behind a consumer is, and a poll that waits
+     for the two to meet terminates. Note that positions are not necessarily
+     contiguous — reads may skip positions — so advance a cursor by the
+     positions you actually receive, never by incrementing through the range. */
   rpc GetHead (GetHeadRequest) returns (GetHeadResponse);
 
   /* Gets the current tail of the event store (first event position). */
@@ -126,7 +133,11 @@ message SequencedEventBatch {
   /* Present on the FINAL batch of a Source stream: the next-exclusive
      consistency marker for subsequent DCB-conditioned appends. A source
      with no matching events still ends with one (empty) marker-carrying
-     batch. Absent on Stream responses and non-final Source batches. */
+     batch. Absent on Stream responses and non-final Source batches.
+
+     Opaque: pass it back in a ConsistencyCondition, unmodified. It counts
+     positions GetHead does not, so comparing the two — or doing any
+     arithmetic against event sequences — yields nonsense. */
   optional int64 consistency_marker = 2;
 }
 

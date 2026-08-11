@@ -27,6 +27,10 @@ pub enum Error {
 
     /// Snapshot not found.
     SnapshotNotFound { key: String },
+
+    /// A client request used the `$` namespace, which is reserved for events
+    /// the server writes about itself. See `docs/system-events.md`.
+    ReservedNamespace { detail: String },
 }
 
 impl From<std::io::Error> for Error {
@@ -57,6 +61,9 @@ impl std::fmt::Display for Error {
                 write!(f, "invalid context name '{name}': {reason}")
             }
             Error::SnapshotNotFound { key } => write!(f, "snapshot not found: {key}"),
+            Error::ReservedNamespace { detail } => {
+                write!(f, "reserved namespace: {detail}")
+            }
         }
     }
 }

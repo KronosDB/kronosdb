@@ -356,6 +356,20 @@ impl ClusterManager {
         claim.leader_id != self.control.node_id() || claim.writable
     }
 
+    /// True when this node holds the writable native claim — the only node
+    /// that may append directly to its local engine.
+    ///
+    /// Writes that bypass the routed path (the server's own system events)
+    /// must check this first: `EventStoreEngine::append_system` writes to the
+    /// local segment unconditionally, so a follower calling it would break
+    /// the byte-identity the replication protocol depends on.
+    pub fn is_writable_leader(&self) -> bool {
+        match self.control.claim() {
+            Some(claim) => claim.writable && claim.leader_id == self.cluster_config.node_id,
+            None => false,
+        }
+    }
+
     /// Gets the underlying ContextManager (for admin, snapshot store access, etc.).
     pub fn context_manager(&self) -> &Arc<ContextManager> {
         &self.context_manager

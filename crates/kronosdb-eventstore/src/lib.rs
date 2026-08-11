@@ -10,10 +10,12 @@ pub mod index;
 pub mod metrics;
 pub mod raft;
 pub mod replication;
+pub mod scheduler;
 pub mod segment;
 pub mod snapshot;
 pub mod store;
 pub mod stream;
+pub mod system;
 pub mod tier;
 
 /// Append acknowledgement mode.

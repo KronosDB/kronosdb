@@ -1,0 +1,70 @@
+syntax = "proto3";
+package kronosdb.scheduler;
+option java_package = "io.kronosdb.grpc.scheduler";
+option java_multiple_files = true;
+
+import "eventstore.proto";
+
+/* Scheduled events (ADR-0003).
+
+   Hands an event to the store now and has the store append it later, with no
+   client left holding a timer. The schedule is durable the moment ScheduleAppend
+   acknowledges, and firing is exactly-once across leader failover, so nothing
+   needs to poll for due work or reconcile duplicates.
+
+   Schedules are stored as events under the reserved `$` namespace and are not
+   visible to Source or Stream; ListSchedules is how you observe them. */
+service SchedulerService {
+
+  /* Schedules an event to be appended when `due_ms` arrives.
+
+     Idempotent on the token: supply your own to make a retry after a timeout
+     safe, or leave it empty and the server generates one. Returns
+     ALREADY_EXISTS if the token is already in use. */
+  rpc ScheduleAppend (ScheduleAppendRequest) returns (ScheduleAppendResponse);
+
+  /* Cancels a schedule that has not yet fired.
+
+     Returns FAILED_PRECONDITION if the event has already been appended — the
+     race between a cancel and its firing has exactly one winner, and the
+     caller is told which. */
+  rpc CancelSchedule (CancelScheduleRequest) returns (CancelScheduleResponse);
+
+  /* Lists schedules that have neither fired nor been cancelled, soonest first. */
+  rpc ListSchedules (ListSchedulesRequest) returns (ListSchedulesResponse);
+}
+
+message ScheduleAppendRequest {
+  /* When the event should be appended, in milliseconds since epoch. A time
+     in the past fires on the next scheduler tick. */
+  int64 due_ms = 1;
+  /* The event to append, with the tags it should carry. */
+  kronosdb.eventstore.TaggedEvent event = 2;
+  /* Optional caller-supplied idempotency token. Generated when empty. */
+  string token = 3;
+}
+
+message ScheduleAppendResponse {
+  /* Identifies the schedule for cancellation. */
+  string token = 1;
+}
+
+message CancelScheduleRequest {
+  string token = 1;
+}
+
+message CancelScheduleResponse {}
+
+message ListSchedulesRequest {}
+
+/* A schedule that has neither fired nor been cancelled. */
+message Schedule {
+  string token = 1;
+  int64 due_ms = 2;
+  /* Type name of the event that will be appended. */
+  string event_name = 3;
+}
+
+message ListSchedulesResponse {
+  repeated Schedule schedules = 1;
+}

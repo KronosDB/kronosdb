@@ -738,7 +738,10 @@ impl pb::event_store_server::EventStore for EventStoreService {
     ) -> Result<Response<pb::GetHeadResponse>, Status> {
         let context_name = Self::extract_context(&request).to_string();
         let store = self.get_store(&context_name)?;
-        let head = tokio::task::spawn_blocking(move || store.head())
+        // The visible head, not the true one: clients compare their own
+        // cursor against this, and positions they can never read would show
+        // as permanent lag and stall any poll-until-caught-up loop.
+        let head = tokio::task::spawn_blocking(move || store.visible_head())
             .await
             .map_err(|e| Status::internal(format!("task join error: {e}")))?;
 
@@ -904,6 +907,9 @@ fn to_status(e: Error) -> Status {
             Status::invalid_argument(format!("invalid context name '{name}': {reason}"))
         }
         Error::SnapshotNotFound { key } => Status::not_found(format!("snapshot not found: {key}")),
+        Error::ReservedNamespace { detail } => {
+            Status::invalid_argument(format!("reserved namespace: {detail}"))
+        }
     }
 }
 
