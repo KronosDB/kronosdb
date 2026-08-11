@@ -46,7 +46,14 @@ pub trait EventStore: Send + Sync {
     fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream;
 
     /// Returns the current head position (next position to be assigned).
+    ///
+    /// Counts every position, including events clients cannot read. Use
+    /// `visible_head` for anything a client compares its own cursor against.
     fn head(&self) -> Position;
+
+    /// The head as clients see it: the position after the last readable
+    /// event. Equal to `head` unless system events trail the log.
+    fn visible_head(&self) -> Position;
 
     /// Returns the tail position (first event in the store).
     fn tail(&self) -> Position;

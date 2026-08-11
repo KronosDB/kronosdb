@@ -8,6 +8,7 @@ mod messaging;
 mod platform;
 mod processor;
 mod proto;
+mod scheduler_service;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -199,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build gRPC services.
     let event_store_service = EventStoreService::new(Arc::clone(&cluster));
+    let scheduler_service = scheduler_service::SchedulerServiceImpl::new(Arc::clone(&cluster));
     let snapshot_service = SnapshotServiceImpl::new(Arc::clone(&cluster));
     let command_service = CommandServiceImpl::new(
         Arc::clone(&messaging),
@@ -316,6 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer;
     use crate::proto::kronosdb::platform::platform_service_server::PlatformServiceServer;
     use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
+    use crate::proto::kronosdb::scheduler::scheduler_service_server::SchedulerServiceServer;
     use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer;
 
     // Configure TLS and gRPC keepalive. The ping cadence keeps idle
@@ -383,6 +386,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .add_service(PlatformServiceServer::with_interceptor(
             platform_service,
+            auth.clone(),
+        ))
+        .add_service(SchedulerServiceServer::with_interceptor(
+            scheduler_service,
             auth.clone(),
         ));
 
@@ -506,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         info!(url = %backup_url, interval_secs = config.backup_interval_secs, "segment backup enabled");
     }
+    cluster.start_scheduler(Duration::from_secs(1));
     router
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;

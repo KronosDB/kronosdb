@@ -192,6 +192,15 @@ fn encode_forward_append(
 #[async_trait::async_trait]
 impl EventStore for NativeEngine {
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        // Checked here as well as in the leader's `append_stage` so a
+        // follower rejects a reserved-namespace append before forwarding it.
+        // Leader-side, the same error maps to the forward protocol's Retry
+        // arm — the client would spin on a request that can never succeed.
+        crate::system::validate_client_append(&request.events)?;
+        if let Some(condition) = &request.condition {
+            crate::system::validate_client_condition(&condition.criteria)?;
+        }
+
         let claim = self.control.claim().ok_or_else(|| Error::Corrupted {
             message: "native append unavailable: no committed leader claim".into(),
         })?;
@@ -253,6 +262,10 @@ impl EventStore for NativeEngine {
 
     fn head(&self) -> Position {
         self.local_engine.head()
+    }
+
+    fn visible_head(&self) -> Position {
+        self.local_engine.visible_head()
     }
 
     fn tail(&self) -> Position {

@@ -247,7 +247,11 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
     };
 
     // head = next write position (exclusive). Events span [tail, head-1] inclusive
-    // and are contiguous: tail, tail+1, ..., head-1.
+    // and are contiguous: tail, tail+1, ..., head-1. Contiguity holds because
+    // this page reads the internal path (`source_internal`): the admin console
+    // is the operator's window into `$` system events, and hiding them here
+    // would also break this exact-window math — client reads skip system
+    // positions, so a window of N positions would yield fewer than N rows.
     let head = store.head().0;
     let tail = store.tail().0;
     let total_events = head.saturating_sub(tail);
@@ -272,7 +276,7 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
         // not the total store size — acceptable for filtered browsing.
         let fetch_limit = limit * page as usize;
         let from = Position(tail);
-        match store.source_stored(from, &condition, fetch_limit) {
+        match store.source_internal(from, &condition, fetch_limit) {
             Ok(mut events) => {
                 events.reverse();
                 let total_matching = events.len();
@@ -318,7 +322,7 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
 
         let fetch_count = (page_top - page_bottom + 1) as usize;
 
-        match store.source_stored(Position(page_bottom), &condition, fetch_count) {
+        match store.source_internal(Position(page_bottom), &condition, fetch_count) {
             Ok(mut events) => {
                 events.reverse();
                 let total_pages = (total_events as usize).div_ceil(limit);
