@@ -24,4 +24,8 @@ pub mod kronosdb {
     pub mod snapshot {
         tonic::include_proto!("kronosdb.snapshot");
     }
+
+    pub mod scheduler {
+        tonic::include_proto!("kronosdb.scheduler");
+    }
 }

@@ -83,6 +83,72 @@ impl ClusterManager {
         }
     }
 
+    /// Starts the ADR-0003 scheduler. Every node folds the schedule
+    /// projection from its local log, but only the claimed leader fires, so
+    /// failover needs no recovery pass — the new leader's view is already
+    /// current and it simply starts firing. A fire that a dying leader
+    /// already committed is refused by its own DCB guard, so the handover
+    /// cannot double-fire.
+    pub fn start_scheduler(self: &Arc<Self>, tick: Duration) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.run_scheduler_loop(tick).await;
+        });
+    }
+
+    async fn run_scheduler_loop(self: Arc<Self>, tick: Duration) {
+        let mut projections: HashMap<String, crate::scheduler::Projection> = HashMap::new();
+        loop {
+            tokio::time::sleep(tick).await;
+
+            let leading = self.is_writable_leader();
+
+            for context in self.context_manager.list_contexts() {
+                let Ok(engine) = self.context_manager.get_context(&context) else {
+                    continue;
+                };
+                let projection = projections.entry(context.clone()).or_default();
+
+                // Folded on every node so a new leader starts warm.
+                if let Err(error) = projection.advance(&engine) {
+                    tracing::warn!(%error, context, "schedule projection stalled; retrying");
+                    continue;
+                }
+                if !leading {
+                    continue;
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                for live in projection.due(now) {
+                    match crate::scheduler::fire(&engine, &live) {
+                        Ok(()) => tracing::debug!(
+                            context,
+                            token = live.token,
+                            event = live.target.name,
+                            "scheduled event fired"
+                        ),
+                        // The schedule resolved under us — cancelled, or
+                        // already fired by the leader we took over from.
+                        Err(Error::ConsistencyConditionViolated { .. }) => tracing::debug!(
+                            context,
+                            token = live.token,
+                            "scheduled event already resolved; skipping"
+                        ),
+                        // Transient: the guard makes a retry next tick safe.
+                        Err(error) => tracing::warn!(
+                            %error, context, token = live.token,
+                            "scheduled event failed to fire; retrying next tick"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_watermark_checkpoints(self: Arc<Self>) {
         let mut last = HashMap::new();
         loop {

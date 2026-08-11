@@ -14,6 +14,7 @@ use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{Position, SequencedEvent, StoredEvent, Tag};
 use crate::stream::{CommitNotification, EventStream};
+use crate::system::Visibility;
 
 use crate::index::tag_index::TagIndex;
 use crate::metrics::{StoreMetrics, Timer};
@@ -1530,6 +1531,67 @@ impl EventStoreEngine {
     pub fn append_stage(&self, request: AppendRequest) -> Result<StagedAppend, Error> {
         let timer = Timer::start();
 
+        // A client must not be able to forge an event the server claims to
+        // have written about itself. Subsystems that legitimately write into
+        // the namespace go through `append_system_stage`.
+        crate::system::validate_client_append(&request.events)?;
+        if let Some(condition) = &request.condition {
+            crate::system::validate_client_condition(&condition.criteria)?;
+        }
+
+        self.append_stage_unchecked(request, timer)
+    }
+
+    /// Appends on behalf of the server itself, skipping the checks that stop
+    /// a client from writing into the `$` namespace. For the subsystems that
+    /// own system events; never reachable from a client request.
+    pub fn append_system(&self, mut request: AppendRequest) -> Result<AppendResponse, Error> {
+        // Stamped here rather than trusted from callers: the read path judges
+        // visibility by event type while `visible_head` judges it by this tag,
+        // and a system event missing it would be unreadable yet still counted
+        // in the head clients are shown — phantom lag no consumer can clear.
+        for event in &mut request.events {
+            if !crate::system::is_system_name(&event.name) {
+                continue;
+            }
+            // A system event may only carry `$` tags. DCB checks match by
+            // tag with no visibility filter, so a user tag here would let
+            // invisible state reject client appends — a conflict the client
+            // can neither see nor explain. Correlate through `$` tags only.
+            if let Some(tag) = event
+                .tags
+                .iter()
+                .find(|tag| !crate::system::is_system_tag(tag))
+            {
+                return Err(Error::ReservedNamespace {
+                    detail: format!(
+                        "system event '{}' may not carry user tag '{}'",
+                        event.name,
+                        String::from_utf8_lossy(&tag.key)
+                    ),
+                });
+            }
+            if !event.tags.iter().any(crate::system::is_marker) {
+                event.tags.push(crate::system::marker());
+            }
+        }
+
+        let staged = self.append_stage_unchecked(request, Timer::start())?;
+        let wait = match staged.wait_pos() {
+            Some(pos) => self.watermark.wait_for(pos),
+            None => Ok(()),
+        };
+        self.append_finalize(staged, wait)
+    }
+
+    /// `append_stage` without the reserved-namespace checks. The seam the
+    /// subsystems that own system events write through; nothing reachable
+    /// from a client request may call it.
+    fn append_stage_unchecked(
+        &self,
+        request: AppendRequest,
+        timer: Timer,
+    ) -> Result<StagedAppend, Error> {
         // Fail fast once poisoned: after an fsync failure nothing written
         // here can be made durable, so accepting the write would lie.
         if self.sync_state.is_failed() {
@@ -1761,8 +1823,14 @@ impl EventStoreEngine {
         };
 
         for result in reader.iter(None) {
-            let event = result?;
+            let mut event = result?;
             if event.position == position {
+                // A system event reports no tags rather than an error: an
+                // error would itself tell the caller what lives there.
+                if crate::system::is_system_name(&event.name) {
+                    return Ok(Vec::new());
+                }
+                crate::system::strip_system_tags(&mut event.tags);
                 return Ok(event.tags);
             }
             if event.position > position {
@@ -1806,7 +1874,12 @@ impl EventStoreEngine {
 
             for result in reader.iter(Some(Position(head))) {
                 let event = result?;
-                if event.timestamp >= timestamp_millis {
+                // First *readable* event: clients turn this position into a
+                // replay cursor, and it should land on an event they can
+                // actually receive, not on hidden system bookkeeping.
+                if event.timestamp >= timestamp_millis
+                    && !crate::system::is_system_name(&event.name)
+                {
                     return Ok(Some(event.position));
                 }
             }
@@ -1838,6 +1911,65 @@ impl EventStoreEngine {
         Position(self.watermark.get())
     }
 
+    /// The head as clients see it: the position after the last event a client
+    /// can actually read.
+    ///
+    /// System events occupy positions but are never returned by the client
+    /// read path, so a client whose cursor has drained the log would otherwise
+    /// sit permanently short of `head()` — reporting phantom lag, and hanging
+    /// any "poll until caught up" loop forever. This is the number to expose
+    /// over the wire; `head()` stays the true head for the watermark, read
+    /// bounds, and DCB markers, all of which must account for every position.
+    ///
+    /// Resolved from the tag index rather than by decoding events, and the
+    /// walk stops at the first visible position — normally the first one
+    /// tested, since system events are rare and rarely trail the log.
+    pub fn visible_head(&self) -> Position {
+        let head = self.watermark.get();
+        if head == 0 {
+            return Position(0);
+        }
+
+        let seg_list = self.segments.read().clone();
+        let condition = crate::system::marker_condition();
+        let mut pos = head - 1;
+
+        for (i, &base) in seg_list.bases.iter().enumerate().rev() {
+            if base >= head {
+                continue;
+            }
+            let system = if seg_list.is_sealed(i) {
+                let seg_path = segment::segment_path(&self.dir, base);
+                match self.cache.get_index(&seg_path, base) {
+                    Ok(index) => index.matching(&condition),
+                    // Unreadable index: fall back to the true head rather
+                    // than under-reporting and stranding a client's cursor.
+                    Err(_) => return Position(head),
+                }
+            } else {
+                self.tag_index.matching_bitmap(&condition, Position(base))
+            };
+
+            loop {
+                let is_system = system.as_ref().is_some_and(|bm| bm.contains(pos));
+                if !is_system {
+                    return Position(pos + 1);
+                }
+                if pos == base {
+                    break; // Continue into the previous segment.
+                }
+                pos -= 1;
+            }
+            if base == 0 {
+                break;
+            }
+            pos = base - 1;
+        }
+
+        // Every position is a system event — nothing visible has ever landed.
+        Position(0)
+    }
+
     /// Returns the tail position (first available event position).
     ///
     /// For an empty store, returns the same as `head()` so that `head - tail == 0`.
@@ -1861,6 +1993,7 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
     ) -> Result<Vec<SequencedEvent>, Error> {
         let timer = Timer::start();
+        crate::system::validate_client_condition(condition)?;
         let head = self.watermark.get();
 
         // Read cached segment list — no readdir syscall.
@@ -1933,6 +2066,9 @@ impl EventStoreEngine {
                     }
                     if let Some(offset) = idx.get_offset(pos) {
                         let stored = reader.read_event_at(offset as usize)?;
+                        if crate::system::is_system_name(&stored.name) {
+                            continue;
+                        }
                         events.push(stored.into_sequenced());
                     }
                 }
@@ -1951,6 +2087,9 @@ impl EventStoreEngine {
                         }
                         if let Some(offset) = active_idx.get_offset(pos) {
                             let stored = reader.read_event_at(offset as usize)?;
+                            if crate::system::is_system_name(&stored.name) {
+                                continue;
+                            }
                             events.push(stored.into_sequenced());
                         }
                     }
@@ -1964,7 +2103,9 @@ impl EventStoreEngine {
                             continue;
                         }
 
-                        if matching_positions.contains(stored.position.0) {
+                        if matching_positions.contains(stored.position.0)
+                            && !crate::system::is_system_name(&stored.name)
+                        {
                             events.push(stored.into_sequenced());
                         }
                     }
@@ -1984,7 +2125,19 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, Error> {
-        self.source_stored_bounded(from_position, condition, None, limit)
+        self.source_stored_bounded(from_position, condition, None, limit, Visibility::Client)
+    }
+
+    /// Like `source_stored`, but on the internal read path: system events are
+    /// visible and system tags intact. For the subsystems that own those
+    /// events — never for anything serving a client request.
+    pub fn source_internal(
+        &self,
+        from_position: Position,
+        condition: &SourcingCondition,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, Error> {
+        self.source_stored_bounded(from_position, condition, None, limit, Visibility::Internal)
     }
 
     /// Reads up to `limit` matching events with position in
@@ -1999,22 +2152,35 @@ impl EventStoreEngine {
         up_to: Position,
         limit: usize,
     ) -> Result<Vec<SequencedEvent>, Error> {
-        let stored = self.source_stored_bounded(from_position, condition, Some(up_to), limit)?;
+        let stored = self.source_stored_bounded(
+            from_position,
+            condition,
+            Some(up_to),
+            limit,
+            Visibility::Client,
+        )?;
         Ok(stored.into_iter().map(|e| e.into_sequenced()).collect())
     }
 
     /// Bounded variant of `source_stored`: up to `limit` matching events with
     /// position in `[from_position, min(head, up_to))`, tags included.
-    /// pub(crate) for the Raft snapshot builder, which pages the whole store
-    /// through this with a frozen `up_to` so builds are consistent with the
-    /// snapshot's `last_applied` and memory stays bounded.
+    ///
+    /// `visibility` selects the read path. Under `Client`, system events are
+    /// skipped and system tags stripped — and because the skip happens before
+    /// the event is counted, `limit` still means "up to `limit` events the
+    /// caller can see", which is what keeps chunked callers from mistaking a
+    /// filtered page for the end of the log.
     pub(crate) fn source_stored_bounded(
         &self,
         from_position: Position,
         condition: &SourcingCondition,
         up_to: Option<Position>,
         limit: usize,
+        visibility: Visibility,
     ) -> Result<Vec<StoredEvent>, Error> {
+        if visibility.hides_system() {
+            crate::system::validate_client_condition(condition)?;
+        }
         let head = self.watermark.get();
         let head = match up_to {
             Some(bound) => head.min(bound.0),
@@ -2025,6 +2191,21 @@ impl EventStoreEngine {
         if seg_list.bases.is_empty() || head == 0 {
             return Ok(vec![]);
         }
+
+        // Returns false for an event this caller may not see; otherwise
+        // prepares it for return. Applied before the event is counted
+        // against `limit`.
+        let hides_system = visibility.hides_system();
+        let admit = move |stored: &mut StoredEvent| -> bool {
+            if !hides_system {
+                return true;
+            }
+            if crate::system::is_system_name(&stored.name) {
+                return false;
+            }
+            crate::system::strip_system_tags(&mut stored.tags);
+            true
+        };
 
         let mut events = Vec::new();
 
@@ -2084,7 +2265,10 @@ impl EventStoreEngine {
                         continue;
                     }
                     if let Some(offset) = idx.get_offset(pos) {
-                        let stored = reader.read_event_at(offset as usize)?;
+                        let mut stored = reader.read_event_at(offset as usize)?;
+                        if !admit(&mut stored) {
+                            continue;
+                        }
                         events.push(stored);
                         if events.len() >= limit {
                             return Ok(events);
@@ -2099,7 +2283,10 @@ impl EventStoreEngine {
                             continue;
                         }
                         if let Some(offset) = active_idx.get_offset(pos) {
-                            let stored = reader.read_event_at(offset as usize)?;
+                            let mut stored = reader.read_event_at(offset as usize)?;
+                            if !admit(&mut stored) {
+                                continue;
+                            }
                             events.push(stored);
                             if events.len() >= limit {
                                 return Ok(events);
@@ -2109,13 +2296,16 @@ impl EventStoreEngine {
                 } else {
                     drop(active_idx);
                     for result in reader.iter(Some(Position(head))) {
-                        let stored = result?;
+                        let mut stored = result?;
 
                         if stored.position.0 < from_position.0 {
                             continue;
                         }
 
                         if matching_positions.contains(stored.position.0) {
+                            if !admit(&mut stored) {
+                                continue;
+                            }
                             events.push(stored);
                             if events.len() >= limit {
                                 return Ok(events);
@@ -2161,6 +2351,10 @@ impl EventStore for EventStoreEngine {
 
     fn head(&self) -> Position {
         self.head()
+    }
+
+    fn visible_head(&self) -> Position {
+        self.visible_head()
     }
 
     fn tail(&self) -> Position {
@@ -2424,6 +2618,223 @@ mod tests {
             metadata: vec![],
             tags,
         }
+    }
+
+    /// The client read path must not reveal the store's own events. Three
+    /// distinct leaks are covered: the system event itself, a system tag
+    /// riding on a user event, and `get_tags` on a system position.
+    #[test]
+    fn system_events_are_invisible_to_the_client_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+
+        store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+            })
+            .unwrap();
+
+        // System events carry only `$` tags (enforced by `append_system`),
+        // so no client tag query can even select one; type-based filtering
+        // covers the remaining paths (unfiltered reads, position lookups).
+        store
+            .append_system(AppendRequest {
+                condition: None,
+                events: vec![make_event(
+                    "$schedule.created",
+                    vec![tag("$schedule", "tok")],
+                )],
+            })
+            .unwrap();
+
+        // The event a schedule fires: the application's own type, carrying the
+        // system tag that correlates it back to its schedule.
+        store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event("PaymentTimedOut", vec![tag("orderId", "A")])],
+            })
+            .unwrap();
+        store
+            .append_system(AppendRequest {
+                condition: None,
+                events: vec![make_event(
+                    "ReminderDue",
+                    vec![tag("orderId", "A"), tag("$schedule", "tok")],
+                )],
+            })
+            .unwrap();
+
+        // All four consumed positions — system events are hidden, not absent.
+        assert_eq!(store.head(), Position(4));
+
+        let by_order = SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![tag("orderId", "A")],
+            }],
+        };
+
+        let names: Vec<String> = store
+            .source(Position(0), &by_order)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["OrderPlaced", "PaymentTimedOut", "ReminderDue"]);
+
+        // The fired event survives; only its system tag is stripped.
+        let fired = store
+            .source_stored(Position(0), &by_order, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ReminderDue")
+            .expect("the fired event is the application's own and stays visible");
+        assert_eq!(fired.tags, vec![tag("orderId", "A")]);
+
+        // Position 1 holds the system event: no tags rather than an error,
+        // which would itself disclose what lives there.
+        assert_eq!(store.get_tags(Position(1)).unwrap(), Vec::<Tag>::new());
+        assert_eq!(
+            store.get_tags(Position(3)).unwrap(),
+            vec![tag("orderId", "A")]
+        );
+    }
+
+    /// A consistency marker taken from an append response must keep working
+    /// as system events land after it: they carry only `$` tags, so they can
+    /// never be the conflict that rejects a client's conditioned append.
+    #[test]
+    fn markers_round_trip_across_interleaved_system_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+
+        let first = store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+            })
+            .unwrap();
+
+        // System events land after the client took its marker.
+        for name in ["$schedule.created", "$schedule.cancelled"] {
+            store
+                .append_system(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(name, vec![tag("$schedule", "tok")])],
+                })
+                .unwrap();
+        }
+
+        let guard = AppendCondition {
+            consistency_marker: first.consistency_marker,
+            criteria: SourcingCondition {
+                criteria: vec![Criterion {
+                    names: vec![],
+                    tags: vec![tag("orderId", "A")],
+                }],
+            },
+        };
+
+        // Only invisible bookkeeping followed the marker: no conflict.
+        store
+            .append(AppendRequest {
+                condition: Some(guard.clone()),
+                events: vec![make_event("PaymentReceived", vec![tag("orderId", "A")])],
+            })
+            .expect("system events must never trip a client's condition");
+
+        // A real user event after the marker still conflicts as ever.
+        let stale = store.append(AppendRequest {
+            condition: Some(guard),
+            events: vec![make_event("PaymentReceived", vec![tag("orderId", "A")])],
+        });
+        assert!(matches!(
+            stale,
+            Err(Error::ConsistencyConditionViolated { .. })
+        ));
+    }
+
+    /// `GetSequenceAt` becomes a replay cursor: it must land on an event the
+    /// client can actually receive.
+    #[test]
+    fn get_sequence_at_skips_system_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+
+        let stamped = |name: &str, ts: i64, tags: Vec<Tag>| AppendEvent {
+            timestamp: ts,
+            ..make_event(name, tags)
+        };
+
+        store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![stamped("OrderPlaced", 1_000, vec![tag("orderId", "A")])],
+            })
+            .unwrap();
+        store
+            .append_system(AppendRequest {
+                condition: None,
+                events: vec![stamped("$schedule.created", 2_000, vec![])],
+            })
+            .unwrap();
+        store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![stamped("PaymentReceived", 3_000, vec![tag("orderId", "A")])],
+            })
+            .unwrap();
+
+        // The system event at position 1 (ts 2000) matches the cutoff first,
+        // but a client sourcing from it would receive nothing until 3000.
+        assert_eq!(
+            store.get_sequence_at(1_500).unwrap(),
+            Some(Position(2)),
+            "must land on the first readable event, not hidden bookkeeping"
+        );
+    }
+
+    /// The seam refuses a system event carrying user tags — the misuse that
+    /// would let invisible state reject client appends.
+    #[test]
+    fn system_events_may_not_carry_user_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+
+        let smuggled = store.append_system(AppendRequest {
+            condition: None,
+            events: vec![make_event(
+                "$schedule.created",
+                vec![tag("orderId", "A"), tag("$schedule", "tok")],
+            )],
+        });
+        assert!(matches!(smuggled, Err(Error::ReservedNamespace { .. })));
+    }
+
+    /// Clients may neither forge system events nor query for them.
+    #[test]
+    fn the_reserved_namespace_is_closed_to_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+
+        let forged = store.append(AppendRequest {
+            condition: None,
+            events: vec![make_event("$schedule.created", vec![])],
+        });
+        assert!(matches!(forged, Err(Error::ReservedNamespace { .. })));
+
+        let probe = store.source(
+            Position(0),
+            &SourcingCondition {
+                criteria: vec![Criterion {
+                    names: vec![],
+                    tags: vec![tag("$schedule", "tok")],
+                }],
+            },
+        );
+        assert!(matches!(probe, Err(Error::ReservedNamespace { .. })));
     }
 
     /// After rotation prunes sealed positions from the in-memory tag index,
