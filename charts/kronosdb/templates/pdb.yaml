@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kronosdb.fullname" . }}
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  # One voter down keeps quorum at 3+; never allow voluntary disruptions
+  # to take a second.
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "kronosdb.selectorLabels" . | nindent 6 }}
+      kronosdb.io/role: voter

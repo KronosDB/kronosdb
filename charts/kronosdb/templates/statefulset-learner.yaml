@@ -1,0 +1,58 @@
+{{- if gt (int .Values.learners.replicas) 0 }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kronosdb.fullname" . }}-learner
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  # Learners register under the same headless service as the voters so the
+  # DNS names in KRONOSDB_CLUSTER_LEARNERS resolve.
+  serviceName: {{ include "kronosdb.fullname" . }}-hl
+  replicas: {{ .Values.learners.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "kronosdb.selectorLabels" . | nindent 6 }}
+      kronosdb.io/role: learner
+  template:
+    metadata:
+      labels:
+        {{- include "kronosdb.selectorLabels" . | nindent 8 }}
+        kronosdb.io/role: learner
+    spec:
+      terminationGracePeriodSeconds: {{ add (int .Values.config.drainDeadlineSecs) 10 }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - {{- include "kronosdb.container" (dict "root" . "nodeType" "passive-backup" "idOffset" 101) | nindent 10 }}
+      volumes:
+        {{- if .Values.contexts }}
+        - name: manifest
+          configMap:
+            name: {{ include "kronosdb.fullname" . }}-manifest
+        {{- end }}
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- if not (or .Values.contexts .Values.tls.secretName) }}
+        []
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+{{- end }}

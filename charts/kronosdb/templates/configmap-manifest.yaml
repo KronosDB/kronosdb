@@ -1,0 +1,14 @@
+{{- if .Values.contexts }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kronosdb.fullname" . }}-manifest
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+data:
+  # Applied at startup on every node: idempotent, never deletes contexts.
+  manifest.toml: |
+    {{- range .Values.contexts }}
+    [[contexts]]
+    name = {{ . | quote }}
+    {{- end }}
+{{- end }}
