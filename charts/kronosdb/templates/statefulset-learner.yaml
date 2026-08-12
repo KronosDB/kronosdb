@@ -19,6 +19,10 @@ spec:
       labels:
         {{- include "kronosdb.selectorLabels" . | nindent 8 }}
         kronosdb.io/role: learner
+      {{- if and .Values.contexts .Values.rollOnManifestChange }}
+      annotations:
+        checksum/manifest: {{ include (print $.Template.BasePath "/configmap-manifest.yaml") . | sha256sum }}
+      {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ add (int .Values.config.drainDeadlineSecs) 10 }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
