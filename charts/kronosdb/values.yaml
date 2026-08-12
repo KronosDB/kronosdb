@@ -51,11 +51,19 @@ config:
   #  - name: KRONOSDB_GROUP_COMMIT_MS
   #    value: "1"
 
-# Contexts to declare at startup (idempotent, never deletes). One context
-# per service is the recommended multi-service layout.
+# Contexts declared in the manifest — the GitOps source of truth. The server
+# applies additions LIVE (it watches the mounted manifest; no restart), and
+# removing an entry never deletes or unloads a context — deletion stays an
+# explicit admin operation. One context per service is the recommended
+# multi-service layout.
 contexts: []
 #  - orders
 #  - billing
+
+# Roll the pods when the context manifest changes. Only needed for server
+# images older than 0.7.1, which apply the manifest at startup rather than
+# watching it; on current servers this just causes needless restarts.
+rollOnManifestChange: false
 
 backup:
   # Object-store URL (s3://…, gs://…, file://…) enabling sealed-segment

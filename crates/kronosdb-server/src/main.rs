@@ -514,12 +514,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(url = %backup_url, interval_secs = config.backup_interval_secs, "segment backup enabled");
     }
     cluster.start_scheduler(Duration::from_secs(1));
+    if let Some(ref manifest_path) = config.manifest {
+        spawn_manifest_watch(Arc::clone(&cluster), manifest_path.clone());
+    }
     router
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;
 
     info!("KronosDB shut down gracefully");
     Ok(())
+}
+
+/// Watches the manifest file and applies additions live, so declaring a new
+/// context in a GitOps-managed ConfigMap materializes it without a restart.
+///
+/// Strictly additive, like the startup apply: an entry disappearing from the
+/// manifest never deletes or unloads anything — it is logged as drift and
+/// nothing more. Runtime creation goes through the replicated control plane
+/// (unlike the pre-Raft startup apply), and only the claimed leader proposes,
+/// so a cluster whose ConfigMap updates on every node does not race three
+/// identical proposals. Followers converge through consensus; after failover
+/// the new leader picks up any pending additions on its next tick.
+fn spawn_manifest_watch(cluster: Arc<ClusterManager>, path: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut last_contents = std::fs::read_to_string(&path).unwrap_or_default();
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Content comparison, not mtime: Kubernetes updates mounted
+            // ConfigMaps by atomically swapping a symlinked directory.
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                // Transient: the file can vanish mid-swap.
+                Err(_) => continue,
+            };
+            let changed = contents != last_contents;
+
+            let manifest = match toml::from_str::<manifest::Manifest>(&contents) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    if changed {
+                        tracing::warn!(%error, manifest = %path.display(),
+                            "manifest changed but does not parse; keeping previous state");
+                        last_contents = contents;
+                    }
+                    continue;
+                }
+            };
+
+            let existing = cluster.context_manager().list_contexts();
+            if changed {
+                last_contents = contents;
+                let undeclared = manifest::undeclared(&manifest, &existing);
+                if !undeclared.is_empty() {
+                    tracing::info!(contexts = ?undeclared,
+                        "manifest no longer declares existing contexts; they keep \
+                         running — deletion is an explicit admin operation");
+                }
+            }
+
+            // Reconciled every tick, not only on change: a creation that
+            // failed (or arrived while this node was not leader) is retried
+            // here, and a new leader picks up pending additions on its first
+            // tick. The steady-state cost is a list + diff, no proposals.
+            if !cluster.is_writable_leader() {
+                continue;
+            }
+            for name in manifest::missing(&manifest, &existing) {
+                match cluster.create_context_replicated(&name).await {
+                    Ok(()) => {
+                        tracing::info!(context = name, "context created from manifest change")
+                    }
+                    Err(error) => tracing::warn!(%error, context = name,
+                        "manifest context creation failed; retrying next tick"),
+                }
+            }
+        }
+    });
 }
 
 pub(crate) async fn shutdown_signal() {

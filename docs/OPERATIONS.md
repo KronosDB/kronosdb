@@ -73,7 +73,12 @@ must match actual Raft membership — see the scaling note below.
 
 ## Declarative manifest
 
-Declare contexts in a TOML manifest applied at startup (idempotent, never deletes):
+Declare contexts in a TOML manifest — applied at startup and **watched
+while running**: additions to the file (a GitOps-managed ConfigMap edit)
+materialize live through the replicated control plane, no restart needed.
+Strictly additive both times: removing an entry never deletes or unloads a
+context — the server logs the drift and the context keeps serving.
+Deletion stays an explicit admin operation.
 
 ```toml
 [[contexts]]
