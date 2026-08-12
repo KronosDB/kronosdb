@@ -1,0 +1,73 @@
+{{- if .Values.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "kronosdb.fullname" . }}
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: kronosdb
+      rules:
+        - alert: KronosDBEnginePoisoned
+          expr: max by (context) (kronosdb_engine_poisoned) > 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Context {{ printf "{{ $labels.context }}" }} is poisoned — all writes fail until restart"
+            description: >-
+              An fsync failure poisoned the engine. The process reports
+              healthy while rejecting every append. Restart the pod after
+              checking the underlying volume.
+
+        - alert: KronosDBWritesStalled
+          expr: max (kronosdb_native_write_gate_open) == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "No node holds a writable leader claim — writes are stalled"
+            description: >-
+              No claimed leader for over 2 minutes: quorum loss or a stuck
+              election. Reads continue from local data; appends fail.
+
+        - alert: KronosDBDiskAlmostFull
+          expr: >-
+            kubelet_volume_stats_available_bytes{persistentvolumeclaim=~"data-{{ include "kronosdb.fullname" . }}-.*"}
+            / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"data-{{ include "kronosdb.fullname" . }}-.*"}
+            < 0.20
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "KronosDB volume {{ printf "{{ $labels.persistentvolumeclaim }}" }} below 20% free"
+            description: >-
+              The store never deletes; disk exhaustion ends in fsync failure
+              and a poisoned engine. Grow the volume before it fills.
+
+        - alert: KronosDBReplicationLagGrowing
+          expr: max by (context) (kronosdb_replication_lag_events) > {{ .Values.alerts.replicationLagEvents }}
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Context {{ printf "{{ $labels.context }}" }} replication lag over {{ .Values.alerts.replicationLagEvents }} events"
+
+        - alert: KronosDBAckDegradation
+          expr: sum by (context) (rate(kronosdb_ack_degradations_total[5m])) > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Context {{ printf "{{ $labels.context }}" }} falling back to durable-mode ack pacing"
+            description: >-
+              The disk is not keeping up with the written-ack path. Latency
+              is about to climb; check volume throughput and fsync latency.
+
+        - alert: KronosDBDCBRejectionSpike
+          expr: sum by (context) (rate(kronosdb_dcb_violations_total[5m])) > {{ .Values.alerts.dcbRejectionsPerSecond }}
+          for: 10m
+          labels: { severity: info }
+          annotations:
+            summary: "High DCB rejection rate in context {{ printf "{{ $labels.context }}" }}"
+            description: >-
+              Sustained consistency-condition rejections usually mean many
+              writers competing on one tag — a modeling problem (too-coarse
+              consistency boundary), not a database problem. Expect client
+              retry amplification until the boundary is narrowed.
+{{- end }}

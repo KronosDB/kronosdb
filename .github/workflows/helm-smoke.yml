@@ -1,0 +1,33 @@
+name: helm-smoke
+
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+      - "scripts/helm-smoke.sh"
+      - "Dockerfile"
+      - ".github/workflows/helm-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build server image
+        run: docker build -t kronosdb:smoke .
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Install grpcurl
+        run: |
+          curl -sSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin grpcurl
+
+      - name: Run smoke test
+        run: IMAGE=kronosdb:smoke scripts/helm-smoke.sh

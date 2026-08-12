@@ -44,6 +44,25 @@ Every deployment uses the same native segment path. A single voter acknowledges 
 
 Loss of quorum stalls writes (CP) while local reads and subscriptions remain bounded by the last committed watermark.
 
+## Helm chart
+
+`charts/kronosdb` packages everything below: a voter StatefulSet with
+stable-DNS peer lists and ordinal-derived node IDs, optional
+passive-backup learners, headless + client + admin services, the context
+manifest as a ConfigMap, auth secrets, PDB, anti-affinity, and probes.
+
+```bash
+helm install kronosdb charts/kronosdb \
+  --set auth.accessToken=… --set admin.adminToken=… \
+  --set contexts='{orders,billing}' \
+  --set backup.url=s3://backups/kronos --set backup.credentialsSecret=aws-creds \
+  --set persistence.storageClassName=local-nvme
+```
+
+The chart refuses to render with admin token auth enabled but no token
+set, and warns at install when gRPC auth or backup is off. `replicas`
+must match actual Raft membership — see the scaling note below.
+
 ## Clustering on Kubernetes
 
 - Use a StatefulSet with a headless Service and **stable DNS names** in peer lists, never pod IPs (addresses are persisted in Raft membership):
@@ -101,6 +120,37 @@ The console runs the authorization-code + PKCE flow and stores an HMAC-signed se
 
 - **Prometheus**: `GET /metrics` on the admin port — per-context engine counters (`kronosdb_appends_total`, cache hit/miss, DCB violations, positions) and Raft gauges (`kronosdb_raft_is_leader`, `kronosdb_raft_leader_known`, term, applied index, voter count). Alert on `kronosdb_raft_leader_known == 0`.
 - **JSON logs**: set `KRONOSDB_LOG_FORMAT=json`. Log filtering via `RUST_LOG` (default `kronosdb=info,warn`).
+
+## Production readiness
+
+The alert set below is shipped as a PrometheusRule by the Helm chart
+(`alerts.enabled=true`). If you run your own rules, replicate at least the
+first three — they cover every failure mode that needs a human.
+
+| Signal | Metric | Severity | Meaning |
+|---|---|---|---|
+| Engine poisoned | `kronosdb_engine_poisoned > 0` | critical | An fsync failure poisoned the engine: the process looks healthy while **rejecting all writes** until restart. |
+| Writes stalled | `max(kronosdb_native_write_gate_open) == 0` | critical | No node holds a writable leader claim — quorum loss or stuck election. Reads keep serving locally. |
+| Disk almost full | `kubelet_volume_stats_*` < 20% free | warning | The store never deletes. Disk exhaustion ends in fsync failure → poisoned engine. `kronosdb_data_dir_bytes` gives per-context growth for capacity planning. |
+| Ack degradation | `rate(kronosdb_ack_degradations_total) > 0` | warning | Written-acks are falling back to durable pacing: the disk is behind. Latency climbs next. |
+| Replication lag | `kronosdb_replication_lag_events` growing | warning | A follower (or the quorum) is not keeping up with the leader. |
+| DCB rejection spike | `rate(kronosdb_dcb_violations_total)` sustained | info | Many writers competing on one tag. This is a **modeling smell**, not a database problem: a consistency boundary was drawn too coarse (the DCB equivalent of a table-level lock). Expect client retry amplification until the boundary is narrowed — e.g. per-entity tags instead of a global one. |
+
+Environment checklist:
+
+- **Clocks**: run NTP/chrony on every node. Correctness and ordering never
+  depend on wall clocks, but scheduled-event punctuality follows the
+  leader's clock across failover.
+- **File descriptors**: sealed segments are mmap'd and every client stream
+  holds a socket — raise `nofile` (65536 is a sane floor). On Kubernetes
+  this is a node/kubelet setting, not a pod securityContext field.
+- **Append size**: client gRPC messages are capped at tonic's default
+  4 MB decode limit — one append batch (events + tags + payloads) must fit
+  in a single message. Oversized batches are rejected at the transport
+  with a clear error; there is no server-side re-chunking.
+- **Memory limits**: leave headroom above the process for the page cache —
+  reads are mmap-backed, so the kernel cache *is* the read cache and
+  over-tight container limits convert reads into reclaim thrash.
 
 ## Backup & restore
 

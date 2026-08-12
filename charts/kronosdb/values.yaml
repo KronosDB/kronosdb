@@ -1,0 +1,128 @@
+# KronosDB Helm chart values.
+#
+# The defaults produce a production-shaped 3-voter Raft cluster. The two
+# decisions you cannot skip: storage (use local NVMe — replicated network
+# volumes pay for replication twice; quorum + object-store backup is the
+# durability story) and auth (set the tokens, or consciously run open).
+
+image:
+  repository: ghcr.io/kronosdb/kronosdb
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Voter count. 3 tolerates one node loss; 5 tolerates two. Even numbers buy
+# nothing. NOTE: changing this after install does NOT resize the Raft
+# cluster — membership changes go through the admin API first (see NOTES).
+replicas: 3
+
+# Passive-backup learners: replicate everything, never vote, never serve
+# writes. Useful as an analytics read target or a warm copy in another zone.
+learners:
+  replicas: 0
+
+clusterDomain: cluster.local
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+
+persistence:
+  # Strongly prefer a local-NVMe class (e.g. openebs-lvm, topolvm,
+  # local-path on bare metal). Acked writes are quorum-replicated; the
+  # object-store backup (below) covers node loss beyond quorum.
+  storageClassName: ""
+  size: 100Gi
+
+config:
+  # auto = written acks with 2+ voters (quorum has the bytes; fsync trails
+  # one group-commit wave), durable fsync-before-ack on a single voter.
+  # Override to "durable" to force fsync-before-ack everywhere.
+  ackMode: auto
+  # Seconds the server waits for connections to drain on shutdown. The pod's
+  # terminationGracePeriodSeconds is derived from this (+10).
+  drainDeadlineSecs: 20
+  # Extra KRONOSDB_* environment variables, applied to all nodes last —
+  # e.g. group-commit tuning, cache sizes, OIDC settings for the console.
+  extraEnv: []
+  #  - name: KRONOSDB_GROUP_COMMIT_MS
+  #    value: "1"
+
+# Contexts to declare at startup (idempotent, never deletes). One context
+# per service is the recommended multi-service layout.
+contexts: []
+#  - orders
+#  - billing
+
+backup:
+  # Object-store URL (s3://…, gs://…, file://…) enabling sealed-segment
+  # backup. Leave empty to disable. Cloud credentials come from the
+  # environment — point credentialsSecret at a Secret with AWS_* keys etc.
+  url: ""
+  intervalSecs: 30
+  credentialsSecret: ""
+
+auth:
+  # Client access token for the gRPC API. Empty = unauthenticated gRPC
+  # (the chart will tell you so at install). Ignored if existingSecret set.
+  accessToken: ""
+  # Secret with key "access-token". Takes precedence over accessToken.
+  existingSecret: ""
+
+admin:
+  # none | token | oidc. "token" requires adminToken or existingSecret;
+  # "oidc" is configured via config.extraEnv (KRONOSDB_OIDC_*).
+  authMode: token
+  adminToken: ""
+  # Secret with key "admin-token". Takes precedence over adminToken.
+  existingSecret: ""
+  service:
+    type: ClusterIP
+
+tls:
+  # Name of a kubernetes.io/tls Secret (tls.crt / tls.key, optional ca.crt)
+  # for the gRPC port. Empty = plaintext.
+  secretName: ""
+
+service:
+  # Client-facing gRPC service.
+  type: ClusterIP
+
+podDisruptionBudget:
+  # Never let voluntary disruptions take out quorum.
+  maxUnavailable: 1
+
+# "required" refuses to schedule two voters on one node; "soft" prefers not
+# to. Use "soft" only on clusters smaller than the replica count.
+antiAffinity: required
+
+# Spread voters across zones when the cluster is multi-zone (soft).
+zoneSpread: true
+
+serviceMonitor:
+  # Prometheus-operator ServiceMonitor scraping /metrics on the admin port.
+  enabled: false
+  interval: 30s
+
+alerts:
+  # Prometheus-operator PrometheusRule with the production alert set:
+  # poisoned engine, stalled writes, disk almost full, replication lag,
+  # ack degradation, DCB rejection spikes.
+  enabled: false
+  replicationLagEvents: 100000
+  dcbRejectionsPerSecond: 10
+
+# Matches the image's kronosdb user so the PVC is writable.
+podSecurityContext:
+  fsGroup: 1000
+
+startupProbe:
+  # 60 × 5s = 5 minutes for segment recovery on large volumes.
+  failureThreshold: 60
+  periodSeconds: 5
+
+nodeSelector: {}
+tolerations: []
