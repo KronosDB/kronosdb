@@ -1,4 +1,5 @@
-//! Declarative manifest — resources ensured to exist at startup.
+//! Declarative manifest — resources ensured to exist at startup, and kept
+//! in sync while running (the file is watched; additions apply live).
 //!
 //! The manifest is a TOML file declaring resources (today: contexts) that the
 //! server guarantees exist before it starts serving. Applying it is
@@ -53,6 +54,32 @@ pub fn load(path: &Path) -> Result<Manifest, Box<dyn std::error::Error>> {
     Ok(manifest)
 }
 
+/// Declared contexts that do not exist yet.
+pub fn missing(manifest: &Manifest, existing: &[String]) -> Vec<String> {
+    manifest
+        .contexts
+        .iter()
+        .filter(|spec| !existing.iter().any(|name| name == &spec.name))
+        .map(|spec| spec.name.clone())
+        .collect()
+}
+
+/// Existing contexts the manifest no longer declares.
+///
+/// Deliberately informational only: removing an entry never deletes or
+/// unloads anything — the context keeps serving, replicating, and backing
+/// up. This exists so GitOps drift is *visible* (logged on manifest change)
+/// instead of silent. Deletion stays an explicit admin operation.
+pub fn undeclared(manifest: &Manifest, existing: &[String]) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|name| {
+            *name != "default" && !manifest.contexts.iter().any(|spec| &spec.name == *name)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Ensures every declared context exists. Returns the names that were
 /// actually created (already-existing ones are skipped silently).
 pub fn apply(
@@ -101,6 +128,30 @@ name = "payments"
     fn empty_manifest_is_valid() {
         let manifest: Manifest = toml::from_str("").unwrap();
         assert!(manifest.contexts.is_empty());
+    }
+
+    #[test]
+    fn missing_and_undeclared_diff_against_existing() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[[contexts]]
+name = "orders"
+
+[[contexts]]
+name = "billing"
+"#,
+        )
+        .unwrap();
+        let existing = vec![
+            "default".to_string(),
+            "orders".to_string(),
+            "legacy".to_string(),
+        ];
+
+        assert_eq!(missing(&manifest, &existing), ["billing"]);
+        // "default" is never reported as drift; "legacy" is informational
+        // only — undeclared never implies deletion or unloading.
+        assert_eq!(undeclared(&manifest, &existing), ["legacy"]);
     }
 
     #[test]
