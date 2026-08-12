@@ -31,12 +31,17 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
 
     // ── Per-context engine metrics ──
     let mut snaps = Vec::new();
+    let mut poisoned = Vec::new();
+    let mut data_bytes = Vec::new();
     for name in state.contexts.list_contexts() {
         if let Ok(engine) = state.contexts.get_context(&name) {
             let watermark = engine.head().0;
             let local_tail = engine.local_tail().0;
             let durable_tail = engine.durable_tail().0;
             let tail = engine.tail().0;
+            poisoned.push((ctx_label(&name), engine.is_poisoned() as u64));
+            // Directory walk per scrape, off the request path's hot loops.
+            data_bytes.push((ctx_label(&name), engine.data_dir_bytes()));
             snaps.push((
                 name,
                 engine.metrics_snapshot(),
@@ -132,6 +137,26 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         "counter",
         "Appends rejected by a DCB consistency condition",
         dcb_violations
+    );
+    engine_family!(
+        "kronosdb_ack_degradations_total",
+        "counter",
+        "Appends that fell back from written-ack to durable pacing (disk behind)",
+        ack_degradations
+    );
+    family(
+        &mut out,
+        "kronosdb_engine_poisoned",
+        "gauge",
+        "1 after an fsync failure poisoned the engine; all writes fail until restart",
+        &poisoned,
+    );
+    family(
+        &mut out,
+        "kronosdb_data_dir_bytes",
+        "gauge",
+        "Bytes on disk under the context's data directory",
+        &data_bytes,
     );
     engine_family!(
         "kronosdb_append_duration_us_total",

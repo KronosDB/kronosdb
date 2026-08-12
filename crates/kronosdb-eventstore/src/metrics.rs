@@ -25,6 +25,10 @@ pub struct StoreMetrics {
     pub dcb_violations: AtomicU64,
     /// Cumulative append duration in microseconds (divide by appends for average).
     pub append_duration_us: AtomicU64,
+    /// Appends that found the durable cursor past the ack-lag limit and fell
+    /// back to durable-mode pacing. A rising rate means the disk cannot keep
+    /// up with the written-ack path — the early warning before latency climbs.
+    pub ack_degradations: AtomicU64,
 
     // ── Reads ──
     /// Total source() calls.
@@ -70,6 +74,7 @@ impl StoreMetrics {
             appends: AtomicU64::new(0),
             events_appended: AtomicU64::new(0),
             dcb_violations: AtomicU64::new(0),
+            ack_degradations: AtomicU64::new(0),
             append_duration_us: AtomicU64::new(0),
             source_queries: AtomicU64::new(0),
             events_sourced: AtomicU64::new(0),
@@ -94,6 +99,7 @@ impl StoreMetrics {
             events_appended: self.events_appended.load(ORD),
             dcb_violations: self.dcb_violations.load(ORD),
             append_duration_us: self.append_duration_us.load(ORD),
+            ack_degradations: self.ack_degradations.load(ORD),
             source_queries: self.source_queries.load(ORD),
             events_sourced: self.events_sourced.load(ORD),
             source_duration_us: self.source_duration_us.load(ORD),
@@ -121,6 +127,11 @@ impl StoreMetrics {
     #[inline]
     pub fn record_dcb_violation(&self) {
         self.dcb_violations.fetch_add(1, ORD);
+    }
+
+    #[inline]
+    pub fn record_ack_degradation(&self) {
+        self.ack_degradations.fetch_add(1, ORD);
     }
 
     #[inline]
@@ -161,6 +172,7 @@ pub struct MetricsSnapshot {
     pub appends: u64,
     pub events_appended: u64,
     pub dcb_violations: u64,
+    pub ack_degradations: u64,
     pub append_duration_us: u64,
     pub source_queries: u64,
     pub events_sourced: u64,

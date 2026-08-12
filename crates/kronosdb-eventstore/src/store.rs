@@ -1504,6 +1504,34 @@ impl EventStoreEngine {
         snap
     }
 
+    /// True once an fsync failure has poisoned the engine: every pending and
+    /// future append fails until restart. The single most important alerting
+    /// signal — a poisoned engine looks healthy from /health (the process is
+    /// up) while rejecting all writes.
+    pub fn is_poisoned(&self) -> bool {
+        self.sync_state.is_failed()
+    }
+
+    /// Bytes on disk under this context's data directory (segments, indices,
+    /// bloom filters, raft log). Walked per call — the metrics scrape
+    /// interval, not the hot path.
+    pub fn data_dir_bytes(&self) -> u64 {
+        fn walk(dir: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| match entry.metadata() {
+                    Ok(meta) if meta.is_dir() => walk(&entry.path()),
+                    Ok(meta) => meta.len(),
+                    Err(_) => 0,
+                })
+                .sum()
+        }
+        walk(&self.dir)
+    }
+
     /// Appends events to the store, optionally with a DCB consistency condition.
     ///
     /// 1. Checks DCB condition against the tag index
@@ -1616,18 +1644,24 @@ impl EventStoreEngine {
         let staged = StagedAppend { outcome, timer };
         if crate::written_acks(self.watermark.voter_count())
             && let Some(pos) = staged.wait_pos()
-            && pos.saturating_sub(self.durable_tail.load(Ordering::Acquire))
-                <= crate::ack_lag_limit()
         {
-            // Replicated-ack fast path: this node's cursor advances at write
-            // (bytes are already pread-visible — the writer write_alls into
-            // the file). Quorum-of-one opens the ack gate inline; with more
-            // voters the follower cursors still gate the quorum math. Past
-            // the lag limit the advance is skipped and release waits on the
-            // sync loop — durable-mode behavior until the disk catches up.
-            let _ = self
-                .watermark
-                .advance(self.node_id, self.watermark.epoch(), pos);
+            if pos.saturating_sub(self.durable_tail.load(Ordering::Acquire))
+                <= crate::ack_lag_limit()
+            {
+                // Replicated-ack fast path: this node's cursor advances at write
+                // (bytes are already pread-visible — the writer write_alls into
+                // the file). Quorum-of-one opens the ack gate inline; with more
+                // voters the follower cursors still gate the quorum math.
+                let _ = self
+                    .watermark
+                    .advance(self.node_id, self.watermark.epoch(), pos);
+            } else {
+                // Past the lag limit the advance is skipped and release waits
+                // on the sync loop — durable-mode behavior until the disk
+                // catches up. Counted: a rising rate is the disk-is-behind
+                // early warning, before clients notice latency.
+                self.metrics.record_ack_degradation();
+            }
         }
         Ok(staged)
     }
