@@ -1,0 +1,43 @@
+# Headless service for peer discovery. publishNotReadyAddresses is
+# required: during elections and cold starts no pod is Ready, and peers
+# must still resolve each other or the cluster can never form.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kronosdb.fullname" . }}-hl
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "kronosdb.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: grpc, port: 50051, targetPort: grpc }
+---
+# Client-facing gRPC service — voters only (learners never serve writes,
+# and client reads follow the connection's context routing anyway).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kronosdb.fullname" . }}
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "kronosdb.selectorLabels" . | nindent 4 }}
+    kronosdb.io/role: voter
+  ports:
+    - { name: grpc, port: 50051, targetPort: grpc }
+---
+# Admin console / API / metrics.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kronosdb.fullname" . }}-admin
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.admin.service.type }}
+  selector:
+    {{- include "kronosdb.selectorLabels" . | nindent 4 }}
+    kronosdb.io/role: voter
+  ports:
+    - { name: admin, port: 9240, targetPort: admin }

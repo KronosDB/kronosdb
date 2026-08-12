@@ -109,3 +109,25 @@ jobs:
             --title "v${VERSION}" \
             --generate-notes \
             --latest
+
+  publish-chart:
+    needs: [check-version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Chart version rides the server version: one release train, and
+      # `helm install oci://ghcr.io/kronosdb/charts/kronosdb` always pulls
+      # a chart whose default image tag is the matching server.
+      - name: Package and push chart
+        run: |
+          VERSION=${{ needs.check-version.outputs.version }}
+          helm package charts/kronosdb --version "${VERSION}" --app-version "${VERSION}"
+          helm push "kronosdb-${VERSION}.tgz" oci://ghcr.io/kronosdb/charts

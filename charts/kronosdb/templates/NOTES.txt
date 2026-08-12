@@ -1,0 +1,37 @@
+KronosDB {{ .Chart.AppVersion }} — {{ .Values.replicas }} voter(s){{ if gt (int .Values.learners.replicas) 0 }}, {{ .Values.learners.replicas }} learner(s){{ end }}
+
+Endpoints (in-cluster):
+  gRPC:          {{ include "kronosdb.fullname" . }}.{{ .Release.Namespace }}.svc:50051
+  Admin console: http://{{ include "kronosdb.fullname" . }}-admin.{{ .Release.Namespace }}.svc:9240
+
+{{- if not (or .Values.auth.accessToken .Values.auth.existingSecret) }}
+
+!! gRPC is UNAUTHENTICATED — any pod that can reach the service can read
+   and append events. Set auth.accessToken or auth.existingSecret.
+{{- end }}
+{{- if eq .Values.admin.authMode "none" }}
+
+!! Admin console auth is DISABLED — anyone reaching port 9240 can browse
+   events and mutate cluster membership. Set admin.authMode=token.
+{{- end }}
+{{- if not .Values.backup.url }}
+
+Backup is disabled (backup.url is empty). Quorum protects against node
+loss, not against operator or application mistakes replicated to every
+node. Point backup.url at an object store for sealed-segment backup.
+{{- end }}
+{{- if not .Values.persistence.storageClassName }}
+
+persistence.storageClassName is unset (cluster default). Prefer local
+NVMe: acked writes are already quorum-replicated, so replicated network
+volumes pay for replication twice. See docs/OPERATIONS.md.
+{{- end }}
+
+Scaling the cluster
+  `helm upgrade --set replicas=N` does NOT resize the Raft cluster.
+  Raft membership is persisted state, changed through the admin API:
+    grow:   add the node via the admin console/API (add-voter), THEN
+            `helm upgrade --set replicas=N` so the peer list matches.
+    shrink: remove-voter first, then lower replicas.
+  Rolling updates and pod rescheduling need no special handling — node
+  IDs and DNS names are stable, and the PDB protects quorum.

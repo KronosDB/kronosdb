@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kronosdb.fullname" . }}
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "kronosdb.fullname" . }}-hl
+  replicas: {{ .Values.replicas }}
+  # Parallel lets a cold cluster form quorum immediately instead of waiting
+  # for pod-by-pod readiness (a lone voter is never ready — deadlock).
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "kronosdb.selectorLabels" . | nindent 6 }}
+      kronosdb.io/role: voter
+  template:
+    metadata:
+      labels:
+        {{- include "kronosdb.selectorLabels" . | nindent 8 }}
+        kronosdb.io/role: voter
+    spec:
+      terminationGracePeriodSeconds: {{ add (int .Values.config.drainDeadlineSecs) 10 }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if eq .Values.antiAffinity "required" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "kronosdb.selectorLabels" . | nindent 18 }}
+                  kronosdb.io/role: voter
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "kronosdb.selectorLabels" . | nindent 20 }}
+                    kronosdb.io/role: voter
+      {{- end }}
+      {{- if .Values.zoneSpread }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "kronosdb.selectorLabels" . | nindent 14 }}
+              kronosdb.io/role: voter
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - {{- include "kronosdb.container" (dict "root" . "nodeType" "standard" "idOffset" 1) | nindent 10 }}
+      volumes:
+        {{- if .Values.contexts }}
+        - name: manifest
+          configMap:
+            name: {{ include "kronosdb.fullname" . }}-manifest
+        {{- end }}
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- if not (or .Values.contexts .Values.tls.secretName) }}
+        []
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
