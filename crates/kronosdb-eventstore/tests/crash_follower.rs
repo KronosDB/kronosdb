@@ -68,6 +68,7 @@ async fn run_one_iteration(iter: usize) {
                 group_commit_ms: Some(2),
                 segment_size: None,
                 backup: None,
+                max_snapshot_size: None,
             })
             .expect("spawn node"),
         );
@@ -150,6 +151,7 @@ async fn run_one_iteration(iter: usize) {
         group_commit_ms: Some(2),
         segment_size: None,
         backup: None,
+        max_snapshot_size: None,
     })
     .expect("respawn follower");
     wait_until_ready(

@@ -56,6 +56,7 @@ async fn run() {
         group_commit_ms: Some(2),
         segment_size: Some(SEGMENT_SIZE),
         backup: None,
+        max_snapshot_size: None,
     })
     .expect("spawn node 1");
     wait_until_ready(srv1.listen, srv1.admin, READY_TIMEOUT)
@@ -126,6 +127,7 @@ async fn run() {
         group_commit_ms: Some(2),
         segment_size: Some(SEGMENT_SIZE),
         backup: None,
+        max_snapshot_size: None,
     })
     .expect("spawn node 2");
     // Not `wait_until_ready`: an un-adopted node has no claim and reports 503.

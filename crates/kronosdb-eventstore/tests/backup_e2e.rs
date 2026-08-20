@@ -45,6 +45,7 @@ async fn run() {
         group_commit_ms: Some(2),
         segment_size: Some(SEGMENT_SIZE),
         backup: Some((backup_url, 1)),
+        max_snapshot_size: None,
     })
     .expect("spawn server");
     wait_until_ready(srv.listen, srv.admin, READY_TIMEOUT)

@@ -69,6 +69,7 @@ async fn run_one_iteration(iter: usize) {
             group_commit_ms: Some(2),
             segment_size: None,
             backup: None,
+            max_snapshot_size: None,
         };
         srvs.push(spawn_server(&cfg).expect("spawn node"));
     }
@@ -296,6 +297,7 @@ async fn post_restart_verify(
         group_commit_ms: Some(2),
         segment_size: None,
         backup: None,
+        max_snapshot_size: None,
     };
     srvs[leader_idx] = spawn_server(&cfg).expect("respawn killed node");
     wait_until_ready(

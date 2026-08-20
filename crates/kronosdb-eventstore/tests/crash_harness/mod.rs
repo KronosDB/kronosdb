@@ -102,6 +102,9 @@ pub struct SpawnConfig {
     pub segment_size: Option<u64>,
     /// Object-store URL + pass interval for the ADR-0002 backup uploader.
     pub backup: Option<(String, u64)>,
+    /// Snapshot state cap in bytes (`max-snapshot-size`). `None` keeps the
+    /// 4 MB default.
+    pub max_snapshot_size: Option<u64>,
 }
 
 /// Ensures the kronosdb-server binary is built once before any crash test runs it.
@@ -181,6 +184,9 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     if let Some((url, interval_secs)) = &cfg.backup {
         cmd.env("KRONOSDB_BACKUP_URL", url)
             .env("KRONOSDB_BACKUP_INTERVAL_SECS", interval_secs.to_string());
+    }
+    if let Some(bytes) = cfg.max_snapshot_size {
+        cmd.env("KRONOSDB_MAX_SNAPSHOT_SIZE", bytes.to_string());
     }
 
     let child = cmd.spawn()?;
