@@ -68,6 +68,7 @@ impl NativeEngine {
         request: AppendRequest,
         epoch: u64,
         leader_id: u64,
+        system: bool,
     ) -> Result<AppendResponse, Error> {
         let leader = self
             .peers
@@ -87,6 +88,7 @@ impl NativeEngine {
             epoch,
             leader_id,
             request,
+            system,
         ))?;
         let response = client
             .forward_append(request)
@@ -134,6 +136,7 @@ fn encode_forward_append(
     epoch: u64,
     leader_id: u64,
     request: AppendRequest,
+    system: bool,
 ) -> replication_proto::ForwardAppendRequest {
     let events = request
         .events
@@ -186,21 +189,19 @@ fn encode_forward_append(
         leader_id,
         events,
         condition,
+        system,
     }
 }
 
-#[async_trait::async_trait]
-impl EventStore for NativeEngine {
-    async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
-        // Checked here as well as in the leader's `append_stage` so a
-        // follower rejects a reserved-namespace append before forwarding it.
-        // Leader-side, the same error maps to the forward protocol's Retry
-        // arm — the client would spin on a request that can never succeed.
-        crate::system::validate_client_append(&request.events)?;
-        if let Some(condition) = &request.condition {
-            crate::system::validate_client_condition(&condition.criteria)?;
-        }
-
+impl NativeEngine {
+    /// The shared append route: leader-local staged write or forward to the
+    /// claimed leader. `system` selects the server-authored staging path
+    /// (snapshot records) over the client-checked one.
+    async fn route_append(
+        &self,
+        request: AppendRequest,
+        system: bool,
+    ) -> Result<AppendResponse, Error> {
         let claim = self.control.claim().ok_or_else(|| Error::Corrupted {
             message: "native append unavailable: no committed leader claim".into(),
         })?;
@@ -216,11 +217,17 @@ impl EventStore for NativeEngine {
             // lock for microseconds); the durability wait is awaited here so
             // no thread is pinned for the fsync duration.
             let engine = Arc::clone(&self.local_engine);
-            let staged = tokio::task::spawn_blocking(move || engine.append_stage(request))
-                .await
-                .map_err(|error| Error::Corrupted {
-                    message: format!("native append worker panicked: {error}"),
-                })?;
+            let staged = tokio::task::spawn_blocking(move || {
+                if system {
+                    engine.append_system_stage(request)
+                } else {
+                    engine.append_stage(request)
+                }
+            })
+            .await
+            .map_err(|error| Error::Corrupted {
+                message: format!("native append worker panicked: {error}"),
+            })?;
             let result = match staged {
                 Ok(staged) => self.local_engine.append_finish_async(staged).await,
                 Err(error) => Err(error),
@@ -232,9 +239,25 @@ impl EventStore for NativeEngine {
             }
             result
         } else {
-            self.forward_append(request, claim.epoch, claim.leader_id)
+            self.forward_append(request, claim.epoch, claim.leader_id, system)
                 .await
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventStore for NativeEngine {
+    async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        // Checked here as well as in the leader's `append_stage` so a
+        // follower rejects a reserved-namespace append before forwarding it.
+        // Leader-side, the same error maps to the forward protocol's Retry
+        // arm — the client would spin on a request that can never succeed.
+        crate::system::validate_client_append(&request.events)?;
+        if let Some(condition) = &request.condition {
+            crate::system::validate_client_condition(&condition.criteria)?;
+        }
+
+        self.route_append(request, false).await
     }
 
     fn source(
@@ -278,5 +301,27 @@ impl EventStore for NativeEngine {
 
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
         self.local_engine.get_sequence_at(timestamp_millis)
+    }
+
+    async fn append_snapshot(
+        &self,
+        key: Vec<u8>,
+        state: Vec<u8>,
+        fold_position: Position,
+    ) -> Result<Position, Error> {
+        // The server frames the record itself — the client's key and state
+        // are data inside it, never a client-authored `$` event. Forwarded
+        // as a system append so the leader stages it through the same seam.
+        let request = crate::snapshot::append_request(&key, state, fold_position);
+        let response = self.route_append(request, true).await?;
+        Ok(response.first_position)
+    }
+
+    fn get_snapshot(
+        &self,
+        key: &[u8],
+        below: Option<Position>,
+    ) -> Result<Option<crate::snapshot::Snapshot>, Error> {
+        crate::snapshot::latest(&self.local_engine, key, below)
     }
 }

@@ -122,10 +122,17 @@ impl SegmentReplication for SegmentReplicationService {
         }
         let request_epoch = request.epoch;
         let request_leader = request.leader_id;
+        let system = request.system;
         let append = decode_forward_append(request)?;
-        let result = tokio::task::spawn_blocking(move || engine.append(append))
-            .await
-            .map_err(|error| Status::internal(format!("append task panicked: {error}")))?;
+        let result = tokio::task::spawn_blocking(move || {
+            if system {
+                engine.append_system(append)
+            } else {
+                engine.append(append)
+            }
+        })
+        .await
+        .map_err(|error| Status::internal(format!("append task panicked: {error}")))?;
         if !self
             .control
             .is_local_writable(request_epoch, request_leader)

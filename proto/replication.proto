@@ -36,6 +36,11 @@ message ForwardAppendRequest {
   uint64 leader_id = 3;
   repeated ForwardEvent events = 4;
   optional ForwardCondition condition = 5;
+  // Server-authored append into the `$` namespace (snapshot records). The
+  // leader stages it through the system seam, skipping the client-forgery
+  // checks. Peer-trusted surface only — the same trust that lets a peer
+  // truncate segments.
+  bool system = 6;
 }
 
 message ForwardEvent {

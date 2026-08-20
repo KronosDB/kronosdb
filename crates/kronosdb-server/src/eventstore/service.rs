@@ -52,6 +52,8 @@ const HUB_CAPACITY: usize = 64;
 /// blocking the tokio async worker threads with synchronous file I/O.
 pub struct EventStoreService {
     cluster: Arc<ClusterManager>,
+    /// Maximum snapshot state size in bytes (`max-snapshot-size`).
+    max_snapshot_size: u64,
     /// Per-context fan-out hubs (created lazily by the first match-all
     /// subscriber). The hub task removes its entry and drops its sender on
     /// engine shutdown, which propagates `Closed` to subscribers.
@@ -59,9 +61,10 @@ pub struct EventStoreService {
 }
 
 impl EventStoreService {
-    pub fn new(cluster: Arc<ClusterManager>) -> Self {
+    pub fn new(cluster: Arc<ClusterManager>, max_snapshot_size: u64) -> Self {
         Self {
             cluster,
+            max_snapshot_size,
             hubs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -175,6 +178,7 @@ fn from_proto_read_criteria_empty() -> SourcingCondition {
 impl pb::event_store_server::EventStore for EventStoreService {
     type SourceStream = ReceiverStream<Result<pb::SourceResponse, Status>>;
     type StreamStream = ReceiverStream<Result<pb::StreamResponse, Status>>;
+    type SnapshottedSourceStream = ReceiverStream<Result<pb::SnapshottedSourceResponse, Status>>;
 
     async fn append(
         &self,
@@ -784,6 +788,181 @@ impl pb::event_store_server::EventStore for EventStoreService {
         }))
     }
 
+    async fn append_snapshot(
+        &self,
+        request: Request<pb::AppendSnapshotRequest>,
+    ) -> Result<Response<pb::AppendSnapshotResponse>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
+        let req = request.into_inner();
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("snapshot key must not be empty"));
+        }
+        if req.position < 0 {
+            return Err(Status::invalid_argument(
+                "snapshot position must not be negative",
+            ));
+        }
+        // Snapshot blobs share the log with events; a runaway state size
+        // would bloat segments and replication waves for every consumer.
+        if req.state.len() as u64 > self.max_snapshot_size {
+            return Err(Status::invalid_argument(format!(
+                "snapshot state is {} bytes; the configured maximum is {} (max-snapshot-size)",
+                req.state.len(),
+                self.max_snapshot_size
+            )));
+        }
+
+        let store = self.get_store(&context_name)?;
+        let sequence = store
+            .append_snapshot(req.key, req.state, Position(req.position as u64))
+            .await
+            .map_err(to_status)?;
+
+        Ok(Response::new(pb::AppendSnapshotResponse {
+            sequence: sequence.0 as i64,
+        }))
+    }
+
+    async fn get_snapshot(
+        &self,
+        request: Request<pb::GetSnapshotRequest>,
+    ) -> Result<Response<pb::GetSnapshotResponse>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
+        let req = request.into_inner();
+
+        let store = self.get_store(&context_name)?;
+        let snapshot = tokio::task::spawn_blocking(move || store.get_snapshot(&req.key, None))
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?
+            .map_err(to_status)?;
+
+        Ok(Response::new(pb::GetSnapshotResponse {
+            snapshot: snapshot.map(to_proto_snapshot),
+        }))
+    }
+
+    async fn snapshotted_source(
+        &self,
+        request: Request<pb::SnapshottedSourceRequest>,
+    ) -> Result<Response<Self::SnapshottedSourceStream>, Status> {
+        let context_name = Self::extract_context(&request).to_string();
+        let req = request.into_inner();
+        let batch_size = match req.batch_size as usize {
+            0 => 1024, // Server default; 0 means "let the server pick".
+            n => n,
+        };
+        let condition = from_proto_read_criteria(req.criteria);
+        let store = self.get_store(&context_name)?;
+
+        // Freeze the marker FIRST, then resolve the snapshot bounded by it:
+        // snapshot, events, and marker form one consistent view of the log.
+        // Unbounded, a snapshot record landing mid-read could summarize
+        // positions past the marker the client will append against.
+        let marker = store.head().0;
+
+        let snapshot = {
+            let store_snap = Arc::clone(&store);
+            let key = req.key;
+            tokio::task::spawn_blocking(move || {
+                store_snap.get_snapshot(&key, Some(Position(marker)))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?
+            .map_err(to_status)?
+        };
+        // With a snapshot: replay from its fold marker. The marker is
+        // next-exclusive (the client's consistency marker at fold time), so
+        // the first unfolded event sits AT it, not after it — `+ 1` here
+        // would silently drop an event that landed between the client's fold
+        // and its snapshot write. Without a snapshot: exactly a plain Source
+        // from the beginning.
+        let from_position = Position(snapshot.as_ref().map(|s| s.position.0).unwrap_or(0));
+
+        // Bound in-flight memory by events, not messages (see `source`).
+        let channel_capacity = (16384 / batch_size).clamp(2, 128);
+        let (tx, rx) = mpsc::channel(channel_capacity);
+
+        tokio::spawn(async move {
+            if let Some(snapshot) = snapshot {
+                let frame = pb::SnapshottedSourceResponse {
+                    frame: Some(pb::snapshotted_source_response::Frame::Snapshot(
+                        to_proto_snapshot(snapshot),
+                    )),
+                };
+                if tx.send(Ok(frame)).await.is_err() {
+                    return;
+                }
+            }
+
+            const PAGE: usize = 8192;
+            let mut cursor = from_position;
+            loop {
+                let page = {
+                    let store_page = Arc::clone(&store);
+                    let condition_page = condition.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store_page.source_page(cursor, &condition_page, Position(marker), PAGE)
+                    })
+                    .await
+                };
+                let page = match page {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(to_status(e))).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("task join error: {e}"))))
+                            .await;
+                        return;
+                    }
+                };
+                let is_final = page.len() < PAGE;
+                // Chunk exactly like `source`: short batches are sent
+                // immediately, the last chunk of the final page carries the
+                // marker, and an empty final page sends one empty
+                // marker-carrying batch.
+                let mut chunks = page.chunks(batch_size).peekable();
+                if is_final && chunks.peek().is_none() {
+                    let frame = pb::SnapshottedSourceResponse {
+                        frame: Some(pb::snapshotted_source_response::Frame::Batch(
+                            pb::SequencedEventBatch {
+                                events: Vec::new(),
+                                consistency_marker: Some(marker as i64),
+                            },
+                        )),
+                    };
+                    let _ = tx.send(Ok(frame)).await;
+                    return;
+                }
+                while let Some(chunk) = chunks.next() {
+                    let last_of_stream = is_final && chunks.peek().is_none();
+                    let frame = pb::SnapshottedSourceResponse {
+                        frame: Some(pb::snapshotted_source_response::Frame::Batch(
+                            pb::SequencedEventBatch {
+                                events: chunk.iter().map(to_proto_sequenced_event).collect(),
+                                consistency_marker: last_of_stream.then_some(marker as i64),
+                            },
+                        )),
+                    };
+                    if tx.send(Ok(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                if is_final {
+                    return;
+                }
+                cursor = match page.last() {
+                    Some(last) => Position(last.position.0 + 1),
+                    None => return, // Unreachable: a full page has a last event.
+                };
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn get_sequence_at(
         &self,
         request: Request<pb::GetSequenceAtRequest>,
@@ -884,6 +1063,13 @@ fn to_proto_tag(t: Tag) -> pb::Tag {
     pb::Tag {
         key: t.key,
         value: t.value,
+    }
+}
+
+fn to_proto_snapshot(s: kronosdb_eventstore::snapshot::Snapshot) -> pb::Snapshot {
+    pb::Snapshot {
+        state: s.state,
+        position: s.position.0 as i64,
     }
 }
 

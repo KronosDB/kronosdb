@@ -4,8 +4,8 @@ import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.kronosdb.connector.grpc.KronosDbConnection;
-import io.kronosdb.grpc.snapshot.AddSnapshotRequest;
-import io.kronosdb.grpc.snapshot.GetLastSnapshotRequest;
+import io.kronosdb.grpc.eventstore.AppendSnapshotRequest;
+import io.kronosdb.grpc.eventstore.GetSnapshotRequest;
 import org.axonframework.conversion.Converter;
 import org.axonframework.eventsourcing.eventstore.AggregateSequenceNumberPosition;
 import org.axonframework.eventsourcing.eventstore.GlobalIndexPosition;
@@ -15,6 +15,12 @@ import org.axonframework.eventsourcing.snapshot.store.SnapshotStore;
 import org.axonframework.messaging.core.QualifiedName;
 import org.jspecify.annotations.Nullable;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
@@ -25,13 +31,23 @@ import java.util.concurrent.CompletionException;
 /**
  * A KronosDB-backed implementation of {@link SnapshotStore}.
  * <p>
- * Stores and retrieves aggregate snapshots via the KronosDB Snapshot Store gRPC service.
- * Snapshots are keyed by qualified name + identifier, matching the Axon Framework convention.
+ * Stores and retrieves aggregate snapshots via the KronosDB EventStore snapshot
+ * RPCs (ADR-0005: snapshots ride the replicated event log). KronosDB stores one
+ * opaque state blob per key, so this adapter encodes the Axon snapshot's
+ * version, timestamp, metadata, position type, and payload into the blob
+ * itself; the numeric position value travels in the wire {@code position}
+ * field. Snapshots are keyed by qualified name + identifier, matching the
+ * Axon Framework convention. Superseded snapshots need no pruning — a newer
+ * record for the same key wins by log order.
  */
 public class KronosDbSnapshotStore implements SnapshotStore {
 
-    private static final String POSITION_TYPE_KEY = "__AxonFramework__:Position-Type";
     private static final ByteString NUL = ByteString.copyFrom(new byte[]{0});
+
+    /** Format version of the encoded state blob. */
+    private static final byte STATE_FORMAT_V1 = 1;
+    private static final byte POSITION_GLOBAL_INDEX = 0;
+    private static final byte POSITION_AGGREGATE_SEQUENCE = 1;
 
     private final KronosDbConnection connection;
     private final Converter converter;
@@ -53,35 +69,27 @@ public class KronosDbSnapshotStore implements SnapshotStore {
         Objects.requireNonNull(identifier);
         Objects.requireNonNull(snapshot);
 
-        ByteString key = makeKey(qualifiedName, identifier);
-        ByteString data = converter.convert(snapshot.payload(), byte[].class) instanceof byte[] ba
-                ? ByteString.copyFrom(ba) : ByteString.EMPTY;
-
-        long sequence = switch (snapshot.position()) {
+        long position = switch (snapshot.position()) {
             case GlobalIndexPosition gip -> GlobalIndexPosition.toIndex(snapshot.position());
             case AggregateSequenceNumberPosition asnp ->
                     AggregateSequenceNumberPosition.toSequenceNumber(snapshot.position());
             default -> throw new IllegalArgumentException("Unsupported position type: " + snapshot.position());
         };
 
-        String positionType = switch (snapshot.position()) {
-            case GlobalIndexPosition gip -> "GIP";
-            case AggregateSequenceNumberPosition asnp -> "ASNP";
+        byte positionType = switch (snapshot.position()) {
+            case GlobalIndexPosition gip -> POSITION_GLOBAL_INDEX;
+            case AggregateSequenceNumberPosition asnp -> POSITION_AGGREGATE_SEQUENCE;
             default -> throw new IllegalArgumentException("Unsupported position type: " + snapshot.position());
         };
 
-        return connection.snapshotChannel()
-                .addSnapshot(AddSnapshotRequest.newBuilder()
-                        .setKey(key)
-                        .setSequence(sequence)
-                        .setPrune(true)
-                        .setSnapshot(io.kronosdb.grpc.snapshot.Snapshot.newBuilder()
-                                .setName(qualifiedName.fullName())
-                                .setVersion(snapshot.version())
-                                .setTimestamp(snapshot.timestamp().toEpochMilli())
-                                .setPayload(data)
-                                .putAllMetadata(snapshot.metadata())
-                                .putMetadata(POSITION_TYPE_KEY, positionType))
+        byte[] payload = converter.convert(snapshot.payload(), byte[].class) instanceof byte[] ba
+                ? ba : new byte[0];
+
+        return connection.eventStoreChannel()
+                .appendSnapshot(AppendSnapshotRequest.newBuilder()
+                        .setKey(makeKey(qualifiedName, identifier))
+                        .setState(encodeState(snapshot, positionType, payload))
+                        .setPosition(position)
                         .build())
                 .thenApply(v -> null);
     }
@@ -91,32 +99,15 @@ public class KronosDbSnapshotStore implements SnapshotStore {
         Objects.requireNonNull(qualifiedName);
         Objects.requireNonNull(identifier);
 
-        ByteString key = makeKey(qualifiedName, identifier);
-
-        return connection.snapshotChannel()
-                .getLastSnapshot(GetLastSnapshotRequest.newBuilder().setKey(key).build())
+        return connection.eventStoreChannel()
+                .getSnapshot(GetSnapshotRequest.newBuilder()
+                        .setKey(makeKey(qualifiedName, identifier))
+                        .build())
                 .thenApply(sr -> {
-                    io.kronosdb.grpc.snapshot.Snapshot snapshot = sr.getSnapshot();
-                    if (snapshot == null) {
+                    if (!sr.hasSnapshot()) {
                         return null;
                     }
-
-                    Map<String, String> metadata = new HashMap<>(snapshot.getMetadataMap());
-                    String positionType = metadata.remove(POSITION_TYPE_KEY);
-                    Position position = switch (positionType) {
-                        case "GIP" -> new GlobalIndexPosition(sr.getSequence());
-                        case "ASNP" -> new AggregateSequenceNumberPosition(sr.getSequence());
-                        case null, default ->
-                                throw new IllegalArgumentException("Unexpected position type: " + positionType);
-                    };
-
-                    return new Snapshot(
-                            position,
-                            snapshot.getVersion(),
-                            snapshot.getPayload().toByteArray(),
-                            Instant.ofEpochMilli(snapshot.getTimestamp()),
-                            metadata
-                    );
+                    return decodeState(sr.getSnapshot().getState(), sr.getSnapshot().getPosition());
                 })
                 .exceptionally(e -> {
                     while (e instanceof CompletionException) {
@@ -131,5 +122,52 @@ public class KronosDbSnapshotStore implements SnapshotStore {
                             "Snapshot loading failed for %s with identifier %s"
                                     .formatted(qualifiedName.toString(), identifier.toString()), e);
                 });
+    }
+
+    static ByteString encodeState(Snapshot snapshot, byte positionType, byte[] payload) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(payload.length + 128);
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            out.writeByte(STATE_FORMAT_V1);
+            out.writeByte(positionType);
+            out.writeUTF(snapshot.version());
+            out.writeLong(snapshot.timestamp().toEpochMilli());
+            out.writeInt(snapshot.metadata().size());
+            for (Map.Entry<String, String> entry : snapshot.metadata().entrySet()) {
+                out.writeUTF(entry.getKey());
+                out.writeUTF(entry.getValue());
+            }
+            out.writeInt(payload.length);
+            out.write(payload);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to encode snapshot state", e);
+        }
+        return ByteString.copyFrom(bytes.toByteArray());
+    }
+
+    static Snapshot decodeState(ByteString state, long positionValue) {
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(state.toByteArray()))) {
+            byte formatVersion = in.readByte();
+            if (formatVersion != STATE_FORMAT_V1) {
+                throw new IllegalArgumentException("Unsupported snapshot state format: " + formatVersion);
+            }
+            byte positionType = in.readByte();
+            Position position = switch (positionType) {
+                case POSITION_GLOBAL_INDEX -> new GlobalIndexPosition(positionValue);
+                case POSITION_AGGREGATE_SEQUENCE -> new AggregateSequenceNumberPosition(positionValue);
+                default -> throw new IllegalArgumentException("Unexpected position type: " + positionType);
+            };
+            String version = in.readUTF();
+            Instant timestamp = Instant.ofEpochMilli(in.readLong());
+            int metadataCount = in.readInt();
+            Map<String, String> metadata = new HashMap<>(metadataCount);
+            for (int i = 0; i < metadataCount; i++) {
+                metadata.put(in.readUTF(), in.readUTF());
+            }
+            byte[] payload = new byte[in.readInt()];
+            in.readFully(payload);
+            return new Snapshot(position, version, payload, timestamp, metadata);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to decode snapshot state", e);
+        }
     }
 }

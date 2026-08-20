@@ -5,12 +5,10 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::Error;
-use crate::snapshot::SnapshotStore;
 use crate::store::{EventStoreEngine, StoreOptions};
 
 struct ContextEntry {
     engine: Arc<EventStoreEngine>,
-    snapshots: Arc<SnapshotStore>,
 }
 
 /// Manages multiple isolated event store contexts.
@@ -100,8 +98,7 @@ impl ContextManager {
             &context_dir,
             &self.store_options,
         )?);
-        let snapshots = Arc::new(SnapshotStore::open(&context_dir.join("snapshots"))?);
-        contexts.insert(name.to_string(), ContextEntry { engine, snapshots });
+        contexts.insert(name.to_string(), ContextEntry { engine });
 
         Ok(())
     }
@@ -132,17 +129,6 @@ impl ContextManager {
         contexts
             .get(name)
             .map(|entry| Arc::clone(&entry.engine))
-            .ok_or_else(|| Error::ContextNotFound {
-                name: name.to_string(),
-            })
-    }
-
-    /// Gets a cloneable reference to a context's snapshot store.
-    pub fn get_snapshot_store(&self, name: &str) -> Result<Arc<SnapshotStore>, Error> {
-        let contexts = self.contexts.read();
-        contexts
-            .get(name)
-            .map(|entry| Arc::clone(&entry.snapshots))
             .ok_or_else(|| Error::ContextNotFound {
                 name: name.to_string(),
             })
@@ -205,8 +191,7 @@ impl ContextManager {
                     &path,
                     &self.store_options,
                 )?);
-                let snapshots = Arc::new(SnapshotStore::open(&path.join("snapshots"))?);
-                contexts.insert(name, ContextEntry { engine, snapshots });
+                contexts.insert(name, ContextEntry { engine });
             }
         }
 

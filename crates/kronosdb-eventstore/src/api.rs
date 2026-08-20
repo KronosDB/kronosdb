@@ -2,6 +2,7 @@ use crate::append::{AppendRequest, AppendResponse};
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{Position, SequencedEvent, Tag};
+use crate::snapshot::Snapshot;
 use crate::stream::EventStream;
 
 /// The event store interface.
@@ -64,4 +65,21 @@ pub trait EventStore: Send + Sync {
     /// Returns the position of the first event with timestamp >= the given millis-since-epoch.
     /// Returns `None` if no such event exists (empty store or all events are older).
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error>;
+
+    /// Stores an opaque client snapshot under a client-composed key,
+    /// returning the log position of its record (ADR-0005).
+    ///
+    /// Rides the same replicated append path as events: async because
+    /// clustered nodes forward it to the claimed leader.
+    async fn append_snapshot(
+        &self,
+        key: Vec<u8>,
+        state: Vec<u8>,
+        fold_position: Position,
+    ) -> Result<Position, Error>;
+
+    /// The latest snapshot for a key whose record landed strictly below
+    /// `below` (`None` = no bound). A miss returns `Ok(None)` — always legal.
+    /// Local read, like `source`.
+    fn get_snapshot(&self, key: &[u8], below: Option<Position>) -> Result<Option<Snapshot>, Error>;
 }

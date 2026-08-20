@@ -113,6 +113,35 @@ public class EventStoreChannel {
     }
 
     /**
+     * Appends a snapshot record to the log (ADR-0005). The server stores the
+     * state bytes opaquely under the key; a newer snapshot for the same key
+     * supersedes older ones by log order.
+     */
+    public CompletableFuture<AppendSnapshotResponse> appendSnapshot(AppendSnapshotRequest request) {
+        return GrpcFutures.toCompletableFuture(futureStub.appendSnapshot(request));
+    }
+
+    /**
+     * Fetches the latest snapshot for a key, without events. The response's
+     * snapshot field is absent on a miss — a miss is always legal.
+     */
+    public CompletableFuture<GetSnapshotResponse> getSnapshot(GetSnapshotRequest request) {
+        return GrpcFutures.toCompletableFuture(futureStub.getSnapshot(request));
+    }
+
+    /**
+     * The fused read: the latest snapshot under the key plus all events
+     * matching the criteria after it, one stream, one consistent view.
+     */
+    public ResultStream<SnapshottedSourceResponse> snapshottedSource(SnapshottedSourceRequest request) {
+        CompletableFuture<Void> completionFuture = new CompletableFuture<>();
+        CollectingStreamObserver<SnapshottedSourceResponse> observer =
+                new CollectingStreamObserver<>(completionFuture);
+        asyncStub.snapshottedSource(request, observer);
+        return new ResultStream<>(observer, completionFuture);
+    }
+
+    /**
      * Gets the current tail (first event position) of the event store.
      */
     public CompletableFuture<GetTailResponse> tail() {

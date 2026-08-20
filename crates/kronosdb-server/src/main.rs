@@ -33,7 +33,6 @@ use kronosdb_messaging::manager::MessagingManager;
 
 use crate::config::ServerConfig;
 use crate::eventstore::service::EventStoreService;
-use crate::eventstore::snapshot_service::SnapshotServiceImpl;
 use crate::messaging::command_service::CommandServiceImpl;
 use crate::messaging::query_service::QueryServiceImpl;
 use crate::platform::service::{ClientChannelRegistry, PlatformServiceImpl, spawn_reaper};
@@ -199,9 +198,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler_stream_registry = Arc::new(handler_registry::HandlerStreamRegistry::new());
 
     // Build gRPC services.
-    let event_store_service = EventStoreService::new(Arc::clone(&cluster));
+    let event_store_service =
+        EventStoreService::new(Arc::clone(&cluster), config.max_snapshot_size);
     let scheduler_service = scheduler_service::SchedulerServiceImpl::new(Arc::clone(&cluster));
-    let snapshot_service = SnapshotServiceImpl::new(Arc::clone(&cluster));
     let command_service = CommandServiceImpl::new(
         Arc::clone(&messaging),
         Duration::from_secs(config.command_timeout_secs),
@@ -319,7 +318,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use crate::proto::kronosdb::platform::platform_service_server::PlatformServiceServer;
     use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
     use crate::proto::kronosdb::scheduler::scheduler_service_server::SchedulerServiceServer;
-    use crate::proto::kronosdb::snapshot::snapshot_store_server::SnapshotStoreServer;
 
     // Configure TLS and gRPC keepalive. The ping cadence keeps idle
     // connector streams from being silently dropped by middleboxes while
@@ -370,10 +368,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut router = server
         .add_service(EventStoreServer::with_interceptor(
             event_store_service,
-            auth.clone(),
-        ))
-        .add_service(SnapshotStoreServer::with_interceptor(
-            snapshot_service,
             auth.clone(),
         ))
         .add_service(CommandServiceServer::with_interceptor(

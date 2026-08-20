@@ -5,7 +5,6 @@ import io.kronosdb.grpc.command.CommandServiceGrpc;
 import io.kronosdb.grpc.eventstore.EventStoreGrpc;
 import io.kronosdb.grpc.platform.PlatformServiceGrpc;
 import io.kronosdb.grpc.query.QueryServiceGrpc;
-import io.kronosdb.grpc.snapshot.SnapshotStoreGrpc;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,7 +14,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Represents a connection to a single KronosDB server for a specific context.
- * Provides access to typed channel abstractions for event store, snapshot store,
+ * Provides access to typed channel abstractions for event store,
  * command bus, query bus, and platform operations.
  */
 public class KronosDbConnection {
@@ -26,7 +25,6 @@ public class KronosDbConnection {
     private final String context;
 
     private volatile @Nullable EventStoreChannel eventStoreChannel;
-    private volatile @Nullable SnapshotChannel snapshotChannel;
     private volatile @Nullable CommandChannel commandChannel;
     private volatile @Nullable QueryChannel queryChannel;
     private volatile @Nullable PlatformChannel platformChannel;
@@ -53,23 +51,6 @@ public class KronosDbConnection {
             }
         }
         return eventStoreChannel;
-    }
-
-    /**
-     * Returns the snapshot channel for this connection.
-     */
-    public SnapshotChannel snapshotChannel() {
-        if (snapshotChannel == null) {
-            synchronized (this) {
-                if (snapshotChannel == null) {
-                    snapshotChannel = new SnapshotChannel(
-                            SnapshotStoreGrpc.newStub(channel),
-                            SnapshotStoreGrpc.newFutureStub(channel)
-                    );
-                }
-            }
-        }
-        return snapshotChannel;
     }
 
     /**

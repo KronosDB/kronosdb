@@ -1573,7 +1573,20 @@ impl EventStoreEngine {
     /// Appends on behalf of the server itself, skipping the checks that stop
     /// a client from writing into the `$` namespace. For the subsystems that
     /// own system events; never reachable from a client request.
-    pub fn append_system(&self, mut request: AppendRequest) -> Result<AppendResponse, Error> {
+    pub fn append_system(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        let staged = self.append_system_stage(request)?;
+        let wait = match staged.wait_pos() {
+            Some(pos) => self.watermark.wait_for(pos),
+            None => Ok(()),
+        };
+        self.append_finalize(staged, wait)
+    }
+
+    /// The synchronous half of [`append_system`]: validates and stamps the
+    /// `$` framing, then stages the write. Finish with `append_finish_async`
+    /// — the seam for async callers (the snapshot gRPC path) that must not
+    /// pin a thread through the durability wait.
+    pub fn append_system_stage(&self, mut request: AppendRequest) -> Result<StagedAppend, Error> {
         // Stamped here rather than trusted from callers: the read path judges
         // visibility by event type while `visible_head` judges it by this tag,
         // and a system event missing it would be unreadable yet still counted
@@ -1604,12 +1617,7 @@ impl EventStoreEngine {
             }
         }
 
-        let staged = self.append_stage_unchecked(request, Timer::start())?;
-        let wait = match staged.wait_pos() {
-            Some(pos) => self.watermark.wait_for(pos),
-            None => Ok(()),
-        };
-        self.append_finalize(staged, wait)
+        self.append_stage_unchecked(request, Timer::start())
     }
 
     /// `append_stage` without the reserved-namespace checks. The seam the
@@ -2002,6 +2010,114 @@ impl EventStoreEngine {
 
         // Every position is a system event — nothing visible has ever landed.
         Position(0)
+    }
+
+    /// Highest position strictly below `below` matching `condition`, or
+    /// `None` if nothing matches. The mirror image of the DCB primitive
+    /// (`find_matching_after`), resolved newest-first with bloom-filter
+    /// skips: the expected caller — the snapshot lookup — almost always
+    /// finds its answer in the newest segment or two, so the walk usually
+    /// probes once and stops.
+    pub(crate) fn latest_matching(
+        &self,
+        condition: &SourcingCondition,
+        below: Position,
+    ) -> Result<Option<Position>, Error> {
+        let bound = self.watermark.get().min(below.0);
+        if bound == 0 {
+            return Ok(None);
+        }
+
+        let seg_list = self.segments.read().clone();
+        for (i, &base) in seg_list.bases.iter().enumerate().rev() {
+            if base >= bound {
+                continue;
+            }
+            let bitmap = if seg_list.is_sealed(i) {
+                let seg_path = segment::segment_path(&self.dir, base);
+                if let Some(false) = self.cache.bloom_check(&seg_path, base, condition) {
+                    continue;
+                }
+                self.cache.get_index(&seg_path, base)?.matching(condition)
+            } else {
+                self.tag_index.matching_bitmap(condition, Position(base))
+            };
+            if let Some(mut bitmap) = bitmap {
+                // The tag index is written before the watermark advances, so
+                // positions at or past the bound may be present — they are
+                // not committed reads and must not be returned.
+                bitmap.remove_range(bound..);
+                if let Some(max) = bitmap.max() {
+                    return Ok(Some(Position(max)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reads the stored event at a known position, tags and payload intact.
+    /// No visibility filter — the callers (the snapshot lookup) own the
+    /// records they read; nothing serving a client query may call this.
+    pub(crate) fn read_stored_at(&self, position: Position) -> Result<StoredEvent, Error> {
+        let head = self.watermark.get();
+        if position.0 >= head {
+            return Err(Error::Corrupted {
+                message: format!("position {} does not exist", position.0),
+            });
+        }
+
+        let seg_list = self.segments.read().clone();
+        let seg_idx = match seg_list.bases.binary_search(&position.0) {
+            Ok(i) => i,
+            Err(0) => {
+                return Err(Error::Corrupted {
+                    message: format!("no segment contains position {}", position.0),
+                });
+            }
+            Err(i) => i - 1,
+        };
+
+        let base = seg_list.bases[seg_idx];
+        let seg_path = segment::segment_path(&self.dir, base);
+
+        let reader = if seg_list.is_sealed(seg_idx) {
+            let mmap = self.cache.get_mmap(&seg_path, base)?;
+            let reader = SegmentReader::from_shared_mmap(mmap)?;
+            // Sealed segment: direct seek via the offset table.
+            if let Some(offset) = self
+                .cache
+                .get_index(&seg_path, base)?
+                .get_offset(position.0)
+            {
+                return reader.read_event_at(offset as usize);
+            }
+            reader
+        } else {
+            let reader = self.active_segment_reader(base, &seg_path)?;
+            let active_idx = self.active_index.read();
+            if active_idx.base_position() == base
+                && let Some(offset) = active_idx.get_offset(position.0)
+            {
+                drop(active_idx);
+                return reader.read_event_at(offset as usize);
+            }
+            reader
+        };
+
+        // Fallback: linear scan (unindexed segment after crash recovery).
+        for result in reader.iter(Some(Position(head))) {
+            let event = result?;
+            if event.position == position {
+                return Ok(event);
+            }
+            if event.position > position {
+                break;
+            }
+        }
+
+        Err(Error::Corrupted {
+            message: format!("event at position {} not found in segment", position.0),
+        })
     }
 
     /// Returns the tail position (first available event position).
@@ -2401,6 +2517,23 @@ impl EventStore for EventStoreEngine {
 
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
         self.get_sequence_at(timestamp_millis)
+    }
+
+    async fn append_snapshot(
+        &self,
+        key: Vec<u8>,
+        state: Vec<u8>,
+        fold_position: Position,
+    ) -> Result<Position, Error> {
+        crate::snapshot::append(self, &key, state, fold_position)
+    }
+
+    fn get_snapshot(
+        &self,
+        key: &[u8],
+        below: Option<Position>,
+    ) -> Result<Option<crate::snapshot::Snapshot>, Error> {
+        crate::snapshot::latest(self, key, below)
     }
 }
 

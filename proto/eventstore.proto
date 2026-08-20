@@ -40,6 +40,24 @@ service EventStore {
      Used by event processors to support time-based replay (e.g., Axon's tokenAt). */
   rpc GetSequenceAt (GetSequenceAtRequest) returns (GetSequenceAtResponse);
 
+  /* Appends a snapshot record to the log (ADR-0005). Replicated like any
+     append; the server stores opaque bytes under a client-composed key and
+     never interprets them. A newer snapshot for the same key supersedes
+     older ones purely by being later in the log. */
+  rpc AppendSnapshot (AppendSnapshotRequest) returns (AppendSnapshotResponse);
+
+  /* The fused read: the latest snapshot under the key plus all events
+     matching the criteria from the snapshot's fold marker onward, one
+     stream, one consistent view. Without a snapshot it behaves exactly
+     like Source from the beginning. Ends with the same consistency marker
+     Source ends with — conditional appends work identically on both paths. */
+  rpc SnapshottedSource (SnapshottedSourceRequest) returns (stream SnapshottedSourceResponse);
+
+  /* The latest snapshot alone, no events. For adapters whose interfaces
+     load snapshots separately (e.g. the Axon connector); SnapshottedSource
+     is the intended path for event-sourced rehydration. */
+  rpc GetSnapshot (GetSnapshotRequest) returns (GetSnapshotResponse);
+
   /* Tag mutations (AddTags/RemoveTags) and other transformations are admin
      operations handled via a separate HTTP admin API, not this gRPC service. */
 }
@@ -225,6 +243,65 @@ message GetTagsRequest {
 
 message GetTagsResponse {
   repeated Tag tags = 1;
+}
+
+/* A snapshot: opaque client state at a point in the log. The server never
+   interprets it — fitness, invalidation, and versioning are the client's
+   business (invalidation is the client renaming its key). */
+message Snapshot {
+  /* Opaque state bytes, returned byte-exact. */
+  bytes state = 1;
+  /* The client's fold-time consistency marker — NOT the snapshot record's
+     own log position. Markers are next-exclusive, so this is the sequence
+     the replay resumes AT: events with sequence >= position are not
+     summarized by the state. Pass the marker from the read/append the
+     state was folded from, unmodified. */
+  int64 position = 2;
+}
+
+message AppendSnapshotRequest {
+  /* One client-composed opaque key; the client folds any entity id into it
+     (e.g. "course:cs-101"). */
+  bytes key = 1;
+  /* Opaque state, forever. */
+  bytes state = 2;
+  /* The fold-time consistency marker (see Snapshot.position). */
+  int64 position = 3;
+}
+
+message AppendSnapshotResponse {
+  /* Log sequence of the snapshot record itself. Informational. */
+  int64 sequence = 1;
+}
+
+message SnapshottedSourceRequest {
+  /* Identical semantics to SourceRequest.criteria. */
+  repeated Criterion criteria = 1;
+  /* The snapshot key to resolve. */
+  bytes key = 2;
+  /* Maximum events per batch message. 0 = server default (1024). */
+  uint32 batch_size = 3;
+}
+
+/* Stream frames: at most one snapshot frame, always first if present, then
+   event batches. The final batch carries the consistency marker exactly as
+   Source does — a stream with no events still ends with one (empty)
+   marker-carrying batch. A snapshot is never delivered as an event. */
+message SnapshottedSourceResponse {
+  oneof frame {
+    Snapshot snapshot = 1;
+    SequencedEventBatch batch = 2;
+  }
+}
+
+message GetSnapshotRequest {
+  bytes key = 1;
+}
+
+message GetSnapshotResponse {
+  /* Absent if no snapshot exists under the key — a miss is always legal;
+     the caller replays from the beginning. */
+  Snapshot snapshot = 1;
 }
 
 message GetSequenceAtRequest {

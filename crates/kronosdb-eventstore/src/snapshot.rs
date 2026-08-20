@@ -1,482 +1,333 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+//! Snapshots on the log (ADR-0005).
+//!
+//! A snapshot is not a file in a side store — it is a record in the log, so
+//! it inherits quorum durability, replication, backup, and crash recovery
+//! rather than reimplementing them. Each snapshot is one `$snapshot.written`
+//! system event (`docs/system-events.md`), invisible to the ordinary read
+//! path and served back only through the dedicated snapshot RPCs:
+//!
+//! ```text
+//! $snapshot.written    opaque client state, tagged `$snapshot:{key}`
+//! ```
+//!
+//! The server never interprets a snapshot. The key is one client-composed
+//! byte string (the client folds any entity id into it), the state is opaque
+//! bytes, and `position` is the client's fold-time consistency marker
+//! (next-exclusive — the sequence replay resumes AT), NOT the record's own
+//! log position (the record lands later). All semantics — fitness, invalidation,
+//! versioning — are the client's business; invalidation is the client
+//! renaming its key. A newer snapshot supersedes older ones purely by being
+//! later in the log; superseded records remain as inert history.
 
+use serde::{Deserialize, Serialize};
+
+use crate::append::AppendRequest;
+use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
+use crate::event::{AppendEvent, Position, Tag};
+use crate::store::EventStoreEngine;
 
-/// A stored snapshot: projection/read model state at a point in the event stream.
-#[derive(Debug, Clone)]
+/// Appended when a client stores a snapshot. Payload is a bincoded
+/// [`SnapshotRecord`].
+pub const WRITTEN: &str = "$snapshot.written";
+
+/// Correlation tag: its value is the client's opaque key. `$`-prefixed, so
+/// a client DCB condition can structurally never match a snapshot record.
+const KEY_TAG: &str = "$snapshot";
+
+/// A snapshot as served back to a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// The name/type of the snapshot.
-    pub name: String,
-    /// The version of the serialized form.
-    pub version: String,
-    /// The serialized payload (opaque bytes).
-    pub payload: Vec<u8>,
-    /// Timestamp of snapshot creation (millis since epoch).
-    pub timestamp: i64,
-    /// Arbitrary key-value metadata.
-    pub metadata: HashMap<String, String>,
+    /// Opaque client state, returned byte-exact.
+    pub state: Vec<u8>,
+    /// The fold-time consistency marker. Next-exclusive: events with
+    /// position >= this are not summarized by `state` and must be replayed
+    /// on top of it.
+    pub position: Position,
 }
 
-/// A snapshot entry with its key and sequence.
-#[derive(Debug, Clone)]
-pub struct SnapshotEntry {
-    pub key: Vec<u8>,
-    pub sequence: i64,
-    pub snapshot: Snapshot,
+/// The on-log payload of a `$snapshot.written` event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SnapshotRecord {
+    fold_position: u64,
+    state: Vec<u8>,
 }
 
-/// Persistent snapshot store.
-///
-/// Layout on disk:
-/// ```text
-/// {dir}/
-///   {hex_key}/
-///     {sequence:020}.snap      # one file per snapshot
-/// ```
-///
-/// No in-memory cache — snapshot access patterns have poor temporal locality
-/// (each entity is loaded once per command, then not again for a long time).
-/// The OS page cache handles recently-read files naturally.
-pub struct SnapshotStore {
-    dir: PathBuf,
+/// The tag correlating snapshot records for one key.
+fn key_tag(key: &[u8]) -> Tag {
+    Tag::new(KEY_TAG.as_bytes().to_vec(), key.to_vec())
 }
 
-/// Magic bytes for snapshot files.
-const SNAP_MAGIC: [u8; 4] = *b"KSNP";
-const SNAP_VERSION: u8 = 1;
-
-impl SnapshotStore {
-    /// Creates or opens a snapshot store at the given directory.
-    pub fn open(dir: &Path) -> Result<Self, Error> {
-        fs::create_dir_all(dir)?;
-        Ok(Self {
-            dir: dir.to_path_buf(),
-        })
-    }
-
-    /// Stores a snapshot. If `prune` is true, older snapshots for the same key are deleted.
-    pub fn add(
-        &self,
-        key: &[u8],
-        sequence: i64,
-        snapshot: &Snapshot,
-        prune: bool,
-    ) -> Result<(), Error> {
-        let key_dir = self.key_dir(key);
-        fs::create_dir_all(&key_dir)?;
-
-        let snap_path = key_dir.join(format!("{:020}.snap", sequence));
-        let tmp_path = snap_path.with_extension("snap.tmp");
-
-        let mut file = File::create(&tmp_path)?;
-        write_snapshot(&mut file, snapshot)?;
-        file.sync_all()?;
-        fs::rename(&tmp_path, &snap_path)?;
-
-        if prune {
-            // Delete all snapshots for this key with sequence < the new one.
-            self.delete_range(key, 0, sequence)?;
-        }
-
-        Ok(())
-    }
-
-    /// Deletes all snapshots for a key with sequence in [0, to_sequence).
-    pub fn delete(&self, key: &[u8], to_sequence: i64) -> Result<(), Error> {
-        self.delete_range(key, 0, to_sequence)
-    }
-
-    /// Lists all snapshots for a key with sequence in [from_sequence, to_sequence).
-    pub fn list(
-        &self,
-        key: &[u8],
-        from_sequence: i64,
-        to_sequence: i64,
-    ) -> Result<Vec<SnapshotEntry>, Error> {
-        let key_dir = self.key_dir(key);
-        if !key_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = Vec::new();
-        for seq in self.list_sequences(&key_dir)? {
-            if seq >= from_sequence && seq < to_sequence {
-                let snap_path = key_dir.join(format!("{:020}.snap", seq));
-                let snapshot = read_snapshot(&snap_path)?;
-                entries.push(SnapshotEntry {
-                    key: key.to_vec(),
-                    sequence: seq,
-                    snapshot,
-                });
-            }
-        }
-
-        Ok(entries)
-    }
-
-    /// Gets the snapshot with the highest sequence for a key, if any.
-    pub fn get_last(&self, key: &[u8]) -> Result<Option<SnapshotEntry>, Error> {
-        let key_dir = self.key_dir(key);
-        if !key_dir.exists() {
-            return Ok(None);
-        }
-
-        let sequences = self.list_sequences(&key_dir)?;
-        match sequences.last() {
-            Some(&seq) => {
-                let snap_path = key_dir.join(format!("{:020}.snap", seq));
-                let snapshot = read_snapshot(&snap_path)?;
-                Ok(Some(SnapshotEntry {
-                    key: key.to_vec(),
-                    sequence: seq,
-                    snapshot,
-                }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn key_dir(&self, key: &[u8]) -> PathBuf {
-        self.dir.join(hex_encode(key))
-    }
-
-    fn list_sequences(&self, key_dir: &Path) -> Result<Vec<i64>, Error> {
-        let mut sequences = Vec::new();
-        for entry in fs::read_dir(key_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "snap")
-                && let Some(seq) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<i64>().ok())
-            {
-                sequences.push(seq);
-            }
-        }
-        sequences.sort();
-        Ok(sequences)
-    }
-
-    fn delete_range(&self, key: &[u8], from_sequence: i64, to_sequence: i64) -> Result<(), Error> {
-        let key_dir = self.key_dir(key);
-        if !key_dir.exists() {
-            return Ok(());
-        }
-
-        for seq in self.list_sequences(&key_dir)? {
-            if seq >= from_sequence && seq < to_sequence {
-                let snap_path = key_dir.join(format!("{:020}.snap", seq));
-                let _ = fs::remove_file(snap_path);
-            }
-        }
-
-        Ok(())
+/// Matches every snapshot record for one key.
+fn by_key(key: &[u8]) -> SourcingCondition {
+    SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![],
+            tags: vec![key_tag(key)],
+        }],
     }
 }
 
-// --- Binary format ---
-
-fn write_snapshot(file: &mut File, snap: &Snapshot) -> Result<(), Error> {
-    file.write_all(&SNAP_MAGIC)?;
-    file.write_all(&[SNAP_VERSION])?;
-
-    let name_bytes = snap.name.as_bytes();
-    file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-    file.write_all(name_bytes)?;
-
-    let version_bytes = snap.version.as_bytes();
-    file.write_all(&(version_bytes.len() as u16).to_le_bytes())?;
-    file.write_all(version_bytes)?;
-
-    file.write_all(&snap.timestamp.to_le_bytes())?;
-
-    file.write_all(&(snap.metadata.len() as u16).to_le_bytes())?;
-    for (k, v) in &snap.metadata {
-        let k_bytes = k.as_bytes();
-        let v_bytes = v.as_bytes();
-        file.write_all(&(k_bytes.len() as u16).to_le_bytes())?;
-        file.write_all(k_bytes)?;
-        file.write_all(&(v_bytes.len() as u16).to_le_bytes())?;
-        file.write_all(v_bytes)?;
-    }
-
-    file.write_all(&(snap.payload.len() as u32).to_le_bytes())?;
-    file.write_all(&snap.payload)?;
-
-    Ok(())
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-fn read_snapshot(path: &Path) -> Result<Snapshot, Error> {
-    let data = fs::read(path)?;
-    if data.len() < 5 || data[0..4] != SNAP_MAGIC {
-        return Err(Error::Corrupted {
-            message: "invalid snapshot magic bytes".into(),
-        });
-    }
-    if data[4] != SNAP_VERSION {
-        return Err(Error::Corrupted {
-            message: format!("unsupported snapshot version: {}", data[4]),
-        });
-    }
-    let mut cursor = 5;
-
-    let name_len = read_u16(&data, &mut cursor)? as usize;
-    let name = read_string(&data, &mut cursor, name_len)?;
-
-    let version_len = read_u16(&data, &mut cursor)? as usize;
-    let version = read_string(&data, &mut cursor, version_len)?;
-
-    let timestamp = read_i64(&data, &mut cursor)?;
-
-    let meta_count = read_u16(&data, &mut cursor)? as usize;
-    let mut metadata = HashMap::with_capacity(meta_count);
-    for _ in 0..meta_count {
-        let k_len = read_u16(&data, &mut cursor)? as usize;
-        let k = read_string(&data, &mut cursor, k_len)?;
-        let v_len = read_u16(&data, &mut cursor)? as usize;
-        let v = read_string(&data, &mut cursor, v_len)?;
-        metadata.insert(k, v);
-    }
-
-    let payload_len = read_u32(&data, &mut cursor)? as usize;
-    let payload = take(&data, &mut cursor, payload_len)?.to_vec();
-
-    Ok(Snapshot {
-        name,
-        version,
-        payload,
-        timestamp,
-        metadata,
+fn encode(record: &SnapshotRecord) -> Result<Vec<u8>, Error> {
+    bincode::serialize(record).map_err(|error| Error::Corrupted {
+        message: format!("could not encode snapshot: {error}"),
     })
 }
 
-/// Bounds-checked take: corrupt/truncated files must surface as
-/// `Error::Corrupted`, never as an out-of-range slice panic.
-fn take<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8], Error> {
-    let end = cursor.checked_add(len).filter(|&e| e <= data.len());
-    match end {
-        Some(end) => {
-            let slice = &data[*cursor..end];
-            *cursor = end;
-            Ok(slice)
-        }
-        None => Err(Error::Corrupted {
-            message: format!(
-                "snapshot file truncated: need {len} bytes at offset {cursor}, file is {} bytes",
-                data.len()
-            ),
-        }),
+fn decode(bytes: &[u8]) -> Result<SnapshotRecord, Error> {
+    bincode::deserialize(bytes).map_err(|error| Error::Corrupted {
+        message: format!("could not decode snapshot: {error}"),
+    })
+}
+
+/// Builds the append that stores a snapshot. Unconditional: the latest
+/// record for a key wins purely by log order, so concurrent writers need no
+/// coordination — both records land, the later one supersedes.
+///
+/// Public so the cluster routing layer can build the request on a follower
+/// and forward it to the leader as a system append.
+pub fn append_request(key: &[u8], state: Vec<u8>, fold_position: Position) -> AppendRequest {
+    AppendRequest {
+        condition: None,
+        events: vec![AppendEvent {
+            identifier: format!("snapshot-{}", fold_position.0),
+            name: WRITTEN.into(),
+            version: "1".into(),
+            timestamp: now_ms(),
+            payload: encode(&SnapshotRecord {
+                fold_position: fold_position.0,
+                state,
+            })
+            .expect("bincode of bytes+u64 cannot fail"),
+            metadata: vec![],
+            tags: vec![key_tag(key)],
+        }],
     }
 }
 
-fn read_u16(data: &[u8], cursor: &mut usize) -> Result<u16, Error> {
-    Ok(u16::from_le_bytes(
-        take(data, cursor, 2)?.try_into().unwrap(),
-    ))
+/// Stores a snapshot, returning the log position of its record. Blocking —
+/// the record is quorum-durable on return, like any append.
+pub fn append(
+    engine: &EventStoreEngine,
+    key: &[u8],
+    state: Vec<u8>,
+    fold_position: Position,
+) -> Result<Position, Error> {
+    let response = engine.append_system(append_request(key, state, fold_position))?;
+    Ok(response.first_position)
 }
 
-fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, Error> {
-    Ok(u32::from_le_bytes(
-        take(data, cursor, 4)?.try_into().unwrap(),
-    ))
-}
-
-fn read_i64(data: &[u8], cursor: &mut usize) -> Result<i64, Error> {
-    Ok(i64::from_le_bytes(
-        take(data, cursor, 8)?.try_into().unwrap(),
-    ))
-}
-
-fn read_string(data: &[u8], cursor: &mut usize, len: usize) -> Result<String, Error> {
-    let s = std::str::from_utf8(take(data, cursor, len)?).map_err(|e| Error::Corrupted {
-        message: format!("invalid UTF-8 in snapshot: {e}"),
-    })?;
-    Ok(s.to_string())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// The latest snapshot for a key whose record landed strictly below `below`,
+/// or `None` — a miss is always legal and always safe (the caller replays
+/// from the beginning).
+///
+/// `below` is how the fused read stays one consistent view: bounded by the
+/// marker frozen at the start of the read, a record that lands mid-read can
+/// never be returned with state summarizing positions past that marker.
+pub fn latest(
+    engine: &EventStoreEngine,
+    key: &[u8],
+    below: Option<Position>,
+) -> Result<Option<Snapshot>, Error> {
+    let below = below.unwrap_or(Position(u64::MAX));
+    let Some(record_pos) = engine.latest_matching(&by_key(key), below)? else {
+        return Ok(None);
+    };
+    let stored = engine.read_stored_at(record_pos)?;
+    let record = decode(&stored.payload)?;
+    Ok(Some(Snapshot {
+        state: record.state,
+        position: Position(record.fold_position),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Tag;
+    use crate::store::EventStoreEngine;
 
-    fn make_snapshot(name: &str, payload: &[u8]) -> Snapshot {
-        Snapshot {
-            name: name.to_string(),
-            version: "1.0".to_string(),
-            payload: payload.to_vec(),
-            timestamp: 1712345678000,
-            metadata: HashMap::from([("source".to_string(), "test".to_string())]),
+    fn engine() -> (tempfile::TempDir, EventStoreEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EventStoreEngine::create(dir.path()).unwrap();
+        (dir, engine)
+    }
+
+    fn user_event(name: &str, tags: Vec<Tag>) -> AppendEvent {
+        AppendEvent {
+            identifier: format!("id-{name}"),
+            name: name.into(),
+            version: "1".into(),
+            timestamp: 0,
+            payload: b"payload".to_vec(),
+            metadata: vec![],
+            tags,
         }
     }
 
-    #[test]
-    fn add_and_get_last() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
-
-        let key = b"OrderSummary\x00order-123";
-        let snap = make_snapshot("OrderSummary", b"serialized state v1");
-
-        store.add(key, 100, &snap, false).unwrap();
-
-        let entry = store.get_last(key).unwrap().unwrap();
-        assert_eq!(entry.sequence, 100);
-        assert_eq!(entry.snapshot.name, "OrderSummary");
-        assert_eq!(entry.snapshot.payload, b"serialized state v1");
-        assert_eq!(entry.snapshot.metadata.get("source").unwrap(), "test");
+    fn append_user(engine: &EventStoreEngine, name: &str) -> Position {
+        engine
+            .append(AppendRequest {
+                condition: None,
+                events: vec![user_event(name, vec![Tag::from_str("orderId", "1")])],
+            })
+            .unwrap()
+            .first_position
     }
 
     #[test]
-    fn get_last_returns_highest_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
-
-        let key = b"projection-1";
-        store
-            .add(key, 10, &make_snapshot("P", b"v1"), false)
-            .unwrap();
-        store
-            .add(key, 50, &make_snapshot("P", b"v2"), false)
-            .unwrap();
-        store
-            .add(key, 30, &make_snapshot("P", b"v3"), false)
-            .unwrap();
-
-        let entry = store.get_last(key).unwrap().unwrap();
-        assert_eq!(entry.sequence, 50);
-        assert_eq!(entry.snapshot.payload, b"v2");
+    fn a_miss_is_none_not_an_error() {
+        let (_dir, engine) = engine();
+        assert_eq!(latest(&engine, b"course:cs-101", None).unwrap(), None);
     }
 
     #[test]
-    fn get_last_nonexistent_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
+    fn roundtrip_state_and_fold_position() {
+        let (_dir, engine) = engine();
+        append_user(&engine, "CourseCreated");
+        let marker = engine.head();
 
-        assert!(store.get_last(b"nonexistent").unwrap().is_none());
+        append(&engine, b"course:cs-101", b"folded state".to_vec(), marker).unwrap();
+
+        let snap = latest(&engine, b"course:cs-101", None).unwrap().unwrap();
+        assert_eq!(snap.state, b"folded state");
+        assert_eq!(snap.position, marker);
     }
 
     #[test]
-    fn list_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
+    fn latest_wins_by_log_order() {
+        let (_dir, engine) = engine();
+        append(&engine, b"k", b"v1".to_vec(), Position(1)).unwrap();
+        append(&engine, b"k", b"v2".to_vec(), Position(2)).unwrap();
+        append(&engine, b"k", b"v3".to_vec(), Position(3)).unwrap();
 
-        let key = b"proj";
-        store
-            .add(key, 10, &make_snapshot("P", b"a"), false)
-            .unwrap();
-        store
-            .add(key, 20, &make_snapshot("P", b"b"), false)
-            .unwrap();
-        store
-            .add(key, 30, &make_snapshot("P", b"c"), false)
-            .unwrap();
-        store
-            .add(key, 40, &make_snapshot("P", b"d"), false)
-            .unwrap();
-
-        let entries = store.list(key, 20, 40).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].sequence, 20);
-        assert_eq!(entries[1].sequence, 30);
+        let snap = latest(&engine, b"k", None).unwrap().unwrap();
+        assert_eq!(snap.state, b"v3");
     }
 
     #[test]
-    fn delete_removes_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
+    fn keys_are_isolated() {
+        let (_dir, engine) = engine();
+        append(&engine, b"a", b"state-a".to_vec(), Position(0)).unwrap();
+        append(&engine, b"b", b"state-b".to_vec(), Position(0)).unwrap();
 
-        let key = b"proj";
-        store
-            .add(key, 10, &make_snapshot("P", b"a"), false)
-            .unwrap();
-        store
-            .add(key, 20, &make_snapshot("P", b"b"), false)
-            .unwrap();
-        store
-            .add(key, 30, &make_snapshot("P", b"c"), false)
-            .unwrap();
-
-        store.delete(key, 25).unwrap();
-
-        let entries = store.list(key, 0, i64::MAX).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sequence, 30);
-    }
-
-    #[test]
-    fn prune_on_add() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
-
-        let key = b"proj";
-        store
-            .add(key, 10, &make_snapshot("P", b"a"), false)
-            .unwrap();
-        store
-            .add(key, 20, &make_snapshot("P", b"b"), false)
-            .unwrap();
-        store.add(key, 30, &make_snapshot("P", b"c"), true).unwrap();
-
-        let entries = store.list(key, 0, i64::MAX).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sequence, 30);
-    }
-
-    #[test]
-    fn different_keys_isolated() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
-
-        store
-            .add(b"key-a", 10, &make_snapshot("A", b"a"), false)
-            .unwrap();
-        store
-            .add(b"key-b", 10, &make_snapshot("B", b"b"), false)
-            .unwrap();
-
-        let a = store.get_last(b"key-a").unwrap().unwrap();
-        let b = store.get_last(b"key-b").unwrap().unwrap();
-        assert_eq!(a.snapshot.name, "A");
-        assert_eq!(b.snapshot.name, "B");
-    }
-
-    #[test]
-    fn roundtrip_snapshot_format() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(&dir.path().join("snapshots")).unwrap();
-
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "position-type".to_string(),
-            "GlobalIndexPosition".to_string(),
-        );
-        metadata.insert("source".to_string(), "order-service".to_string());
-
-        let snap = Snapshot {
-            name: "OrderProjection".to_string(),
-            version: "2.1".to_string(),
-            payload: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02],
-            timestamp: 1712345678999,
-            metadata,
-        };
-
-        store.add(b"test-key", 42, &snap, false).unwrap();
-
-        let entry = store.get_last(b"test-key").unwrap().unwrap();
-        assert_eq!(entry.snapshot.name, "OrderProjection");
-        assert_eq!(entry.snapshot.version, "2.1");
         assert_eq!(
-            entry.snapshot.payload,
-            vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02]
+            latest(&engine, b"a", None).unwrap().unwrap().state,
+            b"state-a"
         );
-        assert_eq!(entry.snapshot.timestamp, 1712345678999);
-        assert_eq!(entry.snapshot.metadata.len(), 2);
+        assert_eq!(
+            latest(&engine, b"b", None).unwrap().unwrap().state,
+            b"state-b"
+        );
+        assert_eq!(latest(&engine, b"c", None).unwrap(), None);
+    }
+
+    #[test]
+    fn below_bound_excludes_later_records() {
+        let (_dir, engine) = engine();
+        let first = append(&engine, b"k", b"old".to_vec(), Position(0)).unwrap();
+        append(&engine, b"k", b"new".to_vec(), Position(1)).unwrap();
+
+        // Bounded at the second record's position: only the first is visible.
+        let snap = latest(&engine, b"k", Some(Position(first.0 + 1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.state, b"old");
+
+        // Bounded at the first record: nothing is visible.
+        assert_eq!(latest(&engine, b"k", Some(first)).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_records_are_invisible_to_the_client_read_path() {
+        let (_dir, engine) = engine();
+        append_user(&engine, "CourseCreated");
+        append(&engine, b"k", b"state".to_vec(), Position(1)).unwrap();
+
+        // The client read path never returns the record...
+        let all = SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![],
+            }],
+        };
+        let events = engine.source(Position(0), &all).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "CourseCreated");
+
+        // ...and the visible head hides its position.
+        assert_eq!(engine.visible_head(), Position(1));
+        assert_eq!(engine.head(), Position(2));
+    }
+
+    #[test]
+    fn snapshot_records_never_trip_client_dcb_conditions() {
+        let (_dir, engine) = engine();
+        append(&engine, b"orderId", b"state".to_vec(), Position(0)).unwrap();
+
+        // A client condition on a user tag whose value happens to equal a
+        // snapshot key must not conflict: the tag KEY differs.
+        let response = engine.append(AppendRequest {
+            condition: Some(crate::append::AppendCondition {
+                consistency_marker: Position(0),
+                criteria: SourcingCondition {
+                    criteria: vec![Criterion {
+                        names: vec![],
+                        tags: vec![Tag::from_str("orderId", "orderId")],
+                    }],
+                },
+            }),
+            events: vec![user_event(
+                "OrderPlaced",
+                vec![Tag::from_str("orderId", "1")],
+            )],
+        });
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn clients_cannot_forge_or_query_snapshot_records() {
+        let (_dir, engine) = engine();
+
+        // Forging the event type is rejected.
+        let forged = engine.append(AppendRequest {
+            condition: None,
+            events: vec![user_event(WRITTEN, vec![])],
+        });
+        assert!(matches!(forged, Err(Error::ReservedNamespace { .. })));
+
+        // Querying by the snapshot tag is rejected.
+        let condition = by_key(b"k");
+        assert!(engine.source(Position(0), &condition).is_err());
+    }
+
+    #[test]
+    fn latest_survives_segment_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny segments force rotation so the lookup exercises the sealed
+        // bloom → index → max path, not just the active tag index.
+        let engine = EventStoreEngine::create_with_options(dir.path(), 4096).unwrap();
+
+        append(&engine, b"k", b"early".to_vec(), Position(0)).unwrap();
+        for i in 0..64 {
+            append_user(&engine, &format!("Event{i}"));
+        }
+        let marker = engine.head();
+        append(&engine, b"k", b"late".to_vec(), marker).unwrap();
+        for i in 0..64 {
+            append_user(&engine, &format!("More{i}"));
+        }
+
+        let snap = latest(&engine, b"k", None).unwrap().unwrap();
+        assert_eq!(snap.state, b"late");
+        assert_eq!(snap.position, marker);
     }
 }

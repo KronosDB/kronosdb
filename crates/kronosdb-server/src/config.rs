@@ -36,6 +36,11 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_BLOOM_CACHE_SIZE")]
     bloom_cache_size: Option<usize>,
 
+    /// Maximum snapshot state size in bytes (default 4MB). Snapshot records
+    /// share the log with events; oversized blobs are rejected at the RPC.
+    #[arg(long, env = "KRONOSDB_MAX_SNAPSHOT_SIZE")]
+    max_snapshot_size: Option<u64>,
+
     /// Append acknowledgement mode. "written": ack once a quorum has
     /// written the events to its log (fsync trails by one group-commit
     /// wave). "durable": ack only once a quorum has fsynced. "auto"
@@ -211,6 +216,8 @@ struct StorageConfig {
     bloom_cache_size: Option<usize>,
     #[serde(rename = "ack-mode")]
     ack_mode: Option<String>,
+    #[serde(rename = "max-snapshot-size")]
+    max_snapshot_size: Option<u64>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -350,6 +357,8 @@ pub struct ServerConfig {
     /// "auto" (default), "written", or "durable"; see the CLI flag docs.
     pub ack_mode: String,
     pub bloom_cache_size: usize,
+    /// Maximum snapshot state size in bytes; larger appends are rejected.
+    pub max_snapshot_size: u64,
     pub group_commit_ms: u64,
     /// Object-store URL for sealed-segment backup; None = backups disabled.
     pub backup_url: Option<String>,
@@ -413,6 +422,7 @@ impl ServerConfig {
         const DEFAULT_QUERY_TIMEOUT: u64 = 30;
         const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5;
         const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 15;
+        const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = 4 * 1024 * 1024;
 
         // CLI overrides file config. clap already handles env vars.
         // Every value resolves CLI/env > file > default.
@@ -473,6 +483,10 @@ impl ServerConfig {
                 .bloom_cache_size
                 .or(file_config.storage.bloom_cache_size)
                 .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
+            max_snapshot_size: cli
+                .max_snapshot_size
+                .or(file_config.storage.max_snapshot_size)
+                .unwrap_or(DEFAULT_MAX_SNAPSHOT_SIZE),
             ack_mode: cli
                 .ack_mode
                 // A set-but-empty env var (e.g. compose passthrough
