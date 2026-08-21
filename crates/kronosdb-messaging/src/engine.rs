@@ -157,6 +157,14 @@ impl QueryDispatcher for MessagingEngine {
     fn dispatch_query(&self, query: Query) -> Result<PendingQuery, QueryError> {
         self.query_bus.dispatch(query)
     }
+
+    fn dispatch_query_to(
+        &self,
+        query: Query,
+        targets: &[ClientId],
+    ) -> Result<PendingQuery, QueryError> {
+        self.query_bus.dispatch_to(query, targets)
+    }
 }
 
 impl SubscriptionQueryDispatcher for MessagingEngine {

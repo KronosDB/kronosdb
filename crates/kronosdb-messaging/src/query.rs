@@ -236,6 +236,47 @@ impl QueryBus {
         })
     }
 
+    /// Dispatches a query to specific handler instances — the fabric path
+    /// (ADR-0007): the dispatching node already selected these targets
+    /// against the replicated routing table. Targets without permits are
+    /// skipped (scatter-gather is best-effort per handler); errors only
+    /// when no named target could accept.
+    pub fn dispatch_to(
+        &self,
+        query: Query,
+        targets: &[ClientId],
+    ) -> Result<PendingQuery, QueryError> {
+        let query_name = query.name.clone();
+        let handlers = self.handlers.read();
+        let handler_list = handlers.get_handlers(&query.name).ok_or_else(|| {
+            self.record_no_handler(&query_name);
+            QueryError::NoHandlerAvailable {
+                query_name: query.name.clone(),
+            }
+        })?;
+
+        let mut accepted = Vec::new();
+        for target in targets {
+            if let Some(entry) = handler_list.iter().find(|e| &e.handler.client_id == target)
+                && entry.handler.try_acquire_permit()
+            {
+                accepted.push(entry.handler.client_id.clone());
+            }
+        }
+        if accepted.is_empty() {
+            self.record_no_permits(&query_name);
+            return Err(QueryError::NoPermitsAvailable {
+                query_name: query.name.clone(),
+            });
+        }
+
+        self.record_dispatched(&query_name);
+        Ok(PendingQuery {
+            query,
+            target_handlers: accepted,
+        })
+    }
+
     // ── Metrics helpers ─────────────────────────────────────────────
 
     fn record_dispatched(&self, name: &str) {

@@ -209,6 +209,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so forwarded commands reach locally-connected handlers (ADR-0007).
     let command_handler_streams: messaging_fabric::CommandHandlerStreams =
         Arc::new(dashmap::DashMap::new());
+    let query_handler_streams: messaging_fabric::QueryHandlerStreams =
+        Arc::new(dashmap::DashMap::new());
+    let pending_queries: messaging_fabric::PendingQueries = Arc::new(dashmap::DashMap::new());
     let fabric_router = Arc::new(messaging_fabric::FabricRouter::new(Arc::clone(&cluster)));
     let command_service = CommandServiceImpl::new(
         Arc::clone(&messaging),
@@ -224,11 +227,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(config.query_timeout_secs),
         Arc::clone(&channel_registry),
         Arc::clone(&handler_stream_registry),
+        Arc::clone(&query_handler_streams),
+        Arc::clone(&pending_queries),
         Arc::clone(&cluster),
+        Arc::clone(&fabric_router),
     );
     let fabric_service = messaging_fabric::FabricServiceImpl::new(
         Arc::clone(&messaging),
         Arc::clone(&command_handler_streams),
+        Arc::clone(&query_handler_streams),
+        Arc::clone(&pending_queries),
     );
 
     // Drop any handler rows this node stranded in a previous life — a

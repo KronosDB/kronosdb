@@ -22,9 +22,13 @@ mod pb {
     pub mod command {
         tonic::include_proto!("kronosdb.command");
     }
+    pub mod query {
+        tonic::include_proto!("kronosdb.query");
+    }
 }
 
 use pb::command::command_service_client::CommandServiceClient;
+use pb::query::query_service_client::QueryServiceClient;
 
 struct Node {
     child: Child,
@@ -202,6 +206,129 @@ async fn dispatch_until_ok(
     panic!("dispatch never succeeded for {name}");
 }
 
+/// Opens a query handler stream, subscribes to `query_name`, grants
+/// permits, and answers every query with one response (tagged with this
+/// handler's id) followed by QueryComplete.
+async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str) {
+    let mut client = QueryServiceClient::new(channel);
+    let (tx, rx) = mpsc::channel(64);
+
+    tx.send(pb::query::QueryHandlerOutbound {
+        request: Some(pb::query::query_handler_outbound::Request::Subscribe(
+            pb::query::QuerySubscription {
+                message_id: "qsub-1".into(),
+                query: query_name.into(),
+                result_name: "String".into(),
+                component_name: "fabric-test".into(),
+                client_id: client_id.into(),
+            },
+        )),
+        instruction_id: String::new(),
+    })
+    .await
+    .unwrap();
+    tx.send(pb::query::QueryHandlerOutbound {
+        request: Some(pb::query::query_handler_outbound::Request::FlowControl(
+            pb::FlowControl {
+                client_id: client_id.into(),
+                permits: 1_000,
+            },
+        )),
+        instruction_id: String::new(),
+    })
+    .await
+    .unwrap();
+
+    let mut inbound = client
+        .open_stream(ReceiverStream::new(rx))
+        .await
+        .expect("open query handler stream")
+        .into_inner();
+
+    let responder_id = client_id.to_string();
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = inbound.message().await {
+            if let Some(pb::query::query_handler_inbound::Request::Query(q)) = msg.request {
+                let response = pb::query::QueryHandlerOutbound {
+                    request: Some(pb::query::query_handler_outbound::Request::QueryResponse(
+                        pb::query::QueryResponse {
+                            message_identifier: format!("qresp-{}", q.message_identifier),
+                            error_code: String::new(),
+                            error_message: None,
+                            payload: Some(pb::SerializedObject {
+                                r#type: "String".into(),
+                                revision: "1".into(),
+                                data: format!("answer-from-{responder_id}").into_bytes(),
+                            }),
+                            metadata: Default::default(),
+                            processing_instructions: vec![],
+                            request_identifier: q.message_identifier.clone(),
+                        },
+                    )),
+                    instruction_id: String::new(),
+                };
+                if tx.send(response).await.is_err() {
+                    break;
+                }
+                let complete = pb::query::QueryHandlerOutbound {
+                    request: Some(pb::query::query_handler_outbound::Request::QueryComplete(
+                        pb::query::QueryComplete {
+                            message_id: format!("qc-{}", q.message_identifier),
+                            request_id: q.message_identifier,
+                        },
+                    )),
+                    instruction_id: String::new(),
+                };
+                if tx.send(complete).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Retries a scatter-gather query until it yields at least
+/// `expected_responses` answers within one collection window.
+async fn query_until_responses(
+    channel: Channel,
+    query_name: &str,
+    expected_responses: usize,
+) -> Vec<String> {
+    let mut client = QueryServiceClient::new(channel);
+    for attempt in 0..150u32 {
+        let request = pb::query::QueryRequest {
+            message_identifier: format!("fabric-query-{attempt}"),
+            query: query_name.into(),
+            timestamp: 0,
+            payload: Some(pb::SerializedObject {
+                r#type: query_name.into(),
+                revision: "1".into(),
+                data: vec![],
+            }),
+            metadata: Default::default(),
+            processing_instructions: vec![],
+            client_id: "fabric-querier".into(),
+            component_name: "fabric-test".into(),
+        };
+        if let Ok(response) = client.query(request).await {
+            let mut stream = response.into_inner();
+            let mut answers = Vec::new();
+            while let Ok(Ok(Some(resp))) =
+                tokio::time::timeout(Duration::from_secs(5), stream.message()).await
+            {
+                if let Some(payload) = resp.payload {
+                    answers.push(String::from_utf8_lossy(&payload.data).to_string());
+                }
+            }
+            if answers.len() >= expected_responses {
+                return answers;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("scatter-gather never yielded {expected_responses} responses for {query_name}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn command_dispatched_on_a_reaches_handler_on_b() {
     let grpc_a = free_port();
@@ -232,6 +359,27 @@ async fn command_dispatched_on_a_reaches_handler_on_b() {
     // Keyed dispatch takes the ring path to the same remote handler.
     let response = dispatch_until_ok(&mut dispatcher, "FabricEcho", Some("order-42")).await;
     assert!(response.payload.is_some());
+
+    // ── Scatter-gather across the fabric ────────────────────────────
+    // Query handlers on BOTH nodes; a query through node A must gather
+    // answers from the local handler and the remote one.
+    start_query_handler(channel_a.clone(), "FabricGather", "query-handler-a").await;
+    start_query_handler(channel_b.clone(), "FabricGather", "query-handler-b").await;
+
+    let answers = query_until_responses(channel_a.clone(), "FabricGather", 2).await;
+    assert!(
+        answers.iter().any(|a| a == "answer-from-query-handler-a"),
+        "missing local answer: {answers:?}"
+    );
+    assert!(
+        answers.iter().any(|a| a == "answer-from-query-handler-b"),
+        "missing remote answer: {answers:?}"
+    );
+
+    // Remote-only point-to-point: handler exists ONLY on B, query via A.
+    start_query_handler(channel_b.clone(), "FabricRemoteOnly", "query-handler-b2").await;
+    let answers = query_until_responses(channel_a.clone(), "FabricRemoteOnly", 1).await;
+    assert_eq!(answers, vec!["answer-from-query-handler-b2".to_string()]);
 
     // Kill the owning node: dispatch must fail fast with a retriable
     // error, not hang. (The registry row lingers until membership or

@@ -101,6 +101,10 @@ pub struct ClusterManager {
     /// Replicated messaging-handler routing table (ADR-0007). Written by
     /// the state machine, read by the server's dispatch paths.
     handler_routing: Arc<HandlerRoutingTable>,
+    /// One-shot startup cleanup of rows this node stranded in a previous
+    /// life. Ordered BEFORE this node's first registration write — a late
+    /// background clear would wipe fresh registrations.
+    handler_clear_once: tokio::sync::OnceCell<()>,
     pub(super) coordinator_started: AtomicBool,
     pub(super) cluster_config: ClusterConfig,
 }
@@ -131,6 +135,7 @@ impl ClusterManager {
             topology_lock: tokio::sync::Mutex::new(()),
             forward_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             handler_routing: Arc::new(HandlerRoutingTable::new()),
+            handler_clear_once: tokio::sync::OnceCell::new(),
             coordinator_started: AtomicBool::new(false),
             cluster_config,
         }
@@ -262,6 +267,9 @@ impl ClusterManager {
 
     /// Registers a messaging handler in the replicated routing table.
     /// Forwards to the Raft leader when called on a follower.
+    ///
+    /// The node's startup crash-cleanup (`ClearNodeHandlers`) is ordered
+    /// before the first registration so it can never wipe fresh rows.
     pub async fn register_handler(&self, registration: HandlerRegistration) -> Result<(), Error> {
         if registration.bus.is_empty()
             || registration.message_type.is_empty()
@@ -271,6 +279,7 @@ impl ClusterManager {
                 message: "handler registration requires bus, message_type, and client_id".into(),
             });
         }
+        self.clear_node_handlers().await?;
         self.submit_control_request(RaftRequest::RegisterHandler { registration })
             .await
             .map(|_| ())
@@ -306,14 +315,21 @@ impl ClusterManager {
         .map(|_| ())
     }
 
-    /// Drops every registration owned by this node. Written at startup so
-    /// rows stranded by a crash never outlive the restart.
+    /// Drops every registration this node stranded in a previous life.
+    /// Runs at most once per process (a crash cannot deregister its
+    /// clients); every registration write awaits it first, so the clear
+    /// is always log-ordered before this node's first fresh row.
     pub async fn clear_node_handlers(&self) -> Result<(), Error> {
-        self.submit_control_request(RaftRequest::ClearNodeHandlers {
-            node_id: self.cluster_config.node_id,
-        })
-        .await
-        .map(|_| ())
+        self.handler_clear_once
+            .get_or_try_init(|| async {
+                self.submit_control_request(RaftRequest::ClearNodeHandlers {
+                    node_id: self.cluster_config.node_id,
+                })
+                .await
+                .map(|_| ())
+            })
+            .await
+            .map(|_| ())
     }
 
     /// A peer node's advertised address, from live membership (falling

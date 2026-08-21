@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -18,16 +19,13 @@ use super::convert::{
     detail_to_proto_error, effective_timeout, expected_results, internal_metadata_to_proto,
     internal_pi_to_proto, proto_error_to_detail, proto_metadata_to_internal, proto_pi_to_internal,
 };
+use super::fabric::{
+    FabricRouter, PendingQueries, PendingQueryEntry, QueryHandlerStreams, forward_query,
+};
 use crate::handler_registry::HandlerStreamRegistry;
 use crate::platform::service::ClientChannelRegistry;
 use crate::proto::kronosdb::platform as platform_pb;
 use crate::proto::kronosdb::query as pb;
-
-type HandlerSender = mpsc::Sender<Result<pb::QueryHandlerInbound, Status>>;
-
-/// Pending query response collectors: request_id → channel to send results to the caller.
-type QueryResponseSender = mpsc::Sender<pb::QueryResponse>;
-type PendingQueries = Arc<DashMap<String, QueryResponseSender>>;
 
 /// Pending subscription-query initial results: subscription_id → sender on the
 /// subscription stream. Routed when a regular QueryResponse comes back tagged
@@ -43,32 +41,38 @@ type PendingSubscriptionInitials = Arc<DashMap<String, SubscriptionInitialSender
 /// queries and response completions don't contend on a single mutex.
 pub struct QueryServiceImpl {
     messaging: Arc<MessagingManager>,
-    handler_streams: Arc<DashMap<String, HandlerSender>>,
+    handler_streams: QueryHandlerStreams,
     pending_queries: PendingQueries,
     pending_sub_initials: PendingSubscriptionInitials,
     query_timeout: Duration,
     channel_registry: Arc<ClientChannelRegistry>,
     handler_stream_registry: Arc<HandlerStreamRegistry>,
     cluster: Arc<ClusterManager>,
+    fabric: Arc<FabricRouter>,
 }
 
 impl QueryServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         messaging: Arc<MessagingManager>,
         query_timeout: Duration,
         channel_registry: Arc<ClientChannelRegistry>,
         handler_stream_registry: Arc<HandlerStreamRegistry>,
+        handler_streams: QueryHandlerStreams,
+        pending_queries: PendingQueries,
         cluster: Arc<ClusterManager>,
+        fabric: Arc<FabricRouter>,
     ) -> Self {
         Self {
             messaging,
-            handler_streams: Arc::new(DashMap::new()),
-            pending_queries: Arc::new(DashMap::new()),
+            handler_streams,
+            pending_queries,
             pending_sub_initials: Arc::new(DashMap::new()),
             query_timeout,
             channel_registry,
             handler_stream_registry,
             cluster,
+            fabric,
         }
     }
 }
@@ -248,7 +252,7 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                         // First try regular pending queries.
                         let routed = if let Some(entry) = pending_queries.get(&request_id) {
-                            if let Err(e) = entry.value().try_send(resp.clone()) {
+                            if let Err(e) = entry.value().sender.try_send(resp.clone()) {
                                 tracing::warn!(
                                     request_id = %request_id,
                                     reason = %e,
@@ -290,7 +294,16 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         }
                     }
                     Some(pb::query_handler_outbound::Request::QueryComplete(complete)) => {
-                        pending_queries.remove(&complete.request_id);
+                        // Retire the pending entry only when EVERY targeted
+                        // handler has completed — a fast handler's completion
+                        // must not drop a slower handler's responses.
+                        let retire = pending_queries
+                            .get(&complete.request_id)
+                            .map(|entry| entry.remaining.fetch_sub(1, Ordering::AcqRel) <= 1)
+                            .unwrap_or(false);
+                        if retire {
+                            pending_queries.remove(&complete.request_id);
+                        }
                         // Initial result delivered (or never coming); drop the subscriber sender.
                         pending_sub_initials.remove(&complete.request_id);
                     }
@@ -371,86 +384,151 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let req = request.into_inner();
         let message_id = req.message_identifier.clone();
 
-        let processing_instructions = proto_pi_to_internal(req.processing_instructions);
-        let query = Query {
-            message_id: req.message_identifier,
-            name: req.query.clone(),
-            timestamp: req.timestamp,
-            payload: Payload {
-                payload_type: req
-                    .payload
-                    .as_ref()
-                    .map(|p| p.r#type.clone())
-                    .unwrap_or_default(),
-                revision: req
-                    .payload
-                    .as_ref()
-                    .map(|p| p.revision.clone())
-                    .unwrap_or_default(),
-                data: req.payload.map(|p| p.data).unwrap_or_default(),
-            },
-            metadata: proto_metadata_to_internal(req.metadata),
-            client_id: ClientId(req.client_id),
-            component_name: ComponentName(req.component_name),
-            // NrOfResults == 1 selects point-to-point routing; everything
-            // else is scatter-gather.
-            expected_results: expected_results(&processing_instructions),
-            processing_instructions,
+        // Fan-out plan from the replicated routing table (ADR-0007):
+        // scatter-gather spans every node with registered handlers;
+        // point-to-point is locality-preferred.
+        let instructions = proto_pi_to_internal(req.processing_instructions.clone());
+        let point_to_point = expected_results(&instructions) == 1;
+        let fanout = self.fabric.route_query(&bus, &req.query, point_to_point);
+        tracing::debug!(
+            query = %req.query,
+            local = fanout.local,
+            remote_nodes = fanout.remote.len(),
+            "query fanout"
+        );
+        let remote_proto = if fanout.remote.is_empty() {
+            None
+        } else {
+            Some(req.clone())
+        };
+        let query_timeout = effective_timeout(&instructions, self.query_timeout);
+
+        let query = from_proto_query(req);
+        let query_name = query.name.clone();
+
+        // Local dispatch. A local failure (no handler / no permits) is
+        // tolerated when remote targets exist — scatter-gather is
+        // best-effort per handler, and point-to-point remote-only routes
+        // skip the local bus entirely.
+        let local_pending = if fanout.local || fanout.remote.is_empty() {
+            match platform.dispatch_query(query) {
+                Ok(pending) => Some(pending),
+                Err(e) if !fanout.remote.is_empty() => {
+                    tracing::debug!(query = %query_name, error = %e, "local query dispatch skipped");
+                    None
+                }
+                Err(e) => return Err(Status::unavailable(e.to_string())),
+            }
+        } else {
+            None
         };
 
-        let query_name = query.name.clone();
-        let pending = platform
-            .dispatch_query(query)
-            .map_err(|e| Status::unavailable(e.to_string()))?;
-
-        // Create a channel for collecting responses from handlers.
+        // Local response collector, registered before delivery. The map
+        // holds the only sender, so the channel closes when the entry
+        // retires (all local handlers completed).
         let (response_tx, mut response_rx) = mpsc::channel::<pb::QueryResponse>(64);
+        if let Some(ref pending) = local_pending {
+            self.pending_queries.insert(
+                message_id.clone(),
+                Arc::new(PendingQueryEntry {
+                    sender: response_tx,
+                    remaining: AtomicUsize::new(pending.target_handlers.len()),
+                }),
+            );
 
-        // Register in pending map so handler responses route here.
-        self.pending_queries.insert(message_id.clone(), response_tx);
+            // Deliver the query to each local target handler.
+            for target_client_id in &pending.target_handlers {
+                let handler_tx = self
+                    .handler_streams
+                    .get(&target_client_id.0)
+                    .map(|r| r.value().clone());
 
-        // Deliver the query to each target handler.
-        for target_client_id in &pending.target_handlers {
-            let handler_tx = self
-                .handler_streams
-                .get(&target_client_id.0)
-                .map(|r| r.value().clone());
-
-            if let Some(tx) = handler_tx {
-                let inbound_query = pb::QueryHandlerInbound {
-                    request: Some(pb::query_handler_inbound::Request::Query(
-                        pb::QueryRequest {
-                            message_identifier: message_id.clone(),
-                            query: query_name.clone(),
-                            timestamp: pending.query.timestamp,
-                            payload: Some(crate::proto::kronosdb::SerializedObject {
-                                r#type: pending.query.payload.payload_type.clone(),
-                                revision: pending.query.payload.revision.clone(),
-                                data: pending.query.payload.data.clone(),
-                            }),
-                            metadata: internal_metadata_to_proto(&pending.query.metadata),
-                            processing_instructions: internal_pi_to_proto(
-                                &pending.query.processing_instructions,
-                            ),
-                            client_id: pending.query.client_id.0.clone(),
-                            component_name: pending.query.component_name.0.clone(),
-                        },
-                    )),
-                    instruction_id: String::new(),
-                };
-                let _ = tx.send(Ok(inbound_query)).await;
+                if let Some(tx) = handler_tx {
+                    let inbound_query = pb::QueryHandlerInbound {
+                        request: Some(pb::query_handler_inbound::Request::Query(
+                            pb::QueryRequest {
+                                message_identifier: message_id.clone(),
+                                query: query_name.clone(),
+                                timestamp: pending.query.timestamp,
+                                payload: Some(crate::proto::kronosdb::SerializedObject {
+                                    r#type: pending.query.payload.payload_type.clone(),
+                                    revision: pending.query.payload.revision.clone(),
+                                    data: pending.query.payload.data.clone(),
+                                }),
+                                metadata: internal_metadata_to_proto(&pending.query.metadata),
+                                processing_instructions: internal_pi_to_proto(
+                                    &pending.query.processing_instructions,
+                                ),
+                                client_id: pending.query.client_id.0.clone(),
+                                component_name: pending.query.component_name.0.clone(),
+                            },
+                        )),
+                        instruction_id: String::new(),
+                    };
+                    let _ = tx.send(Ok(inbound_query)).await;
+                }
             }
         }
+        // No local dispatch → the collector channel is already closed.
 
-        // Stream responses back to the caller.
+        // Merge local + remote responses into the caller's stream. The
+        // stream ends when every source finishes (all caller_tx clones
+        // dropped) — each source under the shared deadline.
         let (caller_tx, caller_rx) = mpsc::channel(64);
+        let deadline = tokio::time::Instant::now() + query_timeout;
+
+        for (node_id, targets) in fanout.remote {
+            let caller_tx = caller_tx.clone();
+            let cluster = Arc::clone(&self.cluster);
+            let forward_bus = bus.clone();
+            let proto = remote_proto.clone().expect("remote fanout implies proto");
+            tokio::spawn(async move {
+                let stream = forward_query(
+                    &cluster,
+                    node_id,
+                    &forward_bus,
+                    targets,
+                    proto,
+                    query_timeout,
+                )
+                .await;
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(status) => {
+                        tracing::warn!(node = node_id, error = %status, "fabric: query forward failed");
+                        if point_to_point {
+                            // Single-target route: surface the failure
+                            // instead of an empty stream.
+                            let _ = caller_tx.send(Err(status)).await;
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    match tokio::time::timeout_at(deadline, stream.message()).await {
+                        Ok(Ok(Some(resp))) => {
+                            if caller_tx.send(Ok(resp)).await.is_err() {
+                                break; // Caller disconnected.
+                            }
+                        }
+                        Ok(Ok(None)) => break, // Remote node done.
+                        Ok(Err(status)) => {
+                            tracing::warn!(node = node_id, error = %status, "fabric: query forward stream error");
+                            if point_to_point {
+                                let _ = caller_tx.send(Err(status)).await;
+                            }
+                            break;
+                        }
+                        Err(_) => break, // Deadline.
+                    }
+                }
+            });
+        }
+
         let pending_queries = Arc::clone(&self.pending_queries);
         let msg_id = message_id.clone();
-        let query_timeout =
-            effective_timeout(&pending.query.processing_instructions, self.query_timeout);
-
+        let local_active = local_pending.is_some();
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + query_timeout;
             loop {
                 match tokio::time::timeout_at(deadline, response_rx.recv()).await {
                     Ok(Some(resp)) => {
@@ -458,12 +536,14 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                             break; // Caller disconnected.
                         }
                     }
-                    Ok(None) => break, // All handlers done (channel closed).
+                    Ok(None) => break, // All local handlers done (channel closed).
                     Err(_) => {
                         // Timeout — send error and stop collecting.
-                        let _ = caller_tx
-                            .send(Err(Status::deadline_exceeded("query response timed out")))
-                            .await;
+                        if local_active {
+                            let _ = caller_tx
+                                .send(Err(Status::deadline_exceeded("query response timed out")))
+                                .await;
+                        }
                         break;
                     }
                 }
@@ -645,6 +725,36 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(sub_rx)))
+    }
+}
+
+/// Converts a proto query request into the internal representation.
+pub(crate) fn from_proto_query(req: pb::QueryRequest) -> Query {
+    let processing_instructions = proto_pi_to_internal(req.processing_instructions);
+    Query {
+        message_id: req.message_identifier,
+        name: req.query.clone(),
+        timestamp: req.timestamp,
+        payload: Payload {
+            payload_type: req
+                .payload
+                .as_ref()
+                .map(|p| p.r#type.clone())
+                .unwrap_or_default(),
+            revision: req
+                .payload
+                .as_ref()
+                .map(|p| p.revision.clone())
+                .unwrap_or_default(),
+            data: req.payload.map(|p| p.data).unwrap_or_default(),
+        },
+        metadata: proto_metadata_to_internal(req.metadata),
+        client_id: ClientId(req.client_id),
+        component_name: ComponentName(req.component_name),
+        // NrOfResults == 1 selects point-to-point routing; everything
+        // else is scatter-gather.
+        expected_results: expected_results(&processing_instructions),
+        processing_instructions,
     }
 }
 

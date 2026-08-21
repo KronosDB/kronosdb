@@ -107,6 +107,15 @@ pub trait QueryDispatcher: Send + Sync {
     /// Dispatches a query.
     /// Returns the pending query with target handler client IDs.
     fn dispatch_query(&self, query: Query) -> Result<PendingQuery, QueryError>;
+
+    /// Dispatches a query to specific handler instances — the fabric path
+    /// (ADR-0007): selection happened on the dispatching node, this node
+    /// just delivers to the named local handlers.
+    fn dispatch_query_to(
+        &self,
+        query: Query,
+        targets: &[ClientId],
+    ) -> Result<PendingQuery, QueryError>;
 }
 
 /// The subscription query interface.
