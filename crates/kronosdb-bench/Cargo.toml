@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 kronosdb-eventstore = { path = "../kronosdb-eventstore" }
+kronosdb-messaging = { path = "../kronosdb-messaging" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
@@ -47,4 +48,10 @@ harness = false
 
 [[bench]]
 name = "throughput_sustained"
+harness = false
+
+# --- Messaging benchmarks ---
+
+[[bench]]
+name = "command_dispatch"
 harness = false

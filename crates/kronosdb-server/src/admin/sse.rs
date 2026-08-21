@@ -109,6 +109,7 @@ fn fingerprint(state: &AdminState, topic: &str) -> u64 {
             for s in state.messaging.all_subscription_stats() {
                 s.subscription_id.hash(&mut h);
                 s.query_name.hash(&mut h);
+                s.bus.hash(&mut h);
                 s.handler_client_id.0.hash(&mut h);
             }
         }
@@ -138,6 +139,7 @@ fn hash_message_type_detail(
     h: &mut impl Hasher,
 ) {
     d.name.hash(h);
+    d.bus.hash(h);
     for handler in &d.handlers {
         handler.client_id.hash(h);
         handler.available_permits.hash(h);

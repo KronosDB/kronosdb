@@ -200,6 +200,9 @@ struct ConfigFile {
     timeouts: TimeoutConfig,
 
     #[serde(default)]
+    messaging: MessagingFileConfig,
+
+    #[serde(default)]
     admin: AdminConfig,
 
     #[serde(default)]
@@ -237,6 +240,15 @@ struct TimeoutConfig {
     heartbeat_interval: Option<u64>,
     #[serde(rename = "heartbeat-timeout")]
     heartbeat_timeout: Option<u64>,
+}
+
+#[derive(Deserialize, Default, Debug)]
+struct MessagingFileConfig {
+    /// When a command's target handler is out of flow-control permits,
+    /// wait (bounded by the command timeout) for a grant instead of
+    /// failing immediately. Default: true.
+    #[serde(rename = "permit-wait")]
+    permit_wait: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -365,6 +377,8 @@ pub struct ServerConfig {
     pub backup_interval_secs: u64,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
+    /// Bounded permit-wait on saturated command handlers (false = fail fast).
+    pub messaging_permit_wait: bool,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_timeout_secs: u64,
     /// Max seconds to wait for connections to drain after SIGTERM.
@@ -508,6 +522,7 @@ impl ServerConfig {
                 .query_timeout
                 .or(file_config.timeouts.query_timeout)
                 .unwrap_or(DEFAULT_QUERY_TIMEOUT),
+            messaging_permit_wait: file_config.messaging.permit_wait.unwrap_or(true),
             heartbeat_interval_secs: cli
                 .heartbeat_interval
                 .or(file_config.timeouts.heartbeat_interval)

@@ -26,4 +26,8 @@ pub mod kronosdb {
     pub mod scheduler {
         tonic::include_proto!("kronosdb.scheduler");
     }
+
+    pub mod fabric {
+        tonic::include_proto!("kronosdb.fabric");
+    }
 }

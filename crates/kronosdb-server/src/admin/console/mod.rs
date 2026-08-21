@@ -44,9 +44,14 @@ pub(crate) struct MessagePage {
 }
 
 /// Query params for the `/fragments/{topic}/detail` routes.
+///
+/// Handlers are keyed by (bus, name): the same message type can be
+/// registered on several buses, so the name alone is ambiguous.
 #[derive(Deserialize)]
 pub(crate) struct DetailParams {
     pub name: String,
+    #[serde(default)]
+    pub bus: String,
 }
 
 /// Full page content: Basecoat card with master list (left, SSE-refreshed)
@@ -59,7 +64,7 @@ pub(crate) fn message_page_html(cfg: &MessagePage, details: &[MessageTypeDetail]
     };
     let detail = details
         .first()
-        .map(|d| detail_fragment_html(cfg, Some(d), &d.name))
+        .map(|d| detail_fragment_html(cfg, Some(d), &d.name, &d.bus))
         .unwrap_or_default();
 
     // After the master list is re-rendered by SSE, re-apply the active
@@ -114,6 +119,7 @@ pub(crate) fn detail_fragment_html(
     cfg: &MessagePage,
     detail: Option<&MessageTypeDetail>,
     name: &str,
+    bus: &str,
 ) -> String {
     let body = match detail {
         Some(d) => detail_body_html(cfg, d),
@@ -123,10 +129,11 @@ pub(crate) fn detail_fragment_html(
         ),
     };
     format!(
-        r#"<div id="{prefix}-detail-root" hx-get="/fragments/{topic}/detail?name={enc}" hx-trigger="sse-{topic} from:body" hx-swap="morph:outerHTML">{body}</div>"#,
+        r#"<div id="{prefix}-detail-root" hx-get="/fragments/{topic}/detail?name={enc}&bus={bus_enc}" hx-trigger="sse-{topic} from:body" hx-swap="morph:outerHTML">{body}</div>"#,
         prefix = cfg.id_prefix,
         topic = cfg.topic,
         enc = urlencode(name),
+        bus_enc = urlencode(bus),
     )
 }
 
@@ -154,12 +161,23 @@ fn master_items_html(cfg: &MessagePage, details: &[MessageTypeDetail], mark_firs
         } else {
             String::new()
         };
+        // Only label rows with their bus when it isn't the default —
+        // single-bus deployments shouldn't pay a noise tax.
+        let bus_tag = if d.bus.is_empty() || d.bus == "default" {
+            String::new()
+        } else {
+            format!(
+                r#"<span class="font-mono text-[10px] text-k-muted">@{}</span>"#,
+                html_escape(&d.bus)
+            )
+        };
         html.push_str(&format!(
-            r##"<div id="{prefix}-row-{dom}" class="master-item flex items-center justify-between px-4 py-2.5 border-b border-k-subtle cursor-pointer border-l-2 border-l-transparent hover:bg-k-hover transition-colors{active_cls}" onclick="selectMaster(this)" hx-get="/fragments/{topic}/detail?name={enc}" hx-target="#{target}" hx-swap="morph:innerHTML"><span class="mi-name font-mono text-xs {name_cls}">{name}</span><span class="font-mono text-[11px] text-k-muted">{count} handler{plural}</span>{dispatched}</div>"##,
+            r##"<div id="{prefix}-row-{dom}" class="master-item flex items-center justify-between gap-2 px-4 py-2.5 border-b border-k-subtle cursor-pointer border-l-2 border-l-transparent hover:bg-k-hover transition-colors{active_cls}" onclick="selectMaster(this)" hx-get="/fragments/{topic}/detail?name={enc}&bus={bus_enc}" hx-target="#{target}" hx-swap="morph:innerHTML"><span class="mi-name font-mono text-xs {name_cls}">{name}</span>{bus_tag}<span class="font-mono text-[11px] text-k-muted ml-auto">{count} handler{plural}</span>{dispatched}</div>"##,
             prefix = cfg.id_prefix,
-            dom = dom_id(&d.name),
+            dom = dom_id(&format!("{}-{}", d.bus, d.name)),
             topic = cfg.topic,
             enc = urlencode(&d.name),
+            bus_enc = urlencode(&d.bus),
             target = cfg.detail_target,
             name = html_escape(&d.name),
             count = d.handlers.len(),
@@ -182,6 +200,15 @@ fn detail_body_html(cfg: &MessagePage, d: &MessageTypeDetail) -> String {
     };
     let plural = if d.handlers.len() == 1 { "" } else { "s" };
 
+    let bus_badge = if d.bus.is_empty() || d.bus == "default" {
+        String::new()
+    } else {
+        format!(
+            r#" <span class="badge font-mono text-[11px]" data-variant="secondary">@{}</span>"#,
+            html_escape(&d.bus)
+        )
+    };
+
     let mode_badge = if cfg.show_mode_badge {
         let (label, cls) = if d.handlers.len() > 1 {
             ("scatter-gather", "bg-k-teal-d text-k-teal")
@@ -198,7 +225,7 @@ fn detail_body_html(cfg: &MessagePage, d: &MessageTypeDetail) -> String {
     let mut html = format!(
         r#"<div class="flex items-baseline gap-3 mb-4">
   <h3 class="text-base font-semibold">{name}</h3>
-  <span class="badge font-mono text-[11px] {accent}" data-variant="secondary">{count} handler{plural}</span>{mode_badge}
+  <span class="badge font-mono text-[11px] {accent}" data-variant="secondary">{count} handler{plural}</span>{bus_badge}{mode_badge}
 </div>
 <div class="flex gap-4 mb-5 flex-wrap">
   {cards}

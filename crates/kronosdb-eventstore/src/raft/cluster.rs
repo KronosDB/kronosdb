@@ -18,6 +18,7 @@ use crate::api::EventStore;
 use crate::context::ContextManager;
 use crate::error::Error;
 
+use super::handler_registry::{HandlerKind, HandlerRegistration, HandlerRoutingTable};
 use super::log_store::{LogStore, LogStoreConfig};
 use super::network::NetworkFactory;
 use super::proto;
@@ -97,6 +98,9 @@ pub struct ClusterManager {
     pub(super) topology_lock: tokio::sync::Mutex<()>,
     /// Cached peer channels keyed by advertised address.
     forward_channels: Arc<tokio::sync::RwLock<HashMap<String, Channel>>>,
+    /// Replicated messaging-handler routing table (ADR-0007). Written by
+    /// the state machine, read by the server's dispatch paths.
+    handler_routing: Arc<HandlerRoutingTable>,
     pub(super) coordinator_started: AtomicBool,
     pub(super) cluster_config: ClusterConfig,
 }
@@ -126,6 +130,7 @@ impl ClusterManager {
             known_peers: RwLock::new(known_peers),
             topology_lock: tokio::sync::Mutex::new(()),
             forward_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            handler_routing: Arc::new(HandlerRoutingTable::new()),
             coordinator_started: AtomicBool::new(false),
             cluster_config,
         }
@@ -161,6 +166,7 @@ impl ClusterManager {
         let state_machine = EventStoreStateMachine::new(
             Arc::clone(&self.context_manager),
             Arc::clone(&snapshot_store),
+            Arc::clone(&self.handler_routing),
             self.control_updates.clone(),
         )?;
 
@@ -240,6 +246,100 @@ impl ClusterManager {
                 message: format!("unexpected raft response for create_context: {other:?}"),
             }),
         }
+    }
+
+    // ── Messaging-fabric registry (ADR-0007) ───────────────────────────
+
+    /// The replicated handler routing table, shared with the state machine.
+    pub fn handler_routing(&self) -> Arc<HandlerRoutingTable> {
+        Arc::clone(&self.handler_routing)
+    }
+
+    /// This node's id, for stamping handler registrations.
+    pub fn local_node_id(&self) -> NodeId {
+        self.cluster_config.node_id
+    }
+
+    /// Registers a messaging handler in the replicated routing table.
+    /// Forwards to the Raft leader when called on a follower.
+    pub async fn register_handler(&self, registration: HandlerRegistration) -> Result<(), Error> {
+        if registration.bus.is_empty()
+            || registration.message_type.is_empty()
+            || registration.client_id.is_empty()
+        {
+            return Err(Error::Corrupted {
+                message: "handler registration requires bus, message_type, and client_id".into(),
+            });
+        }
+        self.submit_control_request(RaftRequest::RegisterHandler { registration })
+            .await
+            .map(|_| ())
+    }
+
+    /// Removes one handler registration (explicit unsubscribe).
+    pub async fn deregister_handler(
+        &self,
+        bus: &str,
+        kind: HandlerKind,
+        message_type: &str,
+        client_id: &str,
+    ) -> Result<(), Error> {
+        self.submit_control_request(RaftRequest::DeregisterHandler {
+            bus: bus.to_string(),
+            kind,
+            message_type: message_type.to_string(),
+            client_id: client_id.to_string(),
+            node_id: self.cluster_config.node_id,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Removes all of a client's registrations made through this node
+    /// (disconnect / heartbeat reap).
+    pub async fn deregister_client_handlers(&self, client_id: &str) -> Result<(), Error> {
+        self.submit_control_request(RaftRequest::DeregisterClient {
+            client_id: client_id.to_string(),
+            node_id: self.cluster_config.node_id,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Drops every registration owned by this node. Written at startup so
+    /// rows stranded by a crash never outlive the restart.
+    pub async fn clear_node_handlers(&self) -> Result<(), Error> {
+        self.submit_control_request(RaftRequest::ClearNodeHandlers {
+            node_id: self.cluster_config.node_id,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// A peer node's advertised address, from live membership (falling
+    /// back to the configured peer directory).
+    pub fn peer_address(&self, node_id: NodeId) -> Option<String> {
+        if let Some(raft) = self.raft_node() {
+            let metrics = raft.metrics().borrow().clone();
+            if let Some(node) = metrics.membership_config.membership().get_node(&node_id) {
+                return Some(node.addr.clone());
+            }
+        }
+        self.known_peers
+            .read()
+            .get(&node_id)
+            .map(|p| p.addr.clone())
+    }
+
+    /// A cached, authenticated gRPC channel to a peer address. Used by the
+    /// messaging fabric to forward commands/queries between nodes.
+    pub async fn peer_channel(&self, address: &str) -> Result<Channel, Error> {
+        self.cached_channel(address).await
+    }
+
+    /// Wraps a peer request with this cluster's auth token / TLS identity.
+    pub fn peer_request<T>(&self, message: T) -> Result<tonic::Request<T>, Error> {
+        self.cluster_config.peer_transport.request(message)
     }
 
     pub(super) async fn submit_control_request(

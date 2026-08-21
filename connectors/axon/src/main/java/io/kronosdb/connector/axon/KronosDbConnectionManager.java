@@ -48,6 +48,10 @@ public class KronosDbConnectionManager {
             factoryBuilder.token(configuration.getToken());
         }
 
+        if (configuration.getBusName() != null && !configuration.getBusName().isEmpty()) {
+            factoryBuilder.busName(configuration.getBusName());
+        }
+
         if (configuration.isSslEnabled()) {
             try {
                 if (configuration.getCertFile() != null) {

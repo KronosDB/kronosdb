@@ -31,6 +31,7 @@ public class KronosDbConnectionFactory {
     private final int port;
     private final String clientId;
     private final String componentName;
+    private final @Nullable String busName;
     private final @Nullable String token;
     private final @Nullable SslContext sslContext;
     private final long keepAliveTimeMillis;
@@ -45,6 +46,7 @@ public class KronosDbConnectionFactory {
         this.port = builder.port;
         this.clientId = builder.clientId;
         this.componentName = builder.componentName;
+        this.busName = builder.busName;
         this.token = builder.token;
         this.sslContext = builder.sslContext;
         this.keepAliveTimeMillis = builder.keepAliveTimeMillis;
@@ -88,8 +90,13 @@ public class KronosDbConnectionFactory {
             channelBuilder.maxInboundMessageSize(maxInboundMessageSize);
         }
 
-        // Add context and token metadata interceptor
-        channelBuilder.intercept(new ContextMetadata(context, token != null ? token : ""));
+        // Add context, bus, and token metadata interceptor. The bus routes
+        // messaging (commands/queries/subscriptions) independently of the
+        // event store context; unset means the server's default bus.
+        channelBuilder.intercept(new ContextMetadata(
+                context,
+                busName != null ? busName : "",
+                token != null ? token : ""));
 
         if (channelCustomizer != null) {
             channelCustomizer.apply(channelBuilder);
@@ -124,6 +131,7 @@ public class KronosDbConnectionFactory {
         private int port = DEFAULT_PORT;
         private final String clientId;
         private final String componentName;
+        private @Nullable String busName;
         private @Nullable String token;
         private @Nullable SslContext sslContext;
         private long keepAliveTimeMillis = 10_000;   // 10s ping interval, conventional for long-lived streams
@@ -143,6 +151,17 @@ public class KronosDbConnectionFactory {
 
         public Builder port(int port) {
             this.port = port;
+            return this;
+        }
+
+        /**
+         * Names the messaging bus for command, query, and subscription-query
+         * calls. Buses are independent of event store contexts: connections
+         * to different contexts share one bus when given the same name.
+         * Unset routes messaging to the server's {@code default} bus.
+         */
+        public Builder busName(String busName) {
+            this.busName = busName;
             return this;
         }
 

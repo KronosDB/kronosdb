@@ -108,6 +108,10 @@ pub struct CommandBusConfig {
     /// Hard capacity limit. ALL commands are rejected when this is reached.
     /// Default: 110% of capacity.
     pub hard_capacity: usize,
+    /// Whether `dispatch_wait` waits (bounded by the caller's budget) for a
+    /// flow-control grant when the target handler is out of permits, rather
+    /// than failing immediately. Default: true.
+    pub permit_wait: bool,
 }
 
 impl Default for CommandBusConfig {
@@ -121,6 +125,7 @@ impl CommandBusConfig {
         Self {
             capacity,
             hard_capacity: capacity + capacity / 10, // 110%
+            permit_wait: true,
         }
     }
 }
@@ -161,6 +166,8 @@ pub struct CommandBus {
     /// Per-command-type dispatch metrics. Lock-free atomic counters
     /// inside the value; DashMap shards the key-level insert contention.
     metrics: DashMap<String, MessageTypeMetrics>,
+    /// Wakes `dispatch_wait` loops when flow-control permits are granted.
+    permit_notify: tokio::sync::Notify,
     /// Configuration.
     config: CommandBusConfig,
 }
@@ -182,6 +189,7 @@ impl CommandBus {
             in_flight: DashMap::new(),
             dispatch_counter: AtomicU64::new(0),
             metrics: DashMap::new(),
+            permit_notify: tokio::sync::Notify::new(),
             config,
         }
     }
@@ -218,8 +226,12 @@ impl CommandBus {
 
     /// Grants flow control permits to a client.
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
-        let handlers = self.handlers.read();
-        handlers.grant_permits(client_id, permits);
+        {
+            let handlers = self.handlers.read();
+            handlers.grant_permits(client_id, permits);
+        }
+        // Wake any dispatch_wait loops parked on permit exhaustion.
+        self.permit_notify.notify_waiters();
     }
 
     /// Dispatches a command to a handler.
@@ -237,6 +249,162 @@ impl CommandBus {
     pub fn dispatch(
         &self,
         command: Command,
+    ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        self.dispatch_inner(command, true)
+    }
+
+    /// Dispatches a command, waiting up to `max_wait` for a flow-control
+    /// grant when the target is out of permits.
+    ///
+    /// Sticky (routing-keyed) commands wait on their ring-selected handler
+    /// specifically — waiting instead of re-routing is what preserves
+    /// per-routing-key ordering under load. With `permit_wait` disabled
+    /// this is exactly [`dispatch`](CommandBus::dispatch).
+    ///
+    /// The wait is grant-driven (`grant_permits` wakes waiters) with a
+    /// 50ms re-poll cap: `Notify` registration races a grant that lands
+    /// between a failed attempt and the await, so the cap bounds how long
+    /// a lost wakeup can stall a waiter.
+    pub async fn dispatch_wait(
+        &self,
+        command: Command,
+        max_wait: Duration,
+    ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        if !self.config.permit_wait || max_wait.is_zero() {
+            return self.dispatch(command);
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            // Register interest before attempting so a grant arriving
+            // right after a failed attempt still wakes us.
+            let notified = self.permit_notify.notified();
+            match self.dispatch_inner(command.clone(), false) {
+                Err(CommandError::NoPermitsAvailable { .. }) => {}
+                other => return other,
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                // Record the failure once, for the whole waited attempt —
+                // not once per retry, which would inflate the metric.
+                self.record_no_permits(&command.name);
+                return Err(CommandError::NoPermitsAvailable {
+                    command_name: command.name,
+                });
+            }
+            let slice = deadline.min(now + Duration::from_millis(50));
+            let _ = tokio::time::timeout_at(slice, notified).await;
+        }
+    }
+
+    /// Dispatches to a specific handler — the fabric path (ADR-0007),
+    /// where selection already happened on the dispatching node against
+    /// the replicated routing table. Waits (bounded) for a permit like
+    /// [`dispatch_wait`](CommandBus::dispatch_wait); never re-selects.
+    pub async fn dispatch_to_wait(
+        &self,
+        command: Command,
+        target: &ClientId,
+        max_wait: Duration,
+    ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        if !self.config.permit_wait || max_wait.is_zero() {
+            return self.dispatch_to_inner(command, target, true);
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let notified = self.permit_notify.notified();
+            match self.dispatch_to_inner(command.clone(), target, false) {
+                Err(CommandError::NoPermitsAvailable { .. }) => {}
+                other => return other,
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                self.record_no_permits(&command.name);
+                return Err(CommandError::NoPermitsAvailable {
+                    command_name: command.name,
+                });
+            }
+            let slice = deadline.min(now + Duration::from_millis(50));
+            let _ = tokio::time::timeout_at(slice, notified).await;
+        }
+    }
+
+    fn dispatch_to_inner(
+        &self,
+        command: Command,
+        target: &ClientId,
+        record_no_permits: bool,
+    ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        let command_name = command.name.clone();
+        let message_id = command.message_id.clone();
+
+        let priority = extract_priority(&command.processing_instructions);
+        let count = self.in_flight.len();
+        if count >= self.config.hard_capacity {
+            return Err(CommandError::AtCapacity {
+                capacity: self.config.hard_capacity,
+            });
+        }
+        if count >= self.config.capacity && priority <= 0 {
+            return Err(CommandError::AtCapacity {
+                capacity: self.config.capacity,
+            });
+        }
+        if self.in_flight.contains_key(&message_id) {
+            return Err(CommandError::Duplicate { message_id });
+        }
+
+        let handlers = self.handlers.read();
+        let selected = handlers
+            .get_handlers(&command.name)
+            .and_then(|list| list.iter().find(|e| &e.handler.client_id == target))
+            .ok_or_else(|| {
+                self.record_no_handler(&command_name);
+                CommandError::NoHandlerAvailable {
+                    command_name: command.name.clone(),
+                }
+            })?;
+
+        if !selected.handler.try_acquire_permit() {
+            if record_no_permits {
+                self.record_no_permits(&command_name);
+            }
+            return Err(CommandError::NoPermitsAvailable {
+                command_name: command.name.clone(),
+            });
+        }
+
+        let target_handler = selected.handler.client_id.clone();
+        let now = Instant::now();
+        drop(handlers);
+
+        self.record_dispatched(&command_name);
+
+        let (response_tx, response_rx) = oneshot::channel();
+        self.in_flight.insert(
+            message_id,
+            InFlightEntry {
+                response_tx,
+                target_handler: target_handler.clone(),
+                dispatched_at: now,
+                command_name: command_name.clone(),
+                timeout_override: extract_timeout(&command.processing_instructions),
+            },
+        );
+
+        Ok((
+            PendingCommand {
+                command,
+                target_handler,
+                dispatched_at: now,
+            },
+            response_rx,
+        ))
+    }
+
+    fn dispatch_inner(
+        &self,
+        command: Command,
+        record_no_permits: bool,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
         let command_name = command.name.clone();
         let message_id = command.message_id.clone();
@@ -274,11 +442,17 @@ impl CommandBus {
             });
         }
 
-        // Select a handler.
-        let selected = if let Some(ref routing_key) = command.routing_key {
-            let hash = simple_hash(&routing_key.0);
-            let idx = (hash as usize) % handler_list.len();
-            &handler_list[idx]
+        // Select a handler. Routing-keyed commands resolve through the
+        // weighted consistent-hash ring and are strictly sticky; unkeyed
+        // commands are weighted round-robin with permit fallback.
+        let (selected, sticky) = if let Some(ref routing_key) = command.routing_key {
+            // Ring and handler list are read under the same lock and the
+            // ring is rebuilt on every registration change, so the index
+            // is always in bounds; unwrap_or(0) is unreachable in practice.
+            let idx = handlers
+                .ring_lookup(&command.name, &routing_key.0)
+                .unwrap_or(0);
+            (&handler_list[idx], true)
         } else {
             let counter = self.dispatch_counter.fetch_add(1, Ordering::Relaxed);
             // Weights are >= 1 (Handler::new clamps), but guard the sum
@@ -299,19 +473,31 @@ impl CommandBus {
                     break;
                 }
             }
-            selected
+            (selected, false)
         };
 
-        // Check permits on the selected handler first; if none, fall back to
-        // any handler with available permits before giving up.
+        // Check permits on the selected handler. Sticky targets are never
+        // re-routed — silently moving a keyed command to another handler
+        // would break per-key ordering; callers bound-wait for a grant
+        // (dispatch_wait) or fail. Unkeyed commands fall back to any
+        // handler with available permits before giving up.
         let selected = if selected.handler.try_acquire_permit() {
             selected
+        } else if sticky {
+            if record_no_permits {
+                self.record_no_permits(&command_name);
+            }
+            return Err(CommandError::NoPermitsAvailable {
+                command_name: command.name.clone(),
+            });
         } else {
             let fallback = handler_list.iter().find(|e| e.handler.try_acquire_permit());
             match fallback {
                 Some(entry) => entry,
                 None => {
-                    self.record_no_permits(&command_name);
+                    if record_no_permits {
+                        self.record_no_permits(&command_name);
+                    }
                     return Err(CommandError::NoPermitsAvailable {
                         command_name: command.name.clone(),
                     });
@@ -364,6 +550,7 @@ impl CommandBus {
                     name,
                     handlers,
                     metrics: snapshot,
+                    bus: String::new(),
                 }
             })
             .collect()
@@ -529,15 +716,6 @@ fn extract_timeout(instructions: &[ProcessingInstruction]) -> Option<Duration> {
         .map(|ms| Duration::from_millis(ms.clamp(1_000, 3_600_000) as u64))
 }
 
-/// Simple hash function for routing key consistent hashing.
-fn simple_hash(s: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for byte in s.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
-    }
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +816,119 @@ mod tests {
             cmd.message_id = format!("cmd-{i}");
             let (_pending, _rx) = bus.dispatch(cmd).unwrap();
         }
+    }
+
+    #[test]
+    fn sticky_command_fails_rather_than_rerouting() {
+        let bus = CommandBus::new();
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-2"),
+            component("order-service"),
+            100,
+        );
+        // Permits only on node-1: keys owned by node-2 must fail sticky,
+        // never silently re-route to node-1.
+        bus.grant_permits(&client("node-1"), 1_000);
+
+        let mut saw_sticky_failure = false;
+        for i in 0..200 {
+            let mut cmd = make_command("CreateOrder");
+            cmd.message_id = format!("cmd-{i}");
+            cmd.routing_key = Some(RoutingKey(format!("key-{i}")));
+            match bus.dispatch(cmd) {
+                Ok((pending, _rx)) => assert_eq!(pending.target_handler, client("node-1")),
+                Err(CommandError::NoPermitsAvailable { .. }) => saw_sticky_failure = true,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            saw_sticky_failure,
+            "no key mapped to the saturated handler in 200 tries"
+        );
+    }
+
+    #[test]
+    fn ring_stickiness_survives_unrelated_membership_change() {
+        let bus = CommandBus::new();
+        for node in ["node-a", "node-b", "node-c"] {
+            bus.subscribe(
+                "CreateOrder".into(),
+                client(node),
+                component("order-service"),
+                100,
+            );
+            bus.grant_permits(&client(node), 1_000);
+        }
+
+        let mut cmd = make_command("CreateOrder");
+        cmd.message_id = "cmd-before".into();
+        cmd.routing_key = Some(RoutingKey("order-42".into()));
+        let (before, _) = bus.dispatch(cmd).unwrap();
+
+        // Remove a handler that does NOT own the key — the key must not move.
+        let bystander = ["node-a", "node-b", "node-c"]
+            .into_iter()
+            .find(|n| client(n) != before.target_handler)
+            .unwrap();
+        bus.remove_client(&client(bystander));
+
+        let mut cmd = make_command("CreateOrder");
+        cmd.message_id = "cmd-after".into();
+        cmd.routing_key = Some(RoutingKey("order-42".into()));
+        let (after, _) = bus.dispatch(cmd).unwrap();
+
+        assert_eq!(before.target_handler, after.target_handler);
+    }
+
+    #[tokio::test]
+    async fn dispatch_wait_succeeds_after_grant() {
+        let bus = std::sync::Arc::new(CommandBus::new());
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        // No permits yet — the dispatch must park, not fail.
+
+        let waiter = std::sync::Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            waiter
+                .dispatch_wait(make_command("CreateOrder"), Duration::from_secs(5))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bus.grant_permits(&client("node-1"), 1);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "waited dispatch should succeed after grant");
+    }
+
+    #[tokio::test]
+    async fn dispatch_wait_times_out_without_grant() {
+        let bus = CommandBus::new();
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+
+        let result = bus
+            .dispatch_wait(make_command("CreateOrder"), Duration::from_millis(120))
+            .await;
+        assert!(matches!(
+            result,
+            Err(CommandError::NoPermitsAvailable { .. })
+        ));
     }
 
     #[test]

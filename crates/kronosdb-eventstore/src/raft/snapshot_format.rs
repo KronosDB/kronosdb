@@ -5,21 +5,28 @@
 //! `SnapshotMeta` remains the carrier for `last_log_id` and membership. This
 //! payload carries only context names and the current leader claim.
 //!
-//! Layout ("KSM4"):
+//! Layout ("KSM5"):
 //!
 //! ```text
-//! magic "KSM4" (4) | version u8 = 4 | payload_len u32 LE
+//! magic "KSM5" (4) | version u8 = 5 | payload_len u32 LE
 //! bincode(MetadataSnapshot) | crc32c u32 LE
 //! ```
+//!
+//! "KSM4" (no handler registry) is still readable: its payload decodes
+//! into the v4 shape and upgrades with an empty handler table.
 
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+use super::handler_registry::HandlerRegistration;
 use super::types::LeaderClaim;
 
-pub const MAGIC: &[u8; 4] = b"KSM4";
-pub const VERSION: u8 = 4;
+pub const MAGIC: &[u8; 4] = b"KSM5";
+pub const VERSION: u8 = 5;
+
+const LEGACY_MAGIC: &[u8; 4] = b"KSM4";
+const LEGACY_VERSION: u8 = 4;
 
 const HEADER_LEN: usize = 9;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -29,6 +36,15 @@ const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub struct MetadataSnapshot {
     pub contexts: Vec<String>,
     pub leader_claim: Option<LeaderClaim>,
+    /// Replicated messaging-handler registrations (ADR-0007).
+    pub handlers: Vec<HandlerRegistration>,
+}
+
+/// The v4 payload shape, for upgrading pre-fabric snapshots.
+#[derive(Deserialize)]
+struct MetadataSnapshotV4 {
+    contexts: Vec<String>,
+    leader_claim: Option<LeaderClaim>,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -62,7 +78,8 @@ pub fn read_snapshot<R: Read>(mut reader: R) -> io::Result<MetadataSnapshot> {
     reader
         .read_exact(&mut header)
         .map_err(|_| invalid("snapshot data too short for header"))?;
-    if &header[0..4] != MAGIC || header[4] != VERSION {
+    let legacy = &header[0..4] == LEGACY_MAGIC && header[4] == LEGACY_VERSION;
+    if !legacy && (&header[0..4] != MAGIC || header[4] != VERSION) {
         return Err(invalid(format!(
             "unsupported snapshot data format {:?}/{}",
             &header[0..4],
@@ -89,6 +106,15 @@ pub fn read_snapshot<R: Read>(mut reader: R) -> io::Result<MetadataSnapshot> {
         return Err(invalid("trailing bytes after metadata snapshot"));
     }
 
+    if legacy {
+        let v4: MetadataSnapshotV4 =
+            bincode::deserialize(&payload).map_err(|e| invalid(e.to_string()))?;
+        return Ok(MetadataSnapshot {
+            contexts: v4.contexts,
+            leader_claim: v4.leader_claim,
+            handlers: Vec::new(),
+        });
+    }
     bincode::deserialize(&payload).map_err(|e| invalid(e.to_string()))
 }
 
@@ -111,10 +137,42 @@ mod tests {
                 voters: vec![1, 2, 3],
                 per_context_tails: BTreeMap::from([("orders".into(), 99)]),
             }),
+            handlers: vec![HandlerRegistration {
+                bus: "main".into(),
+                kind: crate::raft::handler_registry::HandlerKind::Command,
+                message_type: "CreateOrder".into(),
+                client_id: "c1".into(),
+                node_id: 2,
+                load_factor: 100,
+            }],
         };
 
         let bytes = write_snapshot(Vec::new(), &snapshot).unwrap();
         assert_eq!(read_snapshot(&bytes[..]).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn legacy_v4_upgrades_with_empty_handlers() {
+        #[derive(Serialize)]
+        struct V4 {
+            contexts: Vec<String>,
+            leader_claim: Option<LeaderClaim>,
+        }
+        let payload = bincode::serialize(&V4 {
+            contexts: vec!["default".into()],
+            leader_claim: None,
+        })
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"KSM4");
+        bytes.push(4);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+
+        let snapshot = read_snapshot(&bytes[..]).unwrap();
+        assert_eq!(snapshot.contexts, vec!["default".to_string()]);
+        assert!(snapshot.handlers.is_empty());
     }
 
     #[test]

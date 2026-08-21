@@ -6,5 +6,6 @@ pub mod error_codes;
 pub mod handler;
 pub mod manager;
 pub mod query;
+pub mod ring;
 pub mod subscription;
 pub mod types;

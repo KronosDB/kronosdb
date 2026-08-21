@@ -164,6 +164,7 @@ impl QueryBus {
                     name,
                     handlers,
                     metrics: snapshot,
+                    bus: String::new(),
                 }
             })
             .collect()

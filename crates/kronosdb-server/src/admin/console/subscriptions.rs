@@ -61,6 +61,7 @@ fn subscriptions_table_html(subs: &[SubscriptionInfo]) -> String {
             r#"<tr id="sub-{id}">
   <td class="font-mono text-xs !text-k-text">{id}</td>
   <td class="font-mono text-xs">{query}</td>
+  <td class="font-mono text-xs text-k-muted">{bus}</td>
   <td class="text-xs">{component} <span class="text-k-muted">({client})</span></td>
   <td class="text-xs">{handler}</td>
   <td class="text-right text-xs text-k-muted">{duration}</td>
@@ -68,12 +69,13 @@ fn subscriptions_table_html(subs: &[SubscriptionInfo]) -> String {
 </tr>"#,
             id = html_escape(&sub.subscription_id),
             query = html_escape(&sub.query_name),
+            bus = html_escape(&sub.bus),
             component = html_escape(&sub.subscriber_component.0),
             client = html_escape(&sub.subscriber_client_id.0),
             handler = html_escape(&sub.handler_client_id.0),
         ));
     }
     format!(
-        r#"<table><thead><tr><th>Subscription ID</th><th>Query Type</th><th>Subscriber</th><th>Handler</th><th class="text-right">Uptime</th><th class="text-right">Status</th></tr></thead><tbody>{rows}</tbody></table>"#
+        r#"<table><thead><tr><th>Subscription ID</th><th>Query Type</th><th>Bus</th><th>Subscriber</th><th>Handler</th><th class="text-right">Uptime</th><th class="text-right">Status</th></tr></thead><tbody>{rows}</tbody></table>"#
     )
 }

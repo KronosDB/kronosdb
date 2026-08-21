@@ -37,8 +37,12 @@ impl StoreBuilder<TypeConfig, LogStore, EventStoreStateMachine, TempDir> for Bui
         let snapshots =
             Arc::new(SnapshotStore::new(raft_dir.join("snapshots")).expect("snapshot store"));
         let (control_updates, _) = tokio::sync::watch::channel(AppliedControlState::default());
-        let state_machine = EventStoreStateMachine::new(contexts, snapshots, control_updates)
-            .expect("state machine");
+        let handler_routing = Arc::new(
+            kronosdb_eventstore::raft::handler_registry::HandlerRoutingTable::new(),
+        );
+        let state_machine =
+            EventStoreStateMachine::new(contexts, snapshots, handler_routing, control_updates)
+                .expect("state machine");
         Ok((tmp, log_store, state_machine))
     }
 }

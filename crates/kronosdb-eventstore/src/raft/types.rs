@@ -44,6 +44,30 @@ pub enum RaftRequest {
         voters: Vec<NodeId>,
         per_context_tails: BTreeMap<String, u64>,
     },
+
+    /// Register a messaging handler in the replicated routing table
+    /// (ADR-0007). Written by the node the handler connected to.
+    RegisterHandler {
+        registration: crate::raft::handler_registry::HandlerRegistration,
+    },
+
+    /// Remove one handler registration (explicit unsubscribe).
+    DeregisterHandler {
+        bus: String,
+        kind: crate::raft::handler_registry::HandlerKind,
+        message_type: String,
+        client_id: String,
+        node_id: NodeId,
+    },
+
+    /// Remove all of a client's registrations made through `node_id`
+    /// (client disconnect / heartbeat reap).
+    DeregisterClient { client_id: String, node_id: NodeId },
+
+    /// Drop every handler registration owned by a node. Each node writes
+    /// this for itself at startup so registrations stranded by a crash
+    /// never outlive the restart.
+    ClearNodeHandlers { node_id: NodeId },
 }
 
 /// Application response returned after applying a control-plane entry.

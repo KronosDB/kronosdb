@@ -7,6 +7,19 @@ use crate::query::{PendingQuery, Query, QueryError};
 use crate::subscription::{SubscriptionError, SubscriptionQuery, SubscriptionUpdate};
 use crate::types::{ClientId, ComponentName};
 
+/// Boxed future returned by [`CommandDispatcher::dispatch_command_wait`].
+///
+/// Hand-rolled instead of `async fn` so the trait stays object-safe — the
+/// gRPC layer programs against `Arc<dyn MessagingPlatform>`.
+pub type DispatchFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 /// The command bus interface.
 ///
 /// Routes commands to exactly one registered handler, load-balanced.
@@ -38,6 +51,25 @@ pub trait CommandDispatcher: Send + Sync {
         &self,
         command: Command,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError>;
+
+    /// Dispatches a command, waiting up to `max_wait` for a flow-control
+    /// grant when the target handler is out of permits. Sticky
+    /// (routing-keyed) commands wait on their ring-selected handler
+    /// specifically — they are never re-routed. With permit-wait disabled
+    /// in the bus config this behaves exactly like [`dispatch_command`].
+    ///
+    /// [`dispatch_command`]: CommandDispatcher::dispatch_command
+    fn dispatch_command_wait(&self, command: Command, max_wait: Duration) -> DispatchFuture<'_>;
+
+    /// Dispatches a command to a specific handler instance — the fabric
+    /// path (ADR-0007): selection happened on the dispatching node, this
+    /// node just delivers. Bounded permit wait, never re-selects.
+    fn dispatch_command_to_wait(
+        &self,
+        command: Command,
+        target: ClientId,
+        max_wait: Duration,
+    ) -> DispatchFuture<'_>;
 
     /// Completes a pending command with a response from the handler.
     fn complete_command(&self, request_id: &str, result: CommandResult);

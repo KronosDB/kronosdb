@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use kronosdb_eventstore::raft::cluster::ClusterManager;
+use kronosdb_eventstore::raft::handler_registry::{HandlerKind, HandlerRegistration};
 use kronosdb_messaging::manager::MessagingManager;
 use kronosdb_messaging::query::Query;
 use kronosdb_messaging::subscription::{SubscriptionQuery, SubscriptionUpdate};
@@ -20,9 +22,6 @@ use crate::handler_registry::HandlerStreamRegistry;
 use crate::platform::service::ClientChannelRegistry;
 use crate::proto::kronosdb::platform as platform_pb;
 use crate::proto::kronosdb::query as pb;
-
-const CONTEXT_HEADER: &str = "kronosdb-context";
-const DEFAULT_CONTEXT: &str = "default";
 
 type HandlerSender = mpsc::Sender<Result<pb::QueryHandlerInbound, Status>>;
 
@@ -39,7 +38,7 @@ type PendingSubscriptionInitials = Arc<DashMap<String, SubscriptionInitialSender
 
 /// gRPC service implementation for the query bus.
 ///
-/// Routes handlers to per-context messaging engines via `kronosdb-context` header.
+/// Routes handlers to named messaging buses via the `kronosdb-bus` header.
 /// `handler_streams` and `pending_queries` are sharded maps so concurrent
 /// queries and response completions don't contend on a single mutex.
 pub struct QueryServiceImpl {
@@ -50,6 +49,7 @@ pub struct QueryServiceImpl {
     query_timeout: Duration,
     channel_registry: Arc<ClientChannelRegistry>,
     handler_stream_registry: Arc<HandlerStreamRegistry>,
+    cluster: Arc<ClusterManager>,
 }
 
 impl QueryServiceImpl {
@@ -58,6 +58,7 @@ impl QueryServiceImpl {
         query_timeout: Duration,
         channel_registry: Arc<ClientChannelRegistry>,
         handler_stream_registry: Arc<HandlerStreamRegistry>,
+        cluster: Arc<ClusterManager>,
     ) -> Self {
         Self {
             messaging,
@@ -67,6 +68,7 @@ impl QueryServiceImpl {
             query_timeout,
             channel_registry,
             handler_stream_registry,
+            cluster,
         }
     }
 }
@@ -81,14 +83,9 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         &self,
         request: Request<Streaming<pb::QueryHandlerOutbound>>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
-        let context = request
-            .metadata()
-            .get(CONTEXT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_CONTEXT)
-            .to_string();
-        tracing::info!(context = %context, "Query OpenStream opened");
-        let platform = self.messaging.get_platform(&context);
+        let bus = super::bus_from_metadata(request.metadata());
+        tracing::info!(bus = %bus, "Query OpenStream opened");
+        let platform = self.messaging.get_platform(&bus);
 
         let mut inbound = request.into_inner();
         // 4096 absorbs dispatch bursts without blocking the send.await path.
@@ -100,6 +97,8 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let pending_sub_initials = Arc::clone(&self.pending_sub_initials);
         let channel_registry = Arc::clone(&self.channel_registry);
         let handler_stream_registry = Arc::clone(&self.handler_stream_registry);
+        let cluster = Arc::clone(&self.cluster);
+        let reg_bus = bus.clone();
         let mut client_id: Option<String> = None;
 
         tokio::spawn(async move {
@@ -167,6 +166,23 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                             ComponentName(sub.component_name),
                         );
 
+                        // Replicated routing-table row (ADR-0007); query
+                        // fan-out consumes these in the next fabric stage.
+                        let registration = HandlerRegistration {
+                            bus: reg_bus.clone(),
+                            kind: HandlerKind::Query,
+                            message_type: query_name.clone(),
+                            client_id: sub_client_id.clone(),
+                            node_id: cluster.local_node_id(),
+                            load_factor: 100,
+                        };
+                        let reg_cluster = Arc::clone(&cluster);
+                        tokio::spawn(async move {
+                            if let Err(e) = reg_cluster.register_handler(registration).await {
+                                tracing::warn!(error = %e, "fabric: query handler registration write failed");
+                            }
+                        });
+
                         channel_registry
                             .broadcast_topology_notification(platform_pb::TopologyNotification {
                                 change_type: "handler_registered".to_string(),
@@ -195,6 +211,24 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         let query_name = sub.query.clone();
                         let unsub_client_id = sub.client_id.clone();
                         platform.unsubscribe_query(&sub.query, &ClientId(sub.client_id));
+
+                        let dereg_cluster = Arc::clone(&cluster);
+                        let dereg_bus = reg_bus.clone();
+                        let dereg_type = query_name.clone();
+                        let dereg_client = unsub_client_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = dereg_cluster
+                                .deregister_handler(
+                                    &dereg_bus,
+                                    HandlerKind::Query,
+                                    &dereg_type,
+                                    &dereg_client,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, "fabric: query handler deregistration write failed");
+                            }
+                        });
 
                         channel_registry
                             .broadcast_topology_notification(platform_pb::TopologyNotification {
@@ -287,6 +321,16 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
 
                 if !was_cancelled {
                     let client = ClientId(cid.clone());
+                    let dereg_cluster = Arc::clone(&cluster);
+                    let dereg_client = cid.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = dereg_cluster
+                            .deregister_client_handlers(&dereg_client)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "fabric: client deregistration write failed");
+                        }
+                    });
                     for query in &subscribed_queries {
                         platform.unsubscribe_query(query, &client);
                     }
@@ -321,13 +365,8 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         &self,
         request: Request<pb::QueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
-        let context = request
-            .metadata()
-            .get(CONTEXT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_CONTEXT)
-            .to_string();
-        let platform = self.messaging.get_platform(&context);
+        let bus = super::bus_from_metadata(request.metadata());
+        let platform = self.messaging.get_platform(&bus);
 
         let req = request.into_inner();
         let message_id = req.message_identifier.clone();
@@ -440,13 +479,8 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         &self,
         request: Request<Streaming<pb::SubscriptionQueryRequest>>,
     ) -> Result<Response<Self::SubscriptionStream>, Status> {
-        let context = request
-            .metadata()
-            .get(CONTEXT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_CONTEXT)
-            .to_string();
-        let platform = self.messaging.get_platform(&context);
+        let bus = super::bus_from_metadata(request.metadata());
+        let platform = self.messaging.get_platform(&bus);
 
         let mut inbound = request.into_inner();
         let (sub_tx, sub_rx) = mpsc::channel::<Result<pb::SubscriptionQueryResponse, Status>>(64);

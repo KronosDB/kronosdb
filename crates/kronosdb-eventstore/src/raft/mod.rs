@@ -5,6 +5,7 @@
 //! `routed_engine` connect committed claims to byte-exact segment replication.
 
 pub mod cluster;
+pub mod handler_registry;
 pub mod log_store;
 mod native_coordinator;
 pub mod network;

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use kronosdb_eventstore::raft::cluster::ClusterManager;
+use kronosdb_eventstore::raft::handler_registry::{HandlerKind, HandlerRegistration};
 use kronosdb_messaging::command::{Command, CommandResult};
 use kronosdb_messaging::manager::MessagingManager;
 use kronosdb_messaging::types::{ClientId, ComponentName, Payload, RoutingKey};
@@ -14,29 +15,27 @@ use super::convert::{
     effective_timeout, internal_metadata_to_proto, internal_pi_to_proto,
     proto_metadata_to_internal, proto_pi_to_internal,
 };
+use super::fabric::{CommandHandlerStreams, CommandRoute, FabricRouter, forward_command};
 use crate::handler_registry::HandlerStreamRegistry;
 use crate::platform::service::ClientChannelRegistry;
 use crate::proto::kronosdb::command as pb;
 use crate::proto::kronosdb::platform as platform_pb;
 
-/// gRPC metadata header for context routing.
-const CONTEXT_HEADER: &str = "kronosdb-context";
-const DEFAULT_CONTEXT: &str = "default";
-
-type HandlerSender = mpsc::Sender<Result<pb::CommandHandlerInbound, Status>>;
-
 /// gRPC service implementation for the command bus.
 ///
-/// Routes handlers to per-context messaging engines via `kronosdb-context` header.
+/// Routes handlers to named messaging buses via the `kronosdb-bus` header.
 /// `handler_streams` is sharded so concurrent dispatches don't contend; the
 /// caller-side response channel lives in the messaging engine's in-flight map
-/// rather than a parallel gRPC-side map.
+/// rather than a parallel gRPC-side map. Dispatch is location-aware
+/// (ADR-0007): handlers on remote nodes are reached through the fabric.
 pub struct CommandServiceImpl {
     messaging: Arc<MessagingManager>,
-    handler_streams: Arc<DashMap<String, HandlerSender>>,
+    handler_streams: CommandHandlerStreams,
     command_timeout: Duration,
     channel_registry: Arc<ClientChannelRegistry>,
     handler_stream_registry: Arc<HandlerStreamRegistry>,
+    cluster: Arc<ClusterManager>,
+    fabric: Arc<FabricRouter>,
 }
 
 impl CommandServiceImpl {
@@ -45,13 +44,18 @@ impl CommandServiceImpl {
         command_timeout: Duration,
         channel_registry: Arc<ClientChannelRegistry>,
         handler_stream_registry: Arc<HandlerStreamRegistry>,
+        handler_streams: CommandHandlerStreams,
+        cluster: Arc<ClusterManager>,
+        fabric: Arc<FabricRouter>,
     ) -> Self {
         Self {
             messaging,
-            handler_streams: Arc::new(DashMap::new()),
+            handler_streams,
             command_timeout,
             channel_registry,
             handler_stream_registry,
+            cluster,
+            fabric,
         }
     }
 }
@@ -64,14 +68,9 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         &self,
         request: Request<Streaming<pb::CommandHandlerOutbound>>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
-        let context = request
-            .metadata()
-            .get(CONTEXT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_CONTEXT)
-            .to_string();
-        tracing::info!(context = %context, "Command OpenStream opened");
-        let platform = self.messaging.get_platform(&context);
+        let bus = super::bus_from_metadata(request.metadata());
+        tracing::info!(bus = %bus, "Command OpenStream opened");
+        let platform = self.messaging.get_platform(&bus);
 
         let mut inbound = request.into_inner();
         // 4096 absorbs dispatch bursts without blocking the send.await path.
@@ -81,6 +80,8 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         let handler_streams = Arc::clone(&self.handler_streams);
         let channel_registry = Arc::clone(&self.channel_registry);
         let handler_stream_registry = Arc::clone(&self.handler_stream_registry);
+        let cluster = Arc::clone(&self.cluster);
+        let reg_bus = bus.clone();
         let mut client_id: Option<String> = None;
 
         tokio::spawn(async move {
@@ -149,6 +150,25 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                             sub.load_factor,
                         );
 
+                        // Publish to the replicated routing table so every
+                        // node can route to this handler (ADR-0007). Written
+                        // off the stream loop; dispatch falls back to the
+                        // local path until it lands.
+                        let registration = HandlerRegistration {
+                            bus: reg_bus.clone(),
+                            kind: HandlerKind::Command,
+                            message_type: command_name.clone(),
+                            client_id: sub_client_id.clone(),
+                            node_id: cluster.local_node_id(),
+                            load_factor: sub.load_factor,
+                        };
+                        let reg_cluster = Arc::clone(&cluster);
+                        tokio::spawn(async move {
+                            if let Err(e) = reg_cluster.register_handler(registration).await {
+                                tracing::warn!(error = %e, "fabric: handler registration write failed");
+                            }
+                        });
+
                         channel_registry
                             .broadcast_topology_notification(platform_pb::TopologyNotification {
                                 change_type: "handler_registered".to_string(),
@@ -177,6 +197,24 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                         let command_name = sub.command.clone();
                         let unsub_client_id = sub.client_id.clone();
                         platform.unsubscribe_command(&sub.command, &ClientId(sub.client_id));
+
+                        let dereg_cluster = Arc::clone(&cluster);
+                        let dereg_bus = reg_bus.clone();
+                        let dereg_type = command_name.clone();
+                        let dereg_client = unsub_client_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = dereg_cluster
+                                .deregister_handler(
+                                    &dereg_bus,
+                                    HandlerKind::Command,
+                                    &dereg_type,
+                                    &dereg_client,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, "fabric: handler deregistration write failed");
+                            }
+                        });
 
                         channel_registry
                             .broadcast_topology_notification(platform_pb::TopologyNotification {
@@ -214,6 +252,16 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                     let client = ClientId(cid.clone());
                     // Removes all subscriptions and cancels in-flight commands
                     // (each receives a KRONOSDB-4006 failure on its caller).
+                    let dereg_cluster = Arc::clone(&cluster);
+                    let dereg_client = cid.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = dereg_cluster
+                            .deregister_client_handlers(&dereg_client)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "fabric: client deregistration write failed");
+                        }
+                    });
                     let cancelled = platform.remove_command_client(&client);
                     tracing::info!(
                         client_id = %cid,
@@ -247,23 +295,47 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
         &self,
         request: Request<pb::Command>,
     ) -> Result<Response<pb::CommandResponse>, Status> {
-        let context = request
-            .metadata()
-            .get(CONTEXT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(DEFAULT_CONTEXT)
-            .to_string();
-        let platform = self.messaging.get_platform(&context);
+        let bus = super::bus_from_metadata(request.metadata());
+        let platform = self.messaging.get_platform(&bus);
 
         let cmd = request.into_inner();
+        let routing_key = routing_key_of(&cmd);
+        let instructions = proto_pi_to_internal(cmd.processing_instructions.clone());
+        let timeout = effective_timeout(&instructions, self.command_timeout);
+
+        // Location-aware routing (ADR-0007): selection runs against the
+        // replicated handler table. A remote owner means the command never
+        // touches the local bus — it forwards to the owning node, which
+        // acquires the permit and delivers.
+        let route = self
+            .fabric
+            .route_command(&bus, &cmd.name, routing_key.as_deref());
+        if let CommandRoute::Remote { client_id, node_id } = route {
+            return forward_command(&self.cluster, node_id, &bus, client_id, cmd, timeout)
+                .await
+                .map(Response::new);
+        }
+
         let command = from_proto_command(cmd);
         let message_id = command.message_id.clone();
+        let dispatch_started = tokio::time::Instant::now();
 
         // Dispatch — selects a handler, acquires a permit, and registers the
-        // in-flight tracking entry holding the response sender.
-        let (pending_cmd, response_rx) = platform
-            .dispatch_command(command)
-            .map_err(|e| Status::unavailable(e.to_string()))?;
+        // in-flight tracking entry holding the response sender. When the
+        // target handler is saturated this waits (bounded by the command
+        // timeout) for a flow-control grant rather than failing immediately.
+        let dispatched = match route {
+            // Keyed command whose ring owner is local: deliver to exactly
+            // that handler — the global ring decision, not local re-selection.
+            CommandRoute::Local { client_id } => {
+                platform
+                    .dispatch_command_to_wait(command, ClientId(client_id), timeout)
+                    .await
+            }
+            _ => platform.dispatch_command_wait(command, timeout).await,
+        };
+        let (pending_cmd, response_rx) =
+            dispatched.map_err(|e| Status::unavailable(e.to_string()))?;
 
         // Find the selected handler's stream and deliver the command.
         let target_id = &pending_cmd.target_handler.0;
@@ -288,13 +360,12 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             return Err(Status::unavailable("handler disconnected"));
         }
 
-        // Wait for the handler's response, with a per-request timeout. The
-        // bus also runs a background sweep as a safety net, but the per-
-        // request deadline is enforced here so callers see deadline_exceeded.
-        let timeout = effective_timeout(
-            &pending_cmd.command.processing_instructions,
-            self.command_timeout,
-        );
+        // Wait for the handler's response. The command timeout is one
+        // budget covering dispatch (including any permit wait) plus the
+        // handler's response — deduct what dispatch consumed. The bus also
+        // runs a background sweep as a safety net, but the per-request
+        // deadline is enforced here so callers see deadline_exceeded.
+        let timeout = timeout.saturating_sub(dispatch_started.elapsed());
         match tokio::time::timeout(timeout, response_rx).await {
             Ok(Ok(result)) => Ok(Response::new(to_proto_command_response(result))),
             Ok(Err(_)) => {
@@ -313,19 +384,22 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
     }
 }
 
-fn from_proto_command(cmd: pb::Command) -> Command {
-    let routing_key = cmd.processing_instructions.iter().find_map(|pi| {
+/// Extracts the routing key from a proto command's processing instructions.
+pub(crate) fn routing_key_of(cmd: &pb::Command) -> Option<String> {
+    cmd.processing_instructions.iter().find_map(|pi| {
         if pi.key == crate::proto::kronosdb::ProcessingKey::RoutingKey as i32 {
             pi.value.as_ref().and_then(|v| match &v.data {
-                Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => {
-                    Some(RoutingKey(s.clone()))
-                }
+                Some(crate::proto::kronosdb::metadata_value::Data::TextValue(s)) => Some(s.clone()),
                 _ => None,
             })
         } else {
             None
         }
-    });
+    })
+}
+
+pub(crate) fn from_proto_command(cmd: pb::Command) -> Command {
+    let routing_key = routing_key_of(&cmd).map(RoutingKey);
 
     let processing_instructions = proto_pi_to_internal(cmd.processing_instructions);
 
@@ -381,7 +455,7 @@ fn from_proto_command_response(resp: pb::CommandResponse) -> CommandResult {
     }
 }
 
-fn to_proto_command_inbound(cmd: &Command) -> pb::CommandHandlerInbound {
+pub(crate) fn to_proto_command_inbound(cmd: &Command) -> pb::CommandHandlerInbound {
     pb::CommandHandlerInbound {
         request: Some(pb::command_handler_inbound::Request::Command(pb::Command {
             message_identifier: cmd.message_id.clone(),
@@ -401,7 +475,7 @@ fn to_proto_command_inbound(cmd: &Command) -> pb::CommandHandlerInbound {
     }
 }
 
-fn to_proto_command_response(result: CommandResult) -> pb::CommandResponse {
+pub(crate) fn to_proto_command_response(result: CommandResult) -> pb::CommandResponse {
     pb::CommandResponse {
         message_identifier: result.message_id,
         error_code: result.error_code.unwrap_or_default(),

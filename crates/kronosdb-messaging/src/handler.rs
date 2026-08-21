@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use crate::ring::Ring;
 use crate::types::{ClientId, ComponentName};
 
 /// Snapshot of a single handler's state, for admin display.
@@ -100,6 +101,9 @@ pub struct MessageTypeDetail {
     pub name: String,
     pub handlers: Vec<HandlerDetail>,
     pub metrics: MetricsSnapshot,
+    /// Bus this detail belongs to. Empty at the engine level; stamped by
+    /// `MessagingManager` when aggregating across buses.
+    pub bus: String,
 }
 
 /// A registered handler — a connected client that can process messages.
@@ -165,6 +169,12 @@ pub struct HandlerRegistry {
     subscriptions: HashMap<String, Vec<HandlerEntry>>,
     /// client_id → list of message types they handle
     client_subscriptions: HashMap<ClientId, Vec<String>>,
+    /// message_type → consistent-hash ring over that type's handler list.
+    /// Rebuilt on every registration change (rare), read on every
+    /// routing-keyed dispatch (hot). Indices are only valid against the
+    /// same registry state the ring was built from — both are read under
+    /// the bus's lock, so they can't drift.
+    rings: HashMap<String, Ring>,
 }
 
 /// An entry in the handler list for a message type.
@@ -183,6 +193,25 @@ impl HandlerRegistry {
         Self {
             subscriptions: HashMap::new(),
             client_subscriptions: HashMap::new(),
+            rings: HashMap::new(),
+        }
+    }
+
+    /// Rebuilds the consistent-hash ring for a message type after its
+    /// handler list changed.
+    fn rebuild_ring(&mut self, message_type: &str) {
+        match self.subscriptions.get(message_type) {
+            Some(handlers) if !handlers.is_empty() => {
+                let ring = Ring::build(
+                    handlers
+                        .iter()
+                        .map(|e| (e.handler.client_id.0.as_str(), e.handler.load_factor)),
+                );
+                self.rings.insert(message_type.to_string(), ring);
+            }
+            _ => {
+                self.rings.remove(message_type);
+            }
         }
     }
 
@@ -215,8 +244,9 @@ impl HandlerRegistry {
 
         let types = self.client_subscriptions.entry(client_id).or_default();
         if !types.contains(&message_type) {
-            types.push(message_type);
+            types.push(message_type.clone());
         }
+        self.rebuild_ring(&message_type);
     }
 
     /// Unregisters a handler for a message type.
@@ -234,6 +264,7 @@ impl HandlerRegistry {
                 self.client_subscriptions.remove(client_id);
             }
         }
+        self.rebuild_ring(message_type);
     }
 
     /// Removes all subscriptions for a client (e.g., on disconnect).
@@ -246,6 +277,7 @@ impl HandlerRegistry {
                         self.subscriptions.remove(&message_type);
                     }
                 }
+                self.rebuild_ring(&message_type);
             }
         }
     }
@@ -253,6 +285,12 @@ impl HandlerRegistry {
     /// Gets the handlers for a message type.
     pub fn get_handlers(&self, message_type: &str) -> Option<&Vec<HandlerEntry>> {
         self.subscriptions.get(message_type)
+    }
+
+    /// Resolves a routing key to a handler index via the message type's
+    /// consistent-hash ring.
+    pub fn ring_lookup(&self, message_type: &str, key: &str) -> Option<usize> {
+        self.rings.get(message_type).and_then(|r| r.lookup(key))
     }
 
     /// Grants permits to a specific client across all their subscriptions.

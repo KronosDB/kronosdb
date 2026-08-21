@@ -13,6 +13,7 @@ use openraft::{
 use crate::context::ContextManager;
 use crate::error::Error;
 
+use super::handler_registry::HandlerRoutingTable;
 use super::snapshot_format::{MetadataSnapshot, read_snapshot, write_snapshot};
 use super::snapshot_store::{PersistedControlState, SnapshotStore};
 use super::types::{LeaderClaim, NodeId, RaftRequest, RaftResponse, TypeConfig};
@@ -34,6 +35,9 @@ pub struct EventStoreStateMachine {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, openraft::BasicNode>,
     leader_claim: Option<LeaderClaim>,
+    /// Replicated messaging-handler routing table (ADR-0007). Shared with
+    /// `ClusterManager` so dispatch paths read the same applied state.
+    handler_routing: Arc<HandlerRoutingTable>,
     control_updates: tokio::sync::watch::Sender<AppliedControlState>,
 }
 
@@ -41,6 +45,7 @@ impl EventStoreStateMachine {
     pub fn new(
         contexts: Arc<ContextManager>,
         snapshot_store: Arc<SnapshotStore>,
+        handler_routing: Arc<HandlerRoutingTable>,
         control_updates: tokio::sync::watch::Sender<AppliedControlState>,
     ) -> Result<Self, Error> {
         let durable = snapshot_store.load_control_state().map_err(Error::Io)?;
@@ -113,6 +118,9 @@ impl EventStoreStateMachine {
         for name in &metadata.contexts {
             Self::create_context_idempotent(&contexts, name)?;
         }
+        // Provisional restore: stale rows are removed by each node's startup
+        // ClearNodeHandlers entry and by membership diffs.
+        handler_routing.restore(metadata.handlers);
 
         tracing::info!(
             target: "raft.recovery",
@@ -128,6 +136,7 @@ impl EventStoreStateMachine {
             last_applied,
             last_membership,
             leader_claim: metadata.leader_claim,
+            handler_routing,
             control_updates,
         };
         state.publish_control_state();
@@ -145,6 +154,7 @@ impl EventStoreStateMachine {
         MetadataSnapshot {
             contexts: self.contexts.list_contexts(),
             leader_claim: self.leader_claim.clone(),
+            handlers: self.handler_routing.rows(),
         }
     }
 
@@ -211,6 +221,35 @@ impl EventStoreStateMachine {
                 });
                 Ok(RaftResponse::LeaderClaimed { epoch })
             }
+            RaftRequest::RegisterHandler { registration } => {
+                self.handler_routing.apply_register(registration);
+                Ok(RaftResponse::Ok)
+            }
+            RaftRequest::DeregisterHandler {
+                bus,
+                kind,
+                message_type,
+                client_id,
+                node_id,
+            } => {
+                self.handler_routing.apply_deregister(
+                    &bus,
+                    kind,
+                    &message_type,
+                    &client_id,
+                    node_id,
+                );
+                Ok(RaftResponse::Ok)
+            }
+            RaftRequest::DeregisterClient { client_id, node_id } => {
+                self.handler_routing
+                    .apply_deregister_client(&client_id, node_id);
+                Ok(RaftResponse::Ok)
+            }
+            RaftRequest::ClearNodeHandlers { node_id } => {
+                self.handler_routing.apply_clear_node(node_id);
+                Ok(RaftResponse::Ok)
+            }
         }
     }
 }
@@ -253,6 +292,12 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
                                 error,
                             )
                         })?;
+                    // Handler registrations are leased to membership: rows
+                    // owned by a node that left the cluster drop here, on
+                    // every node, at the same log position.
+                    let live: std::collections::BTreeSet<NodeId> =
+                        membership.nodes().map(|(id, _)| *id).collect();
+                    self.handler_routing.retain_nodes(&live);
                     RaftResponse::Ok
                 }
                 EntryPayload::Blank => RaftResponse::Ok,
@@ -352,6 +397,7 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         self.leader_claim = metadata.leader_claim;
+        self.handler_routing.restore(metadata.handlers);
 
         self.snapshot_store
             .save_membership(&self.last_membership)

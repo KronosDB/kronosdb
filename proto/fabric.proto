@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package kronosdb.fabric;
+
+import "command.proto";
+import "query.proto";
+
+// Internode messaging-fabric service (ADR-0007 Tier 2).
+//
+// Carries commands and queries from the node a dispatcher is connected to
+// ("dispatching node") to the node the target handler is connected to
+// ("owning node"). Handler selection — ring or weighted round-robin over
+// the Raft-replicated routing table — happens on the dispatching node;
+// the forward names the chosen handler explicitly. The owning node
+// acquires the handler's flow-control permit, delivers on the handler's
+// local stream, and relays the response.
+//
+// Peer-to-peer only: authenticated with the same kronosdb-token / mTLS
+// as Raft transport and segment replication.
+service MessagingFabric {
+  // Deliver a command to a handler connected to the receiving node and
+  // return its response.
+  rpc ForwardCommand(ForwardCommandRequest) returns (kronosdb.command.CommandResponse);
+
+  // Deliver a query to handlers connected to the receiving node and
+  // stream their responses back.
+  rpc ForwardQuery(ForwardQueryRequest) returns (stream kronosdb.query.QueryResponse);
+}
+
+message ForwardCommandRequest {
+  // Bus the command belongs to.
+  string bus = 1;
+  // The handler instance the dispatching node selected.
+  string target_client_id = 2;
+  kronosdb.command.Command command = 3;
+  // Remaining time budget, milliseconds. The owning node bounds its
+  // permit wait and response wait by this.
+  uint64 timeout_ms = 4;
+}
+
+message ForwardQueryRequest {
+  string bus = 1;
+  // Handler instances on the receiving node that should see the query.
+  repeated string target_client_ids = 2;
+  kronosdb.query.QueryRequest query = 3;
+  uint64 timeout_ms = 4;
+}

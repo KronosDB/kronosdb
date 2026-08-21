@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use kronosdb_messaging::api::MessagingPlatform;
+use kronosdb_eventstore::raft::cluster::ClusterManager;
 use kronosdb_messaging::client::ClientRegistry;
 use kronosdb_messaging::manager::MessagingManager;
 use kronosdb_messaging::types::{ClientId, ComponentName};
@@ -105,7 +105,7 @@ pub struct PlatformServiceImpl {
     processor_registry: Arc<ProcessorRegistry>,
     messaging: Arc<MessagingManager>,
     handler_stream_registry: Arc<HandlerStreamRegistry>,
-    platform: Arc<dyn MessagingPlatform>,
+    cluster: Arc<ClusterManager>,
     context_names: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     node_name: String,
     heartbeat_interval: Duration,
@@ -120,7 +120,7 @@ impl PlatformServiceImpl {
         processor_registry: Arc<ProcessorRegistry>,
         messaging: Arc<MessagingManager>,
         handler_stream_registry: Arc<HandlerStreamRegistry>,
-        platform: Arc<dyn MessagingPlatform>,
+        cluster: Arc<ClusterManager>,
         context_names: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         node_name: String,
         heartbeat_interval: Duration,
@@ -132,7 +132,7 @@ impl PlatformServiceImpl {
             processor_registry,
             messaging,
             handler_stream_registry,
-            platform,
+            cluster,
             context_names,
             node_name,
             heartbeat_interval,
@@ -187,7 +187,7 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
         let processor_registry = Arc::clone(&self.processor_registry);
         let messaging = Arc::clone(&self.messaging);
         let handler_stream_registry = Arc::clone(&self.handler_stream_registry);
-        let platform = Arc::clone(&self.platform);
+        let cluster = Arc::clone(&self.cluster);
         let platform_info = self.make_platform_info();
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_timeout = self.heartbeat_timeout;
@@ -313,10 +313,13 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
             client_registry.set_stream_active(&cid, false);
             client_registry.unregister(&cid);
 
-            platform.remove_client(&cid);
-            for context in messaging.list_contexts() {
-                let ctx_platform = messaging.get_platform(&context);
-                ctx_platform.remove_client(&cid);
+            for bus in messaging.list_buses() {
+                messaging.get_platform(&bus).remove_client(&cid);
+            }
+            // Drop the client's rows from the replicated routing table so
+            // other nodes stop forwarding to it (ADR-0007).
+            if let Err(e) = cluster.deregister_client_handlers(&client_id).await {
+                tracing::warn!(error = %e, "fabric: cascade deregistration write failed");
             }
         });
 
@@ -325,10 +328,11 @@ impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
 }
 
 /// Spawns a background task that periodically reaps dead clients from the
-/// registry and cleans up their messaging subscriptions.
+/// registry and cleans up their messaging subscriptions on every bus.
 pub fn spawn_reaper(
     client_registry: Arc<ClientRegistry>,
-    platform: Arc<dyn MessagingPlatform>,
+    messaging: Arc<MessagingManager>,
+    cluster: Arc<ClusterManager>,
     timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -337,7 +341,12 @@ pub fn spawn_reaper(
             interval.tick().await;
             let dead = client_registry.reap_dead_clients(timeout);
             for cid in dead {
-                platform.remove_client(&cid);
+                for bus in messaging.list_buses() {
+                    messaging.get_platform(&bus).remove_client(&cid);
+                }
+                if let Err(e) = cluster.deregister_client_handlers(&cid.0).await {
+                    tracing::warn!(error = %e, "fabric: reaper deregistration write failed");
+                }
             }
         }
     })

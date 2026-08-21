@@ -13,6 +13,7 @@ public class KronosDbConfiguration {
 
     private String servers = "localhost:50051";
     private String context = "default";
+    private @Nullable String busName;
     private String clientId = UUID.randomUUID().toString();
     private String componentName = "Unnamed";
     private @Nullable String token;
@@ -50,6 +51,20 @@ public class KronosDbConfiguration {
 
     public void setContext(String context) {
         this.context = context;
+    }
+
+    /**
+     * Messaging bus for command, query, and subscription-query calls.
+     * Independent of the event store context (ADR-0006); {@code null}
+     * routes messaging to the server's {@code default} bus.
+     */
+    @Nullable
+    public String getBusName() {
+        return busName;
+    }
+
+    public void setBusName(@Nullable String busName) {
+        this.busName = busName;
     }
 
     public String getClientId() {
@@ -160,6 +175,11 @@ public class KronosDbConfiguration {
 
         public Builder context(String context) {
             config.setContext(context);
+            return this;
+        }
+
+        public Builder busName(String busName) {
+            config.setBusName(busName);
             return this;
         }
 

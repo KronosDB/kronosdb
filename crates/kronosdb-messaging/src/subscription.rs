@@ -98,6 +98,9 @@ pub struct SubscriptionInfo {
     pub subscriber_component: ComponentName,
     pub handler_client_id: ClientId,
     pub since_opened: Duration,
+    /// Bus this subscription belongs to. Empty at the engine level; stamped
+    /// by `MessagingManager` when aggregating across buses.
+    pub bus: String,
 }
 
 /// An active subscription — tracks the channel for sending updates to the subscriber.
@@ -370,6 +373,7 @@ impl SubscriptionRegistry {
                 subscriber_component: sub.component_name.clone(),
                 handler_client_id: sub.handler_client_id.clone(),
                 since_opened: now.duration_since(sub.opened_at),
+                bus: String::new(),
             })
             .collect()
     }

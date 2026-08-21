@@ -3,9 +3,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{
-    CommandDispatcher, MessagingPlatform, QueryDispatcher, SubscriptionQueryDispatcher,
+    CommandDispatcher, DispatchFuture, MessagingPlatform, QueryDispatcher,
+    SubscriptionQueryDispatcher,
 };
-use crate::command::{Command, CommandBus, CommandError, CommandResult, PendingCommand};
+use crate::command::{
+    Command, CommandBus, CommandBusConfig, CommandError, CommandResult, PendingCommand,
+};
 use crate::handler::MessageTypeDetail;
 use crate::query::{PendingQuery, Query, QueryBus, QueryError};
 use crate::subscription::{
@@ -32,10 +35,20 @@ impl Default for MessagingEngine {
 
 impl MessagingEngine {
     pub fn new() -> Self {
+        Self::with_permit_wait(true)
+    }
+
+    /// Creates an engine with an explicit permit-wait policy for its
+    /// command bus (`false` = fail fast when handlers are saturated).
+    pub fn with_permit_wait(permit_wait: bool) -> Self {
         let query_bus = QueryBus::new();
         let subscriptions = SubscriptionRegistry::with_shared_handlers(query_bus.shared_handlers());
+        let command_config = CommandBusConfig {
+            permit_wait,
+            ..CommandBusConfig::default()
+        };
         Self {
-            command_bus: CommandBus::new(),
+            command_bus: CommandBus::with_config(command_config),
             query_bus,
             subscriptions,
         }
@@ -86,6 +99,23 @@ impl CommandDispatcher for MessagingEngine {
         command: Command,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
         self.command_bus.dispatch(command)
+    }
+
+    fn dispatch_command_wait(&self, command: Command, max_wait: Duration) -> DispatchFuture<'_> {
+        Box::pin(self.command_bus.dispatch_wait(command, max_wait))
+    }
+
+    fn dispatch_command_to_wait(
+        &self,
+        command: Command,
+        target: ClientId,
+        max_wait: Duration,
+    ) -> DispatchFuture<'_> {
+        Box::pin(async move {
+            self.command_bus
+                .dispatch_to_wait(command, &target, max_wait)
+                .await
+        })
     }
 
     fn complete_command(&self, request_id: &str, result: CommandResult) {

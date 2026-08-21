@@ -34,6 +34,7 @@ use kronosdb_messaging::manager::MessagingManager;
 use crate::config::ServerConfig;
 use crate::eventstore::service::EventStoreService;
 use crate::messaging::command_service::CommandServiceImpl;
+use crate::messaging::fabric as messaging_fabric;
 use crate::messaging::query_service::QueryServiceImpl;
 use crate::platform::service::{ClientChannelRegistry, PlatformServiceImpl, spawn_reaper};
 
@@ -190,8 +191,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = cluster.add_learner(learner.id, learner.addr.clone()).await;
     }
 
-    // Create the messaging manager (per-context) and client registries.
-    let messaging = Arc::new(MessagingManager::new());
+    // Create the messaging manager (named buses, independent of event store
+    // contexts — ADR-0006) and client registries.
+    let messaging = Arc::new(MessagingManager::with_permit_wait(
+        config.messaging_permit_wait,
+    ));
     let client_registry = Arc::new(ClientRegistry::new());
     let channel_registry = Arc::new(ClientChannelRegistry::new());
     let processor_registry = Arc::new(processor::ProcessorRegistry::new());
@@ -201,18 +205,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_store_service =
         EventStoreService::new(Arc::clone(&cluster), config.max_snapshot_size);
     let scheduler_service = scheduler_service::SchedulerServiceImpl::new(Arc::clone(&cluster));
+    // Command handler delivery channels are shared with the fabric service
+    // so forwarded commands reach locally-connected handlers (ADR-0007).
+    let command_handler_streams: messaging_fabric::CommandHandlerStreams =
+        Arc::new(dashmap::DashMap::new());
+    let fabric_router = Arc::new(messaging_fabric::FabricRouter::new(Arc::clone(&cluster)));
     let command_service = CommandServiceImpl::new(
         Arc::clone(&messaging),
         Duration::from_secs(config.command_timeout_secs),
         Arc::clone(&channel_registry),
         Arc::clone(&handler_stream_registry),
+        Arc::clone(&command_handler_streams),
+        Arc::clone(&cluster),
+        Arc::clone(&fabric_router),
     );
     let query_service = QueryServiceImpl::new(
         Arc::clone(&messaging),
         Duration::from_secs(config.query_timeout_secs),
         Arc::clone(&channel_registry),
         Arc::clone(&handler_stream_registry),
+        Arc::clone(&cluster),
     );
+    let fabric_service = messaging_fabric::FabricServiceImpl::new(
+        Arc::clone(&messaging),
+        Arc::clone(&command_handler_streams),
+    );
+
+    // Drop any handler rows this node stranded in a previous life — a
+    // crashed process cannot deregister its clients. Retries in the
+    // background until the control plane has a leader to accept it.
+    {
+        let clear_cluster = Arc::clone(&cluster);
+        tokio::spawn(async move {
+            for attempt in 1..=10u32 {
+                match clear_cluster.clear_node_handlers().await {
+                    Ok(()) => return,
+                    Err(e) if attempt == 10 => {
+                        warn!(error = %e, "fabric: startup ClearNodeHandlers failed; stale rows may linger until membership change");
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await,
+                }
+            }
+        });
+    }
 
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
     let heartbeat_timeout = Duration::from_secs(config.heartbeat_timeout_secs);
@@ -221,25 +256,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let contexts = Arc::clone(&contexts);
         Arc::new(move || contexts.list_contexts()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
     };
-    // Platform service uses the default context for client cleanup.
-    let default_platform = messaging.get_platform("default");
     let platform_service = PlatformServiceImpl::new(
         Arc::clone(&client_registry),
         Arc::clone(&channel_registry),
         Arc::clone(&processor_registry),
         Arc::clone(&messaging),
         Arc::clone(&handler_stream_registry),
-        default_platform.clone(),
+        Arc::clone(&cluster),
         context_names,
         config.node_name.clone(),
         heartbeat_interval,
         heartbeat_timeout,
     );
 
-    // Spawn background heartbeat reaper.
+    // Spawn background heartbeat reaper (cleans dead clients off every bus
+    // and out of the replicated routing table).
     let _reaper = spawn_reaper(
         Arc::clone(&client_registry),
-        default_platform,
+        Arc::clone(&messaging),
+        Arc::clone(&cluster),
         heartbeat_timeout,
     );
 
@@ -254,12 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await; // first tick fires immediately — discard.
         loop {
             interval.tick().await;
-            for ctx_name in sweep_messaging.list_contexts() {
-                let platform = sweep_messaging.get_platform(&ctx_name);
+            for bus_name in sweep_messaging.list_buses() {
+                let platform = sweep_messaging.get_platform(&bus_name);
                 let swept = platform.sweep_command_timeouts(sweep_timeout);
                 if !swept.is_empty() {
                     warn!(
-                        context = %ctx_name,
+                        bus = %bus_name,
                         swept = swept.len(),
                         "command sweep: cancelled in-flight commands past deadline"
                     );
@@ -410,8 +445,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_decoding_message_size(PEER_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(PEER_MAX_MESSAGE_BYTES);
     let replication_server =
-        tonic::service::interceptor::InterceptedService::new(replication_server, auth);
+        tonic::service::interceptor::InterceptedService::new(replication_server, auth.clone());
     router = router.add_service(replication_server);
+
+    // Messaging fabric — internode command/query forwarding (ADR-0007).
+    // Same auth and TLS as the other peer transports.
+    use crate::proto::kronosdb::fabric::messaging_fabric_server::MessagingFabricServer;
+    router = router.add_service(MessagingFabricServer::with_interceptor(
+        fabric_service,
+        auth,
+    ));
 
     // grpc.health.v1 — unauthenticated by design (kubelet probes and gRPC
     // client-side health checking). Overall status tracks Raft leadership:

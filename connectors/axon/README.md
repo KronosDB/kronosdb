@@ -116,6 +116,7 @@ Requires:
 |----------|---------|-------------|
 | `servers` | `localhost:50051` | KronosDB server address (host:port) |
 | `context` | `default` | Default context name |
+| `busName` | `null` | Messaging bus for commands/queries/subscriptions; independent of context, `null` uses the server's `default` bus |
 | `componentName` | `Unnamed` | Application component name |
 | `clientId` | `<random UUID>` | Unique client instance identifier |
 | `token` | `null` | Authentication token |
