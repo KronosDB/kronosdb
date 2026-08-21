@@ -1271,7 +1271,7 @@ fn drive_group_commit_now(inner_mutex: &Mutex<LogStoreInner>) -> Result<(), Stor
 
         // Fire callbacks in FIFO order (D-08). On failure each callback gets
         // an equivalent error (D-09).
-        let callbacks: Vec<LogFlushed<TypeConfig>> = inner.pending_callbacks.drain(..).collect();
+        let callbacks: Vec<LogFlushed<TypeConfig>> = std::mem::take(&mut inner.pending_callbacks);
 
         // Drop the lock before firing callbacks — openraft may reenter the
         // log store from within a callback's synchronous tail.

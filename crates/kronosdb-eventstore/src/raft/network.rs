@@ -52,6 +52,8 @@ pub struct NetworkConnection {
 }
 
 impl NetworkConnection {
+    // tonic's `Status` fixes the large error type.
+    #[allow(clippy::result_large_err)]
     async fn get_client(&mut self) -> Result<&mut RaftTransportClient<Channel>, tonic::Status> {
         if self.client.is_none() {
             let channel = self
