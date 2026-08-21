@@ -1,7 +1,9 @@
 //! Generated protobuf types and gRPC service definitions.
 
 /// Common types shared across services (SerializedObject, MetadataValue, etc.)
-#[allow(clippy::enum_variant_names)]
+// result_large_err: generated service methods return Result<_, tonic::Status>;
+// clippy 1.98 flags the Status variant's size in code we don't author.
+#[allow(clippy::enum_variant_names, clippy::result_large_err)]
 pub mod kronosdb {
     tonic::include_proto!("kronosdb");
 

@@ -17,5 +17,8 @@ pub mod watermark;
 
 /// Generated protobuf types for the native segment Tail protocol.
 pub mod proto {
+    // Generated service methods return Result<_, tonic::Status>; clippy 1.98
+    // flags the Status variant's size in code we don't author.
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kronosdb.replication");
 }

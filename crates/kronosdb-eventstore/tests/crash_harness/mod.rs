@@ -28,7 +28,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Generated client stubs — compiled by crates/kronosdb-eventstore/build.rs
 /// (client-only for eventstore.proto). Usable ONLY from this harness module and
 /// its downstream test files; NOT exported from the library.
-#[allow(clippy::enum_variant_names)]
+// result_large_err: generated client methods return Result<_, tonic::Status>;
+// clippy 1.98 flags the Status variant's size in code we don't author.
+#[allow(clippy::enum_variant_names, clippy::result_large_err)]
 pub mod pb {
     tonic::include_proto!("kronosdb");
     pub mod eventstore {
