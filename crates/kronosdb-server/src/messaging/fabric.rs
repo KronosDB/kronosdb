@@ -8,6 +8,10 @@
 //! The forward then names the chosen handler explicitly; the owning node
 //! only acquires the permit and delivers.
 
+// result_large_err: the peer-forwarding helpers return tonic::Status like
+// every gRPC path here; clippy 1.98 flags the Status variant's size.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
