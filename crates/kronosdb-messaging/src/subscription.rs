@@ -213,7 +213,53 @@ impl SubscriptionRegistry {
             })?;
 
         let handler_client_id = handler.handler.client_id.clone();
+        drop(handlers);
+        Ok(Self::open_selected(query, handler_client_id, &mut active))
+    }
 
+    /// Opens a subscription against a specific handler instance — the
+    /// fabric path (ADR-0007): the subscriber's node already selected the
+    /// handler against the replicated routing table; this node just
+    /// registers and delivers.
+    pub fn open_to(
+        &self,
+        query: SubscriptionQuery,
+        target: &ClientId,
+    ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError> {
+        let mut active = self.active.write();
+        if active.contains_key(&query.subscription_id) {
+            return Err(SubscriptionError::DuplicateSubscription {
+                subscription_id: query.subscription_id.clone(),
+            });
+        }
+
+        let handlers = self.handlers.read();
+        let handler = handlers
+            .get_handlers(&query.query_name)
+            .and_then(|list| list.iter().find(|h| &h.handler.client_id == target))
+            .ok_or_else(|| SubscriptionError::NoHandlerAvailable {
+                query_name: query.query_name.clone(),
+            })?;
+
+        if !handler.handler.try_acquire_permit() {
+            return Err(SubscriptionError::NoPermitsAvailable {
+                query_name: query.query_name.clone(),
+            });
+        }
+
+        let handler_client_id = handler.handler.client_id.clone();
+        drop(handlers);
+        Ok(Self::open_selected(query, handler_client_id, &mut active))
+    }
+
+    /// Shared tail of `open`/`open_to`: builds the update channel and
+    /// registers the active subscription (caller holds the write lock,
+    /// keeping the duplicate check race-free).
+    fn open_selected(
+        query: SubscriptionQuery,
+        handler_client_id: ClientId,
+        active: &mut HashMap<String, ActiveSubscription>,
+    ) -> (PendingQuery, mpsc::Receiver<SubscriptionUpdate>) {
         // Create the update channel. The subscriber's requested permit count
         // sizes the buffer (bounded to keep a hostile value from pinning
         // memory) and seeds the update credit. One extra slot is reserved so
@@ -253,7 +299,7 @@ impl SubscriptionRegistry {
         // duplicate check above).
         active.insert(subscription_id, subscription);
 
-        Ok((pending, update_rx))
+        (pending, update_rx)
     }
 
     /// Sends an update from a handler to a subscription query subscriber.

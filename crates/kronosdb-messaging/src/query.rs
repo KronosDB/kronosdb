@@ -95,6 +95,11 @@ pub struct QueryBus {
     /// value; DashMap shards key-level insert contention (same pattern as
     /// CommandBus).
     metrics: DashMap<String, MessageTypeMetrics>,
+    /// Wakes `dispatch_wait` loops when flow-control permits are granted.
+    permit_notify: tokio::sync::Notify,
+    /// Whether the `_wait` dispatch variants wait (bounded) for a grant
+    /// when no handler can accept, rather than failing immediately.
+    permit_wait: bool,
 }
 
 impl Default for QueryBus {
@@ -105,10 +110,16 @@ impl Default for QueryBus {
 
 impl QueryBus {
     pub fn new() -> Self {
+        Self::with_permit_wait(true)
+    }
+
+    pub fn with_permit_wait(permit_wait: bool) -> Self {
         Self {
             handlers: Arc::new(RwLock::new(HandlerRegistry::new())),
             dispatch_counter: AtomicU64::new(0),
             metrics: DashMap::new(),
+            permit_notify: tokio::sync::Notify::new(),
+            permit_wait,
         }
     }
 
@@ -144,8 +155,12 @@ impl QueryBus {
 
     /// Grants flow control permits to a client.
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
-        let handlers = self.handlers.read();
-        handlers.grant_permits(client_id, permits);
+        {
+            let handlers = self.handlers.read();
+            handlers.grant_permits(client_id, permits);
+        }
+        // Wake any dispatch_wait loops parked on permit exhaustion.
+        self.permit_notify.notify_waiters();
     }
 
     /// Returns detailed handler info + dispatch metrics per query type.
@@ -234,6 +249,66 @@ impl QueryBus {
             query,
             target_handlers,
         })
+    }
+
+    /// Dispatches a query, waiting up to `max_wait` for a flow-control
+    /// grant when no handler can accept. Scatter-gather proceeds as soon
+    /// as at least one handler has permits; the wait applies only when
+    /// zero can. Grant-driven with a 50ms re-poll cap, mirroring
+    /// `CommandBus::dispatch_wait`.
+    pub async fn dispatch_wait(
+        &self,
+        query: Query,
+        max_wait: std::time::Duration,
+    ) -> Result<PendingQuery, QueryError> {
+        if !self.permit_wait || max_wait.is_zero() {
+            return self.dispatch(query);
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let notified = self.permit_notify.notified();
+            match self.dispatch(query.clone()) {
+                Err(QueryError::NoPermitsAvailable { .. }) => {}
+                other => return other,
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(QueryError::NoPermitsAvailable {
+                    query_name: query.name,
+                });
+            }
+            let slice = deadline.min(now + std::time::Duration::from_millis(50));
+            let _ = tokio::time::timeout_at(slice, notified).await;
+        }
+    }
+
+    /// [`dispatch_to`](QueryBus::dispatch_to) with the same bounded
+    /// permit-wait as [`dispatch_wait`](QueryBus::dispatch_wait).
+    pub async fn dispatch_to_wait(
+        &self,
+        query: Query,
+        targets: &[ClientId],
+        max_wait: std::time::Duration,
+    ) -> Result<PendingQuery, QueryError> {
+        if !self.permit_wait || max_wait.is_zero() {
+            return self.dispatch_to(query, targets);
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let notified = self.permit_notify.notified();
+            match self.dispatch_to(query.clone(), targets) {
+                Err(QueryError::NoPermitsAvailable { .. }) => {}
+                other => return other,
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(QueryError::NoPermitsAvailable {
+                    query_name: query.name,
+                });
+            }
+            let slice = deadline.min(now + std::time::Duration::from_millis(50));
+            let _ = tokio::time::timeout_at(slice, notified).await;
+        }
     }
 
     /// Dispatches a query to specific handler instances — the fabric path

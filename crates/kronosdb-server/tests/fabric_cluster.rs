@@ -248,6 +248,67 @@ async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str
     let responder_id = client_id.to_string();
     tokio::spawn(async move {
         while let Ok(Some(msg)) = inbound.message().await {
+            // Subscription queries: answer with an initial result, then
+            // push one update.
+            if let Some(pb::query::query_handler_inbound::Request::SubscriptionQueryRequest(
+                sub_req,
+            )) = &msg.request
+                && let Some(pb::query::subscription_query_request::Request::Subscribe(sub)) =
+                    &sub_req.request
+            {
+                let sub_id = sub.subscription_identifier.clone();
+                let initial = pb::query::QueryHandlerOutbound {
+                    request: Some(pb::query::query_handler_outbound::Request::QueryResponse(
+                        pb::query::QueryResponse {
+                            message_identifier: format!("init-{sub_id}"),
+                            error_code: String::new(),
+                            error_message: None,
+                            payload: Some(pb::SerializedObject {
+                                r#type: "String".into(),
+                                revision: "1".into(),
+                                data: format!("initial-from-{responder_id}").into_bytes(),
+                            }),
+                            metadata: Default::default(),
+                            processing_instructions: vec![],
+                            request_identifier: sub_id.clone(),
+                        },
+                    )),
+                    instruction_id: String::new(),
+                };
+                let update = pb::query::QueryHandlerOutbound {
+                    request: Some(
+                        pb::query::query_handler_outbound::Request::SubscriptionQueryResponse(
+                            pb::query::SubscriptionQueryResponse {
+                                message_identifier: format!("upd-{sub_id}"),
+                                subscription_identifier: sub_id,
+                                response: Some(
+                                    pb::query::subscription_query_response::Response::Update(
+                                        pb::query::QueryUpdate {
+                                            message_identifier: String::new(),
+                                            payload: Some(pb::SerializedObject {
+                                                r#type: "String".into(),
+                                                revision: "1".into(),
+                                                data: format!("update-from-{responder_id}")
+                                                    .into_bytes(),
+                                            }),
+                                            metadata: Default::default(),
+                                            client_id: String::new(),
+                                            component_name: String::new(),
+                                            error_code: String::new(),
+                                            error_message: None,
+                                        },
+                                    ),
+                                ),
+                            },
+                        ),
+                    ),
+                    instruction_id: String::new(),
+                };
+                if tx.send(initial).await.is_err() || tx.send(update).await.is_err() {
+                    break;
+                }
+                continue;
+            }
             if let Some(pb::query::query_handler_inbound::Request::Query(q)) = msg.request {
                 let response = pb::query::QueryHandlerOutbound {
                     request: Some(pb::query::query_handler_outbound::Request::QueryResponse(
@@ -329,6 +390,69 @@ async fn query_until_responses(
     panic!("scatter-gather never yielded {expected_responses} responses for {query_name}");
 }
 
+/// Opens a subscription query and collects events until an initial result
+/// AND an update arrive; retries while registrations replicate.
+async fn subscribe_until_events(channel: Channel, query_name: &str) -> Vec<String> {
+    for attempt in 0..150u32 {
+        let sub_id = format!("fabric-sub-{attempt}");
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(pb::query::SubscriptionQueryRequest {
+            request: Some(pb::query::subscription_query_request::Request::Subscribe(
+                pb::query::SubscriptionQuery {
+                    subscription_identifier: sub_id.clone(),
+                    number_of_permits: 64,
+                    query_request: Some(pb::query::QueryRequest {
+                        message_identifier: sub_id.clone(),
+                        query: query_name.into(),
+                        timestamp: 0,
+                        payload: Some(pb::SerializedObject {
+                            r#type: query_name.into(),
+                            revision: "1".into(),
+                            data: vec![],
+                        }),
+                        metadata: Default::default(),
+                        processing_instructions: vec![],
+                        client_id: "fabric-subscriber".into(),
+                        component_name: "fabric-test".into(),
+                    }),
+                },
+            )),
+        })
+        .await
+        .unwrap();
+
+        let mut client = QueryServiceClient::new(channel.clone());
+        if let Ok(response) = client.subscription(ReceiverStream::new(rx)).await {
+            let mut stream = response.into_inner();
+            let mut events = Vec::new();
+            while let Ok(Ok(Some(msg))) =
+                tokio::time::timeout(Duration::from_secs(3), stream.message()).await
+            {
+                match msg.response {
+                    Some(pb::query::subscription_query_response::Response::InitialResult(r)) => {
+                        if let Some(p) = r.payload {
+                            events.push(String::from_utf8_lossy(&p.data).to_string());
+                        }
+                    }
+                    Some(pb::query::subscription_query_response::Response::Update(u)) => {
+                        if let Some(p) = u.payload {
+                            events.push(String::from_utf8_lossy(&p.data).to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                if events.len() >= 2 {
+                    drop(tx);
+                    return events;
+                }
+            }
+        }
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("subscription never yielded initial+update for {query_name}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn command_dispatched_on_a_reaches_handler_on_b() {
     let grpc_a = free_port();
@@ -380,6 +504,20 @@ async fn command_dispatched_on_a_reaches_handler_on_b() {
     start_query_handler(channel_b.clone(), "FabricRemoteOnly", "query-handler-b2").await;
     let answers = query_until_responses(channel_a.clone(), "FabricRemoteOnly", 1).await;
     assert_eq!(answers, vec!["answer-from-query-handler-b2".to_string()]);
+
+    // ── Subscription relay across the fabric ────────────────────────
+    // Subscription-query handler ONLY on B; subscriber connects to A.
+    // Initial result and update must relay B → A → subscriber.
+    start_query_handler(channel_b.clone(), "FabricSubQ", "sub-handler-b").await;
+    let events = subscribe_until_events(channel_a.clone(), "FabricSubQ").await;
+    assert!(
+        events.contains(&"initial-from-sub-handler-b".to_string()),
+        "missing relayed initial result: {events:?}"
+    );
+    assert!(
+        events.contains(&"update-from-sub-handler-b".to_string()),
+        "missing relayed update: {events:?}"
+    );
 
     // Kill the owning node: dispatch must fail fast with a retriable
     // error, not hang. (The registry row lingers until membership or

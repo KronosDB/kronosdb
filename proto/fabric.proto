@@ -25,6 +25,24 @@ service MessagingFabric {
   // Deliver a query to handlers connected to the receiving node and
   // stream their responses back.
   rpc ForwardQuery(ForwardQueryRequest) returns (stream kronosdb.query.QueryResponse);
+
+  // Relay a subscription query to a handler connected to the receiving
+  // node. The request stream carries Subscribe (first message, with bus
+  // and target), FlowControl grants, and Unsubscribe; the response stream
+  // carries the initial result and updates, wire-identical to what the
+  // subscriber's node forwards to its client.
+  rpc RelaySubscription(stream RelaySubscriptionRequest)
+      returns (stream kronosdb.query.SubscriptionQueryResponse);
+}
+
+message RelaySubscriptionRequest {
+  // Bus the subscription belongs to. Read from the first message.
+  string bus = 1;
+  // The handler instance the subscriber's node selected. Read from the
+  // first message.
+  string target_client_id = 2;
+  // The subscriber-side message (Subscribe / Unsubscribe / FlowControl).
+  kronosdb.query.SubscriptionQueryRequest request = 3;
 }
 
 message ForwardCommandRequest {

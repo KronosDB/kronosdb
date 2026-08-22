@@ -212,6 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_handler_streams: messaging_fabric::QueryHandlerStreams =
         Arc::new(dashmap::DashMap::new());
     let pending_queries: messaging_fabric::PendingQueries = Arc::new(dashmap::DashMap::new());
+    let pending_sub_initials: messaging_fabric::PendingSubscriptionInitials =
+        Arc::new(dashmap::DashMap::new());
     let fabric_router = Arc::new(messaging_fabric::FabricRouter::new(Arc::clone(&cluster)));
     let command_service = CommandServiceImpl::new(
         Arc::clone(&messaging),
@@ -229,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&handler_stream_registry),
         Arc::clone(&query_handler_streams),
         Arc::clone(&pending_queries),
+        Arc::clone(&pending_sub_initials),
         Arc::clone(&cluster),
         Arc::clone(&fabric_router),
     );
@@ -237,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&command_handler_streams),
         Arc::clone(&query_handler_streams),
         Arc::clone(&pending_queries),
+        Arc::clone(&pending_sub_initials),
     );
 
     // Drop any handler rows this node stranded in a previous life — a

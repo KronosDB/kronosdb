@@ -116,7 +116,27 @@ pub trait QueryDispatcher: Send + Sync {
         query: Query,
         targets: &[ClientId],
     ) -> Result<PendingQuery, QueryError>;
+
+    /// Dispatches a query, waiting (bounded by `max_wait`) for a
+    /// flow-control grant when no handler can accept.
+    fn dispatch_query_wait(&self, query: Query, max_wait: Duration) -> QueryDispatchFuture<'_>;
+
+    /// [`dispatch_query_to`] with a bounded permit wait.
+    ///
+    /// [`dispatch_query_to`]: QueryDispatcher::dispatch_query_to
+    fn dispatch_query_to_wait(
+        &self,
+        query: Query,
+        targets: Vec<ClientId>,
+        max_wait: Duration,
+    ) -> QueryDispatchFuture<'_>;
 }
+
+/// Boxed future returned by the waiting query-dispatch variants; hand-
+/// rolled for object safety, like [`DispatchFuture`].
+pub type QueryDispatchFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<PendingQuery, QueryError>> + Send + 'a>,
+>;
 
 /// The subscription query interface.
 ///
@@ -128,6 +148,14 @@ pub trait SubscriptionQueryDispatcher: Send + Sync {
     fn subscribe(
         &self,
         query: SubscriptionQuery,
+    ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError>;
+
+    /// Opens a subscription against a specific handler instance — the
+    /// fabric path (ADR-0007): selection happened on the subscriber's node.
+    fn subscribe_to(
+        &self,
+        query: SubscriptionQuery,
+        target: &ClientId,
     ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError>;
 
     /// Sends an update from a handler to a subscription query subscriber.

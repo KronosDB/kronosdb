@@ -28,7 +28,10 @@ use kronosdb_messaging::types::ClientId;
 use super::command_service::{
     from_proto_command, to_proto_command_inbound, to_proto_command_response,
 };
-use super::query_service::from_proto_query;
+use super::query_service::{
+    from_proto_query, from_proto_subscription, notify_handler_unsubscribe,
+    subscription_update_to_proto,
+};
 use crate::proto::kronosdb::command as command_pb;
 use crate::proto::kronosdb::fabric as pb;
 use crate::proto::kronosdb::query as query_pb;
@@ -57,6 +60,13 @@ pub struct PendingQueryEntry {
 /// queries + handler-response routing) and the fabric service (forwarded
 /// queries).
 pub type PendingQueries = Arc<DashMap<String, Arc<PendingQueryEntry>>>;
+
+/// Pending subscription-query initial results: subscription_id → sender on
+/// the subscriber-facing stream (a client's subscription stream, or a
+/// fabric relay stream). A handler's initial QueryResponse tagged with the
+/// subscription id is re-wrapped as `InitialResult` and routed here.
+pub type PendingSubscriptionInitials =
+    Arc<DashMap<String, mpsc::Sender<Result<query_pb::SubscriptionQueryResponse, Status>>>>;
 
 /// Where a query should fan out, per the replicated routing table.
 pub struct QueryFanout {
@@ -301,13 +311,43 @@ pub async fn forward_query(
     Ok(client.forward_query(request).await?.into_inner())
 }
 
-/// Receiving side of the fabric: delivers forwarded commands and queries
-/// to handlers connected to this node.
+/// Opens a subscription relay to the node owning the selected handler.
+/// Returns the request sender (Subscribe first, then FlowControl /
+/// Unsubscribe) and the response stream (initial result + updates).
+pub async fn open_subscription_relay(
+    cluster: &ClusterManager,
+    node_id: u64,
+) -> Result<
+    (
+        mpsc::Sender<pb::RelaySubscriptionRequest>,
+        tonic::Streaming<query_pb::SubscriptionQueryResponse>,
+    ),
+    Status,
+> {
+    let address = cluster
+        .peer_address(node_id)
+        .ok_or_else(|| Status::unavailable(format!("no address for node {node_id}")))?;
+    let channel = cluster
+        .peer_channel(&address)
+        .await
+        .map_err(|e| Status::unavailable(format!("fabric peer connect: {e}")))?;
+    let (req_tx, req_rx) = mpsc::channel::<pb::RelaySubscriptionRequest>(64);
+    let request = cluster
+        .peer_request(ReceiverStream::new(req_rx))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut client = pb::messaging_fabric_client::MessagingFabricClient::new(channel);
+    let responses = client.relay_subscription(request).await?.into_inner();
+    Ok((req_tx, responses))
+}
+
+/// Receiving side of the fabric: delivers forwarded commands, queries,
+/// and relayed subscriptions to handlers connected to this node.
 pub struct FabricServiceImpl {
     messaging: Arc<MessagingManager>,
     handler_streams: CommandHandlerStreams,
     query_handler_streams: QueryHandlerStreams,
     pending_queries: PendingQueries,
+    pending_sub_initials: PendingSubscriptionInitials,
 }
 
 impl FabricServiceImpl {
@@ -316,12 +356,14 @@ impl FabricServiceImpl {
         handler_streams: CommandHandlerStreams,
         query_handler_streams: QueryHandlerStreams,
         pending_queries: PendingQueries,
+        pending_sub_initials: PendingSubscriptionInitials,
     ) -> Self {
         Self {
             messaging,
             handler_streams,
             query_handler_streams,
             pending_queries,
+            pending_sub_initials,
         }
     }
 }
@@ -393,7 +435,8 @@ impl pb::messaging_fabric_server::MessagingFabric for FabricServiceImpl {
         let query = from_proto_query(query_proto.clone());
         let targets: Vec<ClientId> = req.target_client_ids.into_iter().map(ClientId).collect();
         let pending = platform
-            .dispatch_query_to(query, &targets)
+            .dispatch_query_to_wait(query, targets, budget)
+            .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
         // Register the response collector BEFORE delivery so no handler
@@ -443,6 +486,141 @@ impl pb::messaging_fabric_server::MessagingFabric for FabricServiceImpl {
                 }
             }
             pending_queries.remove(&message_id);
+        });
+
+        Ok(Response::new(ReceiverStream::new(out_rx)))
+    }
+
+    type RelaySubscriptionStream =
+        ReceiverStream<Result<query_pb::SubscriptionQueryResponse, Status>>;
+
+    async fn relay_subscription(
+        &self,
+        request: Request<tonic::Streaming<pb::RelaySubscriptionRequest>>,
+    ) -> Result<Response<Self::RelaySubscriptionStream>, Status> {
+        let mut inbound = request.into_inner();
+        let (out_tx, out_rx) =
+            mpsc::channel::<Result<query_pb::SubscriptionQueryResponse, Status>>(64);
+
+        let messaging = Arc::clone(&self.messaging);
+        let query_handler_streams = Arc::clone(&self.query_handler_streams);
+        let pending_sub_initials = Arc::clone(&self.pending_sub_initials);
+
+        tokio::spawn(async move {
+            // Subscriptions opened over THIS relay stream; retired when the
+            // subscriber's node hangs up.
+            let mut relay_subs: Vec<(String, Arc<dyn kronosdb_messaging::api::MessagingPlatform>)> =
+                Vec::new();
+
+            while let Ok(Some(msg)) = inbound.message().await {
+                let Some(request) = msg.request.and_then(|r| r.request) else {
+                    continue;
+                };
+                match request {
+                    query_pb::subscription_query_request::Request::Subscribe(sub) => {
+                        let sub_id = sub.subscription_identifier.clone();
+                        let sub_permits = sub.number_of_permits;
+                        let platform = messaging.get_platform(&msg.bus);
+                        let target = ClientId(msg.target_client_id.clone());
+                        let subscription = from_proto_subscription(&sub);
+
+                        match platform.subscribe_to(subscription, &target) {
+                            Ok((_pending, mut update_rx)) => {
+                                relay_subs.push((sub_id.clone(), Arc::clone(&platform)));
+                                // The handler's initial QueryResponse routes
+                                // back onto this relay stream as InitialResult.
+                                pending_sub_initials.insert(sub_id.clone(), out_tx.clone());
+
+                                // Deliver the subscribe to the handler,
+                                // wire-identical to the local path.
+                                let handler_tx = query_handler_streams
+                                    .get(&target.0)
+                                    .map(|r| r.value().clone());
+                                if let Some(tx) = handler_tx {
+                                    let inbound_sub = query_pb::QueryHandlerInbound {
+                                        request: Some(
+                                            query_pb::query_handler_inbound::Request::SubscriptionQueryRequest(
+                                                query_pb::SubscriptionQueryRequest {
+                                                    request: Some(
+                                                        query_pb::subscription_query_request::Request::Subscribe(sub),
+                                                    ),
+                                                },
+                                            ),
+                                        ),
+                                        instruction_id: String::new(),
+                                    };
+                                    let _ = tx.send(Ok(inbound_sub)).await;
+                                } else {
+                                    pending_sub_initials.remove(&sub_id);
+                                    platform.cancel_subscription(&sub_id);
+                                    let _ = out_tx
+                                        .send(Err(Status::unavailable(
+                                            "handler stream not found on owning node",
+                                        )))
+                                        .await;
+                                    continue;
+                                }
+
+                                // Drain registry updates onto the relay stream.
+                                let relay_tx = out_tx.clone();
+                                let _ = sub_permits; // permits ride FlowControl relays
+                                tokio::spawn(async move {
+                                    while let Some(update) = update_rx.recv().await {
+                                        let terminal =
+                                            update.complete || update.error_code.is_some();
+                                        let resp = subscription_update_to_proto(update);
+                                        if relay_tx.send(Ok(resp)).await.is_err() {
+                                            break; // Subscriber's node hung up.
+                                        }
+                                        if terminal {
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                let _ = out_tx.send(Err(Status::unavailable(e.to_string()))).await;
+                            }
+                        }
+                    }
+                    query_pb::subscription_query_request::Request::Unsubscribe(sub) => {
+                        let sub_id = sub.subscription_identifier;
+                        pending_sub_initials.remove(&sub_id);
+                        if let Some(pos) = relay_subs.iter().position(|(id, _)| id == &sub_id) {
+                            let (_, platform) = relay_subs.remove(pos);
+                            if let Some(handler_id) = platform.cancel_subscription(&sub_id) {
+                                notify_handler_unsubscribe(
+                                    &query_handler_streams,
+                                    &handler_id.0,
+                                    &sub_id,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    query_pb::subscription_query_request::Request::FlowControl(fc) => {
+                        if let Some((_, platform)) = relay_subs
+                            .iter()
+                            .find(|(id, _)| id == &fc.subscription_identifier)
+                        {
+                            platform.grant_subscription_permits(
+                                &fc.subscription_identifier,
+                                fc.number_of_permits,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Relay closed (subscriber's node gone): retire everything it
+            // opened so handlers stop emitting into a void.
+            for (sub_id, platform) in relay_subs {
+                pending_sub_initials.remove(&sub_id);
+                if let Some(handler_id) = platform.cancel_subscription(&sub_id) {
+                    notify_handler_unsubscribe(&query_handler_streams, &handler_id.0, &sub_id)
+                        .await;
+                }
+            }
         });
 
         Ok(Response::new(ReceiverStream::new(out_rx)))

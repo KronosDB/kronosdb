@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{
-    CommandDispatcher, DispatchFuture, MessagingPlatform, QueryDispatcher,
+    CommandDispatcher, DispatchFuture, MessagingPlatform, QueryDispatchFuture, QueryDispatcher,
     SubscriptionQueryDispatcher,
 };
 use crate::command::{
@@ -39,9 +39,10 @@ impl MessagingEngine {
     }
 
     /// Creates an engine with an explicit permit-wait policy for its
-    /// command bus (`false` = fail fast when handlers are saturated).
+    /// command and query buses (`false` = fail fast when handlers are
+    /// saturated).
     pub fn with_permit_wait(permit_wait: bool) -> Self {
-        let query_bus = QueryBus::new();
+        let query_bus = QueryBus::with_permit_wait(permit_wait);
         let subscriptions = SubscriptionRegistry::with_shared_handlers(query_bus.shared_handlers());
         let command_config = CommandBusConfig {
             permit_wait,
@@ -165,6 +166,23 @@ impl QueryDispatcher for MessagingEngine {
     ) -> Result<PendingQuery, QueryError> {
         self.query_bus.dispatch_to(query, targets)
     }
+
+    fn dispatch_query_wait(&self, query: Query, max_wait: Duration) -> QueryDispatchFuture<'_> {
+        Box::pin(self.query_bus.dispatch_wait(query, max_wait))
+    }
+
+    fn dispatch_query_to_wait(
+        &self,
+        query: Query,
+        targets: Vec<ClientId>,
+        max_wait: Duration,
+    ) -> QueryDispatchFuture<'_> {
+        Box::pin(async move {
+            self.query_bus
+                .dispatch_to_wait(query, &targets, max_wait)
+                .await
+        })
+    }
 }
 
 impl SubscriptionQueryDispatcher for MessagingEngine {
@@ -173,6 +191,14 @@ impl SubscriptionQueryDispatcher for MessagingEngine {
         query: SubscriptionQuery,
     ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError> {
         self.subscriptions.open(query)
+    }
+
+    fn subscribe_to(
+        &self,
+        query: SubscriptionQuery,
+        target: &ClientId,
+    ) -> Result<(PendingQuery, mpsc::Receiver<SubscriptionUpdate>), SubscriptionError> {
+        self.subscriptions.open_to(query, target)
     }
 
     fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate) {

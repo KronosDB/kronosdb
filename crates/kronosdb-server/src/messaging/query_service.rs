@@ -20,19 +20,14 @@ use super::convert::{
     internal_pi_to_proto, proto_error_to_detail, proto_metadata_to_internal, proto_pi_to_internal,
 };
 use super::fabric::{
-    FabricRouter, PendingQueries, PendingQueryEntry, QueryHandlerStreams, forward_query,
+    FabricRouter, PendingQueries, PendingQueryEntry, PendingSubscriptionInitials,
+    QueryHandlerStreams, forward_query, open_subscription_relay,
 };
 use crate::handler_registry::HandlerStreamRegistry;
 use crate::platform::service::ClientChannelRegistry;
+use crate::proto::kronosdb::fabric as fabric_pb;
 use crate::proto::kronosdb::platform as platform_pb;
 use crate::proto::kronosdb::query as pb;
-
-/// Pending subscription-query initial results: subscription_id → sender on the
-/// subscription stream. Routed when a regular QueryResponse comes back tagged
-/// with a subscription's id, so the caller receives it as
-/// `SubscriptionQueryResponse::InitialResult` on the same stream as updates.
-type SubscriptionInitialSender = mpsc::Sender<Result<pb::SubscriptionQueryResponse, Status>>;
-type PendingSubscriptionInitials = Arc<DashMap<String, SubscriptionInitialSender>>;
 
 /// gRPC service implementation for the query bus.
 ///
@@ -60,6 +55,7 @@ impl QueryServiceImpl {
         handler_stream_registry: Arc<HandlerStreamRegistry>,
         handler_streams: QueryHandlerStreams,
         pending_queries: PendingQueries,
+        pending_sub_initials: PendingSubscriptionInitials,
         cluster: Arc<ClusterManager>,
         fabric: Arc<FabricRouter>,
     ) -> Self {
@@ -67,7 +63,7 @@ impl QueryServiceImpl {
             messaging,
             handler_streams,
             pending_queries,
-            pending_sub_initials: Arc::new(DashMap::new()),
+            pending_sub_initials,
             query_timeout,
             channel_registry,
             handler_stream_registry,
@@ -406,12 +402,76 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let query = from_proto_query(req);
         let query_name = query.name.clone();
 
-        // Local dispatch. A local failure (no handler / no permits) is
-        // tolerated when remote targets exist — scatter-gather is
-        // best-effort per handler, and point-to-point remote-only routes
-        // skip the local bus entirely.
+        // Merge local + remote responses into the caller's stream. The
+        // stream ends when every source finishes (all caller_tx clones
+        // dropped) — each source under the shared deadline. Remote legs
+        // launch BEFORE the local dispatch so a local permit wait cannot
+        // delay the fan-out.
+        let (caller_tx, caller_rx) = mpsc::channel(64);
+        let deadline = tokio::time::Instant::now() + query_timeout;
+
+        for (node_id, targets) in fanout.remote.iter().cloned() {
+            let caller_tx = caller_tx.clone();
+            let cluster = Arc::clone(&self.cluster);
+            let forward_bus = bus.clone();
+            let proto = remote_proto.clone().expect("remote fanout implies proto");
+            tokio::spawn(async move {
+                let stream = forward_query(
+                    &cluster,
+                    node_id,
+                    &forward_bus,
+                    targets,
+                    proto,
+                    query_timeout,
+                )
+                .await;
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(status) => {
+                        tracing::warn!(node = node_id, error = %status, "fabric: query forward failed");
+                        if point_to_point {
+                            // Single-target route: surface the failure
+                            // instead of an empty stream.
+                            let _ = caller_tx.send(Err(status)).await;
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    match tokio::time::timeout_at(deadline, stream.message()).await {
+                        Ok(Ok(Some(resp))) => {
+                            if caller_tx.send(Ok(resp)).await.is_err() {
+                                break; // Caller disconnected.
+                            }
+                        }
+                        Ok(Ok(None)) => break, // Remote node done.
+                        Ok(Err(status)) => {
+                            tracing::warn!(node = node_id, error = %status, "fabric: query forward stream error");
+                            if point_to_point {
+                                let _ = caller_tx.send(Err(status)).await;
+                            }
+                            break;
+                        }
+                        Err(_) => break, // Deadline.
+                    }
+                }
+            });
+        }
+
+        // Local dispatch, with a bounded wait for a flow-control grant
+        // when no local handler can accept (same queueing semantics as
+        // commands). A local failure is tolerated when remote targets
+        // exist — scatter-gather is best-effort per handler, and
+        // point-to-point remote-only routes skip the local bus entirely.
         let local_pending = if fanout.local || fanout.remote.is_empty() {
-            match platform.dispatch_query(query) {
+            // Only burn the wait budget on permits when there is no
+            // remote leg to serve the caller in the meantime.
+            let wait = if fanout.remote.is_empty() {
+                query_timeout
+            } else {
+                Duration::ZERO
+            };
+            match platform.dispatch_query_wait(query, wait).await {
                 Ok(pending) => Some(pending),
                 Err(e) if !fanout.remote.is_empty() => {
                     tracing::debug!(query = %query_name, error = %e, "local query dispatch skipped");
@@ -471,60 +531,6 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         }
         // No local dispatch → the collector channel is already closed.
 
-        // Merge local + remote responses into the caller's stream. The
-        // stream ends when every source finishes (all caller_tx clones
-        // dropped) — each source under the shared deadline.
-        let (caller_tx, caller_rx) = mpsc::channel(64);
-        let deadline = tokio::time::Instant::now() + query_timeout;
-
-        for (node_id, targets) in fanout.remote {
-            let caller_tx = caller_tx.clone();
-            let cluster = Arc::clone(&self.cluster);
-            let forward_bus = bus.clone();
-            let proto = remote_proto.clone().expect("remote fanout implies proto");
-            tokio::spawn(async move {
-                let stream = forward_query(
-                    &cluster,
-                    node_id,
-                    &forward_bus,
-                    targets,
-                    proto,
-                    query_timeout,
-                )
-                .await;
-                let mut stream = match stream {
-                    Ok(stream) => stream,
-                    Err(status) => {
-                        tracing::warn!(node = node_id, error = %status, "fabric: query forward failed");
-                        if point_to_point {
-                            // Single-target route: surface the failure
-                            // instead of an empty stream.
-                            let _ = caller_tx.send(Err(status)).await;
-                        }
-                        return;
-                    }
-                };
-                loop {
-                    match tokio::time::timeout_at(deadline, stream.message()).await {
-                        Ok(Ok(Some(resp))) => {
-                            if caller_tx.send(Ok(resp)).await.is_err() {
-                                break; // Caller disconnected.
-                            }
-                        }
-                        Ok(Ok(None)) => break, // Remote node done.
-                        Ok(Err(status)) => {
-                            tracing::warn!(node = node_id, error = %status, "fabric: query forward stream error");
-                            if point_to_point {
-                                let _ = caller_tx.send(Err(status)).await;
-                            }
-                            break;
-                        }
-                        Err(_) => break, // Deadline.
-                    }
-                }
-            });
-        }
-
         let pending_queries = Arc::clone(&self.pending_queries);
         let msg_id = message_id.clone();
         let local_active = local_pending.is_some();
@@ -566,66 +572,80 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         let (sub_tx, sub_rx) = mpsc::channel::<Result<pb::SubscriptionQueryResponse, Status>>(64);
         let handler_streams = Arc::clone(&self.handler_streams);
         let pending_sub_initials = Arc::clone(&self.pending_sub_initials);
+        let cluster = Arc::clone(&self.cluster);
+        let fabric = Arc::clone(&self.fabric);
+        let sub_bus = bus.clone();
 
         tokio::spawn(async move {
             // Subscriptions opened on THIS gRPC stream — cancelled when the
             // subscriber's stream closes, so handler-side registrations and
             // pending-initial entries don't outlive the subscriber.
             let mut stream_subs: Vec<String> = Vec::new();
+            // Subscriptions relayed to remote nodes: sub_id → relay request
+            // sender. Dropping a sender closes that relay; the owning node
+            // cleans up its side on stream end.
+            let mut relayed: HashMap<String, mpsc::Sender<fabric_pb::RelaySubscriptionRequest>> =
+                HashMap::new();
             while let Ok(Some(msg)) = inbound.message().await {
                 match msg.request {
                     Some(pb::subscription_query_request::Request::Subscribe(sub)) => {
                         let sub_id = sub.subscription_identifier.clone();
                         let sub_permits = sub.number_of_permits;
+                        let query_name = sub
+                            .query_request
+                            .as_ref()
+                            .map(|q| q.query.clone())
+                            .unwrap_or_default();
 
-                        let subscription = SubscriptionQuery {
-                            subscription_id: sub_id.clone(),
-                            query_name: sub
-                                .query_request
-                                .as_ref()
-                                .map(|q| q.query.clone())
-                                .unwrap_or_default(),
-                            timestamp: sub.query_request.as_ref().map(|q| q.timestamp).unwrap_or(0),
-                            payload: Payload {
-                                payload_type: sub
-                                    .query_request
-                                    .as_ref()
-                                    .and_then(|q| q.payload.as_ref())
-                                    .map(|p| p.r#type.clone())
-                                    .unwrap_or_default(),
-                                revision: sub
-                                    .query_request
-                                    .as_ref()
-                                    .and_then(|q| q.payload.as_ref())
-                                    .map(|p| p.revision.clone())
-                                    .unwrap_or_default(),
-                                data: sub
-                                    .query_request
-                                    .as_ref()
-                                    .and_then(|q| q.payload.as_ref())
-                                    .map(|p| p.data.clone())
-                                    .unwrap_or_default(),
-                            },
-                            metadata: sub
-                                .query_request
-                                .as_ref()
-                                .map(|q| proto_metadata_to_internal(q.metadata.clone()))
-                                .unwrap_or_default(),
-                            client_id: ClientId(
-                                sub.query_request
-                                    .as_ref()
-                                    .map(|q| q.client_id.clone())
-                                    .unwrap_or_default(),
-                            ),
-                            component_name: ComponentName(
-                                sub.query_request
-                                    .as_ref()
-                                    .map(|q| q.component_name.clone())
-                                    .unwrap_or_default(),
-                            ),
-                            initial_permits: sub.number_of_permits,
-                        };
+                        // Fabric route (ADR-0007): a subscription binds one
+                        // handler, so this is point-to-point — locality-
+                        // preferred, relayed when only remote handlers exist.
+                        let route = fabric.route_query(&sub_bus, &query_name, true);
+                        if !route.local
+                            && let Some((node_id, targets)) = route.remote.into_iter().next()
+                        {
+                            let target = targets.into_iter().next().unwrap_or_default();
+                            match open_subscription_relay(&cluster, node_id).await {
+                                Ok((relay_tx, mut relay_rx)) => {
+                                    let first = fabric_pb::RelaySubscriptionRequest {
+                                        bus: sub_bus.clone(),
+                                        target_client_id: target,
+                                        request: Some(pb::SubscriptionQueryRequest {
+                                            request: Some(
+                                                pb::subscription_query_request::Request::Subscribe(
+                                                    sub,
+                                                ),
+                                            ),
+                                        }),
+                                    };
+                                    if relay_tx.send(first).await.is_ok() {
+                                        relayed.insert(sub_id.clone(), relay_tx);
+                                        // Relay responses are wire-identical
+                                        // to local ones — pass through.
+                                        let forward_tx = sub_tx.clone();
+                                        tokio::spawn(async move {
+                                            while let Ok(Some(resp)) = relay_rx.message().await {
+                                                if forward_tx.send(Ok(resp)).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        let _ = sub_tx
+                                            .send(Err(Status::unavailable(
+                                                "fabric subscription relay closed",
+                                            )))
+                                            .await;
+                                    }
+                                }
+                                Err(status) => {
+                                    let _ = sub_tx.send(Err(status)).await;
+                                }
+                            }
+                            continue;
+                        }
 
+                        let subscription = from_proto_subscription(&sub);
                         match platform.subscribe(subscription) {
                             Ok((pending, mut update_rx)) => {
                                 stream_subs.push(sub_id.clone());
@@ -697,6 +717,28 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                     Some(pb::subscription_query_request::Request::Unsubscribe(sub)) => {
                         let sub_id = sub.subscription_identifier;
                         stream_subs.retain(|s| s != &sub_id);
+                        if let Some(relay_tx) = relayed.remove(&sub_id) {
+                            // Forward the unsubscribe; dropping the sender
+                            // then closes the relay stream.
+                            let _ = relay_tx
+                                .send(fabric_pb::RelaySubscriptionRequest {
+                                    bus: String::new(),
+                                    target_client_id: String::new(),
+                                    request: Some(pb::SubscriptionQueryRequest {
+                                        request: Some(
+                                            pb::subscription_query_request::Request::Unsubscribe(
+                                                pb::SubscriptionQuery {
+                                                    subscription_identifier: sub_id,
+                                                    number_of_permits: 0,
+                                                    query_request: None,
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                })
+                                .await;
+                            continue;
+                        }
                         pending_sub_initials.remove(&sub_id);
                         if let Some(handler_id) = platform.cancel_subscription(&sub_id) {
                             notify_handler_unsubscribe(&handler_streams, &handler_id.0, &sub_id)
@@ -704,6 +746,22 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                         }
                     }
                     Some(pb::subscription_query_request::Request::FlowControl(fc)) => {
+                        if let Some(relay_tx) = relayed.get(&fc.subscription_identifier) {
+                            let _ = relay_tx
+                                .send(fabric_pb::RelaySubscriptionRequest {
+                                    bus: String::new(),
+                                    target_client_id: String::new(),
+                                    request: Some(pb::SubscriptionQueryRequest {
+                                        request: Some(
+                                            pb::subscription_query_request::Request::FlowControl(
+                                                fc,
+                                            ),
+                                        ),
+                                    }),
+                                })
+                                .await;
+                            continue;
+                        }
                         platform.grant_subscription_permits(
                             &fc.subscription_identifier,
                             fc.number_of_permits,
@@ -725,6 +783,57 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(sub_rx)))
+    }
+}
+
+/// Converts a proto subscription-query envelope into the internal form.
+pub(crate) fn from_proto_subscription(sub: &pb::SubscriptionQuery) -> SubscriptionQuery {
+    SubscriptionQuery {
+        subscription_id: sub.subscription_identifier.clone(),
+        query_name: sub
+            .query_request
+            .as_ref()
+            .map(|q| q.query.clone())
+            .unwrap_or_default(),
+        timestamp: sub.query_request.as_ref().map(|q| q.timestamp).unwrap_or(0),
+        payload: Payload {
+            payload_type: sub
+                .query_request
+                .as_ref()
+                .and_then(|q| q.payload.as_ref())
+                .map(|p| p.r#type.clone())
+                .unwrap_or_default(),
+            revision: sub
+                .query_request
+                .as_ref()
+                .and_then(|q| q.payload.as_ref())
+                .map(|p| p.revision.clone())
+                .unwrap_or_default(),
+            data: sub
+                .query_request
+                .as_ref()
+                .and_then(|q| q.payload.as_ref())
+                .map(|p| p.data.clone())
+                .unwrap_or_default(),
+        },
+        metadata: sub
+            .query_request
+            .as_ref()
+            .map(|q| proto_metadata_to_internal(q.metadata.clone()))
+            .unwrap_or_default(),
+        client_id: ClientId(
+            sub.query_request
+                .as_ref()
+                .map(|q| q.client_id.clone())
+                .unwrap_or_default(),
+        ),
+        component_name: ComponentName(
+            sub.query_request
+                .as_ref()
+                .map(|q| q.component_name.clone())
+                .unwrap_or_default(),
+        ),
+        initial_permits: sub.number_of_permits,
     }
 }
 
@@ -826,7 +935,9 @@ fn proto_subscription_response_to_update(
     }
 }
 
-fn subscription_update_to_proto(update: SubscriptionUpdate) -> pb::SubscriptionQueryResponse {
+pub(crate) fn subscription_update_to_proto(
+    update: SubscriptionUpdate,
+) -> pb::SubscriptionQueryResponse {
     let response = if let Some(ref error_code) = update.error_code {
         Some(
             pb::subscription_query_response::Response::CompleteExceptionally(
@@ -874,7 +985,7 @@ fn subscription_update_to_proto(update: SubscriptionUpdate) -> pb::SubscriptionQ
 
 /// Forwards an Unsubscribe to the handler's open stream so its Axon-side
 /// update-emitter registration can be closed (the subscriber is gone).
-async fn notify_handler_unsubscribe(
+pub(crate) async fn notify_handler_unsubscribe(
     handler_streams: &DashMap<String, mpsc::Sender<Result<pb::QueryHandlerInbound, Status>>>,
     handler_client_id: &str,
     subscription_id: &str,
