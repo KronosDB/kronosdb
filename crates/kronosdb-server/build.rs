@@ -4,6 +4,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // Payload fields decode to `Bytes`, not `Vec<u8>`: an event handed to
+        // N subscribers is then N refcount bumps, not N copies, and a decoded
+        // request borrows the receive buffer instead of copying out of it.
+        .bytes([
+            ".kronosdb.eventstore.Event.payload",
+            ".kronosdb.SerializedObject.data",
+        ])
         .compile_protos(
             &[
                 format!("{proto_dir}/common.proto"),

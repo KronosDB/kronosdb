@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bytes = "1"
 kronosdb-eventstore = { path = "../kronosdb-eventstore" }
 kronosdb-messaging = { path = "../kronosdb-messaging" }
 tempfile = "3"

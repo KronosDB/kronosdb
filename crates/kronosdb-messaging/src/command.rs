@@ -737,7 +737,7 @@ mod tests {
             payload: Payload {
                 payload_type: name.to_string(),
                 revision: "1".to_string(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             },
             metadata: std::collections::HashMap::new(),
             processing_instructions: vec![],

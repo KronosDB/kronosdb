@@ -36,7 +36,7 @@ fn make_command(seq: u64, routing_key: Option<RoutingKey>) -> Command {
         payload: Payload {
             payload_type: "BenchCommand".into(),
             revision: "1".into(),
-            data: vec![0u8; 128],
+            data: bytes::Bytes::from(vec![0u8; 128]),
         },
         metadata: HashMap::new(),
         processing_instructions: vec![],
