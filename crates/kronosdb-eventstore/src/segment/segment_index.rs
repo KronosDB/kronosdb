@@ -10,7 +10,7 @@ use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
 use crate::event::{Position, Tag};
 use crate::segment::reader::SegmentReader;
-/// Reserved tag key for event type names (same as in tag_index.rs).
+/// Reserved tag key for event type names.
 const EVENT_TYPE_TAG_KEY: &[u8] = b"__kronosdb_event_type__";
 
 /// Magic bytes for `.idx` files.
@@ -128,6 +128,11 @@ impl SegmentIndex {
         })
     }
 
+    /// The segment's bloom filter over tag and event-type keys.
+    pub fn bloom(&self) -> &GrowableBloom {
+        &self.bloom
+    }
+
     /// Returns the byte offset for a given position within this segment.
     pub fn get_offset(&self, position: u64) -> Option<u64> {
         let relative = position.checked_sub(self.base_position)? as usize;
@@ -171,7 +176,7 @@ impl SegmentIndex {
     /// `after` is the next-exclusive head the caller validated against (DCB marker).
     pub fn has_match_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
         let bitmap = self.matching(condition)?;
-        bitmap.iter().find(|&pos| pos >= after).map(Position)
+        first_at_or_after(&bitmap, after).map(Position)
     }
 
     fn resolve_criterion(&self, criterion: &Criterion) -> Option<RoaringTreemap> {
@@ -396,7 +401,16 @@ impl SegmentIndex {
     }
 }
 
-/// Creates the forward index map key (same as tag_index.rs).
+/// The smallest member of `bitmap` at or after `after`, without walking the
+/// members below it: `rank` counts them, `select` skips them.
+pub fn first_at_or_after(bitmap: &RoaringTreemap, after: u64) -> Option<u64> {
+    if after == 0 {
+        return bitmap.min();
+    }
+    bitmap.select(bitmap.rank(after - 1))
+}
+
+/// Creates the forward index map key.
 fn make_forward_key(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(4 + key.len() + value.len());
     k.extend_from_slice(&(key.len() as u32).to_le_bytes());

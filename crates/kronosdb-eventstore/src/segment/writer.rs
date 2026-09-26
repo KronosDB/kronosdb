@@ -64,6 +64,28 @@ pub struct SegmentWriter {
     /// file. Shared (behind RwLock) so reads can direct-seek into the active
     /// segment without taking the writer lock.
     active_index: Arc<RwLock<SegmentIndex>>,
+    /// Segments rotated away from since the group-commit thread last looked.
+    /// Rotation itself only swaps files and indexes under the writer lock;
+    /// everything that touches the disk for the sealed segment — its final
+    /// fdatasync, the directory sync that makes the new file's name durable,
+    /// and the `.idx`/`.bloom` companions — is the sync thread's, off the lock.
+    pending_seals: Vec<PendingSeal>,
+}
+
+/// A segment the writer has rotated away from but whose seal is not yet on
+/// disk. Handed to the group-commit thread at its next barrier.
+pub struct PendingSeal {
+    /// Base position of the sealed segment.
+    pub base: u64,
+    /// The sealed file, already truncated to `len`. fdatasync'd by the
+    /// wave that takes the seal, so every record in it is durable before
+    /// the wave's writers are released.
+    pub file: File,
+    /// Exact byte length of the sealed file.
+    pub len: u64,
+    /// The segment's complete index. Reads resolve the segment through this
+    /// (pinned in the cache) until the companion files are written.
+    pub index: Arc<SegmentIndex>,
 }
 
 impl SegmentWriter {
@@ -80,6 +102,7 @@ impl SegmentWriter {
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, base_position)?;
         preallocate(&file, max_segment_size);
+        sync_dir(dir)?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -89,8 +112,9 @@ impl SegmentWriter {
             write_offset: SEGMENT_HEADER_SIZE as u64,
             next_position: start_position,
             serialize_buf: Vec::with_capacity(4096),
-            record_buf: Vec::with_capacity(4096),
+            record_buf: Vec::with_capacity(64 * 1024),
             active_index: Arc::new(RwLock::new(SegmentIndex::new(base_position))),
+            pending_seals: Vec::new(),
         })
     }
 
@@ -158,8 +182,9 @@ impl SegmentWriter {
             write_offset,
             next_position,
             serialize_buf: Vec::with_capacity(4096),
-            record_buf: Vec::with_capacity(4096),
+            record_buf: Vec::with_capacity(64 * 1024),
             active_index: Arc::new(RwLock::new(active_index)),
+            pending_seals: Vec::new(),
         })
     }
 
@@ -190,11 +215,77 @@ impl SegmentWriter {
 
         let first_position = self.next_position;
 
-        for event in events {
-            self.write_one_event(event)?;
+        // The batch is framed into one buffer and written with one syscall
+        // per segment it lands in: a 1000-event append is one `write_all`,
+        // not a thousand. Index entries are published after the bytes are
+        // in the file, under one index lock per run, so a reader that sees
+        // an entry can always read its record.
+        let mut run_start = 0;
+        while run_start < events.len() {
+            self.record_buf.clear();
+            let mut indexed: Vec<(u64, u64, usize)> = Vec::new(); // (position, offset, event idx)
+            let mut position = self.next_position;
+            let mut offset = self.write_offset;
+            let mut i = run_start;
+            while i < events.len() {
+                self.serialize_buf.clear();
+                format::serialize_append_event(position, &events[i], &mut self.serialize_buf);
+                let record_size = (RECORD_HEADER_SIZE + self.serialize_buf.len()) as u64;
+                if offset + record_size > self.max_segment_size {
+                    break;
+                }
+                frame_record(flags::EVENT, &self.serialize_buf, &mut self.record_buf);
+                indexed.push((position.0, offset, i));
+                offset += record_size;
+                position = position.next();
+                i += 1;
+            }
+
+            if i == run_start {
+                // The next record does not fit: seal this segment and retry
+                // it in the fresh one. A record larger than a whole segment
+                // is refused rather than looping forever.
+                let needed = (RECORD_HEADER_SIZE + self.serialize_buf.len()) as u64;
+                if SEGMENT_HEADER_SIZE as u64 + needed > self.max_segment_size {
+                    return Err(Error::Io(io::Error::other(format!(
+                        "event record of {needed} bytes exceeds the segment size"
+                    ))));
+                }
+                self.rotate_segment()?;
+                continue;
+            }
+
+            self.active_file.write_all(&self.record_buf)?;
+            self.write_offset = offset;
+            self.next_position = position;
+            {
+                let mut index = self.active_index.write();
+                for &(pos, record_offset, idx) in &indexed {
+                    index.insert_event(pos, record_offset, &events[idx].name, &events[idx].tags);
+                }
+            }
+            run_start = i;
         }
 
         Ok((first_position, events.len() as u32))
+    }
+
+    /// Segments rotated away from since the last barrier, with the sealed
+    /// file handles. The group-commit thread takes these under the writer
+    /// lock and finishes the seals off it.
+    pub fn take_pending_seals(&mut self) -> Vec<PendingSeal> {
+        std::mem::take(&mut self.pending_seals)
+    }
+
+    /// Seals not yet taken by the group-commit thread.
+    pub fn pending_seals(&self) -> &[PendingSeal] {
+        &self.pending_seals
+    }
+
+    /// Drops pending seals at or past `base` — their files are being
+    /// truncated away or reopened, so no companion may be written for them.
+    pub fn discard_pending_seals_from(&mut self, base: u64) {
+        self.pending_seals.retain(|seal| seal.base < base);
     }
 
     /// Writes a native control record without consuming an event position or
@@ -347,51 +438,19 @@ impl SegmentWriter {
         self.rotate_segment()
     }
 
-    /// Writes a single event record, rotating the segment if needed.
-    fn write_one_event(&mut self, event: &AppendEvent) -> Result<(), Error> {
-        self.serialize_buf.clear();
-        format::serialize_append_event(self.next_position, event, &mut self.serialize_buf);
-        let payload = std::mem::take(&mut self.serialize_buf);
-        let record_offset = self.write_record(flags::EVENT, &payload)?;
-        self.serialize_buf = payload;
-
-        // Index the event AFTER its record is fully written, so a concurrent
-        // reader that sees the index entry can always read the record bytes.
-        self.active_index.write().insert_event(
-            self.next_position.0,
-            record_offset,
-            &event.name,
-            &event.tags,
-        );
-
-        self.next_position = self.next_position.next();
-        Ok(())
-    }
-
     /// Low-level: writes a single record to the active segment.
     /// Rotates the segment if the record doesn't fit.
     /// Returns the byte offset of the record header within the (possibly
     /// freshly rotated) active segment.
     fn write_record(&mut self, flags_byte: u8, payload: &[u8]) -> Result<u64, Error> {
-        let payload_with_flags_len = 1 + payload.len();
         let total_record_size = RECORD_HEADER_SIZE + payload.len();
 
         if self.write_offset + total_record_size as u64 > self.max_segment_size {
             self.rotate_segment()?;
         }
 
-        let crc = {
-            let mut digest = crc32c::crc32c(&[flags_byte]);
-            digest = crc32c::crc32c_append(digest, payload);
-            digest
-        };
-
         self.record_buf.clear();
-        self.record_buf.extend_from_slice(&crc.to_le_bytes());
-        self.record_buf
-            .extend_from_slice(&(payload_with_flags_len as u32).to_le_bytes());
-        self.record_buf.push(flags_byte);
-        self.record_buf.extend_from_slice(payload);
+        frame_record(flags_byte, payload, &mut self.record_buf);
 
         let record_offset = self.write_offset;
         self.active_file.write_all(&self.record_buf)?;
@@ -399,8 +458,15 @@ impl SegmentWriter {
         Ok(record_offset)
     }
 
-    /// Fsyncs the active segment to disk, making all written events durable.
+    /// Fsyncs the active segment — and any segment rotated away from since
+    /// the last sync — making all written events durable.
     pub fn sync(&mut self) -> Result<(), Error> {
+        for seal in &self.pending_seals {
+            fdatasync(&seal.file)?;
+        }
+        if !self.pending_seals.is_empty() {
+            sync_dir(&self.dir)?;
+        }
         fdatasync(&self.active_file)?;
         #[cfg(feature = "bench-instrumentation")]
         bi::bump_fsync();
@@ -475,35 +541,41 @@ impl SegmentWriter {
     }
 
     /// Rotates to a new segment file.
-    /// Builds the per-segment `.idx` and `.bloom` files for the sealed segment.
+    ///
+    /// Under the writer lock this is metadata only: trim the old file to its
+    /// data length, swap in a fresh index, create and preallocate the new
+    /// file. Every appender waits on this lock, so nothing here may wait on
+    /// the disk. The sealed segment's fdatasync, the directory sync for the
+    /// new file's name, and its `.idx`/`.bloom` companions are left as a
+    /// `PendingSeal` for the group-commit thread, which does them off the
+    /// lock in the wave that carries the rotation.
     fn rotate_segment(&mut self) -> Result<(), Error> {
-        // Sync the current segment before sealing.
-        fdatasync(&self.active_file)?;
-        #[cfg(feature = "bench-instrumentation")]
-        bi::bump_fsync();
-
-        // Truncate the sealed segment to its actual data size.
-        // It was pre-allocated to max_segment_size, so we trim the unused space.
+        // Truncate the sealed segment to its actual data size. It was
+        // preallocated to max_segment_size; a length change is a metadata
+        // op, not a flush.
         self.active_file.set_len(self.write_offset)?;
 
         // New segment starts at the current next_position.
         let new_base = self.next_position.0;
 
-        // Seal: swap in a fresh index for the new segment and persist the
-        // old one. The index was built incrementally at append time, so this
-        // is serialize-and-write only — no re-read of the segment file.
-        let sealed_path = segment_path(&self.dir, self.active_base_position);
+        // Swap in a fresh index for the new segment. The old one was built
+        // incrementally at append time and is complete.
         let sealed_index = {
             let mut idx = self.active_index.write();
             std::mem::replace(&mut *idx, SegmentIndex::new(new_base))
         };
-        sealed_index.write_to_disk(&sealed_path)?;
         let path = segment_path(&self.dir, new_base);
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, new_base)?;
         preallocate(&file, self.max_segment_size);
 
-        self.active_file = file;
+        let sealed_file = std::mem::replace(&mut self.active_file, file);
+        self.pending_seals.push(PendingSeal {
+            base: self.active_base_position,
+            file: sealed_file,
+            len: self.write_offset,
+            index: Arc::new(sealed_index),
+        });
         self.active_base_position = new_base;
         self.write_offset = SEGMENT_HEADER_SIZE as u64;
 
@@ -522,15 +594,25 @@ fn create_segment_file(path: &Path) -> Result<File, io::Error> {
         .read(true)
         .write(true)
         .open(path)?;
-    // Make the new directory entry durable. `fdatasync` on the file persists
-    // its CONTENTS but not the filename: on some filesystems a crash right
-    // after rotation could lose the freshly created segment file entirely,
-    // even though its records were "synced". One dir fsync per segment
-    // creation (every ~256MB) is noise. Same pattern as raft/snapshot_store.
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
     Ok(file)
+}
+
+/// Makes the directory's entries durable. `fdatasync` on a file persists
+/// its CONTENTS but not its name: without this, a crash after rotation
+/// could lose a freshly created segment file entirely even though its
+/// records were synced. Called by the group-commit thread in the wave that
+/// carries a rotation, never under the writer lock.
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), io::Error> {
+    File::open(dir)?.sync_all()
+}
+
+/// Frames one record — CRC, length, flags, payload — onto `out`.
+fn frame_record(flags_byte: u8, payload: &[u8], out: &mut Vec<u8>) {
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&[flags_byte]), payload);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+    out.push(flags_byte);
+    out.extend_from_slice(payload);
 }
 
 fn write_segment_header(file: &mut File, base_position: u64) -> Result<(), io::Error> {
