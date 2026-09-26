@@ -76,7 +76,7 @@ impl NativeEngine {
             .iter()
             .find(|peer| peer.id == leader_id)
             .cloned()
-            .ok_or_else(|| Error::Corrupted {
+            .ok_or_else(|| Error::Unavailable {
                 message: format!("claimed leader {leader_id} is absent from voter config"),
             })?;
         let channel = self.channel(&leader.addr).await?;
@@ -93,7 +93,7 @@ impl NativeEngine {
         let response = client
             .forward_append(request)
             .await
-            .map_err(|error| Error::Corrupted {
+            .map_err(|error| Error::Unavailable {
                 message: format!("forward native append to node {leader_id}: {error}"),
             })?
             .into_inner();
@@ -101,7 +101,7 @@ impl NativeEngine {
         match response.result {
             Some(replication_proto::forward_append_response::Result::Success(success)) => {
                 if success.epoch != epoch {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Unavailable {
                         message: format!(
                             "claimed leader changed epoch during append: sent {epoch}, received {}",
                             success.epoch
@@ -120,11 +120,11 @@ impl NativeEngine {
                 })
             }
             Some(replication_proto::forward_append_response::Result::Retry(retry)) => {
-                Err(Error::Corrupted {
+                Err(Error::Unavailable {
                     message: format!("native append must be retried: {}", retry.reason),
                 })
             }
-            None => Err(Error::Corrupted {
+            None => Err(Error::Internal {
                 message: "claimed leader returned an empty append response".into(),
             }),
         }
@@ -202,15 +202,20 @@ impl NativeEngine {
         request: AppendRequest,
         system: bool,
     ) -> Result<AppendResponse, Error> {
-        let claim = self.control.claim().ok_or_else(|| Error::Corrupted {
-            message: "native append unavailable: no committed leader claim".into(),
+        let claim = self.control.claim().ok_or_else(|| Error::Unavailable {
+            message: "no leader has claimed the write path yet — the node is starting or \
+                      an election is in progress; retry shortly"
+                .into(),
         })?;
         if claim.leader_id == self.control.node_id() {
             if !self.control.is_local_writable(claim.epoch, claim.leader_id)
                 || self.local_engine.replication_epoch() != claim.epoch
             {
-                return Err(Error::Corrupted {
-                    message: "native append unavailable: context is not installed in the active leader epoch".into(),
+                return Err(Error::Unavailable {
+                    message: "this node leads but is still installing its write epoch — it \
+                              just started, just won an election, or a context was just \
+                              created; retry shortly"
+                        .into(),
                 });
             }
             // The writer-lock section runs on the blocking pool (it holds a
@@ -225,7 +230,7 @@ impl NativeEngine {
                 }
             })
             .await
-            .map_err(|error| Error::Corrupted {
+            .map_err(|error| Error::Internal {
                 message: format!("native append worker panicked: {error}"),
             })?;
             let result = match staged {
@@ -233,8 +238,11 @@ impl NativeEngine {
                 Err(error) => Err(error),
             };
             if !self.control.is_local_writable(claim.epoch, claim.leader_id) {
-                return Err(Error::Corrupted {
-                    message: "native append lost its leader fence before acknowledgement".into(),
+                return Err(Error::Unavailable {
+                    message: "leadership was lost before the append was acknowledged, so its \
+                              outcome is unknown; retry with a consistency condition to \
+                              stay idempotent"
+                        .into(),
                 });
             }
             result

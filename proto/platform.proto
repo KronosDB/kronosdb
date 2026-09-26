@@ -19,6 +19,36 @@ service PlatformService {
    * Used for heartbeat exchange, event processor status reporting,
    * and server-initiated instructions. */
   rpc OpenStream(stream PlatformInbound) returns (stream PlatformOutbound);
+
+  /* Who the server thinks the caller is, and what it may do (ADR-0008).
+   * Answers for any authenticated caller — including one with no grants,
+   * which is exactly when the question gets asked. */
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  /* The principal's name: token name, JWT subject claim, or certificate
+   * identity (SPIFFE ID / DNS SAN / CN). "anonymous" when the server runs
+   * without authentication. */
+  string subject = 1;
+  /* "anonymous", "token", "mtls", or the name of the OIDC issuer. */
+  string source = 2;
+  repeated AccessGrant grants = 3;
+  /* False when the server has no authentication configured at all. */
+  bool authentication_enabled = 4;
+}
+
+/* Roles and where they apply. */
+message AccessGrant {
+  /* read < write < admin; peer (internode) stands apart. */
+  repeated string roles = 1;
+  /* Context name globs. Empty with all_contexts=false means none. */
+  repeated string contexts = 2;
+  bool all_contexts = 3;
+  repeated string buses = 4;
+  bool all_buses = 5;
 }
 
 /* Client identification, sent on initial connect. */

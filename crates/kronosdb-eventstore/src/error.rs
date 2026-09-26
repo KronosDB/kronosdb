@@ -14,7 +14,25 @@ pub enum Error {
     Io(std::io::Error),
 
     /// The event store data is corrupted (e.g., CRC mismatch).
+    /// Stored or replicated bytes failed an integrity check. Reserved for
+    /// that: availability and state problems have their own variants below,
+    /// because "data corrupted" must never be a false alarm.
     Corrupted { message: String },
+
+    /// The node can't serve this right now — it is starting, an election or
+    /// failover is in progress, the leader is unreachable. Nothing is wrong
+    /// with the data and the same request is expected to succeed on retry.
+    Unavailable { message: String },
+
+    /// A well-formed request that the current cluster state or configuration
+    /// doesn't allow. Retrying unchanged won't help.
+    Rejected { message: String },
+
+    /// The server broke one of its own invariants. Not the caller's fault.
+    Internal { message: String },
+
+    /// There is no event at this position (past the head, or truncated away).
+    PositionNotFound { position: u64 },
 
     /// The requested context was not found.
     ContextNotFound { name: String },
@@ -53,6 +71,12 @@ impl std::fmt::Display for Error {
             }
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::Corrupted { message } => write!(f, "data corrupted: {message}"),
+            Error::Unavailable { message } => write!(f, "temporarily unavailable: {message}"),
+            Error::Rejected { message } => write!(f, "rejected: {message}"),
+            Error::Internal { message } => write!(f, "internal error: {message}"),
+            Error::PositionNotFound { position } => {
+                write!(f, "no event at position {position}")
+            }
             Error::ContextNotFound { name } => write!(f, "context not found: {name}"),
             Error::ContextAlreadyExists { name } => {
                 write!(f, "context already exists: {name}")

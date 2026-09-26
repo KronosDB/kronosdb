@@ -15,11 +15,17 @@
 //!   `Authorization: Bearer`, validated against the IdP's JWKS (issuer, exp,
 //!   optional audience, optional required role).
 //!
+//! In every mode except `none`, a bearer credential that the gRPC identity
+//! layer (`crate::auth`) resolves to a cluster-wide `admin` principal is
+//! accepted too — one credential (a named token, a workload-identity JWT)
+//! works against both planes, which is what CLI tooling needs.
+//!
 //! `/health`, `/ready`, `/metrics`, `/auth/*`, and `/static/*` are always
 //! reachable — probes and scrapers don't authenticate, and the login page
 //! needs its stylesheet before a session exists.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::{Form, Query, Request, State};
@@ -34,8 +40,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
 
+use crate::auth::Authenticator;
+use crate::auth::jwt::{Audience, JwksSource, JwksVerifier, extract_roles};
 use crate::config::{AdminAuthConfig, AdminAuthMode, OidcConfig};
 
 use super::AdminState;
@@ -44,7 +51,6 @@ use super::layout::html_escape;
 const SESSION_COOKIE: &str = "kdb_session";
 const FLOW_COOKIE: &str = "kdb_auth_flow";
 const FLOW_TTL_SECS: u64 = 600;
-const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 // ───────────────────────────── runtime ─────────────────────────────
 
@@ -55,12 +61,15 @@ pub struct AuthRuntime {
     key: Key,
     session_ttl: Duration,
     oidc: Option<OidcRuntime>,
+    /// The gRPC plane's identities; its `admin` principals may use the
+    /// admin API as well.
+    identities: Arc<Authenticator>,
 }
 
 impl AuthRuntime {
     /// Builds the runtime. Performs NO network I/O — OIDC discovery is
     /// fetched lazily on first use so an unreachable IdP can't block boot.
-    pub fn new(cfg: &AdminAuthConfig) -> Self {
+    pub fn new(cfg: &AdminAuthConfig, identities: Arc<Authenticator>) -> Self {
         let key = match cfg.oidc.as_ref().and_then(|o| o.cookie_secret.as_deref()) {
             // Stretch the configured secret to the 64 bytes Key::from wants.
             Some(secret) => Key::from(&Sha512::digest(secret.as_bytes())),
@@ -91,6 +100,19 @@ impl AuthRuntime {
             key,
             session_ttl,
             oidc: cfg.oidc.as_ref().map(OidcRuntime::new),
+            identities,
+        }
+    }
+
+    /// True when `token` is a gRPC-plane credential carrying cluster-wide
+    /// `admin`.
+    async fn is_identity_admin(&self, token: &str) -> bool {
+        match self.identities.authenticate_token(token).await {
+            Ok(principal) if principal.is_admin() => {
+                tracing::debug!(subject = %principal.subject, source = %principal.source, "admin API access");
+                true
+            }
+            _ => false,
         }
     }
 
@@ -233,7 +255,7 @@ pub async fn require_auth(State(state): State<AdminState>, req: Request, next: N
                 .map(|pq| pq.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
             if let Some(token) = bearer(req.headers()) {
-                if auth.token_matches(token) {
+                if auth.token_matches(token) || auth.is_identity_admin(token).await {
                     return next.run(req).await;
                 }
                 return token_unauthorized(req.headers(), &original, "invalid token");
@@ -256,6 +278,7 @@ pub async fn require_auth(State(state): State<AdminState>, req: Request, next: N
             if let Some(token) = bearer(req.headers()) {
                 return match oidc.validate_bearer(token).await {
                     Ok(()) => next.run(req).await,
+                    Err(_) if auth.is_identity_admin(token).await => next.run(req).await,
                     Err(e) => unauthorized(&e),
                 };
             }
@@ -283,111 +306,40 @@ pub fn routes() -> Router<AdminState> {
 
 // ─────────────────────────── OIDC runtime ──────────────────────────
 
-#[derive(Deserialize, Clone)]
-struct Discovery {
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-}
-
 struct OidcRuntime {
     cfg: OidcConfig,
-    http: reqwest::Client,
-    discovery: tokio::sync::OnceCell<Discovery>,
-    jwks: RwLock<Option<(jsonwebtoken::jwk::JwkSet, Instant)>>,
+    verifier: JwksVerifier,
 }
 
 impl OidcRuntime {
     fn new(cfg: &OidcConfig) -> Self {
         Self {
             cfg: cfg.clone(),
-            http: reqwest::Client::new(),
-            discovery: tokio::sync::OnceCell::new(),
-            jwks: RwLock::new(None),
+            verifier: JwksVerifier::new(&cfg.issuer, JwksSource::Discovery),
         }
-    }
-
-    async fn discovery(&self) -> Result<&Discovery, String> {
-        self.discovery
-            .get_or_try_init(|| async {
-                let url = format!("{}/.well-known/openid-configuration", self.cfg.issuer);
-                self.http
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("oidc discovery fetch failed: {e}"))?
-                    .error_for_status()
-                    .map_err(|e| format!("oidc discovery fetch failed: {e}"))?
-                    .json::<Discovery>()
-                    .await
-                    .map_err(|e| format!("oidc discovery parse failed: {e}"))
-            })
-            .await
-    }
-
-    /// Returns the JWKS, refreshing when stale or when `kid` is unknown.
-    async fn jwks(&self, kid: Option<&str>) -> Result<jsonwebtoken::jwk::JwkSet, String> {
-        {
-            let cached = self.jwks.read().await;
-            if let Some((set, fetched_at)) = cached.as_ref() {
-                let fresh = fetched_at.elapsed() < JWKS_REFRESH_INTERVAL;
-                let has_kid = kid.is_none_or(|k| set.find(k).is_some());
-                if fresh && has_kid {
-                    return Ok(set.clone());
-                }
-            }
-        }
-        let uri = self.discovery().await?.jwks_uri.clone();
-        let set: jsonwebtoken::jwk::JwkSet = self
-            .http
-            .get(&uri)
-            .send()
-            .await
-            .map_err(|e| format!("jwks fetch failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("jwks fetch failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("jwks parse failed: {e}"))?;
-        *self.jwks.write().await = Some((set.clone(), Instant::now()));
-        Ok(set)
     }
 
     /// Validates a JWT's signature (JWKS), issuer, expiry, and — when
-    /// configured — audience. Returns the claims.
+    /// given — audience and nonce. Returns the claims.
     async fn validate_jwt(
         &self,
         token: &str,
         expected_aud: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let header =
-            jsonwebtoken::decode_header(token).map_err(|e| format!("bad jwt header: {e}"))?;
-        let jwks = self.jwks(header.kid.as_deref()).await?;
-        let jwk = match &header.kid {
-            Some(kid) => jwks.find(kid).ok_or("jwt kid not found in jwks")?,
-            None => jwks.keys.first().ok_or("empty jwks")?,
+        let aud = expected_aud.map(|a| [a.to_string()]);
+        let audience = match &aud {
+            Some(aud) => Audience::OneOf(aud),
+            None => Audience::Any,
         };
-        let decoding_key =
-            jsonwebtoken::DecodingKey::from_jwk(jwk).map_err(|e| format!("bad jwk: {e}"))?;
-
-        let mut validation = jsonwebtoken::Validation::new(header.alg);
-        validation.set_issuer(&[&self.cfg.issuer]);
-        match expected_aud {
-            Some(aud) => validation.set_audience(&[aud]),
-            None => validation.validate_aud = false,
-        }
-
-        let data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
-            .map_err(|e| format!("jwt validation failed: {e}"))?;
-
+        let claims = self.verifier.verify(token, audience).await?;
         if let Some(nonce) = expected_nonce {
-            let claim_nonce = data.claims.get("nonce").and_then(|v| v.as_str());
+            let claim_nonce = claims.get("nonce").and_then(|v| v.as_str());
             if claim_nonce != Some(nonce) {
                 return Err("nonce mismatch".into());
             }
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 
     /// Bearer path for API clients: signature + issuer + expiry + optional
@@ -409,26 +361,6 @@ impl OidcRuntime {
             Err(format!("required role '{required}' not present"))
         }
     }
-}
-
-/// Extracts roles from claims at a dotted path (e.g. Keycloak's
-/// `realm_access.roles`). Falls back to the common top-level `roles` claim.
-fn extract_roles(claims: &serde_json::Value, role_claim: Option<&str>) -> Vec<String> {
-    let path = role_claim.unwrap_or("roles");
-    let mut node = claims;
-    for part in path.split('.') {
-        match node.get(part) {
-            Some(next) => node = next,
-            None => return vec![],
-        }
-    }
-    node.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ─────────────────────────── OIDC handlers ─────────────────────────
@@ -585,8 +517,17 @@ async fn oidc_login(state: &AdminState, rd: String, headers: &HeaderMap) -> Resp
     let Some(oidc) = &auth.oidc else {
         return unauthorized("oidc not configured");
     };
-    let discovery = match oidc.discovery().await {
-        Ok(d) => d.clone(),
+    let authorization_endpoint = match oidc.verifier.discovery().await {
+        Ok(d) => match &d.authorization_endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "oidc discovery has no authorization_endpoint",
+                )
+                    .into_response();
+            }
+        },
         Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
     };
 
@@ -601,7 +542,7 @@ async fn oidc_login(state: &AdminState, rd: String, headers: &HeaderMap) -> Resp
 
     let authorize = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
-        discovery.authorization_endpoint,
+        authorization_endpoint,
         urlencode(&oidc.cfg.client_id),
         urlencode(&redirect_url(&oidc.cfg, headers)),
         urlencode(&oidc.cfg.scopes.join(" ")),
@@ -668,8 +609,17 @@ async fn callback(
         return unauthorized("state mismatch");
     }
 
-    let discovery = match oidc.discovery().await {
-        Ok(d) => d.clone(),
+    let token_endpoint = match oidc.verifier.discovery().await {
+        Ok(d) => match &d.token_endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "oidc discovery has no token_endpoint",
+                )
+                    .into_response();
+            }
+        },
         Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
     };
 
@@ -685,8 +635,9 @@ async fn callback(
         form.push(("client_secret", secret.clone()));
     }
     let token_response = match oidc
-        .http
-        .post(&discovery.token_endpoint)
+        .verifier
+        .http()
+        .post(&token_endpoint)
         .form(&form)
         .send()
         .await
@@ -785,22 +736,8 @@ fn query_param(query: Option<&str>, name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn extract_roles_dotted_path() {
-        let claims = serde_json::json!({
-            "realm_access": { "roles": ["kronosdb-admin", "user"] }
-        });
-        assert_eq!(
-            extract_roles(&claims, Some("realm_access.roles")),
-            vec!["kronosdb-admin".to_string(), "user".to_string()]
-        );
-        assert!(extract_roles(&claims, Some("resource_access.app.roles")).is_empty());
-    }
-
-    #[test]
-    fn extract_roles_default_top_level() {
-        let claims = serde_json::json!({ "roles": ["a"] });
-        assert_eq!(extract_roles(&claims, None), vec!["a".to_string()]);
+    fn no_identities() -> Arc<Authenticator> {
+        Arc::new(Authenticator::new(&Default::default()).unwrap())
     }
 
     #[test]
@@ -825,7 +762,7 @@ mod tests {
             token: Some("secret".into()),
             oidc: None,
         };
-        let auth = AuthRuntime::new(&cfg);
+        let auth = AuthRuntime::new(&cfg, no_identities());
 
         // The on-wire (signed) cookie only exists in response headers —
         // jar.get() would hand back the already-verified plaintext.
@@ -877,7 +814,7 @@ mod tests {
             token: Some("correct-horse".into()),
             oidc: None,
         };
-        let auth = AuthRuntime::new(&cfg);
+        let auth = AuthRuntime::new(&cfg, no_identities());
         assert!(auth.token_matches("correct-horse"));
         assert!(!auth.token_matches("correct-horsf"));
         assert!(!auth.token_matches("correct-hors"));
@@ -885,11 +822,14 @@ mod tests {
     }
 
     fn token_auth() -> AuthRuntime {
-        AuthRuntime::new(&AdminAuthConfig {
-            mode: AdminAuthMode::Token,
-            token: Some("secret".into()),
-            oidc: None,
-        })
+        AuthRuntime::new(
+            &AdminAuthConfig {
+                mode: AdminAuthMode::Token,
+                token: Some("secret".into()),
+                oidc: None,
+            },
+            no_identities(),
+        )
     }
 
     #[test]

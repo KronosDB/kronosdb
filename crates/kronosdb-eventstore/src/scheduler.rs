@@ -118,7 +118,7 @@ fn now_ms() -> i64 {
 }
 
 fn encode(spec: &ScheduleSpec) -> Result<Vec<u8>, Error> {
-    bincode::serialize(spec).map_err(|error| Error::Corrupted {
+    bincode::serialize(spec).map_err(|error| Error::Internal {
         message: format!("could not encode schedule: {error}"),
     })
 }

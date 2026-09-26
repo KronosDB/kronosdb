@@ -77,7 +77,7 @@ fn now_ms() -> i64 {
 }
 
 fn encode(record: &SnapshotRecord) -> Result<Vec<u8>, Error> {
-    bincode::serialize(record).map_err(|error| Error::Corrupted {
+    bincode::serialize(record).map_err(|error| Error::Internal {
         message: format!("could not encode snapshot: {error}"),
     })
 }

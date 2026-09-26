@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
+use crate::auth::config::{ClientAuth, GrantConfig, IdentityConfig, IssuerConfig, TokenConfig};
+
 /// KronosDB — a distributed DCB event store.
 #[derive(Parser, Debug)]
 #[command(name = "kronosdb", version, about)]
@@ -135,6 +137,12 @@ struct Cli {
     /// Path to TLS CA certificate for client verification (mTLS).
     #[arg(long, env = "KRONOSDB_TLS_CA")]
     tls_ca: Option<PathBuf>,
+
+    /// Client certificates at the TLS handshake: "required" (default when a
+    /// CA is set) or "optional" — verified when presented, so mTLS workloads
+    /// and bearer-token callers can share the port.
+    #[arg(long, env = "KRONOSDB_TLS_CLIENT_AUTH")]
+    tls_client_auth: Option<String>,
 
     // --- Admin auth options (see also [admin.auth] / [admin.oidc] in TOML) ---
     /// Admin console/API auth mode: "none", "token", or "oidc".
@@ -348,6 +356,16 @@ struct SecurityConfig {
     tls_key: Option<String>,
     #[serde(rename = "tls-ca")]
     tls_ca: Option<String>,
+    #[serde(rename = "tls-client-auth")]
+    tls_client_auth: Option<String>,
+    /// Named static tokens, trusted OIDC issuers, and grants — see
+    /// `crate::auth`. File-only: lists have no sane CLI/env form.
+    #[serde(default)]
+    tokens: Vec<TokenConfig>,
+    #[serde(default)]
+    issuers: Vec<IssuerConfig>,
+    #[serde(default)]
+    grants: Vec<GrantConfig>,
 }
 
 /// Parsed cluster peer: id + address.
@@ -397,6 +415,11 @@ pub struct ServerConfig {
     pub tls_key: Option<PathBuf>,
     /// TLS CA certificate for client verification (mTLS).
     pub tls_ca: Option<PathBuf>,
+    /// Whether the handshake demands a client certificate (only meaningful
+    /// with `tls_ca`).
+    pub tls_client_auth: ClientAuth,
+    /// gRPC-plane identity: tokens, OIDC issuers, grants.
+    pub identity: IdentityConfig,
     /// Declarative manifest applied at startup, if any.
     pub manifest: Option<PathBuf>,
     /// Admin console/API authentication.
@@ -410,7 +433,7 @@ impl ServerConfig {
         let cli = Cli::parse();
 
         // Load config file if specified.
-        let file_config = if let Some(ref path) = cli.config {
+        let mut file_config = if let Some(ref path) = cli.config {
             let contents = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read config file '{}': {e}", path.display()))?;
             toml::from_str::<ConfigFile>(&contents)
@@ -444,6 +467,43 @@ impl ServerConfig {
         let cluster_peers = parse_peer_list(&cli.cluster_peers)?;
         let cluster_learners = parse_peer_list(&cli.cluster_learners)?;
         let admin_auth = resolve_admin_auth(&cli, &file_config)?;
+
+        let tls_client_auth = match cli
+            .tls_client_auth
+            .as_deref()
+            .or(file_config.security.tls_client_auth.as_deref())
+        {
+            None | Some("required") => ClientAuth::Required,
+            Some("optional") => ClientAuth::Optional,
+            Some(other) => {
+                return Err(format!(
+                    "invalid tls-client-auth '{other}': expected \"required\" or \"optional\""
+                )
+                .into());
+            }
+        };
+        let access_token = cli
+            .access_token
+            .clone()
+            .or(file_config.security.access_token.clone());
+        let identity = IdentityConfig {
+            access_token: access_token.clone(),
+            tokens: std::mem::take(&mut file_config.security.tokens),
+            issuers: std::mem::take(&mut file_config.security.issuers),
+            grants: std::mem::take(&mut file_config.security.grants),
+        };
+        let tls_paths = |cli_path: &Option<PathBuf>, file_path: &Option<String>| {
+            cli_path.is_some() || file_path.is_some()
+        };
+        let mtls_available = tls_paths(&cli.tls_cert, &file_config.security.tls_cert)
+            && tls_paths(&cli.tls_key, &file_config.security.tls_key)
+            && tls_paths(&cli.tls_ca, &file_config.security.tls_ca);
+        identity
+            .validate(
+                cluster_peers.len() > 1 || !cluster_learners.is_empty(),
+                mtls_available,
+            )
+            .map_err(|e| format!("invalid [security] configuration: {e}"))?;
 
         let listen_addr = match cli.listen {
             Some(addr) => addr,
@@ -540,7 +600,7 @@ impl ServerConfig {
                 .unwrap_or(64 * 1024 * 1024),
             cluster_peers,
             cluster_learners,
-            access_token: cli.access_token.or(file_config.security.access_token),
+            access_token,
             tls_cert: cli
                 .tls_cert
                 .or(file_config.security.tls_cert.map(PathBuf::from)),
@@ -550,6 +610,8 @@ impl ServerConfig {
             tls_ca: cli
                 .tls_ca
                 .or(file_config.security.tls_ca.map(PathBuf::from)),
+            tls_client_auth,
+            identity,
             // CLI/env > config file > default discovery of ./kronosdb-manifest.toml.
             manifest: cli
                 .manifest

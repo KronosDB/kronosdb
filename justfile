@@ -9,6 +9,14 @@ stop:
 run *ARGS: stop
     cargo run --bin kronosdb-server -- {{ARGS}}
 
+# The kronos CLI; bare `just kronos` opens the terminal UI
+kronos *ARGS:
+    cargo run -q --bin kronos -- {{ARGS}}
+
+# Install the kronos CLI into ~/.cargo/bin
+kronos-install:
+    cargo install --path crates/kronosdb-cli --locked
+
 # Run in release mode
 run-release *ARGS: stop
     cargo run --release --bin kronosdb-server -- {{ARGS}}

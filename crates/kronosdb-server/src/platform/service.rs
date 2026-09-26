@@ -153,6 +153,33 @@ impl PlatformServiceImpl {
 impl pb::platform_service_server::PlatformService for PlatformServiceImpl {
     type OpenStreamStream = ReceiverStream<Result<pb::PlatformOutbound, Status>>;
 
+    async fn who_am_i(
+        &self,
+        request: Request<pb::WhoAmIRequest>,
+    ) -> Result<Response<pb::WhoAmIResponse>, Status> {
+        // Put there by the identity layer; absent only if the layer is.
+        let principal = request
+            .extensions()
+            .get::<std::sync::Arc<crate::auth::Principal>>()
+            .ok_or_else(|| Status::internal("no principal on request"))?;
+        Ok(Response::new(pb::WhoAmIResponse {
+            subject: principal.subject.clone(),
+            source: principal.source.clone(),
+            authentication_enabled: principal.source != "anonymous",
+            grants: principal
+                .grants
+                .iter()
+                .map(|g| pb::AccessGrant {
+                    roles: g.roles.iter().map(|r| r.as_str().to_string()).collect(),
+                    contexts: g.contexts.clone().unwrap_or_default(),
+                    all_contexts: g.contexts.is_none(),
+                    buses: g.buses.clone().unwrap_or_default(),
+                    all_buses: g.buses.is_none(),
+                })
+                .collect(),
+        }))
+    }
+
     async fn get_platform_server(
         &self,
         request: Request<pb::ClientIdentification>,

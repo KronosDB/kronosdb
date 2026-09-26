@@ -1075,7 +1075,9 @@ fn to_proto_snapshot(s: kronosdb_eventstore::snapshot::Snapshot) -> pb::Snapshot
 
 // --- Error conversion ---
 
-fn to_status(e: Error) -> Status {
+/// The one place engine errors become gRPC statuses, shared by every
+/// service so a condition never reports differently depending on the RPC.
+pub(crate) fn to_status(e: Error) -> Status {
     match e {
         Error::ConsistencyConditionViolated {
             conflicting_position,
@@ -1085,6 +1087,15 @@ fn to_status(e: Error) -> Status {
         )),
         Error::Io(err) => Status::internal(format!("I/O error: {err}")),
         Error::Corrupted { message } => Status::internal(format!("data corrupted: {message}")),
+        // UNAVAILABLE is the code clients retry on; these are all transient.
+        Error::Unavailable { message } => {
+            Status::unavailable(format!("temporarily unavailable: {message}"))
+        }
+        Error::Rejected { message } => Status::failed_precondition(message),
+        Error::Internal { message } => Status::internal(format!("internal error: {message}")),
+        Error::PositionNotFound { position } => {
+            Status::not_found(format!("no event at position {position}"))
+        }
         Error::ContextNotFound { name } => Status::not_found(format!("context not found: {name}")),
         Error::ContextAlreadyExists { name } => {
             Status::already_exists(format!("context already exists: {name}"))

@@ -184,7 +184,7 @@ impl ClusterManager {
             state_machine,
         )
         .await
-        .map_err(|e| Error::Corrupted {
+        .map_err(|e| Error::Internal {
             message: format!("failed to create raft node: {e}"),
         })?;
 
@@ -230,7 +230,7 @@ impl ClusterManager {
         let existed = self.context_manager.context_exists(name);
 
         if self.raft_node().is_none() {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "create_context_replicated called before init_raft".into(),
             });
         }
@@ -247,7 +247,7 @@ impl ClusterManager {
                 }
                 Ok(())
             }
-            other => Err(Error::Corrupted {
+            other => Err(Error::Internal {
                 message: format!("unexpected raft response for create_context: {other:?}"),
             }),
         }
@@ -275,7 +275,7 @@ impl ClusterManager {
             || registration.message_type.is_empty()
             || registration.client_id.is_empty()
         {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: "handler registration requires bus, message_type, and client_id".into(),
             });
         }
@@ -362,7 +362,7 @@ impl ClusterManager {
         &self,
         request: RaftRequest,
     ) -> Result<RaftResponse, Error> {
-        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+        let raft = self.raft_node().ok_or_else(|| Error::Unavailable {
             message: "metadata control plane is not initialized".into(),
         })?;
         match raft.client_write(request.clone()).await {
@@ -373,7 +373,7 @@ impl ClusterManager {
                     Some(openraft::error::ClientWriteError::ForwardToLeader(_))
                 );
                 if !should_forward {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Unavailable {
                         message: format!("control-plane write failed: {error}"),
                     });
                 }
@@ -400,19 +400,19 @@ impl ClusterManager {
         request: &RaftRequest,
     ) -> Result<RaftResponse, Error> {
         let metrics = raft.metrics().borrow().clone();
-        let leader_id = metrics.current_leader.ok_or_else(|| Error::Corrupted {
+        let leader_id = metrics.current_leader.ok_or_else(|| Error::Unavailable {
             message: "no control-plane leader available".into(),
         })?;
         let leader = metrics
             .membership_config
             .membership()
             .get_node(&leader_id)
-            .ok_or_else(|| Error::Corrupted {
+            .ok_or_else(|| Error::Unavailable {
                 message: format!("leader {leader_id} address missing from membership"),
             })?;
         let channel = self.cached_channel(&leader.addr).await?;
         let mut client = RaftTransportClient::new(channel);
-        let data = bincode::serialize(request).map_err(|error| Error::Corrupted {
+        let data = bincode::serialize(request).map_err(|error| Error::Internal {
             message: format!("serialize control request: {error}"),
         })?;
         let request = self
@@ -422,10 +422,10 @@ impl ClusterManager {
         let response = client
             .forward_write(request)
             .await
-            .map_err(|error| Error::Corrupted {
+            .map_err(|error| Error::Unavailable {
                 message: format!("forward control request: {error}"),
             })?;
-        bincode::deserialize(&response.into_inner().data).map_err(|error| Error::Corrupted {
+        bincode::deserialize(&response.into_inner().data).map_err(|error| Error::Internal {
             message: format!("deserialize control response: {error}"),
         })
     }
@@ -549,7 +549,7 @@ impl ClusterManager {
                         Some(openraft::error::InitializeError::NotAllowed(_))
                     );
                     if !already_initialized {
-                        return Err(Error::Corrupted {
+                        return Err(Error::Internal {
                             message: format!("failed to bootstrap cluster: {e}"),
                         });
                     }
@@ -562,7 +562,7 @@ impl ClusterManager {
 
     /// Adds a learner to the cluster (for passive backup nodes).
     pub async fn add_learner(&self, id: NodeId, addr: String) -> Result<(), Error> {
-        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+        let raft = self.raft_node().ok_or_else(|| Error::Unavailable {
             message: "add_learner called before init_raft".into(),
         })?;
 
@@ -571,7 +571,7 @@ impl ClusterManager {
         // a down or stalled learner must not hang the caller.
         raft.add_learner(id, BasicNode { addr: addr.clone() }, false)
             .await
-            .map_err(|e| Error::Corrupted {
+            .map_err(|e| Error::Rejected {
                 message: format!("failed to add learner: {e}"),
             })?;
         self.known_peers.write().insert(id, PeerConfig { id, addr });
@@ -619,7 +619,7 @@ impl ClusterManager {
         voter_ids.sort_unstable();
         voter_ids.dedup();
         if voter_ids.is_empty() {
-            return Err(Error::Corrupted {
+            return Err(Error::Rejected {
                 message: "native voter membership must not be empty".into(),
             });
         }
@@ -629,19 +629,19 @@ impl ClusterManager {
             voter_ids
                 .iter()
                 .map(|id| {
-                    known.get(id).cloned().ok_or_else(|| Error::Corrupted {
+                    known.get(id).cloned().ok_or_else(|| Error::Rejected {
                         message: format!("node {id} is absent from the peer directory"),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+        let raft = self.raft_node().ok_or_else(|| Error::Unavailable {
             message: "change_membership called before init_raft".into(),
         })?;
 
         raft.change_membership(voter_ids.to_vec(), false)
             .await
-            .map_err(|e| Error::Corrupted {
+            .map_err(|e| Error::Rejected {
                 message: format!("failed to change membership: {e}"),
             })?;
 
