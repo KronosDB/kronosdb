@@ -674,59 +674,71 @@ impl ClusterManager {
             contexts: local_contexts,
         });
 
-        for peer in active_voters
+        // Every peer at once: failover waits for the slowest peer (or one
+        // 3 s timeout), not for the sum of them.
+        let queries = active_voters
             .iter()
             .filter(|peer| peer.id != self.cluster_config.node_id)
-        {
-            let result = async {
-                let channel = self.cached_channel(&peer.addr).await?;
-                let mut client = SegmentReplicationClient::new(channel)
-                    .max_decoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES);
-                let request = self
-                    .cluster_config
-                    .peer_transport
-                    .request(replication_proto::GetCursorsRequest {})?;
-                let response = client
-                    .get_cursors(request)
-                    .await
-                    .map_err(|error| Error::Unavailable {
-                        message: format!("query native cursors from node {}: {error}", peer.id),
-                    })?
-                    .into_inner();
-                if response.node_id != peer.id {
-                    return Err(Error::Unavailable {
-                        message: format!(
-                            "cursor endpoint for node {} identified itself as {}",
-                            peer.id, response.node_id
-                        ),
-                    });
+            .map(|peer| async move {
+                let result = async {
+                    let channel = self.cached_channel(&peer.addr).await?;
+                    let mut client = SegmentReplicationClient::new(channel)
+                        .max_decoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES);
+                    let request = self
+                        .cluster_config
+                        .peer_transport
+                        .request(replication_proto::GetCursorsRequest {})?;
+                    let response = client
+                        .get_cursors(request)
+                        .await
+                        .map_err(|error| Error::Unavailable {
+                            message: format!("query native cursors from node {}: {error}", peer.id),
+                        })?
+                        .into_inner();
+                    if response.node_id != peer.id {
+                        return Err(Error::Unavailable {
+                            message: format!(
+                                "cursor endpoint for node {} identified itself as {}",
+                                peer.id, response.node_id
+                            ),
+                        });
+                    }
+                    Ok(VoterCursors {
+                        node_id: response.node_id,
+                        control_epoch: response.control_epoch,
+                        contexts: response
+                            .contexts
+                            .into_iter()
+                            .map(|cursor| {
+                                (
+                                    cursor.context,
+                                    CursorSnapshot {
+                                        position: cursor.durable_position,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    })
+                };
+                match tokio::time::timeout(Duration::from_secs(3), result).await {
+                    Ok(Ok(snapshot)) => Some(snapshot),
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, node_id = peer.id, "voter cursor query failed");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(node_id = peer.id, "voter cursor query timed out");
+                        None
+                    }
                 }
-                Ok(VoterCursors {
-                    node_id: response.node_id,
-                    control_epoch: response.control_epoch,
-                    contexts: response
-                        .contexts
-                        .into_iter()
-                        .map(|cursor| {
-                            (
-                                cursor.context,
-                                CursorSnapshot {
-                                    position: cursor.durable_position,
-                                },
-                            )
-                        })
-                        .collect(),
-                })
-            };
-            match tokio::time::timeout(Duration::from_secs(3), result).await {
-                Ok(Ok(snapshot)) => snapshots.push(snapshot),
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, node_id = peer.id, "voter cursor query failed")
-                }
-                Err(_) => tracing::debug!(node_id = peer.id, "voter cursor query timed out"),
-            }
-        }
+            });
+        snapshots.extend(
+            futures_util::future::join_all(queries)
+                .await
+                .into_iter()
+                .flatten(),
+        );
         Ok(snapshots)
     }
 

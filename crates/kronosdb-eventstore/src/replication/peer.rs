@@ -50,6 +50,11 @@ impl PeerTransportConfig {
                 "invalid peer endpoint {endpoint_uri}: {error}"
             )))
         })?;
+        // The follower is the RECEIVER of the Tail stream, so the window it
+        // advertises bounds replication throughput at window / RTT. Adaptive,
+        // like the server side: the static 64 KiB default would cap
+        // cross-AZ replication at a few MB/s.
+        endpoint = endpoint.http2_adaptive_window(true);
         if let Some(tls) = &self.tls {
             let mut config = ClientTlsConfig::new().identity(Identity::from_pem(
                 &tls.identity_certificate,

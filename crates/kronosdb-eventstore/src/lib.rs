@@ -6,7 +6,6 @@ pub mod event;
 
 pub mod cache;
 pub mod context;
-pub mod index;
 pub mod metrics;
 pub mod raft;
 pub mod replication;

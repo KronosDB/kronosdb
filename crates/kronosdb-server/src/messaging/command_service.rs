@@ -9,7 +9,9 @@ use kronosdb_eventstore::raft::cluster::ClusterManager;
 use kronosdb_eventstore::raft::handler_registry::{HandlerKind, HandlerRegistration};
 use kronosdb_messaging::command::{Command, CommandResult};
 use kronosdb_messaging::manager::MessagingManager;
-use kronosdb_messaging::types::{ClientId, ComponentName, Payload, RoutingKey};
+use kronosdb_messaging::types::{
+    ClientId, ComponentName, Payload, ProcessingInstruction, RoutingKey,
+};
 
 use super::convert::{
     effective_timeout, internal_metadata_to_proto, internal_pi_to_proto,
@@ -316,7 +318,7 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
                 .map(Response::new);
         }
 
-        let command = from_proto_command(cmd);
+        let command = from_proto_command_with(cmd, routing_key.map(RoutingKey), instructions);
         let message_id = command.message_id.clone();
         let dispatch_started = tokio::time::Instant::now();
 
@@ -400,9 +402,18 @@ pub(crate) fn routing_key_of(cmd: &pb::Command) -> Option<String> {
 
 pub(crate) fn from_proto_command(cmd: pb::Command) -> Command {
     let routing_key = routing_key_of(&cmd).map(RoutingKey);
+    let processing_instructions = proto_pi_to_internal(cmd.processing_instructions.clone());
+    from_proto_command_with(cmd, routing_key, processing_instructions)
+}
 
-    let processing_instructions = proto_pi_to_internal(cmd.processing_instructions);
-
+/// `from_proto_command` for a caller that already derived the routing key
+/// and processing instructions (the dispatch path needs both before it
+/// converts), so they are not derived twice.
+pub(crate) fn from_proto_command_with(
+    cmd: pb::Command,
+    routing_key: Option<RoutingKey>,
+    processing_instructions: Vec<ProcessingInstruction>,
+) -> Command {
     Command {
         message_id: cmd.message_identifier,
         name: cmd.name,

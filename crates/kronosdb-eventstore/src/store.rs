@@ -16,13 +16,12 @@ use crate::event::{Position, SequencedEvent, StoredEvent, Tag};
 use crate::stream::{CommitNotification, EventStream};
 use crate::system::Visibility;
 
-use crate::index::tag_index::TagIndex;
 use crate::metrics::{StoreMetrics, Timer};
 use crate::replication::dispatcher::{WaveDescriptor, WavePublisher, WaveSlice};
 use crate::replication::watermark::WatermarkState;
 use crate::segment::reader::SegmentReader;
 use crate::segment::segment_index::SegmentIndex;
-use crate::segment::writer::SegmentWriter;
+use crate::segment::writer::{PendingSeal, SegmentWriter, sync_dir, sync_file};
 use crate::segment::{self, DEFAULT_SEGMENT_SIZE};
 
 /// Default capacity for the commit notification channel.
@@ -207,6 +206,103 @@ impl SyncState {
     }
 }
 
+/// Seals whose companion files are being written on a background thread.
+///
+/// A rotation leaves the sealed segment's `.idx`/`.bloom` to be written off
+/// the writer lock, after the wave that carries the rotation has made the
+/// segment's bytes durable. Until then the segment answers reads from its
+/// pinned in-memory index. Truncation (failover repair) may delete or reopen
+/// such a segment while its companions are in flight; it cancels the seal
+/// and waits, so no companion is ever written for a file it does not
+/// describe.
+struct SealQueue {
+    /// Bases with a finalize in flight, and whether it was cancelled.
+    in_flight: StdMutex<std::collections::BTreeMap<u64, bool>>,
+    done: Condvar,
+}
+
+impl SealQueue {
+    fn new() -> Self {
+        Self {
+            in_flight: StdMutex::new(std::collections::BTreeMap::new()),
+            done: Condvar::new(),
+        }
+    }
+
+    /// Writes the seals' companion files on a background thread. The
+    /// segments' bytes are already durable (the wave fsync'd them), so the
+    /// companions may land in any order relative to further appends.
+    fn finalize(self: &Arc<Self>, seals: Vec<PendingSeal>, dir: &Path, cache: &Arc<IndexCache>) {
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            for seal in &seals {
+                in_flight.insert(seal.base, false);
+            }
+        }
+        let queue = Arc::clone(self);
+        let cache = Arc::clone(cache);
+        let dir = dir.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("kronosdb-seal".into())
+            .spawn(move || {
+                for seal in seals {
+                    let path = segment::segment_path(&dir, seal.base);
+                    let written = seal.index.write_to_disk(&path);
+                    let mut in_flight = queue.in_flight.lock().unwrap();
+                    let cancelled = in_flight.remove(&seal.base).unwrap_or(true);
+                    match written {
+                        Ok(()) if !cancelled => cache.unpin_sealed(seal.base),
+                        Ok(()) => {
+                            // Truncated away or reopened meanwhile: the
+                            // companions describe a file that no longer
+                            // exists in this shape.
+                            let _ = std::fs::remove_file(path.with_extension("idx"));
+                            let _ = std::fs::remove_file(path.with_extension("bloom"));
+                        }
+                        Err(error) => {
+                            // The segment stays readable through its pinned
+                            // index; the next open rebuilds the companions.
+                            tracing::error!(
+                                base = seal.base,
+                                %error,
+                                "failed to write sealed segment companions; \
+                                 they will be rebuilt at the next open"
+                            );
+                        }
+                    }
+                    queue.done.notify_all();
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::error!(%error, "failed to spawn the seal thread; companions will be rebuilt at the next open");
+            self.in_flight.lock().unwrap().clear();
+            self.done.notify_all();
+        }
+    }
+
+    /// Cancels every in-flight seal at or past `base` and waits for the
+    /// thread to acknowledge, so the caller may delete or reopen those
+    /// segment files.
+    fn cancel_from(&self, base: u64) {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        for (_, cancelled) in in_flight.range_mut(base..) {
+            *cancelled = true;
+        }
+        while in_flight.range(base..).next().is_some() {
+            in_flight = self.done.wait(in_flight).unwrap();
+        }
+    }
+
+    /// Waits until no seal is in flight. Test and shutdown helper.
+    #[cfg(test)]
+    fn wait_idle(&self) {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        while !in_flight.is_empty() {
+            in_flight = self.done.wait(in_flight).unwrap();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_sync_thread(
     dir: PathBuf,
@@ -219,6 +315,8 @@ fn spawn_sync_thread(
     watermark: Arc<WatermarkState>,
     commit_tx: broadcast::Sender<CommitNotification>,
     coalesce_window: Duration,
+    cache: Arc<IndexCache>,
+    seals: Arc<SealQueue>,
 ) {
     std::thread::Builder::new()
         .name("kronosdb-sync".into())
@@ -259,11 +357,15 @@ fn spawn_sync_thread(
                     // and clone the active file handle. Dispatch and fsync
                     // proceed independently after the lock is released.
                     let sealed: Result<_, Error> = (|| {
-                        let w = writer.lock();
+                        let mut w = writer.lock();
                         let wave = sync_state.seal_wave();
                         let durable = local_tail.load(Ordering::Acquire);
                         let current_base = w.active_base_position();
                         let current_offset = w.write_offset();
+                        // Segments rotated away from since the last barrier.
+                        // Their files are fdatasync'd with this wave, and
+                        // their companions written afterwards, off the lock.
+                        let taken_seals = w.take_pending_seals();
 
                         let epoch = watermark.epoch();
                         let descriptor = if replication.has_subscribers() {
@@ -277,6 +379,7 @@ fn spawn_sync_thread(
                                 current_base,
                                 current_offset,
                                 durable,
+                                &taken_seals,
                             )?
                         } else {
                             WaveDescriptor {
@@ -297,34 +400,47 @@ fn spawn_sync_thread(
                         wave_position = durable;
 
                         let file = w.active_file_handle()?;
-                        Ok((wave, durable, descriptor, file))
+                        Ok((wave, durable, descriptor, file, taken_seals))
                     })();
-                    let result = sealed.and_then(|(wave, durable, descriptor, file)| {
-                        // Queue before fsync: the dispatcher preads on its own
-                        // thread while this thread enters fdatasync.
-                        replication.try_publish(descriptor);
-                        if crate::written_acks(watermark.voter_count())
-                            && durable.saturating_sub(durable_tail.load(Ordering::Acquire))
-                                <= crate::ack_lag_limit()
-                        {
-                            // Replicated-ack mode: the append path already
-                            // advanced this node's cursor at write, so this
-                            // bump is usually a no-op — but subscribers are
-                            // woken per wave, so notify unconditionally.
-                            // Past the lag limit the pre-fsync advance is
-                            // skipped (disk-stall backpressure).
-                            let wm = watermark
-                                .advance(node_id, watermark.epoch(), durable)
-                                .unwrap_or_else(|| watermark.get());
-                            let _ = commit_tx.send(CommitNotification { watermark: wm });
-                        }
-                        crate::segment::writer::sync_file(&file)?;
-                        Ok((wave, durable))
-                    });
+                    let result =
+                        sealed.and_then(|(wave, durable, descriptor, file, taken_seals)| {
+                            // Queue before fsync: the dispatcher preads on its own
+                            // thread while this thread enters fdatasync.
+                            replication.try_publish(descriptor);
+                            if crate::written_acks(watermark.voter_count())
+                                && durable.saturating_sub(durable_tail.load(Ordering::Acquire))
+                                    <= crate::ack_lag_limit()
+                            {
+                                // Replicated-ack mode: the append path already
+                                // advanced this node's cursor at write, so this
+                                // bump is usually a no-op — but subscribers are
+                                // woken per wave, so notify unconditionally.
+                                // Past the lag limit the pre-fsync advance is
+                                // skipped (disk-stall backpressure).
+                                let wm = watermark
+                                    .advance(node_id, watermark.epoch(), durable)
+                                    .unwrap_or_else(|| watermark.get());
+                                let _ = commit_tx.send(CommitNotification { watermark: wm });
+                            }
+                            // A rotation in this wave: the sealed file's last
+                            // records and the new file's directory entry must
+                            // be durable before the wave's writers are released.
+                            for seal in &taken_seals {
+                                sync_file(&seal.file)?;
+                            }
+                            if !taken_seals.is_empty() {
+                                sync_dir(&dir)?;
+                            }
+                            sync_file(&file)?;
+                            Ok((wave, durable, taken_seals))
+                        });
                     match result {
-                        Ok((wave, durable)) => {
+                        Ok((wave, durable, taken_seals)) => {
                             durable_tail.store(durable, Ordering::Release);
                             sync_state.complete_wave(wave);
+                            if !taken_seals.is_empty() {
+                                seals.finalize(taken_seals, &dir, &cache);
+                            }
                             // This node's durable cursor advances. With a
                             // quorum of one this IS the watermark bump that
                             // releases ack waiters; under replication
@@ -365,13 +481,22 @@ fn build_wave_descriptor(
     current_base: u64,
     current_offset: u64,
     next_position: u64,
+    seals: &[PendingSeal],
 ) -> Result<WaveDescriptor, Error> {
-    let bases = segment::list_segment_files(dir)?;
+    // The segments the wave spans are the previous barrier's active one,
+    // every segment sealed since, and the current active one — all known
+    // from the seals taken at this barrier, so no readdir or stat runs
+    // under the writer lock.
+    let mut selected: Vec<u64> = vec![previous_base];
+    for seal in seals {
+        if seal.base > previous_base && seal.base < current_base {
+            selected.push(seal.base);
+        }
+    }
+    if current_base > previous_base {
+        selected.push(current_base);
+    }
     let mut slices = Vec::new();
-    let selected: Vec<u64> = bases
-        .into_iter()
-        .filter(|base| *base >= previous_base && *base <= current_base)
-        .collect();
     for (index, &base) in selected.iter().enumerate() {
         let path = segment::segment_path(dir, base);
         let byte_start = if base == previous_base {
@@ -381,9 +506,11 @@ fn build_wave_descriptor(
         };
         let byte_end = if base == current_base {
             current_offset
+        } else if let Some(seal) = seals.iter().find(|seal| seal.base == base) {
+            seal.len
         } else {
-            // Sealed segments are truncated to their exact data length at
-            // rotation; unlike the active file this is not preallocation.
+            // A segment sealed before this barrier (its seal was taken by
+            // an earlier wave): truncated to its data length at rotation.
             std::fs::metadata(&path)?.len()
         };
         if byte_end > byte_start {
@@ -461,6 +588,9 @@ pub struct StoreOptions {
     pub max_segment_size: u64,
     pub index_cache_size: usize,
     pub bloom_cache_size: usize,
+    /// Sealed segment mmaps kept open. A wide historical scan over more
+    /// segments than this reopens and remaps files as it goes.
+    pub mmap_cache_size: usize,
     /// Extra group-commit coalescing window in milliseconds. The sync thread
     /// is woken by a wave's first write; with 0 (default) it seals and syncs
     /// immediately, and concurrent writes batch on the fdatasync duration.
@@ -478,6 +608,7 @@ impl Default for StoreOptions {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             bloom_cache_size: DEFAULT_BLOOM_CACHE_SIZE,
+            mmap_cache_size: crate::cache::DEFAULT_MMAP_CACHE_SIZE,
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             node_id: DEFAULT_NODE_ID,
             voters: vec![DEFAULT_NODE_ID],
@@ -527,6 +658,9 @@ impl StoreOptions {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
             index_cache_size,
             bloom_cache_size,
+            // Mmaps cost address space, not memory: keep every sealed
+            // segment mapped, like the bloom filters.
+            mmap_cache_size: segments.max(crate::cache::DEFAULT_MMAP_CACHE_SIZE),
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             node_id: DEFAULT_NODE_ID,
             voters: vec![DEFAULT_NODE_ID],
@@ -628,11 +762,6 @@ pub struct EventStoreEngine {
     /// The segment writer. Behind Arc<Mutex> — shared with the group commit sync thread.
     writer: Arc<parking_lot::Mutex<SegmentWriter>>,
 
-    /// TagIndex is internally sharded (DashMap over tag keys + a brief
-    /// Mutex on all_positions). No outer lock — concurrent writers with
-    /// disjoint tag keys don't contend.
-    tag_index: Arc<TagIndex>,
-
     /// Group commit synchronization.
     sync_state: Arc<SyncState>,
 
@@ -671,7 +800,12 @@ pub struct EventStoreEngine {
     active_index: Arc<parking_lot::RwLock<SegmentIndex>>,
 
     /// LRU cache for sealed segment indices, bloom filters, and mmap handles.
+    /// Also pins the index of every segment sealed in memory but not yet on
+    /// disk — see `PendingSeal`.
     cache: Arc<IndexCache>,
+
+    /// Seals whose companion files are being written in the background.
+    seals: Arc<SealQueue>,
 
     /// Cached segment list — avoids readdir + stat syscalls on every query.
     /// Updated on rotation within the append path (under writer lock).
@@ -726,6 +860,12 @@ impl EventStoreEngine {
             opts.voters.clone()
         };
         let watermark = Arc::new(WatermarkState::new(INITIAL_EPOCH, voters, 0));
+        let cache = Arc::new(IndexCache::new(
+            opts.index_cache_size,
+            opts.bloom_cache_size,
+            opts.mmap_cache_size,
+        ));
+        let seals = Arc::new(SealQueue::new());
 
         spawn_sync_thread(
             dir.to_path_buf(),
@@ -738,12 +878,13 @@ impl EventStoreEngine {
             Arc::clone(&watermark),
             commit_tx.clone(),
             Duration::from_millis(opts.group_commit_interval_ms),
+            Arc::clone(&cache),
+            Arc::clone(&seals),
         );
 
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
-            tag_index: Arc::new(TagIndex::new()),
             sync_state,
             node_id: opts.node_id,
             local_tail,
@@ -752,10 +893,8 @@ impl EventStoreEngine {
             watermark,
             commit_tx,
             active_index,
-            cache: Arc::new(IndexCache::new(
-                opts.index_cache_size,
-                opts.bloom_cache_size,
-            )),
+            cache,
+            seals,
             segments: RwLock::new(SegmentList {
                 bases: vec![active_base],
                 sealed_count: 0,
@@ -788,10 +927,10 @@ impl EventStoreEngine {
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
 
-        // Rebuild the active segment's tag index from its events.
-        // Sealed segments have their own `.idx` files on disk.
-        let tag_index = TagIndex::new();
-        rebuild_active_segment_index(dir, &tag_index)?;
+        // A crash between a rotation and its background seal leaves a sealed
+        // segment without companions; rebuild them so every sealed segment
+        // is served from its own index.
+        heal_sealed_segments(dir, active_base)?;
 
         // Build the cached segment list from disk (one-time cost on startup).
         let all_bases = segment::list_segment_files(dir)?;
@@ -827,6 +966,12 @@ impl EventStoreEngine {
             voters,
             recovered_watermark,
         ));
+        let cache = Arc::new(IndexCache::new(
+            opts.index_cache_size,
+            opts.bloom_cache_size,
+            opts.mmap_cache_size,
+        ));
+        let seals = Arc::new(SealQueue::new());
 
         spawn_sync_thread(
             dir.to_path_buf(),
@@ -839,12 +984,13 @@ impl EventStoreEngine {
             Arc::clone(&watermark),
             commit_tx.clone(),
             Duration::from_millis(opts.group_commit_interval_ms),
+            Arc::clone(&cache),
+            Arc::clone(&seals),
         );
 
         Ok(Self {
             dir: dir.to_path_buf(),
             writer,
-            tag_index: Arc::new(tag_index),
             sync_state,
             node_id: opts.node_id,
             local_tail,
@@ -853,10 +999,8 @@ impl EventStoreEngine {
             watermark,
             commit_tx,
             active_index,
-            cache: Arc::new(IndexCache::new(
-                opts.index_cache_size,
-                opts.bloom_cache_size,
-            )),
+            cache,
+            seals,
             segments: RwLock::new(SegmentList {
                 bases: all_bases,
                 sealed_count,
@@ -1152,11 +1296,6 @@ impl EventStoreEngine {
             (result, wave)
         };
 
-        for fields in &result.events {
-            self.tag_index
-                .index_event(fields.position, &fields.name, &fields.tags);
-        }
-
         Ok(ReplicatedWrite {
             wave,
             durable_position: result.durable_position,
@@ -1181,14 +1320,36 @@ impl EventStoreEngine {
             return Ok(()); // Idempotent replay after reconnect.
         }
         writer.rotate_replicated(new_base)?;
-        let mut seg_list = self.segments.write();
-        seg_list.sealed_count += 1;
-        seg_list.bases.push(new_base.0);
-        self.metrics.record_segment_rotation();
-        drop(seg_list);
-        drop(writer);
-        self.spawn_tag_index_prune(new_base.0);
+        // Wake the group-commit thread so the seal is finished promptly
+        // even if no further frame arrives for a while.
+        self.sync_state.mark_pending();
+        self.note_rotation(&writer, old_base);
         Ok(())
+    }
+
+    /// After a writer call that may have rotated: registers every pending
+    /// seal's index in the cache (so the segment answers reads before its
+    /// companions exist) and extends the segment list. Called under the
+    /// writer lock, before any reader can observe the new segment.
+    fn note_rotation(&self, writer: &SegmentWriter, old_base: u64) {
+        let new_base = writer.active_base_position();
+        if new_base == old_base {
+            return;
+        }
+        for seal in writer.pending_seals() {
+            self.cache.pin_sealed(seal.base, Arc::clone(&seal.index));
+        }
+        let mut seg_list = self.segments.write();
+        for seal in writer.pending_seals() {
+            if seg_list.bases.last().is_some_and(|last| seal.base > *last) {
+                seg_list.bases.push(seal.base);
+            }
+        }
+        if seg_list.bases.last().is_some_and(|last| new_base > *last) {
+            seg_list.bases.push(new_base);
+        }
+        seg_list.sealed_count = seg_list.bases.len().saturating_sub(1);
+        self.metrics.record_segment_rotation();
     }
 
     /// Truncates an uncommitted suffix during divergence repair. This is the
@@ -1323,6 +1484,11 @@ impl EventStoreEngine {
             }
         }
 
+        // Seals in flight for the segments about to go: no companion may be
+        // written for a file that is deleted or reopened below.
+        writer.discard_pending_seals_from(target_base);
+        self.seals.cancel_from(target_base);
+
         for &base in &seg_list.bases[target_index + 1..] {
             let path = segment::segment_path(&self.dir, base);
             remove_if_exists(&path)?;
@@ -1346,11 +1512,6 @@ impl EventStoreEngine {
         *self.active_mmap.lock() = None;
         drop(seg_list);
         drop(writer);
-
-        self.tag_index.prune_from(pos.0);
-        // If truncation reopened a previously sealed segment, restore its
-        // retained prefix to the active TagIndex.
-        rebuild_active_segment_index(&self.dir, &self.tag_index)?;
         Ok(())
     }
 
@@ -1434,12 +1595,10 @@ impl EventStoreEngine {
         let wave = {
             let mut writer = self.writer.lock();
             if writer.has_records() {
+                let old_base = writer.active_base_position();
                 let new_base = writer.head();
                 writer.rotate_replicated(new_base)?;
-                let mut seg_list = self.segments.write();
-                seg_list.sealed_count += 1;
-                seg_list.bases.push(new_base.0);
-                self.metrics.record_segment_rotation();
+                self.note_rotation(&writer, old_base);
             }
             let wave = self.sync_state.mark_pending();
             let start_position = writer.head().0;
@@ -1642,11 +1801,24 @@ impl EventStoreEngine {
             )));
         }
 
-        let outcome = {
-            // Lock the writer. DCB check + write + index update must be atomic.
-            let mut writer = self.writer.lock();
-            self.sync_state.mark_pending();
-            self.append_locked(&mut writer, &request)
+        // The sealed half of the DCB check runs before the lock: it is the
+        // half that can wait on the disk, and sealed segments cannot change
+        // under it. What seals in between is re-checked under the lock.
+        let sealed = match &request.condition {
+            Some(condition) => Some(self.check_dcb_sealed(condition)?),
+            None => None,
+        };
+        let outcome = match sealed {
+            Some((Some(conflicting_position), _)) => Err(Error::ConsistencyConditionViolated {
+                conflicting_position,
+            }),
+            _ => {
+                let sealed_checked = sealed.map(|(_, count)| count).unwrap_or(0);
+                // Lock the writer. DCB check + write + index update must be atomic.
+                let mut writer = self.writer.lock();
+                self.sync_state.mark_pending();
+                self.append_locked(&mut writer, &request, sealed_checked)
+            }
         };
 
         let staged = StagedAppend { outcome, timer };
@@ -1704,33 +1876,33 @@ impl EventStoreEngine {
         }
     }
 
-    /// Prunes sealed-segment positions from the in-memory tag index on a
-    /// background thread. Runs after rotation, once the sealed segment's
-    /// `.idx`/`.bloom` are durable (rotation writes them synchronously), so
-    /// every pruned position is resolvable through the sealed-segment
-    /// indexes. Off-thread because a prune walks every tag bitmap — doing
-    /// that under the writer lock would reintroduce a seal-time stall.
-    fn spawn_tag_index_prune(&self, base: u64) {
-        let tag_index = Arc::clone(&self.tag_index);
-        std::thread::Builder::new()
-            .name("kronos-tagindex-prune".into())
-            .spawn(move || tag_index.prune_below(base))
-            .ok();
+    /// The sealed-segment half of a DCB check, run BEFORE the writer lock:
+    /// sealed segments are immutable, so their answer cannot change while the
+    /// lock is not held, and this is the half that may touch the disk (an
+    /// index the cache has evicted). Returns the conflict, if any, and how
+    /// many sealed segments were covered; `check_dcb_locked` re-checks any
+    /// segment sealed since, under the lock, from its pinned index.
+    fn check_dcb_sealed(
+        &self,
+        condition: &AppendCondition,
+    ) -> Result<(Option<Position>, usize), Error> {
+        let seg_list = self.segments.read().clone();
+        let conflict = self.check_dcb_sealed_range(condition, &seg_list, 0)?;
+        Ok((conflict, seg_list.sealed_count))
     }
 
-    /// Checks a DCB condition against committed state (sealed segments +
-    /// active tag index). Must run under the writer lock so the answer can't
-    /// be invalidated by a concurrent append. Returns the conflicting
-    /// position, if any.
-    fn check_dcb_locked(&self, condition: &AppendCondition) -> Result<Option<Position>, Error> {
+    /// Sealed segments `[from_sealed, sealed_count)` of `seg_list` against
+    /// the condition: bloom → index → first match at or after the marker.
+    fn check_dcb_sealed_range(
+        &self,
+        condition: &AppendCondition,
+        seg_list: &SegmentList,
+        from_sealed: usize,
+    ) -> Result<Option<Position>, Error> {
         let marker = condition.consistency_marker.0;
-
-        // Check sealed segments whose events come after the marker.
-        // Uses the same bloom → index → bitmap path as source reads.
-        let seg_list = self.segments.read().clone();
-        for (i, &base) in seg_list.bases.iter().enumerate() {
+        for (i, &base) in seg_list.bases.iter().enumerate().skip(from_sealed) {
             if !seg_list.is_sealed(i) {
-                break; // Active segment checked below via tag index.
+                break;
             }
             // Segment ends below the marker — all its events were
             // already validated by the caller, skip. seg_end is the
@@ -1758,10 +1930,31 @@ impl EventStoreEngine {
                 return Ok(Some(conflicting_pos));
             }
         }
+        Ok(None)
+    }
 
-        // Check the active segment via in-memory tag index.
-        // tag_index is internally sharded; no lock needed.
-        Ok(self.tag_index.check_condition(condition))
+    /// The half of a DCB check that must run under the writer lock: any
+    /// segment sealed since the pre-lock scan (its index is pinned, so this
+    /// never touches the disk) and the active segment.
+    fn check_dcb_locked(
+        &self,
+        condition: &AppendCondition,
+        sealed_checked: usize,
+    ) -> Result<Option<Position>, Error> {
+        let seg_list = self.segments.read().clone();
+        if seg_list.sealed_count > sealed_checked
+            && let Some(pos) = self.check_dcb_sealed_range(condition, &seg_list, sealed_checked)?
+        {
+            return Ok(Some(pos));
+        }
+        let conflict = self
+            .active_index
+            .read()
+            .has_match_after(&condition.criteria, condition.consistency_marker.0);
+        if conflict.is_some() {
+            self.metrics.record_dcb_violation();
+        }
+        Ok(conflict)
     }
 
     /// The atomic core of an append: DCB check + write + index/head update,
@@ -1771,11 +1964,12 @@ impl EventStoreEngine {
         &self,
         writer: &mut SegmentWriter,
         request: &AppendRequest,
+        sealed_checked: usize,
     ) -> Result<AppendResponse, Error> {
         {
-            // Step 1: Check DCB condition.
+            // Step 1: Check DCB condition (the sealed half ran pre-lock).
             if let Some(condition) = &request.condition
-                && let Some(conflicting_pos) = self.check_dcb_locked(condition)?
+                && let Some(conflicting_pos) = self.check_dcb_locked(condition, sealed_checked)?
             {
                 return Err(Error::ConsistencyConditionViolated {
                     conflicting_position: conflicting_pos,
@@ -1797,27 +1991,11 @@ impl EventStoreEngine {
             // thread's wave fsync; callers wait on the watermark.
             let (first_position, count) = writer.write_events(&request.events)?;
 
-            // Step 2b: Detect rotation and update cached segment list.
-            let new_active_base = writer.active_base_position();
-            if new_active_base != old_active_base {
-                let mut seg_list = self.segments.write();
-                seg_list.sealed_count += 1;
-                seg_list.bases.push(new_active_base);
-                self.metrics.record_segment_rotation();
-                drop(seg_list);
-                self.spawn_tag_index_prune(new_active_base);
-            }
+            // Step 2b: Detect rotation — pin the sealed index, extend the
+            // segment list. The writer indexed the events as it wrote them.
+            self.note_rotation(writer, old_active_base);
 
-            // Step 3: Update in-memory tag index.
-            // TagIndex is internally sharded — concurrent callers indexing events
-            // with different tag keys proceed in parallel.
-            let mut pos = first_position;
-            for event in &request.events {
-                self.tag_index.index_event(pos, &event.name, &event.tags);
-                pos = pos.next();
-            }
-
-            // Step 4: Advance the local tail (next-exclusive: first event's
+            // Step 3: Advance the local tail (next-exclusive: first event's
             // position + count = position the next event will land at).
             // Watermark publication — and with it the subscriber wakeup —
             // happens on the sync thread after the wave's fsync.
@@ -1830,6 +2008,118 @@ impl EventStoreEngine {
                 consistency_marker: Position(new_head),
             })
         }
+    }
+
+    /// The index that answers for segment `base`: the active segment's live
+    /// index when it is still active, otherwise the sealed index from the
+    /// cache (pinned if the seal is in flight, loaded from `.idx` if not).
+    /// A segment-list snapshot may say "active" about a segment that has
+    /// just been rotated away from; this resolves it correctly either way.
+    fn index_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
+        let active = self.active_index.read();
+        if active.base_position() == base {
+            return Ok(IndexRef::Active(active));
+        }
+        drop(active);
+        Ok(IndexRef::Sealed(self.cache.get_index(seg_path, base)?))
+    }
+
+    /// The reader matching `index_for`'s answer.
+    fn reader_for(
+        &self,
+        index: &IndexRef<'_>,
+        base: u64,
+        seg_path: &Path,
+    ) -> Result<SegmentReader, Error> {
+        match index {
+            IndexRef::Active(_) => self.active_segment_reader(base, seg_path),
+            IndexRef::Sealed(_) => {
+                SegmentReader::from_shared_mmap(self.cache.get_mmap(seg_path, base)?)
+            }
+        }
+    }
+
+    /// Positions in segment `base` matching `condition`, at or after `from`.
+    fn matching_in_segment(
+        &self,
+        index: &SegmentIndex,
+        condition: &SourcingCondition,
+        from: u64,
+    ) -> Option<roaring::RoaringTreemap> {
+        // Rank check first: the usual reason a live subscriber reads is a
+        // commit that holds nothing for it, and that is decided here without
+        // touching a bitmap.
+        if !index.any_match_in(condition, from, u64::MAX) {
+            return None;
+        }
+        // A match-everything criterion means every position from `from` on:
+        // positions are dense within a segment, so that is a range, not a
+        // clone of the segment's whole position bitmap per page read.
+        if condition
+            .criteria
+            .iter()
+            .any(|c| c.tags.is_empty() && c.names.is_empty())
+        {
+            let range = index.position_range();
+            let start = range.start.max(from);
+            if start >= range.end {
+                return None;
+            }
+            let mut bitmap = roaring::RoaringTreemap::new();
+            bitmap.insert_range(start..range.end);
+            return Some(bitmap);
+        }
+        let mut bitmap = index.matching(condition)?;
+        if from > index.base_position() {
+            bitmap.remove_range(0..from);
+        }
+        if bitmap.is_empty() {
+            None
+        } else {
+            Some(bitmap)
+        }
+    }
+
+    /// Whether any event in `[from, to)` could match `condition` — a rank
+    /// check per segment, no bitmap materialized, no read. A subscriber
+    /// woken by a commit asks this before paging; with tag criteria the
+    /// answer is usually no, and the wakeup costs a few hash lookups.
+    pub fn has_matches_between(
+        &self,
+        from: Position,
+        to: Position,
+        condition: &SourcingCondition,
+    ) -> bool {
+        let to = to.0.min(self.watermark.get());
+        if from.0 >= to {
+            return false;
+        }
+        let seg_list = self.segments.read().clone();
+        for (i, &base) in seg_list.bases.iter().enumerate() {
+            if base >= to {
+                break;
+            }
+            let seg_end = seg_list.bases.get(i + 1).copied().unwrap_or(u64::MAX);
+            if seg_end <= from.0 {
+                continue;
+            }
+            let seg_path = segment::segment_path(&self.dir, base);
+            if seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            {
+                continue;
+            }
+            match self.index_for(base, &seg_path) {
+                Ok(index) => {
+                    if index.any_match_in(condition, from.0, to) {
+                        return true;
+                    }
+                }
+                // Cannot tell: let the read decide.
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     /// Gets tags for an event at the given position by reading from the segment.
@@ -1857,33 +2147,21 @@ impl EventStoreEngine {
         let base = seg_list.bases[seg_idx];
         let seg_path = segment::segment_path(&self.dir, base);
 
-        // Use cached mmap for sealed segments.
-        let reader = if seg_list.is_sealed(seg_idx) {
-            let mmap = self.cache.get_mmap(&seg_path, base)?;
-            SegmentReader::from_shared_mmap(mmap)?
-        } else {
-            self.active_segment_reader(base, &seg_path)?
+        let index = self.index_for(base, &seg_path)?;
+        let Some(offset) = index.get_offset(position.0) else {
+            return Err(Error::Corrupted {
+                message: format!("event at position {} not found in segment", position.0),
+            });
         };
-
-        for result in reader.iter(None) {
-            let mut event = result?;
-            if event.position == position {
-                // A system event reports no tags rather than an error: an
-                // error would itself tell the caller what lives there.
-                if crate::system::is_system_name(&event.name) {
-                    return Ok(Vec::new());
-                }
-                crate::system::strip_system_tags(&mut event.tags);
-                return Ok(event.tags);
-            }
-            if event.position > position {
-                break;
-            }
+        let reader = self.reader_for(&index, base, &seg_path)?;
+        let mut event = reader.read_event_at(offset as usize)?;
+        // A system event reports no tags rather than an error: an error
+        // would itself tell the caller what lives there.
+        if crate::system::is_system_name(&event.name) {
+            return Ok(Vec::new());
         }
-
-        Err(Error::Corrupted {
-            message: format!("event at position {} not found in segment", position.0),
-        })
+        crate::system::strip_system_tags(&mut event.tags);
+        Ok(event.tags)
     }
 
     /// Returns the position of the first event with timestamp >= the given millis-since-epoch.
@@ -1977,20 +2255,16 @@ impl EventStoreEngine {
         let condition = crate::system::marker_condition();
         let mut pos = head - 1;
 
-        for (i, &base) in seg_list.bases.iter().enumerate().rev() {
+        for &base in seg_list.bases.iter().rev() {
             if base >= head {
                 continue;
             }
-            let system = if seg_list.is_sealed(i) {
-                let seg_path = segment::segment_path(&self.dir, base);
-                match self.cache.get_index(&seg_path, base) {
-                    Ok(index) => index.matching(&condition),
-                    // Unreadable index: fall back to the true head rather
-                    // than under-reporting and stranding a client's cursor.
-                    Err(_) => return Position(head),
-                }
-            } else {
-                self.tag_index.matching_bitmap(&condition, Position(base))
+            let seg_path = segment::segment_path(&self.dir, base);
+            let system = match self.index_for(base, &seg_path) {
+                Ok(index) => index.matching(&condition),
+                // Unreadable index: fall back to the true head rather
+                // than under-reporting and stranding a client's cursor.
+                Err(_) => return Position(head),
             };
 
             loop {
@@ -2034,17 +2308,15 @@ impl EventStoreEngine {
             if base >= bound {
                 continue;
             }
-            let bitmap = if seg_list.is_sealed(i) {
-                let seg_path = segment::segment_path(&self.dir, base);
-                if let Some(false) = self.cache.bloom_check(&seg_path, base, condition) {
-                    continue;
-                }
-                self.cache.get_index(&seg_path, base)?.matching(condition)
-            } else {
-                self.tag_index.matching_bitmap(condition, Position(base))
-            };
+            let seg_path = segment::segment_path(&self.dir, base);
+            if seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            {
+                continue;
+            }
+            let bitmap = self.index_for(base, &seg_path)?.matching(condition);
             if let Some(mut bitmap) = bitmap {
-                // The tag index is written before the watermark advances, so
+                // The index is written before the watermark advances, so
                 // positions at or past the bound may be present — they are
                 // not committed reads and must not be returned.
                 bitmap.remove_range(bound..);
@@ -2082,44 +2354,14 @@ impl EventStoreEngine {
         let base = seg_list.bases[seg_idx];
         let seg_path = segment::segment_path(&self.dir, base);
 
-        let reader = if seg_list.is_sealed(seg_idx) {
-            let mmap = self.cache.get_mmap(&seg_path, base)?;
-            let reader = SegmentReader::from_shared_mmap(mmap)?;
-            // Sealed segment: direct seek via the offset table.
-            if let Some(offset) = self
-                .cache
-                .get_index(&seg_path, base)?
-                .get_offset(position.0)
-            {
-                return reader.read_event_at(offset as usize);
-            }
-            reader
-        } else {
-            let reader = self.active_segment_reader(base, &seg_path)?;
-            let active_idx = self.active_index.read();
-            if active_idx.base_position() == base
-                && let Some(offset) = active_idx.get_offset(position.0)
-            {
-                drop(active_idx);
-                return reader.read_event_at(offset as usize);
-            }
-            reader
+        let index = self.index_for(base, &seg_path)?;
+        let Some(offset) = index.get_offset(position.0) else {
+            return Err(Error::Corrupted {
+                message: format!("event at position {} not found in segment", position.0),
+            });
         };
-
-        // Fallback: linear scan (unindexed segment after crash recovery).
-        for result in reader.iter(Some(Position(head))) {
-            let event = result?;
-            if event.position == position {
-                return Ok(event);
-            }
-            if event.position > position {
-                break;
-            }
-        }
-
-        Err(Error::Corrupted {
-            message: format!("event at position {} not found in segment", position.0),
-        })
+        self.reader_for(&index, base, &seg_path)?
+            .read_event_at(offset as usize)
     }
 
     /// Returns the tail position (first available event position).
@@ -2173,94 +2415,38 @@ impl EventStoreEngine {
                 continue;
             }
 
-            // Determine matching positions — no stat syscalls for sealed check.
-            let (matching_positions, seg_index) = if seg_list.is_sealed(i) {
-                // Sealed segment — check bloom filter first, then load index via cache.
-                if let Some(false) = self.cache.bloom_check(&seg_path, base, condition) {
-                    self.metrics.record_bloom_check(true);
-                    continue; // Bloom filter says definitely no match — skip segment.
-                }
+            // Sealed segments: bloom filter first, so a segment that cannot
+            // hold a match is skipped without loading its index.
+            if seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            {
+                self.metrics.record_bloom_check(true);
+                continue;
+            }
+            if seg_list.is_sealed(i) {
                 self.metrics.record_bloom_check(false);
+            }
 
-                let idx = self.cache.get_index(&seg_path, base)?;
-                let bm = idx.matching(condition);
-                (bm, Some(idx))
-            } else {
-                // Active segment — use the in-memory tag index, clamped to
-                // this segment's position range. The tag index holds every
-                // position since boot, so without the clamp a tag whose
-                // matches are all in sealed segments would still produce a
-                // non-empty bitmap here and force needless work.
-                let clamped = Position(from_position.0.max(base));
-                (self.tag_index.matching_bitmap(condition, clamped), None)
+            let index = self.index_for(base, &seg_path)?;
+            let Some(matching_positions) =
+                self.matching_in_segment(&index, condition, from_position.0)
+            else {
+                continue; // No matches in this segment.
             };
+            let reader = self.reader_for(&index, base, &seg_path)?;
 
-            let matching_positions = match matching_positions {
-                Some(bm) => bm,
-                None => continue, // No matches in this segment.
-            };
-
-            // Sealed segments come from the LRU cache; the active segment from
-            // its own cached mapping.
-            let reader = if seg_list.is_sealed(i) {
-                let mmap = self.cache.get_mmap(&seg_path, base)?;
-                SegmentReader::from_shared_mmap(mmap)?
-            } else {
-                self.active_segment_reader(base, &seg_path)?
-            };
-
-            if let Some(idx) = &seg_index {
-                // Sealed segment: direct seek via offset table — O(K) matching events.
-                self.metrics.record_direct_seek();
-                for pos in matching_positions.iter() {
-                    if pos < from_position.0 || pos >= head {
+            // Direct seek via the offset table — O(K) in matching events.
+            self.metrics.record_direct_seek();
+            for pos in matching_positions.iter() {
+                if pos >= head {
+                    break;
+                }
+                if let Some(offset) = index.get_offset(pos) {
+                    let stored = reader.read_event_at(offset as usize)?;
+                    if crate::system::is_system_name(&stored.name) {
                         continue;
                     }
-                    if let Some(offset) = idx.get_offset(pos) {
-                        let stored = reader.read_event_at(offset as usize)?;
-                        if crate::system::is_system_name(&stored.name) {
-                            continue;
-                        }
-                        events.push(stored.into_sequenced());
-                    }
-                }
-            } else {
-                // Active segment: direct seek via the incrementally-built
-                // in-memory index. Falls back to a sequential scan when the
-                // index doesn't cover this segment (rotation raced the
-                // segment-list snapshot, or an unindexed sealed segment
-                // after crash recovery).
-                let active_idx = self.active_index.read();
-                if active_idx.base_position() == base {
-                    self.metrics.record_direct_seek();
-                    for pos in matching_positions.iter() {
-                        if pos < from_position.0 || pos >= head {
-                            continue;
-                        }
-                        if let Some(offset) = active_idx.get_offset(pos) {
-                            let stored = reader.read_event_at(offset as usize)?;
-                            if crate::system::is_system_name(&stored.name) {
-                                continue;
-                            }
-                            events.push(stored.into_sequenced());
-                        }
-                    }
-                } else {
-                    drop(active_idx);
-                    self.metrics.record_sequential_scan();
-                    for result in reader.iter(Some(Position(head))) {
-                        let stored = result?;
-
-                        if stored.position.0 < from_position.0 {
-                            continue;
-                        }
-
-                        if matching_positions.contains(stored.position.0)
-                            && !crate::system::is_system_name(&stored.name)
-                        {
-                            events.push(stored.into_sequenced());
-                        }
-                    }
+                    events.push(stored.into_sequenced());
                 }
             }
         }
@@ -2377,92 +2563,35 @@ impl EventStoreEngine {
                 continue;
             }
 
-            let (matching_positions, seg_index) = if seg_list.is_sealed(i) {
-                if let Some(false) = self.cache.bloom_check(&seg_path, base, condition) {
-                    continue;
+            if seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            {
+                continue;
+            }
+
+            let index = self.index_for(base, &seg_path)?;
+            // Already-consumed positions are dropped up front so chunked
+            // callers (cursor advancing through the log) don't re-skip the
+            // prefix one position at a time on every call.
+            let Some(matching_positions) =
+                self.matching_in_segment(&index, condition, from_position.0)
+            else {
+                continue;
+            };
+            let reader = self.reader_for(&index, base, &seg_path)?;
+
+            for pos in matching_positions.iter() {
+                if pos >= head {
+                    break;
                 }
-                let idx = self.cache.get_index(&seg_path, base)?;
-                let mut bm = idx.matching(condition);
-                // Drop already-consumed positions up front so chunked callers
-                // (cursor advancing through the log) don't re-skip the prefix
-                // one position at a time on every call.
-                if from_position.0 > base
-                    && let Some(bm) = &mut bm
-                {
-                    bm.remove_range(0..from_position.0);
-                }
-                (bm.filter(|bm| !bm.is_empty()), Some(idx))
-            } else {
-                // Active segment — in-memory tag index, clamped to this
-                // segment's range (see `source` for rationale).
-                let clamped = Position(from_position.0.max(base));
-                (self.tag_index.matching_bitmap(condition, clamped), None)
-            };
-
-            let matching_positions = match matching_positions {
-                Some(bm) => bm,
-                None => continue,
-            };
-
-            let reader = if seg_list.is_sealed(i) {
-                let mmap = self.cache.get_mmap(&seg_path, base)?;
-                SegmentReader::from_shared_mmap(mmap)?
-            } else {
-                self.active_segment_reader(base, &seg_path)?
-            };
-
-            if let Some(idx) = &seg_index {
-                for pos in matching_positions.iter() {
-                    if pos < from_position.0 || pos >= head {
+                if let Some(offset) = index.get_offset(pos) {
+                    let mut stored = reader.read_event_at(offset as usize)?;
+                    if !admit(&mut stored) {
                         continue;
                     }
-                    if let Some(offset) = idx.get_offset(pos) {
-                        let mut stored = reader.read_event_at(offset as usize)?;
-                        if !admit(&mut stored) {
-                            continue;
-                        }
-                        events.push(stored);
-                        if events.len() >= limit {
-                            return Ok(events);
-                        }
-                    }
-                }
-            } else {
-                let active_idx = self.active_index.read();
-                if active_idx.base_position() == base {
-                    for pos in matching_positions.iter() {
-                        if pos < from_position.0 || pos >= head {
-                            continue;
-                        }
-                        if let Some(offset) = active_idx.get_offset(pos) {
-                            let mut stored = reader.read_event_at(offset as usize)?;
-                            if !admit(&mut stored) {
-                                continue;
-                            }
-                            events.push(stored);
-                            if events.len() >= limit {
-                                return Ok(events);
-                            }
-                        }
-                    }
-                } else {
-                    drop(active_idx);
-                    for result in reader.iter(Some(Position(head))) {
-                        let mut stored = result?;
-
-                        if stored.position.0 < from_position.0 {
-                            continue;
-                        }
-
-                        if matching_positions.contains(stored.position.0) {
-                            if !admit(&mut stored) {
-                                continue;
-                            }
-                            events.push(stored);
-                            if events.len() >= limit {
-                                return Ok(events);
-                            }
-                        }
+                    events.push(stored);
+                    if events.len() >= limit {
+                        return Ok(events);
                     }
                 }
             }
@@ -2515,6 +2644,15 @@ impl EventStore for EventStoreEngine {
 
     fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error> {
         self.get_tags(position)
+    }
+
+    fn has_matches_between(
+        &self,
+        from: Position,
+        to: Position,
+        condition: &SourcingCondition,
+    ) -> bool {
+        self.has_matches_between(from, to, condition)
     }
 
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
@@ -2736,32 +2874,42 @@ fn scan_replication_boundary(
     }
 }
 
-/// Rebuilds the tag index for the active (unsealed) segment.
-///
-/// Sealed segments have `.idx` companion files on disk and don't need replay.
-/// Only the active segment (the last one without `.idx`) is replayed.
-/// If a sealed segment is missing its `.idx`, it's rebuilt from the segment data.
-fn rebuild_active_segment_index(dir: &Path, index: &TagIndex) -> Result<(), Error> {
-    let segments = segment::list_segment_files(dir)?;
+/// The index answering for one segment: a read guard on the active
+/// segment's live index, or a shared handle to a sealed one.
+enum IndexRef<'a> {
+    Active(parking_lot::RwLockReadGuard<'a, SegmentIndex>),
+    Sealed(Arc<SegmentIndex>),
+}
 
-    for base_pos in segments {
-        let seg_path = segment::segment_path(dir, base_pos);
-
-        if SegmentIndex::has_companion_files(&seg_path) {
-            // Sealed segment with valid index files — skip replay.
-            continue;
-        }
-
-        // No companion files — either active segment or sealed segment
-        // with missing index. Rebuild the index from segment data.
-        let reader = SegmentReader::open(&seg_path)?;
-
-        for result in reader.iter(None) {
-            let event = result?;
-            index.index_event(event.position, &event.name, &event.tags);
+impl std::ops::Deref for IndexRef<'_> {
+    type Target = SegmentIndex;
+    fn deref(&self) -> &SegmentIndex {
+        match self {
+            IndexRef::Active(guard) => guard,
+            IndexRef::Sealed(index) => index,
         }
     }
+}
 
+/// Writes companions for every sealed segment that lacks them. A crash
+/// between a rotation and its background seal is the one way a sealed
+/// segment ends up without `.idx`/`.bloom`; rebuilding them here is what
+/// lets every read path assume a sealed segment has an index.
+fn heal_sealed_segments(dir: &Path, active_base: u64) -> Result<(), Error> {
+    for base in segment::list_segment_files(dir)? {
+        if base == active_base {
+            continue;
+        }
+        let seg_path = segment::segment_path(dir, base);
+        if SegmentIndex::has_companion_files(&seg_path) {
+            continue;
+        }
+        tracing::info!(
+            base,
+            "sealed segment has no companion files; rebuilding its index"
+        );
+        SegmentIndex::build_from_segment(&seg_path)?.write_to_disk(&seg_path)?;
+    }
     Ok(())
 }
 
@@ -3006,12 +3154,11 @@ mod tests {
         assert!(matches!(probe, Err(Error::ReservedNamespace { .. })));
     }
 
-    /// After rotation prunes sealed positions from the in-memory tag index,
-    /// tag queries and DCB checks must still resolve them via the sealed
-    /// segments' `.idx`/`.bloom` files — pruning changes memory footprint,
-    /// never answers.
+    /// A rotation seals the segment in memory first and writes its
+    /// companions in the background. Both before and after the companions
+    /// land, tag queries and DCB checks must resolve the sealed positions.
     #[test]
-    fn tag_index_prune_preserves_queries_and_dcb() {
+    fn sealed_segments_answer_queries_and_dcb_after_rotation() {
         let dir = tempfile::tempdir().unwrap();
         // Tiny segments force several rotations.
         let store = EventStoreEngine::create_with_options(dir.path(), 4 * 1024).unwrap();
@@ -3029,10 +3176,18 @@ mod tests {
         }
         let sealed = store.segments.read().clone();
         assert!(sealed.sealed_count > 0, "expected at least one rotation");
-        let active_base = *sealed.bases.last().unwrap();
 
-        // Deterministic prune (the rotation-spawned threads race the test).
-        store.tag_index.prune_below(active_base);
+        // Let every background seal land, then every sealed segment must
+        // have its companions and no index may still be pinned.
+        store.seals.wait_idle();
+        for &base in &sealed.bases[..sealed.sealed_count] {
+            let path = segment::segment_path(dir.path(), base);
+            assert!(
+                SegmentIndex::has_companion_files(&path),
+                "segment {base} lacks companions"
+            );
+            assert!(!store.cache.is_pinned(base));
+        }
 
         // Query for an early (sealed-only) tag still finds its event.
         let cond = SourcingCondition {
@@ -3063,13 +3218,56 @@ mod tests {
             Ok(_) => panic!("DCB must still see sealed conflicts after prune"),
         }
 
-        // The index really did shrink: no positions below the active base.
-        let all = store
-            .tag_index
-            .matching_bitmap(&cond_match_all(), Position(0));
-        if let Some(bm) = all {
-            assert!(bm.min().unwrap_or(u64::MAX) >= active_base);
+        // Every event is still reachable across all segments.
+        let all = store.source(Position(0), &cond_match_all()).unwrap();
+        assert_eq!(
+            all.len(),
+            100,
+            "the rejected append wrote nothing; every accepted event resolves"
+        );
+    }
+
+    /// A crash between a rotation and its background seal leaves a sealed
+    /// segment without companions. Opening the store rebuilds them.
+    #[test]
+    fn open_rebuilds_missing_companions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed;
+        {
+            let store = EventStoreEngine::create_with_options(dir.path(), 4 * 1024).unwrap();
+            for i in 0..100 {
+                store
+                    .append(AppendRequest {
+                        condition: None,
+                        events: vec![make_event(
+                            "OrderPlaced",
+                            vec![tag("orderId", &format!("ord-{i}"))],
+                        )],
+                    })
+                    .unwrap();
+            }
+            store.seals.wait_idle();
+            sealed = store.segments.read().clone();
+            assert!(sealed.sealed_count > 0);
+            store.shutdown();
         }
+        let victim = segment::segment_path(dir.path(), sealed.bases[0]);
+        std::fs::remove_file(victim.with_extension("idx")).unwrap();
+        std::fs::remove_file(victim.with_extension("bloom")).unwrap();
+
+        let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
+        assert!(SegmentIndex::has_companion_files(&victim));
+        let cond = SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![tag("orderId", "ord-0")],
+            }],
+        };
+        assert_eq!(store.source(Position(0), &cond).unwrap().len(), 1);
+        assert_eq!(
+            store.source(Position(0), &cond_match_all()).unwrap().len(),
+            100
+        );
     }
 
     fn cond_match_all() -> SourcingCondition {

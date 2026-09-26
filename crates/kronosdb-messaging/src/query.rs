@@ -95,8 +95,9 @@ pub struct QueryBus {
     /// value; DashMap shards key-level insert contention (same pattern as
     /// CommandBus).
     metrics: DashMap<String, MessageTypeMetrics>,
-    /// Wakes `dispatch_wait` loops when flow-control permits are granted.
-    permit_notify: tokio::sync::Notify,
+    /// Wakes `dispatch_wait` loops when flow-control permits are granted —
+    /// one `Notify` per query type (see `CommandBus::permit_notify`).
+    permit_notify: DashMap<String, Arc<tokio::sync::Notify>>,
     /// Whether the `_wait` dispatch variants wait (bounded) for a grant
     /// when no handler can accept, rather than failing immediately.
     permit_wait: bool,
@@ -118,9 +119,22 @@ impl QueryBus {
             handlers: Arc::new(RwLock::new(HandlerRegistry::new())),
             dispatch_counter: AtomicU64::new(0),
             metrics: DashMap::new(),
-            permit_notify: tokio::sync::Notify::new(),
+            permit_notify: DashMap::new(),
             permit_wait,
         }
+    }
+
+    /// The wakeup for dispatchers parked on `query_name`.
+    fn permit_notify_for(&self, query_name: &str) -> Arc<tokio::sync::Notify> {
+        if let Some(notify) = self.permit_notify.get(query_name) {
+            return Arc::clone(&notify);
+        }
+        Arc::clone(
+            &self
+                .permit_notify
+                .entry(query_name.to_string())
+                .or_default(),
+        )
     }
 
     /// Returns a shared reference to the handler registry.
@@ -155,12 +169,13 @@ impl QueryBus {
 
     /// Grants flow control permits to a client.
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
-        {
-            let handlers = self.handlers.read();
-            handlers.grant_permits(client_id, permits);
+        let handlers = self.handlers.read();
+        // Wake the dispatch_wait loops parked on this handler's types.
+        for query_name in handlers.grant_permits(client_id, permits) {
+            if let Some(notify) = self.permit_notify.get(query_name) {
+                notify.notify_waiters();
+            }
         }
-        // Wake any dispatch_wait loops parked on permit exhaustion.
-        self.permit_notify.notify_waiters();
     }
 
     /// Returns detailed handler info + dispatch metrics per query type.
@@ -265,8 +280,9 @@ impl QueryBus {
             return self.dispatch(query);
         }
         let deadline = tokio::time::Instant::now() + max_wait;
+        let notify = self.permit_notify_for(&query.name);
         loop {
-            let notified = self.permit_notify.notified();
+            let notified = notify.notified();
             match self.dispatch(query.clone()) {
                 Err(QueryError::NoPermitsAvailable { .. }) => {}
                 other => return other,
@@ -294,8 +310,9 @@ impl QueryBus {
             return self.dispatch_to(query, targets);
         }
         let deadline = tokio::time::Instant::now() + max_wait;
+        let notify = self.permit_notify_for(&query.name);
         loop {
-            let notified = self.permit_notify.notified();
+            let notified = notify.notified();
             match self.dispatch_to(query.clone(), targets) {
                 Err(QueryError::NoPermitsAvailable { .. }) => {}
                 other => return other,

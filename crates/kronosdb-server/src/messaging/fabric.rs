@@ -104,7 +104,9 @@ struct CachedRing {
 /// per-(bus, type) ring cache keyed by table generation.
 pub struct FabricRouter {
     cluster: Arc<ClusterManager>,
-    rings: RwLock<HashMap<(String, String), CachedRing>>,
+    /// bus → message type → ring at a generation. Two borrowed lookups on
+    /// a hit; nothing allocated on the dispatch path.
+    rings: RwLock<HashMap<String, HashMap<String, CachedRing>>>,
     rr_counter: AtomicU64,
 }
 
@@ -235,10 +237,9 @@ impl FabricRouter {
         generation: u64,
         rows: &[RegisteredHandler],
     ) -> Arc<Ring> {
-        let key = (bus.to_string(), message_type.to_string());
         {
             let rings = self.rings.read();
-            if let Some(cached) = rings.get(&key)
+            if let Some(cached) = rings.get(bus).and_then(|types| types.get(message_type))
                 && cached.generation == generation
             {
                 return Arc::clone(&cached.ring);
@@ -247,13 +248,17 @@ impl FabricRouter {
         let ring = Arc::new(Ring::build(
             rows.iter().map(|r| (r.client_id.as_str(), r.load_factor)),
         ));
-        self.rings.write().insert(
-            key,
-            CachedRing {
-                generation,
-                ring: Arc::clone(&ring),
-            },
-        );
+        self.rings
+            .write()
+            .entry(bus.to_string())
+            .or_default()
+            .insert(
+                message_type.to_string(),
+                CachedRing {
+                    generation,
+                    ring: Arc::clone(&ring),
+                },
+            );
         ring
     }
 }
