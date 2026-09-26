@@ -1,0 +1,19 @@
+{{- if include "kronosdb.identityEnabled" . }}
+{{- if and .Values.identity.tokens (not .Values.identity.tokenSecret) }}
+{{- fail "identity.tokens is set but identity.tokenSecret is empty: token values live in a Secret, referenced by secretKey." }}
+{{- end }}
+{{- $tokens := list }}
+{{- range .Values.identity.tokens }}
+{{- $tokens = append $tokens (merge (dict "token-file" (printf "/etc/kronosdb/tokens/%s" (required "identity.tokens[].secretKey is required" .secretKey))) (omit . "secretKey")) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kronosdb.fullname" . }}-config
+  labels: {{- include "kronosdb.labels" . | nindent 4 }}
+data:
+  # Read once at boot; the pod template carries a checksum of this file so
+  # a change rolls the pods.
+  kronosdb.toml: |
+    {{- dict "security" (dict "tokens" $tokens "issuers" .Values.identity.issuers "grants" .Values.identity.grants) | toToml | nindent 4 }}
+{{- end }}

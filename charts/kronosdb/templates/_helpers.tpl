@@ -115,6 +115,16 @@ env:
     value: /etc/kronosdb/tls/tls.crt
   - name: KRONOSDB_TLS_KEY
     value: /etc/kronosdb/tls/tls.key
+  {{- if $root.Values.tls.clientAuth }}
+  - name: KRONOSDB_TLS_CA
+    value: /etc/kronosdb/tls/ca.crt
+  - name: KRONOSDB_TLS_CLIENT_AUTH
+    value: {{ $root.Values.tls.clientAuth | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if include "kronosdb.identityEnabled" $root }}
+  - name: KRONOSDB_CONFIG
+    value: /etc/kronosdb/config/kronosdb.toml
   {{- end }}
   {{- with $root.Values.config.extraEnv }}
   {{- toYaml . | nindent 2 }}
@@ -132,6 +142,12 @@ volumeMounts:
   {{- if $root.Values.tls.secretName }}
   - { name: tls, mountPath: /etc/kronosdb/tls, readOnly: true }
   {{- end }}
+  {{- if include "kronosdb.identityEnabled" $root }}
+  - { name: config, mountPath: /etc/kronosdb/config, readOnly: true }
+  {{- end }}
+  {{- if $root.Values.identity.tokenSecret }}
+  - { name: identity-tokens, mountPath: /etc/kronosdb/tokens, readOnly: true }
+  {{- end }}
 resources: {{- toYaml $root.Values.resources | nindent 2 }}
 livenessProbe:
   httpGet: { path: /health, port: admin }
@@ -141,4 +157,44 @@ startupProbe:
   httpGet: { path: /ready, port: admin }
   failureThreshold: {{ $root.Values.startupProbe.failureThreshold }}
   periodSeconds: {{ $root.Values.startupProbe.periodSeconds }}
+{{- end -}}
+
+
+{{/* Non-empty when any identity-layer list is set. */}}
+{{- define "kronosdb.identityEnabled" -}}
+{{- if or .Values.identity.issuers .Values.identity.grants .Values.identity.tokens -}}true{{- end -}}
+{{- end -}}
+
+{{/* Pod annotations that roll the pods when boot-time config changes. */}}
+{{- define "kronosdb.podAnnotations" -}}
+{{- if and .Values.contexts .Values.rollOnManifestChange }}
+checksum/manifest: {{ include (print $.Template.BasePath "/configmap-manifest.yaml") . | sha256sum }}
+{{- end }}
+{{- if include "kronosdb.identityEnabled" . }}
+checksum/config: {{ include (print $.Template.BasePath "/configmap-config.yaml") . | sha256sum }}
+{{- end }}
+{{- end -}}
+
+{{/* Pod volumes, shared by the voter and learner StatefulSets. */}}
+{{- define "kronosdb.volumes" -}}
+{{- if .Values.contexts }}
+- name: manifest
+  configMap:
+    name: {{ include "kronosdb.fullname" . }}-manifest
+{{- end }}
+{{- if .Values.tls.secretName }}
+- name: tls
+  secret:
+    secretName: {{ .Values.tls.secretName }}
+{{- end }}
+{{- if include "kronosdb.identityEnabled" . }}
+- name: config
+  configMap:
+    name: {{ include "kronosdb.fullname" . }}-config
+{{- end }}
+{{- if .Values.identity.tokenSecret }}
+- name: identity-tokens
+  secret:
+    secretName: {{ .Values.identity.tokenSecret }}
+{{- end }}
 {{- end -}}

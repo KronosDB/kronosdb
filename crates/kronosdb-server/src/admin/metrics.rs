@@ -300,5 +300,39 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         )],
     );
 
+    // ── gRPC identity layer ──
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = &state.identities.stats;
+        let method = |m: &str| format!("{{method=\"{m}\"}}");
+        family(
+            &mut out,
+            "kronosdb_auth_authenticated_total",
+            "counter",
+            "gRPC requests authenticated, by credential type",
+            &[
+                (method("token"), stats.token.load(Relaxed)),
+                (method("jwt"), stats.jwt.load(Relaxed)),
+                (method("mtls"), stats.mtls.load(Relaxed)),
+            ],
+        );
+        family(
+            &mut out,
+            "kronosdb_auth_rejected_total",
+            "counter",
+            "gRPC requests rejected by the identity layer",
+            &[
+                (
+                    "{reason=\"unauthenticated\"}".to_string(),
+                    stats.unauthenticated.load(Relaxed),
+                ),
+                (
+                    "{reason=\"permission_denied\"}".to_string(),
+                    stats.denied.load(Relaxed),
+                ),
+            ],
+        );
+    }
+
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
 }

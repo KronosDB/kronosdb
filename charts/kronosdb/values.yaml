@@ -80,6 +80,40 @@ auth:
   # Secret with key "access-token". Takes precedence over accessToken.
   existingSecret: ""
 
+# Identity layer (ADR-0008): who may call the gRPC API, and as what. Rendered
+# verbatim into the server's [security] config, so keys are the TOML keys.
+# Everything is optional and combines with auth.accessToken (which peers
+# keep using unless an mtls grant gives them the "peer" role).
+identity:
+  # OIDC issuers whose JWTs are trusted — human SSO and workload identity
+  # are the same thing here.
+  issuers: []
+  #  - name: google                      # gcloud auth print-identity-token
+  #    issuer: https://accounts.google.com
+  #    subject-claim: email
+  #  - name: gke                         # pods' projected service-account tokens
+  #    issuer: https://container.googleapis.com/v1/projects/P/locations/L/clusters/C
+  #    audiences: [kronosdb]
+  # Principal -> roles (read < write < admin; peer is internode only),
+  # optionally narrowed to context/bus globs.
+  grants: []
+  #  - source: google
+  #    subject: "*@example.com"
+  #    claims: { hd: example.com, email_verified: true }
+  #    roles: [read]
+  #  - source: gke
+  #    subject: system:serviceaccount:prod:orders
+  #    roles: [write]
+  #    contexts: [orders]
+  # Named static tokens. Secrets stay out of the ConfigMap: put each token
+  # under a key of tokenSecret and reference it by that key.
+  tokens: []
+  #  - name: ci
+  #    secretKey: ci                     # key in tokenSecret
+  #    roles: [write]
+  #    contexts: ["orders-*"]
+  tokenSecret: ""
+
 admin:
   # none | token | oidc. "token" requires adminToken or existingSecret;
   # "oidc" is configured via config.extraEnv (KRONOSDB_OIDC_*).
@@ -94,6 +128,11 @@ tls:
   # Name of a kubernetes.io/tls Secret (tls.crt / tls.key, optional ca.crt)
   # for the gRPC port. Empty = plaintext.
   secretName: ""
+  # Verify client certificates against the Secret's ca.crt (mTLS).
+  #   "" = off | required = every connection needs a certificate |
+  #   optional = certificates and bearer tokens share the port (needs
+  #   identity/auth configured — the server refuses to start otherwise).
+  clientAuth: ""
 
 service:
   # Client-facing gRPC service.

@@ -21,7 +21,7 @@ impl ClusterManager {
     /// fenced native replication sessions. Idempotent.
     pub fn start_replication(self: &Arc<Self>) -> Result<(), Error> {
         if self.raft_node().is_none() {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "start_replication called before init_raft".into(),
             });
         }
@@ -214,7 +214,7 @@ impl ClusterManager {
                         id,
                         addr: node.addr.clone(),
                     })
-                    .ok_or_else(|| Error::Corrupted {
+                    .ok_or_else(|| Error::Unavailable {
                         message: format!("active voter {id} has no peer address"),
                     })
             })
@@ -430,18 +430,18 @@ impl ClusterManager {
         let voter_ids: Vec<_> = active_voters.iter().map(|peer| peer.id).collect();
         let voter_generation = self.control.voter_generation();
         if !voter_ids.contains(&self.cluster_config.node_id) {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "local node is not an active voter".into(),
             });
         }
-        let raft = self.raft_node().ok_or_else(|| Error::Corrupted {
+        let raft = self.raft_node().ok_or_else(|| Error::Unavailable {
             message: "metadata control plane is not initialized".into(),
         })?;
         let current = raft.metrics().borrow().clone();
         if current.current_leader != Some(self.cluster_config.node_id)
             || current.current_term != term
         {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "leadership changed before native fencing claim".into(),
             });
         }
@@ -506,7 +506,7 @@ impl ClusterManager {
             match response {
                 RaftResponse::LeaderClaimed { epoch } => epoch,
                 other => {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Internal {
                         message: format!("unexpected leader-claim response: {other:?}"),
                     });
                 }
@@ -528,7 +528,7 @@ impl ClusterManager {
             if current.current_leader != Some(self.cluster_config.node_id)
                 || current.current_term != term
             {
-                return Err(Error::Corrupted {
+                return Err(Error::Unavailable {
                     message: "leadership changed while fencing prior Tail sessions".into(),
                 });
             }
@@ -536,7 +536,7 @@ impl ClusterManager {
                 || self.control.voters() != voter_ids
                 || self.control.voter_generation() != voter_generation
             {
-                return Err(Error::Corrupted {
+                return Err(Error::Unavailable {
                     message: "voter membership changed while fencing prior Tail sessions".into(),
                 });
             }
@@ -567,7 +567,7 @@ impl ClusterManager {
         if current.current_leader != Some(self.cluster_config.node_id)
             || current.current_term != term
         {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "leadership changed during native catch-up".into(),
             });
         }
@@ -580,7 +580,7 @@ impl ClusterManager {
             || self.control.voters() != voter_ids
             || self.control.voter_generation() != voter_generation
         {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "voter membership changed before persisting EpochChange".into(),
             });
         }
@@ -616,7 +616,7 @@ impl ClusterManager {
                 if current.current_leader != Some(self.cluster_config.node_id)
                     || current.current_term != term
                 {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Unavailable {
                         message: "leadership changed while confirming native data quorum".into(),
                     });
                 }
@@ -624,7 +624,7 @@ impl ClusterManager {
                     || self.control.voters() != voter_ids
                     || self.control.voter_generation() != voter_generation
                 {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Unavailable {
                         message: "voter membership changed while confirming native data quorum"
                             .into(),
                     });
@@ -637,7 +637,7 @@ impl ClusterManager {
         if current.current_leader != Some(self.cluster_config.node_id)
             || current.current_term != term
         {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "leadership changed while activating native claim".into(),
             });
         }
@@ -645,7 +645,7 @@ impl ClusterManager {
             .control
             .activate_local(epoch, term, voter_ids, voter_generation)
         {
-            return Err(Error::Corrupted {
+            return Err(Error::Unavailable {
                 message: "voter membership changed while activating native leader claim".into(),
             });
         }
@@ -692,12 +692,12 @@ impl ClusterManager {
                     let response = client
                         .get_cursors(request)
                         .await
-                        .map_err(|error| Error::Corrupted {
+                        .map_err(|error| Error::Unavailable {
                             message: format!("query native cursors from node {}: {error}", peer.id),
                         })?
                         .into_inner();
                     if response.node_id != peer.id {
-                        return Err(Error::Corrupted {
+                        return Err(Error::Unavailable {
                             message: format!(
                                 "cursor endpoint for node {} identified itself as {}",
                                 peer.id, response.node_id
@@ -805,13 +805,13 @@ impl ClusterManager {
                         .unwrap_or(0)
                         >= safe_tail
             })
-            .ok_or_else(|| Error::Corrupted {
+            .ok_or_else(|| Error::Unavailable {
                 message: format!("no voter can source context {context} through {safe_tail}"),
             })?;
         let peer = active_voters
             .iter()
             .find(|peer| peer.id == source.node_id)
-            .ok_or_else(|| Error::Corrupted {
+            .ok_or_else(|| Error::Unavailable {
                 message: format!(
                     "cursor source {} is absent from voter config",
                     source.node_id
