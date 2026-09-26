@@ -133,6 +133,11 @@ impl SegmentIndex {
         &self.bloom
     }
 
+    /// The positions this segment holds: dense from its base.
+    pub fn position_range(&self) -> std::ops::Range<u64> {
+        self.base_position..self.base_position + self.offsets.len() as u64
+    }
+
     /// Returns the byte offset for a given position within this segment.
     pub fn get_offset(&self, position: u64) -> Option<u64> {
         let relative = position.checked_sub(self.base_position)? as usize;
@@ -172,6 +177,43 @@ impl SegmentIndex {
         result
     }
 
+    /// Whether any event in `[from, to)` could match `condition`, decided
+    /// from ranks alone: no bitmap is cloned or intersected. A criterion is
+    /// possible when each of its tags has a position in the range and, if it
+    /// names event types, at least one of them does. Never a false negative;
+    /// a true answer still needs `matching` to confirm. This is what lets a
+    /// subscriber woken by a commit decide, in a few lookups, that the
+    /// commit holds nothing for it.
+    pub fn any_match_in(&self, condition: &SourcingCondition, from: u64, to: u64) -> bool {
+        if from >= to {
+            return false;
+        }
+        let in_range =
+            |bitmap: &RoaringTreemap| first_at_or_after(bitmap, from).is_some_and(|p| p < to);
+        condition.criteria.iter().any(|criterion| {
+            let tags_possible = criterion.tags.iter().all(|tag| {
+                self.bitmaps
+                    .get(&make_forward_key(&tag.key, &tag.value))
+                    .is_some_and(in_range)
+            });
+            if !tags_possible {
+                return false;
+            }
+            if criterion.names.is_empty() {
+                return if criterion.tags.is_empty() {
+                    in_range(&self.all_positions)
+                } else {
+                    true
+                };
+            }
+            criterion.names.iter().any(|name| {
+                self.bitmaps
+                    .get(&make_forward_key(EVENT_TYPE_TAG_KEY, name.as_bytes()))
+                    .is_some_and(in_range)
+            })
+        })
+    }
+
     /// Checks if any event matching the query exists at or after the given position.
     /// `after` is the next-exclusive head the caller validated against (DCB marker).
     pub fn has_match_after(&self, condition: &SourcingCondition, after: u64) -> Option<Position> {
@@ -207,6 +249,9 @@ impl SegmentIndex {
             return Some(self.all_positions.clone());
         }
 
+        // Start from the smallest set: the clone is of the most selective
+        // tag, and every AND after it can only shrink it.
+        parts.sort_by_key(|bitmap| bitmap.len());
         let mut result = parts[0].clone();
         for part in &parts[1..] {
             result &= *part;

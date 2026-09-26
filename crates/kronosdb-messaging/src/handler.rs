@@ -294,14 +294,23 @@ impl HandlerRegistry {
     }
 
     /// Grants permits to a specific client across all their subscriptions.
-    pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
-        for handlers in self.subscriptions.values() {
-            for entry in handlers {
-                if &entry.handler.client_id == client_id {
-                    entry.handler.add_permits(permits);
+    /// Walks only the message types the client handles (not every type on
+    /// the bus) and returns them, so the bus can wake exactly the
+    /// dispatchers parked on those types.
+    pub fn grant_permits(&self, client_id: &ClientId, permits: i64) -> &[String] {
+        let Some(types) = self.client_subscriptions.get(client_id) else {
+            return &[];
+        };
+        for message_type in types {
+            if let Some(handlers) = self.subscriptions.get(message_type) {
+                for entry in handlers {
+                    if &entry.handler.client_id == client_id {
+                        entry.handler.add_permits(permits);
+                    }
                 }
             }
         }
+        types
     }
 
     /// Returns detailed handler info per message type, for admin display.

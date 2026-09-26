@@ -66,6 +66,8 @@ struct Inner {
     quorum: usize,
     /// Durable cursor per voter in the current epoch.
     cursors: BTreeMap<NodeId, u64>,
+    /// Scratch for the quorum order statistic; reused across advances.
+    scratch: Vec<u64>,
     /// Waiters keyed by position: released when the watermark passes them.
     ledger: BTreeMap<u64, Vec<Waiter>>,
     /// Latched for the current epoch on fsync failure / epoch loss / shutdown.
@@ -101,6 +103,7 @@ impl WatermarkState {
                 voters,
                 quorum,
                 cursors: BTreeMap::new(),
+                scratch: Vec::new(),
                 ledger: BTreeMap::new(),
                 poisoned: None,
             }),
@@ -169,9 +172,16 @@ impl WatermarkState {
         if inner.cursors.len() < inner.quorum {
             return None;
         }
-        let mut positions: Vec<u64> = inner.cursors.values().copied().collect();
-        positions.sort_unstable_by(|a, b| b.cmp(a));
-        let candidate = positions[inner.quorum - 1];
+        // The quorum-th highest cursor: a selection over the (tiny) voter
+        // set into a reused buffer, no sort and no allocation per advance.
+        let quorum = inner.quorum;
+        let Inner {
+            cursors, scratch, ..
+        } = &mut *inner;
+        scratch.clear();
+        scratch.extend(cursors.values().copied());
+        let (_, candidate, _) = scratch.select_nth_unstable_by(quorum - 1, |a, b| b.cmp(a));
+        let candidate = *candidate;
         self.bump_locked(&mut inner, candidate)
     }
 

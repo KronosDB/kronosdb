@@ -6,6 +6,7 @@
 //! /ready; it exposes counts only, never event payloads.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::header;
@@ -32,7 +33,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     // ── Per-context engine metrics ──
     let mut snaps = Vec::new();
     let mut poisoned = Vec::new();
-    let mut data_bytes = Vec::new();
+    let mut sized = Vec::new();
     for name in state.contexts.list_contexts() {
         if let Ok(engine) = state.contexts.get_context(&name) {
             let watermark = engine.head().0;
@@ -40,8 +41,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             let durable_tail = engine.durable_tail().0;
             let tail = engine.tail().0;
             poisoned.push((ctx_label(&name), engine.is_poisoned() as u64));
-            // Directory walk per scrape, off the request path's hot loops.
-            data_bytes.push((ctx_label(&name), engine.data_dir_bytes()));
+            sized.push((ctx_label(&name), Arc::clone(&engine)));
             snaps.push((
                 name,
                 engine.metrics_snapshot(),
@@ -52,6 +52,17 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             ));
         }
     }
+
+    // One directory walk per context per scrape — a blocking recursive
+    // stat, so it runs on the blocking pool, not a runtime worker.
+    let data_bytes: Vec<(String, u64)> = tokio::task::spawn_blocking(move || {
+        sized
+            .into_iter()
+            .map(|(label, engine)| (label, engine.data_dir_bytes()))
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
 
     macro_rules! engine_family {
         ($metric:literal, $kind:literal, $help:literal, $field:ident) => {

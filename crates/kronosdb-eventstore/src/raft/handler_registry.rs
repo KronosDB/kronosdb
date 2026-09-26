@@ -19,6 +19,7 @@
 //!   when the membership entry applies.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
@@ -55,13 +56,57 @@ pub struct RegisteredHandler {
     pub load_factor: i32,
 }
 
-type TableKey = (String, HandlerKind, String);
+/// The handlers registered for one message type, sorted by client id and
+/// shared: a lookup hands out the `Arc`, a mutation replaces it. Every
+/// dispatch reads rows; registrations are rare.
+pub type HandlerRows = Arc<[RegisteredHandler]>;
+
+#[derive(Default)]
+struct TypeRows {
+    command: Option<HandlerRows>,
+    query: Option<HandlerRows>,
+}
+
+impl TypeRows {
+    fn get(&self, kind: HandlerKind) -> Option<&HandlerRows> {
+        match kind {
+            HandlerKind::Command => self.command.as_ref(),
+            HandlerKind::Query => self.query.as_ref(),
+        }
+    }
+
+    fn slot(&mut self, kind: HandlerKind) -> &mut Option<HandlerRows> {
+        match kind {
+            HandlerKind::Command => &mut self.command,
+            HandlerKind::Query => &mut self.query,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.command.is_none() && self.query.is_none()
+    }
+}
+
+fn sorted_rows(mut rows: Vec<RegisteredHandler>) -> Option<HandlerRows> {
+    if rows.is_empty() {
+        return None;
+    }
+    rows.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+    Some(Arc::from(rows))
+}
+
+fn empty_rows() -> HandlerRows {
+    static EMPTY: std::sync::OnceLock<HandlerRows> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from(Vec::new())))
+}
 
 /// The applied routing table. Written only by the Raft state machine
 /// (single apply thread), read concurrently by dispatch paths.
 #[derive(Default)]
 pub struct HandlerRoutingTable {
-    inner: RwLock<HashMap<TableKey, Vec<RegisteredHandler>>>,
+    /// bus → message type → rows per kind. Two borrowed lookups per
+    /// dispatch, no key allocated.
+    inner: RwLock<HashMap<String, HashMap<String, TypeRows>>>,
     /// Bumped on every mutation. Readers cache derived structures (rings)
     /// keyed by this.
     generation: AtomicU64,
@@ -85,26 +130,30 @@ impl HandlerRoutingTable {
     /// (bus, kind, message_type, client_id) regardless of node — a client
     /// reconnecting through a different node moves its row.
     pub fn apply_register(&self, reg: HandlerRegistration) {
-        let key = (reg.bus, reg.kind, reg.message_type);
         let handler = RegisteredHandler {
             client_id: reg.client_id,
             node_id: reg.node_id,
             load_factor: reg.load_factor,
         };
         let mut table = self.inner.write();
-        let rows = table.entry(key).or_default();
+        let slot = table
+            .entry(reg.bus)
+            .or_default()
+            .entry(reg.message_type)
+            .or_default()
+            .slot(reg.kind);
+        let mut rows: Vec<RegisteredHandler> =
+            slot.as_deref().map(<[_]>::to_vec).unwrap_or_default();
         if let Some(existing) = rows.iter_mut().find(|r| r.client_id == handler.client_id) {
             *existing = handler;
         } else {
             rows.push(handler);
         }
+        *slot = sorted_rows(rows);
         drop(table);
         self.bump();
     }
 
-    /// Applies an explicit unsubscribe. Filtered by node so a stale
-    /// deregistration from a node the client already left cannot remove
-    /// the client's newer registration through another node.
     pub fn apply_deregister(
         &self,
         bus: &str,
@@ -113,82 +162,96 @@ impl HandlerRoutingTable {
         client_id: &str,
         node_id: NodeId,
     ) {
-        let key = (bus.to_string(), kind, message_type.to_string());
         let mut table = self.inner.write();
-        if let Some(rows) = table.get_mut(&key) {
-            rows.retain(|r| !(r.client_id == client_id && r.node_id == node_id));
-            if rows.is_empty() {
-                table.remove(&key);
+        if let Some(types) = table.get_mut(bus) {
+            if let Some(type_rows) = types.get_mut(message_type) {
+                let slot = type_rows.slot(kind);
+                if let Some(rows) = slot.as_deref() {
+                    let kept: Vec<RegisteredHandler> = rows
+                        .iter()
+                        .filter(|r| !(r.client_id == client_id && r.node_id == node_id))
+                        .cloned()
+                        .collect();
+                    *slot = sorted_rows(kept);
+                }
+                if type_rows.is_empty() {
+                    types.remove(message_type);
+                }
+            }
+            if types.is_empty() {
+                table.remove(bus);
             }
         }
         drop(table);
         self.bump();
     }
 
-    /// Applies a client disconnect: removes every row for the client that
-    /// still points at the node it disconnected from.
+    /// Keeps only the rows `keep` accepts, in every bus and type.
+    fn retain_rows(&self, keep: impl Fn(&RegisteredHandler) -> bool) {
+        let mut table = self.inner.write();
+        table.retain(|_, types| {
+            types.retain(|_, type_rows| {
+                for kind in [HandlerKind::Command, HandlerKind::Query] {
+                    let slot = type_rows.slot(kind);
+                    if let Some(rows) = slot.as_deref()
+                        && !rows.iter().all(&keep)
+                    {
+                        let kept: Vec<RegisteredHandler> =
+                            rows.iter().filter(|r| keep(r)).cloned().collect();
+                        *slot = sorted_rows(kept);
+                    }
+                }
+                !type_rows.is_empty()
+            });
+            !types.is_empty()
+        });
+        drop(table);
+        self.bump();
+    }
+
     pub fn apply_deregister_client(&self, client_id: &str, node_id: NodeId) {
-        let mut table = self.inner.write();
-        table.retain(|_, rows| {
-            rows.retain(|r| !(r.client_id == client_id && r.node_id == node_id));
-            !rows.is_empty()
-        });
-        drop(table);
-        self.bump();
+        self.retain_rows(|r| !(r.client_id == client_id && r.node_id == node_id));
     }
 
-    /// Drops every row owned by a node (startup crash-cleanup, node death).
     pub fn apply_clear_node(&self, node_id: NodeId) {
-        let mut table = self.inner.write();
-        table.retain(|_, rows| {
-            rows.retain(|r| r.node_id != node_id);
-            !rows.is_empty()
-        });
-        drop(table);
-        self.bump();
+        self.retain_rows(|r| r.node_id != node_id);
     }
 
-    /// Drops rows owned by nodes outside the live membership set.
     pub fn retain_nodes(&self, live: &BTreeSet<NodeId>) {
-        let mut table = self.inner.write();
-        table.retain(|_, rows| {
-            rows.retain(|r| live.contains(&r.node_id));
-            !rows.is_empty()
-        });
-        drop(table);
-        self.bump();
+        self.retain_rows(|r| live.contains(&r.node_id));
     }
 
-    /// Handlers for a (bus, kind, message_type), sorted by client_id so
-    /// every node derives identical rings from identical generations.
-    pub fn lookup(
-        &self,
-        bus: &str,
-        kind: HandlerKind,
-        message_type: &str,
-    ) -> Vec<RegisteredHandler> {
-        let key = (bus.to_string(), kind, message_type.to_string());
-        let mut rows = self.inner.read().get(&key).cloned().unwrap_or_default();
-        rows.sort_by(|a, b| a.client_id.cmp(&b.client_id));
-        rows
+    /// The handlers for a message type, sorted by client id. Shared, not
+    /// copied: the hot path of every dispatch.
+    pub fn lookup(&self, bus: &str, kind: HandlerKind, message_type: &str) -> HandlerRows {
+        self.inner
+            .read()
+            .get(bus)
+            .and_then(|types| types.get(message_type))
+            .and_then(|type_rows| type_rows.get(kind))
+            .cloned()
+            .unwrap_or_else(empty_rows)
     }
 
-    /// All rows, for snapshotting. Sorted for deterministic snapshots.
     pub fn rows(&self) -> Vec<HandlerRegistration> {
         let table = self.inner.read();
-        let mut rows: Vec<HandlerRegistration> = table
-            .iter()
-            .flat_map(|((bus, kind, message_type), handlers)| {
-                handlers.iter().map(move |h| HandlerRegistration {
-                    bus: bus.clone(),
-                    kind: *kind,
-                    message_type: message_type.clone(),
-                    client_id: h.client_id.clone(),
-                    node_id: h.node_id,
-                    load_factor: h.load_factor,
-                })
-            })
-            .collect();
+        let mut rows: Vec<HandlerRegistration> = Vec::new();
+        for (bus, types) in table.iter() {
+            for (message_type, type_rows) in types {
+                for kind in [HandlerKind::Command, HandlerKind::Query] {
+                    for h in type_rows.get(kind).map(|r| r.iter()).into_iter().flatten() {
+                        rows.push(HandlerRegistration {
+                            bus: bus.clone(),
+                            kind,
+                            message_type: message_type.clone(),
+                            client_id: h.client_id.clone(),
+                            node_id: h.node_id,
+                            load_factor: h.load_factor,
+                        });
+                    }
+                }
+            }
+        }
         rows.sort_by(|a, b| {
             (&a.bus, a.kind, &a.message_type, &a.client_id).cmp(&(
                 &b.bus,
@@ -204,17 +267,42 @@ impl HandlerRoutingTable {
     /// install). Restored rows are provisional: each node's startup
     /// `ClearNodeHandlers` and membership diffs remove any that are stale.
     pub fn restore(&self, rows: Vec<HandlerRegistration>) {
-        let mut table: HashMap<TableKey, Vec<RegisteredHandler>> = HashMap::new();
+        let mut grouped: HashMap<String, HashMap<String, [Vec<RegisteredHandler>; 2]>> =
+            HashMap::new();
         for reg in rows {
-            table
-                .entry((reg.bus, reg.kind, reg.message_type))
+            let kind_index = match reg.kind {
+                HandlerKind::Command => 0,
+                HandlerKind::Query => 1,
+            };
+            grouped
+                .entry(reg.bus)
                 .or_default()
+                .entry(reg.message_type)
+                .or_default()[kind_index]
                 .push(RegisteredHandler {
                     client_id: reg.client_id,
                     node_id: reg.node_id,
                     load_factor: reg.load_factor,
                 });
         }
+        let table = grouped
+            .into_iter()
+            .map(|(bus, types)| {
+                let types = types
+                    .into_iter()
+                    .map(|(message_type, [command, query])| {
+                        (
+                            message_type,
+                            TypeRows {
+                                command: sorted_rows(command),
+                                query: sorted_rows(query),
+                            },
+                        )
+                    })
+                    .collect();
+                (bus, types)
+            })
+            .collect();
         *self.inner.write() = table;
         self.bump();
     }

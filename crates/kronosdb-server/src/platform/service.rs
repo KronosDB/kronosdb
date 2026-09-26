@@ -86,6 +86,10 @@ impl ClientChannelRegistry {
             let channels = self.channels.read();
             channels.values().cloned().collect()
         };
+        // Concurrently: this runs inside a handler stream's frame loop, and
+        // one slow platform client must not hold up that handler's next
+        // frame while the others are sent one after another.
+        let mut sends = tokio::task::JoinSet::new();
         for tx in senders {
             let msg = pb::PlatformOutbound {
                 request: Some(pb::platform_outbound::Request::TopologyNotification(
@@ -93,8 +97,11 @@ impl ClientChannelRegistry {
                 )),
                 instruction_id: String::new(),
             };
-            let _ = tx.send(Ok(msg)).await;
+            sends.spawn(async move {
+                let _ = tx.send(Ok(msg)).await;
+            });
         }
+        while sends.join_next().await.is_some() {}
     }
 }
 

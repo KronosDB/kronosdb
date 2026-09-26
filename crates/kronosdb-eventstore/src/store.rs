@@ -588,6 +588,9 @@ pub struct StoreOptions {
     pub max_segment_size: u64,
     pub index_cache_size: usize,
     pub bloom_cache_size: usize,
+    /// Sealed segment mmaps kept open. A wide historical scan over more
+    /// segments than this reopens and remaps files as it goes.
+    pub mmap_cache_size: usize,
     /// Extra group-commit coalescing window in milliseconds. The sync thread
     /// is woken by a wave's first write; with 0 (default) it seals and syncs
     /// immediately, and concurrent writes batch on the fdatasync duration.
@@ -605,6 +608,7 @@ impl Default for StoreOptions {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             bloom_cache_size: DEFAULT_BLOOM_CACHE_SIZE,
+            mmap_cache_size: crate::cache::DEFAULT_MMAP_CACHE_SIZE,
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             node_id: DEFAULT_NODE_ID,
             voters: vec![DEFAULT_NODE_ID],
@@ -654,6 +658,9 @@ impl StoreOptions {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
             index_cache_size,
             bloom_cache_size,
+            // Mmaps cost address space, not memory: keep every sealed
+            // segment mapped, like the bloom filters.
+            mmap_cache_size: segments.max(crate::cache::DEFAULT_MMAP_CACHE_SIZE),
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             node_id: DEFAULT_NODE_ID,
             voters: vec![DEFAULT_NODE_ID],
@@ -856,6 +863,7 @@ impl EventStoreEngine {
         let cache = Arc::new(IndexCache::new(
             opts.index_cache_size,
             opts.bloom_cache_size,
+            opts.mmap_cache_size,
         ));
         let seals = Arc::new(SealQueue::new());
 
@@ -961,6 +969,7 @@ impl EventStoreEngine {
         let cache = Arc::new(IndexCache::new(
             opts.index_cache_size,
             opts.bloom_cache_size,
+            opts.mmap_cache_size,
         ));
         let seals = Arc::new(SealQueue::new());
 
@@ -2037,6 +2046,29 @@ impl EventStoreEngine {
         condition: &SourcingCondition,
         from: u64,
     ) -> Option<roaring::RoaringTreemap> {
+        // Rank check first: the usual reason a live subscriber reads is a
+        // commit that holds nothing for it, and that is decided here without
+        // touching a bitmap.
+        if !index.any_match_in(condition, from, u64::MAX) {
+            return None;
+        }
+        // A match-everything criterion means every position from `from` on:
+        // positions are dense within a segment, so that is a range, not a
+        // clone of the segment's whole position bitmap per page read.
+        if condition
+            .criteria
+            .iter()
+            .any(|c| c.tags.is_empty() && c.names.is_empty())
+        {
+            let range = index.position_range();
+            let start = range.start.max(from);
+            if start >= range.end {
+                return None;
+            }
+            let mut bitmap = roaring::RoaringTreemap::new();
+            bitmap.insert_range(start..range.end);
+            return Some(bitmap);
+        }
         let mut bitmap = index.matching(condition)?;
         if from > index.base_position() {
             bitmap.remove_range(0..from);
@@ -2046,6 +2078,48 @@ impl EventStoreEngine {
         } else {
             Some(bitmap)
         }
+    }
+
+    /// Whether any event in `[from, to)` could match `condition` — a rank
+    /// check per segment, no bitmap materialized, no read. A subscriber
+    /// woken by a commit asks this before paging; with tag criteria the
+    /// answer is usually no, and the wakeup costs a few hash lookups.
+    pub fn has_matches_between(
+        &self,
+        from: Position,
+        to: Position,
+        condition: &SourcingCondition,
+    ) -> bool {
+        let to = to.0.min(self.watermark.get());
+        if from.0 >= to {
+            return false;
+        }
+        let seg_list = self.segments.read().clone();
+        for (i, &base) in seg_list.bases.iter().enumerate() {
+            if base >= to {
+                break;
+            }
+            let seg_end = seg_list.bases.get(i + 1).copied().unwrap_or(u64::MAX);
+            if seg_end <= from.0 {
+                continue;
+            }
+            let seg_path = segment::segment_path(&self.dir, base);
+            if seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            {
+                continue;
+            }
+            match self.index_for(base, &seg_path) {
+                Ok(index) => {
+                    if index.any_match_in(condition, from.0, to) {
+                        return true;
+                    }
+                }
+                // Cannot tell: let the read decide.
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     /// Gets tags for an event at the given position by reading from the segment.
@@ -2568,6 +2642,15 @@ impl EventStore for EventStoreEngine {
 
     fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error> {
         self.get_tags(position)
+    }
+
+    fn has_matches_between(
+        &self,
+        from: Position,
+        to: Position,
+        condition: &SourcingCondition,
+    ) -> bool {
+        self.has_matches_between(from, to, condition)
     }
 
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {

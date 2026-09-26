@@ -62,6 +62,19 @@ pub trait EventStore: Send + Sync {
     /// Gets tags for an event at the given position.
     fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error>;
 
+    /// Whether any event in `[from, to)` could match `condition`. A cheap
+    /// negative lets a woken subscriber skip a read; `true` means "read and
+    /// see". The default cannot tell and says so.
+    fn has_matches_between(
+        &self,
+        from: Position,
+        to: Position,
+        condition: &SourcingCondition,
+    ) -> bool {
+        let _ = (from, to, condition);
+        true
+    }
+
     /// Returns the position of the first event with timestamp >= the given millis-since-epoch.
     /// Returns `None` if no such event exists (empty store or all events are older).
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error>;

@@ -308,7 +308,9 @@ impl RaftStateMachine<TypeConfig> for EventStoreStateMachine {
         }
 
         if applied_any {
-            self.persist_control_state()?;
+            // Two fsyncs: run them where blocking is allowed so a slow disk
+            // does not stall the runtime worker driving the state machine.
+            blocking_allowed(|| self.persist_control_state())?;
             self.publish_control_state();
         }
         Ok(responses)
@@ -493,5 +495,18 @@ impl RaftSnapshotBuilder<TypeConfig> for EventStoreSnapshotBuilder {
             meta,
             snapshot: Box::new(tokio::fs::File::from_std(file)),
         })
+    }
+}
+
+/// Runs `f` with the runtime told a worker is about to block. On a
+/// multi-thread runtime that hands the worker's queue to another thread for
+/// the duration; on a current-thread runtime (tests) there is nothing to
+/// hand off and `f` simply runs.
+fn blocking_allowed<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }

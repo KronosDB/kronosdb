@@ -38,6 +38,10 @@ use crate::messaging::fabric as messaging_fabric;
 use crate::messaging::query_service::QueryServiceImpl;
 use crate::platform::service::{ClientChannelRegistry, PlatformServiceImpl, spawn_reaper};
 
+/// Largest gRPC message accepted from or sent to a client on the event
+/// store, command and query services.
+const CLIENT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging. KRONOSDB_LOG_FORMAT=json switches to
@@ -88,6 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_segment_size: config.segment_size,
         index_cache_size: config.index_cache_size,
         bloom_cache_size: config.bloom_cache_size,
+        // Every sealed segment stays mapped: address space, not memory.
+        mmap_cache_size: config
+            .index_cache_size
+            .max(kronosdb_eventstore::cache::DEFAULT_MMAP_CACHE_SIZE),
         group_commit_interval_ms: config.group_commit_ms,
         node_id,
         voters: voter_ids,
@@ -412,17 +420,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build gRPC router with auth interceptor on client-facing services.
+    // Message limits are set explicitly, like the internode services': a
+    // bulk-load append of many events would otherwise hit tonic's 4 MiB
+    // decode default and have to split into more RPCs than it needs.
+    use tonic::service::interceptor::InterceptedService;
     let mut router = server
-        .add_service(EventStoreServer::with_interceptor(
-            event_store_service,
+        .add_service(InterceptedService::new(
+            EventStoreServer::new(event_store_service)
+                .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
             auth.clone(),
         ))
-        .add_service(CommandServiceServer::with_interceptor(
-            command_service,
+        .add_service(InterceptedService::new(
+            CommandServiceServer::new(command_service)
+                .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
             auth.clone(),
         ))
-        .add_service(QueryServiceServer::with_interceptor(
-            query_service,
+        .add_service(InterceptedService::new(
+            QueryServiceServer::new(query_service)
+                .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
             auth.clone(),
         ))
         .add_service(PlatformServiceServer::with_interceptor(

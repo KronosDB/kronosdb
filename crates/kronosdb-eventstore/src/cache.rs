@@ -29,8 +29,10 @@ pub const DEFAULT_MMAP_CACHE_SIZE: usize = 100;
 pub struct IndexCache {
     /// LRU cache of loaded segment indices, keyed by segment base position.
     indices: Mutex<LruCache<u64, Arc<SegmentIndex>>>,
-    /// LRU cache of bloom filters, keyed by segment base position.
-    blooms: Mutex<LruCache<u64, GrowableBloom>>,
+    /// LRU cache of bloom filters, keyed by segment base position. Shared
+    /// by `Arc` so a check evaluates the filter after releasing the lock:
+    /// every read of every sealed segment passes through here.
+    blooms: Mutex<LruCache<u64, Arc<GrowableBloom>>>,
     /// LRU cache of mmap handles for sealed segments, keyed by base position.
     mmaps: Mutex<LruCache<u64, Arc<Mmap>>>,
     /// Indexes of segments sealed in memory but not yet on disk. Never
@@ -50,7 +52,7 @@ impl IndexCache {
     ///
     /// `index_capacity`: max number of `.idx` files to keep in memory.
     /// `bloom_capacity`: max number of `.bloom` files to keep in memory.
-    pub fn new(index_capacity: usize, bloom_capacity: usize) -> Self {
+    pub fn new(index_capacity: usize, bloom_capacity: usize, mmap_capacity: usize) -> Self {
         Self {
             indices: Mutex::new(LruCache::new(
                 NonZeroUsize::new(index_capacity.max(1)).unwrap(),
@@ -59,7 +61,7 @@ impl IndexCache {
                 NonZeroUsize::new(bloom_capacity.max(1)).unwrap(),
             )),
             mmaps: Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_MMAP_CACHE_SIZE).unwrap(),
+                NonZeroUsize::new(mmap_capacity.max(1)).unwrap(),
             )),
             pinned: Mutex::new(std::collections::HashMap::new()),
             index_hits: AtomicU64::new(0),
@@ -82,12 +84,10 @@ impl IndexCache {
         base_position: u64,
         condition: &SourcingCondition,
     ) -> Option<bool> {
-        // Try cache first.
-        {
-            let mut blooms = self.blooms.lock();
-            if let Some(bloom) = blooms.get(&base_position) {
-                return Some(condition_might_match_bloom(bloom, condition));
-            }
+        // Try cache first: take the Arc, drop the lock, then evaluate.
+        let cached = self.blooms.lock().get(&base_position).map(Arc::clone);
+        if let Some(bloom) = cached {
+            return Some(condition_might_match_bloom(&bloom, condition));
         }
         if let Some(index) = self.pinned_index(base_position) {
             return Some(condition_might_match_bloom(index.bloom(), condition));
@@ -109,13 +109,7 @@ impl IndexCache {
             }
         };
         let result = condition_might_match_bloom(&bloom, condition);
-
-        // Cache it.
-        {
-            let mut blooms = self.blooms.lock();
-            blooms.put(base_position, bloom);
-        }
-
+        self.blooms.lock().put(base_position, Arc::new(bloom));
         Some(result)
     }
 
@@ -207,7 +201,9 @@ impl IndexCache {
         let Some(index) = self.pinned.lock().remove(&base_position) else {
             return;
         };
-        self.blooms.lock().put(base_position, index.bloom().clone());
+        self.blooms
+            .lock()
+            .put(base_position, Arc::new(index.bloom().clone()));
         self.indices.lock().put(base_position, index);
     }
 
@@ -311,7 +307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = setup_sealed_segment(dir.path());
         let seg_path = crate::segment::segment_path(dir.path(), base);
-        let cache = IndexCache::new(10, 20);
+        let cache = IndexCache::new(10, 20, 100);
 
         let cond = SourcingCondition {
             criteria: vec![Criterion {
@@ -329,7 +325,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = setup_sealed_segment(dir.path());
         let seg_path = crate::segment::segment_path(dir.path(), base);
-        let cache = IndexCache::new(10, 20);
+        let cache = IndexCache::new(10, 20, 100);
 
         let cond = SourcingCondition {
             criteria: vec![Criterion {
@@ -347,7 +343,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = setup_sealed_segment(dir.path());
         let seg_path = crate::segment::segment_path(dir.path(), base);
-        let cache = IndexCache::new(10, 20);
+        let cache = IndexCache::new(10, 20, 100);
 
         // First load — from disk.
         let index = cache.get_index(&seg_path, base).unwrap();
@@ -371,7 +367,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = setup_sealed_segment(dir.path());
         let seg_path = crate::segment::segment_path(dir.path(), base);
-        let cache = IndexCache::new(10, 20);
+        let cache = IndexCache::new(10, 20, 100);
 
         // Populate cache.
         let _ = cache.bloom_check(

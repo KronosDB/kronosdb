@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -166,8 +167,11 @@ pub struct CommandBus {
     /// Per-command-type dispatch metrics. Lock-free atomic counters
     /// inside the value; DashMap shards the key-level insert contention.
     metrics: DashMap<String, MessageTypeMetrics>,
-    /// Wakes `dispatch_wait` loops when flow-control permits are granted.
-    permit_notify: tokio::sync::Notify,
+    /// Wakes `dispatch_wait` loops when flow-control permits are granted —
+    /// one `Notify` per command type, so a grant to one handler wakes only
+    /// the dispatchers parked on the types that handler serves, not every
+    /// waiter on the bus.
+    permit_notify: DashMap<String, Arc<tokio::sync::Notify>>,
     /// Configuration.
     config: CommandBusConfig,
 }
@@ -189,9 +193,22 @@ impl CommandBus {
             in_flight: DashMap::new(),
             dispatch_counter: AtomicU64::new(0),
             metrics: DashMap::new(),
-            permit_notify: tokio::sync::Notify::new(),
+            permit_notify: DashMap::new(),
             config,
         }
+    }
+
+    /// The wakeup for dispatchers parked on `command_name`.
+    fn permit_notify_for(&self, command_name: &str) -> Arc<tokio::sync::Notify> {
+        if let Some(notify) = self.permit_notify.get(command_name) {
+            return Arc::clone(&notify);
+        }
+        Arc::clone(
+            &self
+                .permit_notify
+                .entry(command_name.to_string())
+                .or_default(),
+        )
     }
 
     /// Registers a command handler.
@@ -226,12 +243,13 @@ impl CommandBus {
 
     /// Grants flow control permits to a client.
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
-        {
-            let handlers = self.handlers.read();
-            handlers.grant_permits(client_id, permits);
+        let handlers = self.handlers.read();
+        // Wake the dispatch_wait loops parked on this handler's types.
+        for command_name in handlers.grant_permits(client_id, permits) {
+            if let Some(notify) = self.permit_notify.get(command_name) {
+                notify.notify_waiters();
+            }
         }
-        // Wake any dispatch_wait loops parked on permit exhaustion.
-        self.permit_notify.notify_waiters();
     }
 
     /// Dispatches a command to a handler.
@@ -274,10 +292,11 @@ impl CommandBus {
             return self.dispatch(command);
         }
         let deadline = tokio::time::Instant::now() + max_wait;
+        let notify = self.permit_notify_for(&command.name);
         loop {
             // Register interest before attempting so a grant arriving
             // right after a failed attempt still wakes us.
-            let notified = self.permit_notify.notified();
+            let notified = notify.notified();
             match self.dispatch_inner(command.clone(), false) {
                 Err(CommandError::NoPermitsAvailable { .. }) => {}
                 other => return other,
@@ -310,8 +329,9 @@ impl CommandBus {
             return self.dispatch_to_inner(command, target, true);
         }
         let deadline = tokio::time::Instant::now() + max_wait;
+        let notify = self.permit_notify_for(&command.name);
         loop {
-            let notified = self.permit_notify.notified();
+            let notified = notify.notified();
             match self.dispatch_to_inner(command.clone(), target, false) {
                 Err(CommandError::NoPermitsAvailable { .. }) => {}
                 other => return other,
