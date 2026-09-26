@@ -5,8 +5,9 @@ pub struct Payload {
     pub payload_type: String,
     /// The revision/version of the serialized form.
     pub revision: String,
-    /// The serialized data.
-    pub data: Vec<u8>,
+    /// The serialized data. Refcounted: a payload delivered to several
+    /// handlers, or re-sent on a permit-wait retry, is shared, not copied.
+    pub data: bytes::Bytes,
 }
 
 /// A metadata value. Supports multiple types to allow lossless transport

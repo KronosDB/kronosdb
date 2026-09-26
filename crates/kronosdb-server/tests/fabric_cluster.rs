@@ -178,7 +178,7 @@ fn make_command(seq: u32, name: &str, routing_key: Option<&str>) -> pb::command:
         payload: Some(pb::SerializedObject {
             r#type: name.into(),
             revision: "1".into(),
-            data: format!("payload-{seq}").into_bytes(),
+            data: format!("payload-{seq}").into(),
         }),
         metadata: Default::default(),
         processing_instructions,
@@ -266,7 +266,7 @@ async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str
                             payload: Some(pb::SerializedObject {
                                 r#type: "String".into(),
                                 revision: "1".into(),
-                                data: format!("initial-from-{responder_id}").into_bytes(),
+                                data: format!("initial-from-{responder_id}").into(),
                             }),
                             metadata: Default::default(),
                             processing_instructions: vec![],
@@ -288,8 +288,7 @@ async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str
                                             payload: Some(pb::SerializedObject {
                                                 r#type: "String".into(),
                                                 revision: "1".into(),
-                                                data: format!("update-from-{responder_id}")
-                                                    .into_bytes(),
+                                                data: format!("update-from-{responder_id}").into(),
                                             }),
                                             metadata: Default::default(),
                                             client_id: String::new(),
@@ -319,7 +318,7 @@ async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str
                             payload: Some(pb::SerializedObject {
                                 r#type: "String".into(),
                                 revision: "1".into(),
-                                data: format!("answer-from-{responder_id}").into_bytes(),
+                                data: format!("answer-from-{responder_id}").into(),
                             }),
                             metadata: Default::default(),
                             processing_instructions: vec![],
@@ -364,7 +363,7 @@ async fn query_until_responses(
             payload: Some(pb::SerializedObject {
                 r#type: query_name.into(),
                 revision: "1".into(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             }),
             metadata: Default::default(),
             processing_instructions: vec![],
@@ -408,7 +407,7 @@ async fn subscribe_until_events(channel: Channel, query_name: &str) -> Vec<Strin
                         payload: Some(pb::SerializedObject {
                             r#type: query_name.into(),
                             revision: "1".into(),
-                            data: vec![],
+                            data: bytes::Bytes::new(),
                         }),
                         metadata: Default::default(),
                         processing_instructions: vec![],

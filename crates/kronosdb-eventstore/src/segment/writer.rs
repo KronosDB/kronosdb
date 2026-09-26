@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::Error;
-use crate::event::{AppendEvent, Position, StoredEvent};
+use crate::event::{AppendEvent, Position};
 
 use crate::segment::format::EventIndexFields;
 use crate::segment::segment_index::SegmentIndex;
@@ -349,19 +349,8 @@ impl SegmentWriter {
 
     /// Writes a single event record, rotating the segment if needed.
     fn write_one_event(&mut self, event: &AppendEvent) -> Result<(), Error> {
-        let stored = StoredEvent {
-            position: self.next_position,
-            identifier: event.identifier.clone(),
-            name: event.name.clone(),
-            version: event.version.clone(),
-            timestamp: event.timestamp,
-            payload: event.payload.clone(),
-            metadata: event.metadata.clone(),
-            tags: event.tags.clone(),
-        };
-
         self.serialize_buf.clear();
-        format::serialize_event(&stored, &mut self.serialize_buf);
+        format::serialize_append_event(self.next_position, event, &mut self.serialize_buf);
         let payload = std::mem::take(&mut self.serialize_buf);
         let record_offset = self.write_record(flags::EVENT, &payload)?;
         self.serialize_buf = payload;

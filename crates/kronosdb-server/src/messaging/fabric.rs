@@ -402,7 +402,7 @@ impl pb::messaging_fabric_server::MessagingFabric for FabricServiceImpl {
                 Status::unavailable("handler stream not found on owning node")
             })?;
 
-        let inbound = to_proto_command_inbound(&pending_cmd.command);
+        let inbound = to_proto_command_inbound(pending_cmd.command);
         if handler_tx.send(Ok(inbound)).await.is_err() {
             platform.cancel_in_flight_command(&message_id);
             return Err(Status::unavailable("handler disconnected"));

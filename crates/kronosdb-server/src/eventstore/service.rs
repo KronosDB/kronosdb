@@ -152,7 +152,7 @@ async fn run_fanout_hub(
                 _ => bound,
             };
             let protos: Vec<pb::SequencedEvent> =
-                events.iter().map(to_proto_sequenced_event).collect();
+                events.into_iter().map(to_proto_sequenced_event).collect();
             let _ = tx.send(Arc::new(HubBatch {
                 first: cursor.0,
                 next: next.0,
@@ -264,7 +264,10 @@ impl pb::event_store_server::EventStore for EventStoreService {
             let (tx, rx) = mpsc::channel(1);
             let response = pb::SourceResponse {
                 batch: Some(pb::SequencedEventBatch {
-                    events: first_page.iter().map(to_proto_sequenced_event).collect(),
+                    events: first_page
+                        .into_iter()
+                        .map(to_proto_sequenced_event)
+                        .collect(),
                     consistency_marker: Some(marker as i64),
                 }),
             };
@@ -295,8 +298,8 @@ impl pb::event_store_server::EventStore for EventStoreService {
                 // immediately — never held back for fill. The last chunk of
                 // the final page carries the consistency marker; an empty
                 // final page sends one empty marker-carrying batch.
-                let mut chunks = page.chunks(batch_size).peekable();
-                if is_final && chunks.peek().is_none() {
+                let mut rest = page.into_iter().peekable();
+                if is_final && rest.peek().is_none() {
                     let response = pb::SourceResponse {
                         batch: Some(pb::SequencedEventBatch {
                             events: Vec::new(),
@@ -306,11 +309,16 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     let _ = tx.send(Ok(response)).await;
                     return;
                 }
-                while let Some(chunk) = chunks.next() {
-                    let last_of_stream = is_final && chunks.peek().is_none();
+                while rest.peek().is_some() {
+                    let chunk: Vec<pb::SequencedEvent> = rest
+                        .by_ref()
+                        .take(batch_size)
+                        .map(to_proto_sequenced_event)
+                        .collect();
+                    let last_of_stream = is_final && rest.peek().is_none();
                     let response = pb::SourceResponse {
                         batch: Some(pb::SequencedEventBatch {
-                            events: chunk.iter().map(to_proto_sequenced_event).collect(),
+                            events: chunk,
                             consistency_marker: last_of_stream.then_some(marker as i64),
                         }),
                     };
@@ -513,14 +521,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
             }
 
             async fn send_batched(
-                events: &[kronosdb_eventstore::event::SequencedEvent],
+                events: Vec<kronosdb_eventstore::event::SequencedEvent>,
                 blacklist: &std::collections::HashSet<String>,
                 permits: &tokio::sync::Semaphore,
                 tx: &mpsc::Sender<Result<pb::StreamResponse, Status>>,
                 batch_size: usize,
             ) -> bool {
                 let protos: Vec<pb::SequencedEvent> = events
-                    .iter()
+                    .into_iter()
                     .filter(|e| !blacklist.contains(&e.name))
                     .map(to_proto_sequenced_event)
                     .collect();
@@ -559,15 +567,16 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     }
                 };
                 let page_len = events.len();
-                if !send_batched(&events, &blacklist, &permits_p, &tx, batch_size).await {
+                let last_position = events.last().map(|e| e.position.0);
+                if !send_batched(events, &blacklist, &permits_p, &tx, batch_size).await {
                     return;
                 }
-                match events.last() {
+                match last_position {
                     Some(last) if page_len == PAGE => {
-                        event_stream.advance_cursor(Position(last.position.0 + 1));
+                        event_stream.advance_cursor(Position(last + 1));
                     }
                     Some(last) => {
-                        event_stream.advance_cursor(Position(last.position.0 + 1));
+                        event_stream.advance_cursor(Position(last + 1));
                         break; // Short page — replay caught up to the bound.
                     }
                     None => break,
@@ -614,12 +623,13 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         }
                     };
                     let page_len = events.len();
-                    if !send_batched(&events, blacklist, permits, tx, batch_size).await {
+                    let last_position = events.last().map(|e| e.position.0);
+                    if !send_batched(events, blacklist, permits, tx, batch_size).await {
                         return false;
                     }
-                    match events.last() {
+                    match last_position {
                         Some(last) if page_len == PAGE => {
-                            event_stream.advance_cursor(Position(last.position.0 + 1));
+                            event_stream.advance_cursor(Position(last + 1));
                         }
                         _ => {
                             // Short/empty page: everything below the bound is
@@ -923,8 +933,9 @@ impl pb::event_store_server::EventStore for EventStoreService {
                 // immediately, the last chunk of the final page carries the
                 // marker, and an empty final page sends one empty
                 // marker-carrying batch.
-                let mut chunks = page.chunks(batch_size).peekable();
-                if is_final && chunks.peek().is_none() {
+                let last_position = page.last().map(|e| e.position.0);
+                let mut rest = page.into_iter().peekable();
+                if is_final && rest.peek().is_none() {
                     let frame = pb::SnapshottedSourceResponse {
                         frame: Some(pb::snapshotted_source_response::Frame::Batch(
                             pb::SequencedEventBatch {
@@ -936,12 +947,17 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     let _ = tx.send(Ok(frame)).await;
                     return;
                 }
-                while let Some(chunk) = chunks.next() {
-                    let last_of_stream = is_final && chunks.peek().is_none();
+                while rest.peek().is_some() {
+                    let chunk: Vec<pb::SequencedEvent> = rest
+                        .by_ref()
+                        .take(batch_size)
+                        .map(to_proto_sequenced_event)
+                        .collect();
+                    let last_of_stream = is_final && rest.peek().is_none();
                     let frame = pb::SnapshottedSourceResponse {
                         frame: Some(pb::snapshotted_source_response::Frame::Batch(
                             pb::SequencedEventBatch {
-                                events: chunk.iter().map(to_proto_sequenced_event).collect(),
+                                events: chunk,
                                 consistency_marker: last_of_stream.then_some(marker as i64),
                             },
                         )),
@@ -953,8 +969,8 @@ impl pb::event_store_server::EventStore for EventStoreService {
                 if is_final {
                     return;
                 }
-                cursor = match page.last() {
-                    Some(last) => Position(last.position.0 + 1),
+                cursor = match last_position {
+                    Some(last) => Position(last + 1),
                     None => return, // Unreachable: a full page has a last event.
                 };
             }
@@ -1037,7 +1053,7 @@ fn from_proto_tagged_event(te: pb::TaggedEvent) -> AppendEvent {
         name: event.name,
         version: event.version,
         timestamp: event.timestamp,
-        payload: event.payload,
+        payload: event.payload.into(),
         metadata: event.metadata.into_iter().collect(),
         tags: te.tags.into_iter().map(from_proto_tag).collect(),
     }
@@ -1045,16 +1061,19 @@ fn from_proto_tagged_event(te: pb::TaggedEvent) -> AppendEvent {
 
 // --- Type conversions: engine → proto ---
 
-fn to_proto_sequenced_event(e: &kronosdb_eventstore::event::SequencedEvent) -> pb::SequencedEvent {
+/// Consumes the engine event: every field moves, and the payload `Vec`
+/// becomes a `Bytes` without a copy. Callers own their page, so nothing
+/// is lost by taking it.
+fn to_proto_sequenced_event(e: kronosdb_eventstore::event::SequencedEvent) -> pb::SequencedEvent {
     pb::SequencedEvent {
         sequence: e.position.0 as i64,
         event: Some(pb::Event {
-            identifier: e.identifier.clone(),
+            identifier: e.identifier,
             timestamp: e.timestamp,
-            name: e.name.clone(),
-            version: e.version.clone(),
-            payload: e.payload.clone(),
-            metadata: e.metadata.iter().cloned().collect(),
+            name: e.name,
+            version: e.version,
+            payload: e.payload.into(),
+            metadata: e.metadata.into_iter().collect(),
         }),
     }
 }

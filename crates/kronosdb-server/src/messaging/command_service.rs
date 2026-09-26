@@ -354,7 +354,7 @@ impl pb::command_service_server::CommandService for CommandServiceImpl {
             }
         };
 
-        let inbound_cmd = to_proto_command_inbound(&pending_cmd.command);
+        let inbound_cmd = to_proto_command_inbound(pending_cmd.command);
         if handler_tx.send(Ok(inbound_cmd)).await.is_err() {
             platform.cancel_in_flight_command(&message_id);
             return Err(Status::unavailable("handler disconnected"));
@@ -455,21 +455,23 @@ fn from_proto_command_response(resp: pb::CommandResponse) -> CommandResult {
     }
 }
 
-pub(crate) fn to_proto_command_inbound(cmd: &Command) -> pb::CommandHandlerInbound {
+/// Consumes the command: the bus has already filed its in-flight entry and
+/// nothing reads the command after delivery, so every field moves.
+pub(crate) fn to_proto_command_inbound(cmd: Command) -> pb::CommandHandlerInbound {
     pb::CommandHandlerInbound {
         request: Some(pb::command_handler_inbound::Request::Command(pb::Command {
-            message_identifier: cmd.message_id.clone(),
-            name: cmd.name.clone(),
+            message_identifier: cmd.message_id,
+            name: cmd.name,
             timestamp: cmd.timestamp,
             payload: Some(crate::proto::kronosdb::SerializedObject {
-                r#type: cmd.payload.payload_type.clone(),
-                revision: cmd.payload.revision.clone(),
-                data: cmd.payload.data.clone(),
+                r#type: cmd.payload.payload_type,
+                revision: cmd.payload.revision,
+                data: cmd.payload.data,
             }),
             metadata: internal_metadata_to_proto(&cmd.metadata),
             processing_instructions: internal_pi_to_proto(&cmd.processing_instructions),
-            client_id: cmd.client_id.0.clone(),
-            component_name: cmd.component_name.0.clone(),
+            client_id: cmd.client_id.0,
+            component_name: cmd.component_name.0,
         })),
         instruction_id: String::new(),
     }

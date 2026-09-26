@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::event::Tag;
-use crate::event::{Position, StoredEvent};
+use crate::event::{AppendEvent, Position, StoredEvent};
 
 /// Native data-plane control records interleaved with events. They consume
 /// segment bytes but no event position.
@@ -94,24 +94,66 @@ pub fn deserialize_control(flags: u8, data: &[u8]) -> Result<ControlRecord, Erro
 /// Payload is last so we can skip over fixed-size fields quickly
 /// without reading the (potentially large) payload.
 pub fn serialize_event(event: &StoredEvent, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&event.position.0.to_le_bytes());
+    serialize_event_fields(
+        event.position,
+        &event.identifier,
+        &event.name,
+        &event.version,
+        event.timestamp,
+        &event.metadata,
+        &event.tags,
+        &event.payload,
+        buf,
+    )
+}
 
-    let id_bytes = event.identifier.as_bytes();
+/// Serializes an event being appended at `position` straight from the
+/// request's fields. The writer's hot path: no `StoredEvent` is built, so
+/// the payload, tags and metadata are read once and never copied.
+pub fn serialize_append_event(position: Position, event: &AppendEvent, buf: &mut Vec<u8>) {
+    serialize_event_fields(
+        position,
+        &event.identifier,
+        &event.name,
+        &event.version,
+        event.timestamp,
+        &event.metadata,
+        &event.tags,
+        &event.payload,
+        buf,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_event_fields(
+    position: Position,
+    identifier: &str,
+    name: &str,
+    version: &str,
+    timestamp: i64,
+    metadata: &[(String, String)],
+    tags: &[Tag],
+    payload: &[u8],
+    buf: &mut Vec<u8>,
+) {
+    buf.extend_from_slice(&position.0.to_le_bytes());
+
+    let id_bytes = identifier.as_bytes();
     buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(id_bytes);
 
-    let name_bytes = event.name.as_bytes();
+    let name_bytes = name.as_bytes();
     buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(name_bytes);
 
-    let version_bytes = event.version.as_bytes();
+    let version_bytes = version.as_bytes();
     buf.extend_from_slice(&(version_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(version_bytes);
 
-    buf.extend_from_slice(&event.timestamp.to_le_bytes());
+    buf.extend_from_slice(&timestamp.to_le_bytes());
 
-    buf.extend_from_slice(&(event.metadata.len() as u16).to_le_bytes());
-    for (key, value) in &event.metadata {
+    buf.extend_from_slice(&(metadata.len() as u16).to_le_bytes());
+    for (key, value) in metadata {
         let key_bytes = key.as_bytes();
         buf.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(key_bytes);
@@ -120,16 +162,16 @@ pub fn serialize_event(event: &StoredEvent, buf: &mut Vec<u8>) {
         buf.extend_from_slice(value_bytes);
     }
 
-    buf.extend_from_slice(&(event.tags.len() as u16).to_le_bytes());
-    for tag in &event.tags {
+    buf.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+    for tag in tags {
         buf.extend_from_slice(&(tag.key.len() as u16).to_le_bytes());
         buf.extend_from_slice(&tag.key);
         buf.extend_from_slice(&(tag.value.len() as u16).to_le_bytes());
         buf.extend_from_slice(&tag.value);
     }
 
-    buf.extend_from_slice(&(event.payload.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&event.payload);
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(payload);
 }
 
 /// The fields a follower needs to maintain its active indexes while applying

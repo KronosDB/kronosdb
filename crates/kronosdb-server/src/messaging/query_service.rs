@@ -246,23 +246,20 @@ impl pb::query_service_server::QueryService for QueryServiceImpl {
                     Some(pb::query_handler_outbound::Request::QueryResponse(resp)) => {
                         let request_id = resp.request_identifier.clone();
 
-                        // First try regular pending queries.
-                        let routed = if let Some(entry) = pending_queries.get(&request_id) {
-                            if let Err(e) = entry.value().sender.try_send(resp.clone()) {
+                        // A response belongs to exactly one of the two maps, so
+                        // decide first and then move it — never clone it to keep
+                        // it available for a branch that cannot run.
+                        if let Some(entry) = pending_queries.get(&request_id) {
+                            if let Err(e) = entry.value().sender.try_send(resp) {
                                 tracing::warn!(
                                     request_id = %request_id,
                                     reason = %e,
                                     "query response dropped: caller buffer full or closed"
                                 );
                             }
-                            true
-                        } else {
-                            false
-                        };
-
-                        // Otherwise this may be the initial result for a subscription
-                        // query — wrap and forward on the subscription stream.
-                        if !routed && let Some(entry) = pending_sub_initials.get(&request_id) {
+                        } else if let Some(entry) = pending_sub_initials.get(&request_id) {
+                            // The initial result for a subscription query — wrap
+                            // and forward on the subscription stream.
                             let initial_result = pb::SubscriptionQueryResponse {
                                 message_identifier: String::new(),
                                 subscription_identifier: request_id.clone(),
