@@ -33,6 +33,10 @@ pub struct IndexCache {
     blooms: Mutex<LruCache<u64, GrowableBloom>>,
     /// LRU cache of mmap handles for sealed segments, keyed by base position.
     mmaps: Mutex<LruCache<u64, Arc<Mmap>>>,
+    /// Indexes of segments sealed in memory but not yet on disk. Never
+    /// evicted: until the `.idx`/`.bloom` companions exist, this is the only
+    /// copy, and every read of the segment resolves through it.
+    pinned: Mutex<std::collections::HashMap<u64, Arc<SegmentIndex>>>,
 
     // ── Hit/miss counters (lock-free) ──
     pub index_hits: AtomicU64,
@@ -57,6 +61,7 @@ impl IndexCache {
             mmaps: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_MMAP_CACHE_SIZE).unwrap(),
             )),
+            pinned: Mutex::new(std::collections::HashMap::new()),
             index_hits: AtomicU64::new(0),
             index_misses: AtomicU64::new(0),
             mmap_hits: AtomicU64::new(0),
@@ -83,6 +88,9 @@ impl IndexCache {
             if let Some(bloom) = blooms.get(&base_position) {
                 return Some(condition_might_match_bloom(bloom, condition));
             }
+        }
+        if let Some(index) = self.pinned_index(base_position) {
+            return Some(condition_might_match_bloom(index.bloom(), condition));
         }
 
         // Not cached — try to load from disk.
@@ -125,6 +133,11 @@ impl IndexCache {
                 self.index_hits.fetch_add(1, ORD);
                 return Ok(Arc::clone(index));
             }
+        }
+
+        if let Some(index) = self.pinned_index(base_position) {
+            self.index_hits.fetch_add(1, ORD);
+            return Ok(index);
         }
 
         self.index_misses.fetch_add(1, ORD);
@@ -174,6 +187,33 @@ impl IndexCache {
         self.indices.lock().pop(&base_position);
         self.blooms.lock().pop(&base_position);
         self.mmaps.lock().pop(&base_position);
+        self.pinned.lock().remove(&base_position);
+    }
+
+    fn pinned_index(&self, base_position: u64) -> Option<Arc<SegmentIndex>> {
+        self.pinned.lock().get(&base_position).map(Arc::clone)
+    }
+
+    /// Registers a freshly sealed segment's index before its companion
+    /// files exist. Idempotent. Reads of the segment resolve through the
+    /// pinned copy until `unpin_sealed`.
+    pub fn pin_sealed(&self, base_position: u64, index: Arc<SegmentIndex>) {
+        self.pinned.lock().entry(base_position).or_insert(index);
+    }
+
+    /// The companions are on disk: the index moves from pinned into the
+    /// ordinary caches, warm, and is evictable like any other.
+    pub fn unpin_sealed(&self, base_position: u64) {
+        let Some(index) = self.pinned.lock().remove(&base_position) else {
+            return;
+        };
+        self.blooms.lock().put(base_position, index.bloom().clone());
+        self.indices.lock().put(base_position, index);
+    }
+
+    /// Whether the segment's index is still pinned (seal not yet on disk).
+    pub fn is_pinned(&self, base_position: u64) -> bool {
+        self.pinned.lock().contains_key(&base_position)
     }
 }
 
