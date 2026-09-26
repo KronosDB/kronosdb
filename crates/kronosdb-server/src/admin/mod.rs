@@ -1,4 +1,5 @@
 pub mod activity;
+mod api;
 pub mod auth;
 mod console;
 pub mod layout;
@@ -39,6 +40,8 @@ pub struct AdminState {
     pub channel_registry: Arc<ClientChannelRegistry>,
     pub started_at: std::time::Instant,
     pub auth: Arc<auth::AuthRuntime>,
+    /// gRPC-plane identities (metrics, settings page).
+    pub identities: Arc<crate::auth::Authenticator>,
     pub activity: Arc<activity::ActivityTracker>,
 }
 
@@ -84,6 +87,8 @@ pub async fn start_admin_server(
         .route("/api/contexts", post(console::contexts::api_create_context))
         // Auth routes (login/callback/logout) — public by design
         .merge(auth::routes())
+        // JSON read API for the kronos CLI/TUI
+        .merge(api::routes())
         // HTMX fragment endpoints
         .route("/fragments/stats", get(console::overview::stats_fragment))
         .route(

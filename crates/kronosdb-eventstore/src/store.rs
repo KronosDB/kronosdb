@@ -2126,8 +2126,8 @@ impl EventStoreEngine {
     pub fn get_tags(&self, position: Position) -> Result<Vec<Tag>, Error> {
         let head = self.watermark.get();
         if position.0 >= head {
-            return Err(Error::Corrupted {
-                message: format!("position {} does not exist", position.0),
+            return Err(Error::PositionNotFound {
+                position: position.0,
             });
         }
 
@@ -2136,8 +2136,9 @@ impl EventStoreEngine {
         let seg_idx = match seg_list.bases.binary_search(&position.0) {
             Ok(i) => i,
             Err(0) => {
-                return Err(Error::Corrupted {
-                    message: format!("no segment contains position {}", position.0),
+                // Before the first segment: truncated away.
+                return Err(Error::PositionNotFound {
+                    position: position.0,
                 });
             }
             Err(i) => i - 1,
@@ -2333,8 +2334,8 @@ impl EventStoreEngine {
     pub(crate) fn read_stored_at(&self, position: Position) -> Result<StoredEvent, Error> {
         let head = self.watermark.get();
         if position.0 >= head {
-            return Err(Error::Corrupted {
-                message: format!("position {} does not exist", position.0),
+            return Err(Error::PositionNotFound {
+                position: position.0,
             });
         }
 
@@ -2342,8 +2343,9 @@ impl EventStoreEngine {
         let seg_idx = match seg_list.bases.binary_search(&position.0) {
             Ok(i) => i,
             Err(0) => {
-                return Err(Error::Corrupted {
-                    message: format!("no segment contains position {}", position.0),
+                // Before the first segment: truncated away.
+                return Err(Error::PositionNotFound {
+                    position: position.0,
                 });
             }
             Err(i) => i - 1,

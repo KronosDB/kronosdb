@@ -1,0 +1,31 @@
+[package]
+name = "kronosdb-cli"
+description = "kronos — command-line client and terminal UI for KronosDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kronos"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+prost = "0.13"
+ratatui = "0.30.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tonic = { version = "0.13", features = ["tls-ring", "tls-native-roots", "transport"] }
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

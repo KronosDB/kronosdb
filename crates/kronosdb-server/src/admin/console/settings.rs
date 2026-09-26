@@ -91,13 +91,14 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     ]
     .join("");
 
+    let auth_methods = state.identities.describe();
     let security_rows = [
         setting(
-            "Access Token",
-            if config.access_token.is_some() {
-                "configured"
+            "gRPC Authentication",
+            &if auth_methods.is_empty() {
+                "none (open access)".to_string()
             } else {
-                "none (open access)"
+                html_escape(&auth_methods.join(", "))
             },
         ),
         setting(
@@ -118,10 +119,14 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
         ),
         setting(
             "mTLS CA",
-            if config.tls_ca.is_some() {
-                "configured"
-            } else {
-                "none"
+            match (&config.tls_ca, config.tls_client_auth) {
+                (None, _) => "none",
+                (Some(_), crate::auth::config::ClientAuth::Required) => {
+                    "configured (client certificates required)"
+                }
+                (Some(_), crate::auth::config::ClientAuth::Optional) => {
+                    "configured (client certificates optional)"
+                }
             },
         ),
     ]

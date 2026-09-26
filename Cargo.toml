@@ -5,6 +5,7 @@ members = [
     "crates/kronosdb-messaging",
     "crates/kronosdb-server",
     "crates/kronosdb-bench",
+    "crates/kronosdb-cli",
 ]
 
 [workspace.package]

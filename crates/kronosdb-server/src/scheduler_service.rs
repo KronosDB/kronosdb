@@ -13,6 +13,7 @@ use kronosdb_eventstore::raft::cluster::ClusterManager;
 use kronosdb_eventstore::scheduler::{self, ScheduleSpec, ScheduledEvent};
 use kronosdb_eventstore::store::EventStoreEngine;
 
+use crate::eventstore::service::to_status;
 use crate::proto::kronosdb::scheduler as pb;
 
 const DEFAULT_CONTEXT: &str = "default";
@@ -180,17 +181,5 @@ impl pb::scheduler_service_server::SchedulerService for SchedulerServiceImpl {
                 })
                 .collect(),
         }))
-    }
-}
-
-// tonic's `Status` fixes the large error type.
-#[allow(clippy::result_large_err)]
-fn to_status(error: Error) -> Status {
-    match error {
-        Error::ContextNotFound { name } => Status::not_found(format!("context not found: {name}")),
-        Error::ReservedNamespace { detail } => {
-            Status::invalid_argument(format!("reserved namespace: {detail}"))
-        }
-        other => Status::internal(other.to_string()),
     }
 }

@@ -61,6 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
+    // Both `ring` (tonic) and `aws-lc-rs` (object_store) end up compiled in,
+    // and rustls refuses to guess between them — without this, the first TLS
+    // handshake setup panics. Err just means a provider is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let config = ServerConfig::parse()?;
     match config.ack_mode.as_str() {
         "auto" => kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Auto),
@@ -324,7 +329,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start admin HTTP server in the background.
-    let admin_auth = Arc::new(admin::auth::AuthRuntime::new(&config.admin_auth));
+    let authenticator = Arc::new(auth::Authenticator::new(&config.identity)?);
+    let admin_auth = Arc::new(admin::auth::AuthRuntime::new(
+        &config.admin_auth,
+        Arc::clone(&authenticator),
+    ));
     let admin_state = admin::AdminState {
         config: config.clone(),
         contexts: Arc::clone(&contexts),
@@ -335,6 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel_registry: Arc::clone(&channel_registry),
         started_at: std::time::Instant::now(),
         auth: admin_auth,
+        identities: Arc::clone(&authenticator),
         activity: Arc::new(admin::activity::ActivityTracker::new()),
     };
     tokio::spawn(async move {
@@ -349,7 +359,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "single-node"
     };
     let tls_enabled = config.tls_cert.is_some() && config.tls_key.is_some();
-    let auth_enabled = config.access_token.is_some();
+    let auth_methods = authenticator.describe();
+    if auth_methods.is_empty() {
+        warn!(
+            "gRPC authentication is DISABLED — anyone who can reach the gRPC port can read \
+             and append events. Configure [security] access-token, tokens, issuers, or mtls \
+             grants before exposing it."
+        );
+    }
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %config.listen_addr,
@@ -359,13 +376,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_dir = %config.data_dir.display(),
         admin = %config.admin_listen_addr,
         tls = tls_enabled,
-        auth = auth_enabled,
+        auth = ?auth_methods,
         contexts = ?contexts.list_contexts(),
         "KronosDB starting"
     );
-
-    // Build auth interceptor (no-op when access_token is None).
-    let auth = auth::make_auth_interceptor(config.access_token.clone());
 
     // Import generated gRPC server types.
     use crate::proto::kronosdb::command::command_service_server::CommandServiceServer;
@@ -393,8 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .http2_max_pending_accept_reset_streams(Some(2048))
     };
 
-    let mut server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key)
-    {
+    let server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
         let cert = std::fs::read(cert_path)
             .map_err(|e| format!("failed to read TLS cert '{}': {e}", cert_path.display()))?;
         let key = std::fs::read(key_path)
@@ -407,8 +420,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ca = std::fs::read(ca_path)
                 .map_err(|e| format!("failed to read TLS CA '{}': {e}", ca_path.display()))?;
             let ca_cert = Certificate::from_pem(&ca);
-            tls = tls.client_ca_root(ca_cert);
-            info!("mTLS enabled (client certificate verification)");
+            let optional = config.tls_client_auth == auth::config::ClientAuth::Optional;
+            tls = tls.client_ca_root(ca_cert).client_auth_optional(optional);
+            if optional && !authenticator.enabled() {
+                // Optional certificates with nothing else checking identity
+                // would quietly turn the CA into decoration.
+                return Err(
+                    "tls-client-auth = \"optional\" requires [security] authentication \
+                            (tokens, issuers, or mtls grants) to be configured"
+                        .into(),
+                );
+            }
+            info!(
+                client_certs = if optional { "optional" } else { "required" },
+                "mTLS enabled (client certificate verification)"
+            );
         }
 
         make_builder().tls_config(tls)?
@@ -419,38 +445,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         make_builder()
     };
 
-    // Build gRPC router with auth interceptor on client-facing services.
-    // Message limits are set explicitly, like the internode services': a
-    // bulk-load append of many events would otherwise hit tonic's 4 MiB
-    // decode default and have to split into more RPCs than it needs.
-    use tonic::service::interceptor::InterceptedService;
+    // One identity layer in front of every service: it authenticates the
+    // caller and authorizes per method (client, peer, and health alike — see
+    // auth::policy::classify). Message limits are set explicitly, like the
+    // internode services': a bulk-load append of many events would otherwise
+    // hit tonic's 4 MiB decode default and have to split into more RPCs than
+    // it needs.
     let mut router = server
-        .add_service(InterceptedService::new(
+        .layer(auth::layer::AuthLayer::new(Arc::clone(&authenticator)))
+        .add_service(
             EventStoreServer::new(event_store_service)
                 .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
-            auth.clone(),
-        ))
-        .add_service(InterceptedService::new(
+        )
+        .add_service(
             CommandServiceServer::new(command_service)
                 .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
-            auth.clone(),
-        ))
-        .add_service(InterceptedService::new(
+        )
+        .add_service(
             QueryServiceServer::new(query_service)
                 .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
-            auth.clone(),
-        ))
-        .add_service(PlatformServiceServer::with_interceptor(
-            platform_service,
-            auth.clone(),
-        ))
-        .add_service(SchedulerServiceServer::with_interceptor(
-            scheduler_service,
-            auth.clone(),
-        ));
+        )
+        .add_service(PlatformServiceServer::new(platform_service))
+        .add_service(SchedulerServiceServer::new(scheduler_service));
 
     // Raft transport — always enabled (every node is a Raft node).
     let raft_node = cluster
@@ -460,12 +479,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_server = RaftTransportServer::new(raft_transport)
         .max_decoding_message_size(RAFT_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RAFT_MAX_MESSAGE_BYTES);
-    let raft_server =
-        tonic::service::interceptor::InterceptedService::new(raft_server, auth.clone());
     router = router.add_service(raft_server);
 
-    // Native segment Tail transport uses the same authentication, TLS, and
-    // message limits as the metadata control plane.
+    // Native segment Tail transport uses the same TLS and message limits as
+    // the metadata control plane; both demand the `peer` role.
     let segment_replication = SegmentReplicationService::new(
         Arc::clone(&contexts),
         cluster.replication_control(),
@@ -474,17 +491,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replication_server = SegmentReplicationServer::new(segment_replication)
         .max_decoding_message_size(PEER_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(PEER_MAX_MESSAGE_BYTES);
-    let replication_server =
-        tonic::service::interceptor::InterceptedService::new(replication_server, auth.clone());
     router = router.add_service(replication_server);
 
     // Messaging fabric — internode command/query forwarding (ADR-0007).
     // Same auth and TLS as the other peer transports.
     use crate::proto::kronosdb::fabric::messaging_fabric_server::MessagingFabricServer;
-    router = router.add_service(MessagingFabricServer::with_interceptor(
-        fabric_service,
-        auth,
-    ));
+    router = router.add_service(MessagingFabricServer::new(fabric_service));
 
     // grpc.health.v1 — unauthenticated by design (kubelet probes and gRPC
     // client-side health checking). Overall status tracks Raft leadership:

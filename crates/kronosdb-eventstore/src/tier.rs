@@ -73,10 +73,10 @@ impl Archiver {
     /// Builds an archiver from an object-store URL. `file://` and `memory://`
     /// need no credentials; `s3://` reads the standard AWS environment.
     pub fn from_url(raw_url: &str) -> Result<Self, Error> {
-        let url = url::Url::parse(raw_url).map_err(|error| Error::Corrupted {
+        let url = url::Url::parse(raw_url).map_err(|error| Error::Rejected {
             message: format!("invalid backup url {raw_url}: {error}"),
         })?;
-        let (store, prefix) = object_store::parse_url(&url).map_err(|error| Error::Corrupted {
+        let (store, prefix) = object_store::parse_url(&url).map_err(|error| Error::Rejected {
             message: format!("unsupported backup url {raw_url}: {error}"),
         })?;
         Ok(Self { store, prefix })
@@ -130,7 +130,7 @@ impl Archiver {
             manifest.segments.sort_by_key(|s| s.base);
             manifest.context = context.to_string();
             manifest.watermark = engine.head().0;
-            let body = serde_json::to_vec_pretty(&manifest).map_err(|error| Error::Corrupted {
+            let body = serde_json::to_vec_pretty(&manifest).map_err(|error| Error::Internal {
                 message: format!("encode backup manifest: {error}"),
             })?;
             self.store
@@ -156,7 +156,7 @@ impl Archiver {
             .path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::Corrupted {
+            .ok_or_else(|| Error::Internal {
                 message: format!("segment path has no name: {}", segment.path.display()),
             })?;
         let object = self.context_path(context, &["segments", file_name]);

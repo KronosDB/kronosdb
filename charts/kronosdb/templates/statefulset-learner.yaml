@@ -19,9 +19,8 @@ spec:
       labels:
         {{- include "kronosdb.selectorLabels" . | nindent 8 }}
         kronosdb.io/role: learner
-      {{- if and .Values.contexts .Values.rollOnManifestChange }}
-      annotations:
-        checksum/manifest: {{ include (print $.Template.BasePath "/configmap-manifest.yaml") . | sha256sum }}
+      {{- with (include "kronosdb.podAnnotations" .) }}
+      annotations: {{- . | nindent 8 }}
       {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ add (int .Values.config.drainDeadlineSecs) 10 }}
@@ -34,20 +33,9 @@ spec:
       {{- end }}
       containers:
         - {{- include "kronosdb.container" (dict "root" . "nodeType" "passive-backup" "idOffset" 101) | nindent 10 }}
-      volumes:
-        {{- if .Values.contexts }}
-        - name: manifest
-          configMap:
-            name: {{ include "kronosdb.fullname" . }}-manifest
-        {{- end }}
-        {{- if .Values.tls.secretName }}
-        - name: tls
-          secret:
-            secretName: {{ .Values.tls.secretName }}
-        {{- end }}
-        {{- if not (or .Values.contexts .Values.tls.secretName) }}
-        []
-        {{- end }}
+      {{- with (include "kronosdb.volumes" .) }}
+      volumes: {{- . | nindent 8 }}
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
