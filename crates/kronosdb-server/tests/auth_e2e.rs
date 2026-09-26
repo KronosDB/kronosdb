@@ -99,7 +99,7 @@ fn one_event() -> pb::eventstore::AppendRequest {
                 timestamp: 0,
                 name: "AuthTested".into(),
                 version: "1".into(),
-                payload: vec![1, 2, 3],
+                payload: vec![1, 2, 3].into(),
                 metadata: Default::default(),
             }),
             tags: vec![],
