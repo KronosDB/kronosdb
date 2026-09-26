@@ -299,6 +299,15 @@ impl EventStore for NativeEngine {
         self.local_engine.get_tags(position)
     }
 
+    fn has_matches_between(
+        &self,
+        from: Position,
+        to: Position,
+        condition: &SourcingCondition,
+    ) -> bool {
+        self.local_engine.has_matches_between(from, to, condition)
+    }
+
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
         self.local_engine.get_sequence_at(timestamp_millis)
     }

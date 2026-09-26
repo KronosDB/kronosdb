@@ -157,7 +157,19 @@ impl ClusterManager {
         }
 
         let raft_dir = self.context_manager.data_dir().join("raft");
-        let log_store = LogStore::new(&raft_dir, LogStoreConfig::default()).map_err(Error::Io)?;
+        // Deferred group commit: the log's own thread fsyncs every interval
+        // and openraft keeps appending meanwhile, so a burst of handler
+        // registrations shares an fsync instead of paying one each on the
+        // async runtime. One millisecond is well under any control-plane
+        // latency anyone notices.
+        let log_store = LogStore::new(
+            &raft_dir,
+            LogStoreConfig {
+                group_commit_interval: Some(std::time::Duration::from_millis(1)),
+                ..LogStoreConfig::default()
+            },
+        )
+        .map_err(Error::Io)?;
 
         // On-disk snapshot store. Lives in `<raft_dir>/snapshots`. Used to
         // persist `last_membership` across restart — without this, the
@@ -336,8 +348,9 @@ impl ClusterManager {
     /// back to the configured peer directory).
     pub fn peer_address(&self, node_id: NodeId) -> Option<String> {
         if let Some(raft) = self.raft_node() {
-            let metrics = raft.metrics().borrow().clone();
-            if let Some(node) = metrics.membership_config.membership().get_node(&node_id) {
+            let metrics = raft.metrics();
+            let current = metrics.borrow();
+            if let Some(node) = current.membership_config.membership().get_node(&node_id) {
                 return Some(node.addr.clone());
             }
         }

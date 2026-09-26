@@ -1617,6 +1617,7 @@ dependencies = [
  "crc32c",
  "dashmap",
  "fs2",
+ "futures-util",
  "growable-bloom-filter",
  "libc",
  "lru",

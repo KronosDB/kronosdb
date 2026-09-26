@@ -23,6 +23,7 @@ bincode = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "rt", "fs", "io-util"] }
 tokio-stream = "0.1"
+futures-util = "0.3"
 async-trait = "0.1"
 lru = "0.14"
 

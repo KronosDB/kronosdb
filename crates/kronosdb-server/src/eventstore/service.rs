@@ -114,8 +114,8 @@ async fn run_fanout_hub(
     context_name: String,
 ) {
     const PAGE: usize = 8192;
-    let condition = from_proto_read_criteria_empty();
-    let mut stream = store.subscribe(store.head(), condition.clone());
+    let condition = Arc::new(from_proto_read_criteria_empty());
+    let mut stream = store.subscribe(store.head(), (*condition).clone());
     loop {
         let bound = Position(stream.wait_for_new_events().await);
         if bound.0 <= stream.cursor.0 {
@@ -217,7 +217,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
             0 => 1024, // Server default; 0 means "let the server pick".
             n => n,
         };
-        let condition = from_proto_read_criteria(req.criteria);
+        let condition = Arc::new(from_proto_read_criteria(req.criteria));
         // Per-request logging stays below the default level; the criteria
         // strings are only formatted when debug logging is enabled.
         tracing::debug!(
@@ -310,11 +310,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     return;
                 }
                 while rest.peek().is_some() {
-                    let chunk: Vec<pb::SequencedEvent> = rest
-                        .by_ref()
-                        .take(batch_size)
-                        .map(to_proto_sequenced_event)
-                        .collect();
+                    let chunk = take_chunk(&mut rest, batch_size);
                     let last_of_stream = is_final && rest.peek().is_none();
                     let response = pb::SourceResponse {
                         batch: Some(pb::SequencedEventBatch {
@@ -386,7 +382,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
         }
 
         let from_position = Position(subscribe.from_sequence as u64);
-        let condition = from_proto_read_criteria(subscribe.criteria);
+        let condition = Arc::new(from_proto_read_criteria(subscribe.criteria));
         let blacklist: std::collections::HashSet<String> =
             subscribe.blacklisted_names.into_iter().collect();
         let batch_size = match subscribe.batch_size as usize {
@@ -394,7 +390,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
             n => n,
         };
         let store = self.get_store(&context_name)?;
-        let mut event_stream = store.subscribe(from_position, condition.clone());
+        let mut event_stream = store.subscribe(from_position, (*condition).clone());
 
         // Bound in-flight memory by events, not messages (see `source`).
         let channel_capacity = (16384 / batch_size).clamp(2, 128);
@@ -490,7 +486,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                         return false;
                     };
                     first.forget();
-                    let cap = batch_size.min(protos.len() - i);
+                    let cap = batch_window(&protos[i..], batch_size);
                     let extra = permits.available_permits().min(cap - 1);
                     let n = if extra > 0 {
                         match permits.try_acquire_many(extra as u32) {
@@ -590,7 +586,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
             #[allow(clippy::too_many_arguments)]
             async fn engine_catch_up(
                 store: &Arc<dyn EventStore>,
-                condition: &kronosdb_eventstore::criteria::SourcingCondition,
+                condition: &Arc<kronosdb_eventstore::criteria::SourcingCondition>,
                 event_stream: &mut kronosdb_eventstore::stream::EventStream,
                 bound: Position,
                 blacklist: &std::collections::HashSet<String>,
@@ -726,6 +722,14 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     // when the engine's commit channel closed (shutdown).
                     return;
                 }
+                // Most commits hold nothing for a tag-filtered subscriber.
+                // The engine answers that from ranks in a few lookups, so
+                // the wakeup ends here instead of in a paged read on the
+                // blocking pool.
+                if !store.has_matches_between(event_stream.cursor, bound, &condition) {
+                    event_stream.advance_cursor(bound);
+                    continue;
+                }
                 if !engine_catch_up(
                     &store,
                     &condition,
@@ -770,9 +774,8 @@ impl pb::event_store_server::EventStore for EventStoreService {
     ) -> Result<Response<pb::GetTailResponse>, Status> {
         let context_name = Self::extract_context(&request).to_string();
         let store = self.get_store(&context_name)?;
-        let tail = tokio::task::spawn_blocking(move || store.tail())
-            .await
-            .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+        // A constant read; no thread hop.
+        let tail = store.tail();
 
         Ok(Response::new(pb::GetTailResponse {
             sequence: tail.0 as i64,
@@ -861,7 +864,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
             0 => 1024, // Server default; 0 means "let the server pick".
             n => n,
         };
-        let condition = from_proto_read_criteria(req.criteria);
+        let condition = Arc::new(from_proto_read_criteria(req.criteria));
         let store = self.get_store(&context_name)?;
 
         // Freeze the marker FIRST, then resolve the snapshot bounded by it:
@@ -948,11 +951,7 @@ impl pb::event_store_server::EventStore for EventStoreService {
                     return;
                 }
                 while rest.peek().is_some() {
-                    let chunk: Vec<pb::SequencedEvent> = rest
-                        .by_ref()
-                        .take(batch_size)
-                        .map(to_proto_sequenced_event)
-                        .collect();
+                    let chunk = take_chunk(&mut rest, batch_size);
                     let last_of_stream = is_final && rest.peek().is_none();
                     let frame = pb::SnapshottedSourceResponse {
                         frame: Some(pb::snapshotted_source_response::Frame::Batch(
@@ -1060,6 +1059,45 @@ fn from_proto_tagged_event(te: pb::TaggedEvent) -> AppendEvent {
 }
 
 // --- Type conversions: engine → proto ---
+
+/// Payload bytes one response message may carry. A batch is cut by count
+/// (the client's `batch_size`) AND by bytes, so large events never build a
+/// message a default 4 MiB client decode limit rejects.
+const MAX_BATCH_PAYLOAD_BYTES: usize = 3 * 1024 * 1024;
+
+/// How many of `events` (from the front) fit one message: at most
+/// `batch_size`, at most `MAX_BATCH_PAYLOAD_BYTES` of payload, at least one.
+fn batch_window(events: &[pb::SequencedEvent], batch_size: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut n = 0usize;
+    for event in events.iter().take(batch_size.max(1)) {
+        let len = event.event.as_ref().map_or(0, |e| e.payload.len());
+        if n > 0 && bytes + len > MAX_BATCH_PAYLOAD_BYTES {
+            break;
+        }
+        bytes += len;
+        n += 1;
+    }
+    n.max(1)
+}
+
+/// Takes the next message's worth of events off a page, converting them.
+fn take_chunk(
+    rest: &mut std::iter::Peekable<std::vec::IntoIter<kronosdb_eventstore::event::SequencedEvent>>,
+    batch_size: usize,
+) -> Vec<pb::SequencedEvent> {
+    let mut chunk = Vec::new();
+    let mut bytes = 0usize;
+    while chunk.len() < batch_size.max(1) {
+        let Some(next) = rest.peek() else { break };
+        if !chunk.is_empty() && bytes + next.payload.len() > MAX_BATCH_PAYLOAD_BYTES {
+            break;
+        }
+        bytes += next.payload.len();
+        chunk.push(to_proto_sequenced_event(rest.next().expect("peeked")));
+    }
+    chunk
+}
 
 /// Consumes the engine event: every field moves, and the payload `Vec`
 /// becomes a `Bytes` without a copy. Callers own their page, so nothing

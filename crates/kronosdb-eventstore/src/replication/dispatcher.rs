@@ -95,12 +95,17 @@ impl WavePublisher {
         std::thread::Builder::new()
             .name("kronosdb-replication-dispatch".into())
             .spawn(move || {
+                // The active segment's file, kept open across waves instead
+                // of reopened per dispatch. Retired at rotation.
+                let mut open = OpenSlices::default();
                 while let Ok(descriptor) = descriptor_rx.recv() {
                     if live_tx.receiver_count() == 0 {
                         continue;
                     }
                     let epoch = descriptor.epoch;
-                    if let Err(error) = dispatch_descriptor(&live_tx, &stream_bytes, descriptor) {
+                    if let Err(error) =
+                        dispatch_descriptor(&live_tx, &stream_bytes, descriptor, &mut open)
+                    {
                         tracing::error!(%error, "failed to source sealed wave for replication");
                         let _ = live_tx.send(LiveFrame::Reset { epoch });
                     }
@@ -152,10 +157,32 @@ impl WavePublisher {
     }
 }
 
+/// Segment files the dispatcher has open, by path. One wave's slices are
+/// almost always in the same file as the last wave's.
+#[derive(Default)]
+struct OpenSlices {
+    files: std::collections::HashMap<std::path::PathBuf, File>,
+}
+
+impl OpenSlices {
+    fn get(&mut self, path: &std::path::Path) -> Result<&File, io::Error> {
+        if !self.files.contains_key(path) {
+            self.files.insert(path.to_path_buf(), File::open(path)?);
+        }
+        Ok(&self.files[path])
+    }
+
+    /// Drops every file but `keep` — the segments a wave moved past.
+    fn retain_only(&mut self, keep: &std::path::Path) {
+        self.files.retain(|path, _| path == keep);
+    }
+}
+
 fn dispatch_descriptor(
     tx: &broadcast::Sender<LiveFrame>,
     stream_bytes: &AtomicU64,
     descriptor: WaveDescriptor,
+    open: &mut OpenSlices,
 ) -> Result<(), io::Error> {
     let mut previous_base = Some(descriptor.previous_segment_base);
     for slice in descriptor.slices {
@@ -173,8 +200,9 @@ fn dispatch_descriptor(
         let len = usize::try_from(slice.byte_end - slice.byte_start)
             .map_err(|_| io::Error::other("replication wave slice exceeds address space"))?;
         let mut data = vec![0u8; len];
-        let file = File::open(&slice.path)?;
-        read_exact_at(&file, &mut data, slice.byte_start)?;
+        let file = open.get(&slice.path)?;
+        read_exact_at(file, &mut data, slice.byte_start)?;
+        open.retain_only(&slice.path);
         let end = stream_bytes.fetch_add(len as u64, Ordering::AcqRel) + len as u64;
         let _ = tx.send(LiveFrame::Records {
             epoch: descriptor.epoch,
