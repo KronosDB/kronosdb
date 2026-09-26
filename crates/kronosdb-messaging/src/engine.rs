@@ -259,7 +259,7 @@ mod tests {
             payload: Payload {
                 payload_type: "CreateOrder".into(),
                 revision: "1".into(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             },
             metadata: std::collections::HashMap::new(),
             processing_instructions: vec![],
@@ -290,7 +290,7 @@ mod tests {
             payload: Payload {
                 payload_type: "GetOrders".into(),
                 revision: "1".into(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             },
             metadata: std::collections::HashMap::new(),
             processing_instructions: vec![],
@@ -328,7 +328,7 @@ mod tests {
             payload: Payload {
                 payload_type: "CreateOrder".into(),
                 revision: "1".into(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             },
             metadata: std::collections::HashMap::new(),
             processing_instructions: vec![],
@@ -348,7 +348,7 @@ mod tests {
             payload: Payload {
                 payload_type: "GetOrders".into(),
                 revision: "1".into(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             },
             metadata: std::collections::HashMap::new(),
             processing_instructions: vec![],

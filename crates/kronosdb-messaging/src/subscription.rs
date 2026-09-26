@@ -445,7 +445,7 @@ mod tests {
             payload: Payload {
                 payload_type: query_name.to_string(),
                 revision: "1".to_string(),
-                data: vec![],
+                data: bytes::Bytes::new(),
             },
             metadata: std::collections::HashMap::new(),
             client_id: client("subscriber"),
@@ -501,7 +501,7 @@ mod tests {
                 payload: Some(Payload {
                     payload_type: "OrderCount".into(),
                     revision: "1".into(),
-                    data: b"42".to_vec(),
+                    data: bytes::Bytes::from_static(b"42"),
                 }),
                 metadata: std::collections::HashMap::new(),
                 error_code: None,

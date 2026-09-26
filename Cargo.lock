@@ -1597,6 +1597,7 @@ dependencies = [
 name = "kronosdb-bench"
 version = "0.9.0"
 dependencies = [
+ "bytes",
  "criterion",
  "kronosdb-eventstore",
  "kronosdb-messaging",
@@ -1640,6 +1641,7 @@ dependencies = [
 name = "kronosdb-messaging"
 version = "0.9.0"
 dependencies = [
+ "bytes",
  "dashmap",
  "parking_lot",
  "tokio",
@@ -1653,6 +1655,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64",
+ "bytes",
  "clap",
  "dashmap",
  "jsonwebtoken",

@@ -98,7 +98,7 @@ impl pb::scheduler_service_server::SchedulerService for SchedulerServiceImpl {
                 identifier: event.identifier,
                 name: event.name,
                 version: event.version,
-                payload: event.payload,
+                payload: event.payload.into(),
                 metadata: event.metadata.into_iter().collect(),
                 tags: tagged
                     .tags
