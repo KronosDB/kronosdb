@@ -51,3 +51,6 @@ tokio-stream = "0.1"
 tonic = { version = "0.13", features = ["transport"] }
 prost = "0.13"
 blake3 = "1"
+
+[lints]
+workspace = true

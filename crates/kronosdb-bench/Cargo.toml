@@ -56,3 +56,6 @@ harness = false
 [[bench]]
 name = "command_dispatch"
 harness = false
+
+[lints]
+workspace = true
