@@ -8,8 +8,15 @@ members = [
     "crates/kronosdb-cli",
 ]
 
+[workspace.lints.clippy]
+# `#[async_trait]` expands each method into a `#[must_use]` fn returning a
+# boxed future, which is already `#[must_use]` on its own. Clippy 1.99 began
+# flagging every one of them — ours and the ones tonic generates from the
+# protos alike. There is nothing to fix at either end.
+double_must_use = "allow"
+
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/theoem/kronosdb"

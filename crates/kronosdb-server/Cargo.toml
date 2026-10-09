@@ -45,3 +45,6 @@ tonic-build = "0.13"
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"
+
+[lints]
+workspace = true

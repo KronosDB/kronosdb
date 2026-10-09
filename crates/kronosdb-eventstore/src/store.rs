@@ -812,12 +812,16 @@ pub struct EventStoreEngine {
     segments: RwLock<SegmentList>,
 
     /// Cached mmap of the active segment, keyed by its base position. The
-    /// active file is preallocated to `max_segment_size` at creation, so one
+    /// active file is grown to `max_segment_size` when it is created, so one
     /// mapping covers the whole segment lifetime; callers clamp reads to
     /// committed offsets. Rotation changes the base, which retires the entry
     /// by key mismatch — in-flight readers keep their `Arc<Mmap>` and only
     /// ever touch offsets that existed when they resolved positions.
     active_mmap: parking_lot::Mutex<Option<(u64, Arc<memmap2::Mmap>)>>,
+
+    /// Full length of an active segment file. Only used to tell a mapping
+    /// that covers the segment's whole lifetime from one that does not.
+    max_segment_size: u64,
 
     /// Lock-free internal metrics. Shared via Arc for external access.
     metrics: Arc<StoreMetrics>,
@@ -900,6 +904,7 @@ impl EventStoreEngine {
                 sealed_count: 0,
             }),
             active_mmap: parking_lot::Mutex::new(None),
+            max_segment_size: opts.max_segment_size,
             metrics: Arc::new(StoreMetrics::new()),
         })
     }
@@ -1006,6 +1011,7 @@ impl EventStoreEngine {
                 sealed_count,
             }),
             active_mmap: parking_lot::Mutex::new(None),
+            max_segment_size: opts.max_segment_size,
             metrics: Arc::new(StoreMetrics::new()),
         })
     }
@@ -1019,14 +1025,23 @@ impl EventStoreEngine {
     }
 
     /// Reader over the active segment, backed by a cached mmap. The mapping
-    /// is created once per active segment (the file is preallocated to its
-    /// full size, so it never needs remapping) and retired when rotation
-    /// changes the base position.
+    /// is created once per active segment and retired when rotation changes
+    /// the base position.
+    ///
+    /// Reusing one mapping for the segment's whole lifetime is only sound
+    /// while the file is already its full length, because a mapping does not
+    /// grow with the file behind it. That is the normal case — segment files
+    /// are grown up front — but it is a property of the file, not something
+    /// to assume: a store carried over from a release that tolerated a failed
+    /// preallocation, or a segment just rotated away from and trimmed to its
+    /// data length, maps short. Those reads remap instead of reporting the
+    /// bytes past the mapping as corruption.
     fn active_segment_reader(&self, base: u64, path: &Path) -> Result<SegmentReader, Error> {
         {
             let cached = self.active_mmap.lock();
             if let Some((cached_base, mmap)) = cached.as_ref()
                 && *cached_base == base
+                && mmap.len() as u64 >= self.max_segment_size
             {
                 return SegmentReader::from_shared_mmap(Arc::clone(mmap));
             }
@@ -3267,6 +3282,104 @@ mod tests {
         assert_eq!(
             store.source(Position(0), &cond_match_all()).unwrap().len(),
             100
+        );
+    }
+
+    /// Segment files are grown to their full length up front so the active
+    /// segment can be mapped once and read for its whole lifetime. On a
+    /// filesystem that refuses `fallocate` — ZFS, NFS, a FUSE-backed bind
+    /// mount under a container — that growth has to come from `set_len`
+    /// instead, or the file stays exactly as long as its data.
+    #[test]
+    fn active_segment_file_is_full_length_after_create_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = 1024 * 1024;
+        {
+            let store = EventStoreEngine::create_with_options(dir.path(), size).unwrap();
+            let path = store.writer.lock().active_segment_path();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                size,
+                "a freshly created segment is already its full length"
+            );
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+                })
+                .unwrap();
+            store.shutdown();
+        }
+        let store = EventStoreEngine::open_with_options(dir.path(), size).unwrap();
+        let path = store.writer.lock().active_segment_path();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size,
+            "reopening restores the full length; recovery trims to the data \
+             tail first, and leaving it trimmed strands every later append \
+             outside the reader's mapping"
+        );
+    }
+
+    /// The reader half of the same invariant. A store whose active segment
+    /// is not full-length — written by a release that tolerated a failed
+    /// preallocation — must still read events appended after the mapping was
+    /// taken, rather than reporting them as corrupt or silently dropping
+    /// them. Truncating the file behind the engine's back reproduces exactly
+    /// the state such a store comes up in.
+    #[test]
+    fn reads_follow_an_active_segment_that_was_not_grown_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create_with_options(dir.path(), 1024 * 1024).unwrap();
+
+        for i in 0..3 {
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(
+                        "OrderPlaced",
+                        vec![tag("orderId", &format!("ord-{i}"))],
+                    )],
+                })
+                .unwrap();
+        }
+
+        // Shrink the active segment to its data length: what the file would
+        // have looked like all along had preallocation silently failed.
+        let (path, data_len) = {
+            let writer = store.writer.lock();
+            (writer.active_segment_path(), writer.write_offset())
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(data_len)
+            .unwrap();
+
+        // This read maps the segment at that shortened length.
+        assert_eq!(
+            store.source(Position(0), &cond_match_all()).unwrap().len(),
+            3
+        );
+
+        for i in 3..6 {
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(
+                        "OrderPlaced",
+                        vec![tag("orderId", &format!("ord-{i}"))],
+                    )],
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.source(Position(0), &cond_match_all()).unwrap().len(),
+            6,
+            "events appended past the end of the cached mapping are still \
+             readable"
         );
     }
 

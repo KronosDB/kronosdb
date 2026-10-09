@@ -101,7 +101,7 @@ impl SegmentWriter {
         let path = segment_path(dir, base_position);
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, base_position)?;
-        preallocate(&file, max_segment_size);
+        preallocate(&file, max_segment_size)?;
         sync_dir(dir)?;
 
         Ok(Self {
@@ -154,7 +154,7 @@ impl SegmentWriter {
         // Truncate any torn write garbage / pre-allocated space at the end,
         // then re-preallocate for future writes.
         file.set_len(write_offset)?;
-        preallocate(&file, max_segment_size);
+        preallocate(&file, max_segment_size)?;
 
         // CRITICAL: `set_len` / `preallocate` do NOT reposition the file cursor.
         // `recover_segment` left the cursor at end-of-scan (past `write_offset`
@@ -512,7 +512,7 @@ impl SegmentWriter {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         file.set_len(write_offset)?;
         file.sync_data()?;
-        preallocate(&file, self.max_segment_size);
+        preallocate(&file, self.max_segment_size)?;
         file.seek(SeekFrom::Start(write_offset))?;
 
         let rebuilt = SegmentIndex::build_from_segment(&path)?;
@@ -567,7 +567,7 @@ impl SegmentWriter {
         let path = segment_path(&self.dir, new_base);
         let mut file = create_segment_file(&path)?;
         write_segment_header(&mut file, new_base)?;
-        preallocate(&file, self.max_segment_size);
+        preallocate(&file, self.max_segment_size)?;
 
         let sealed_file = std::mem::replace(&mut self.active_file, file);
         self.pending_seals.push(PendingSeal {
@@ -698,28 +698,31 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
     Ok((valid_offset, next_position))
 }
 
-/// Pre-allocates disk space for a file.
+/// Grows the active segment file to its full size up front.
 ///
-/// On Linux, uses fallocate to reserve contiguous blocks without writing zeros.
-/// On other platforms, falls back to setting the file length (which may write zeros).
+/// On Linux this is `fallocate`, which reserves contiguous blocks without
+/// writing zeros. Filesystems that do not implement it — ZFS, NFS, and the
+/// FUSE/virtiofs mounts behind a bind-mounted container volume — fail the
+/// syscall, so we fall back to extending the file logically with `set_len`.
 ///
-/// Pre-allocation has two benefits:
-/// 1. Contiguous blocks on disk → better sequential read/write performance
-/// 2. File size doesn't change on each append → fdatasync skips metadata update
-///
-/// Errors are silently ignored — pre-allocation is an optimization, not a requirement.
-fn preallocate(file: &File, size: u64) {
+/// The contiguous blocks and the skipped metadata update on each fdatasync
+/// are the optimization. The file *length* is not: readers mmap the active
+/// segment once and keep that mapping for the segment's whole lifetime, so
+/// a file that is not full-length maps short and every later append lands
+/// outside the mapping. That is why a failure here is an error rather than
+/// something to shrug off.
+fn preallocate(file: &File, size: u64) -> Result<(), Error> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::fallocate(file.as_raw_fd(), 0, 0, size as i64);
+        // SAFETY: `fallocate` is a plain syscall and the fd is valid for the
+        // lifetime of `file`.
+        if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as i64) } == 0 {
+            return Ok(());
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file.set_len(size);
-    }
+    file.set_len(size)?;
+    Ok(())
 }
 
 /// Flushes data to disk.
