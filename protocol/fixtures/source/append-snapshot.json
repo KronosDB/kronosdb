@@ -1,0 +1,16 @@
+{
+  "description": "",
+  "frame": "AppendSnapshot",
+  "stream": 23,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "key": {
+      "utf8": "course:cs-101"
+    },
+    "state": {
+      "utf8": "{\"seats\":30,\"enrolled\":28}"
+    },
+    "position": "1048578"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "description": "",
+  "frame": "RaftInstallSnapshotReply",
+  "stream": 65,
+  "flags": 1,
+  "body": {
+    "data": "fe"
+  }
+}

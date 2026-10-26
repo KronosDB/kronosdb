@@ -29,6 +29,11 @@ pub struct StoreMetrics {
     /// back to durable-mode pacing. A rising rate means the disk cannot keep
     /// up with the written-ack path — the early warning before latency climbs.
     pub ack_degradations: AtomicU64,
+    /// Appends staged on an async worker that took longer than the stall
+    /// limit. Each one shuts the inline route for a cooldown, so a rising
+    /// rate means the disk's write path is stalling and appends have moved to
+    /// the staging thread.
+    pub inline_stalls: AtomicU64,
 
     // ── Reads ──
     /// Total source() calls.
@@ -75,6 +80,7 @@ impl StoreMetrics {
             events_appended: AtomicU64::new(0),
             dcb_violations: AtomicU64::new(0),
             ack_degradations: AtomicU64::new(0),
+            inline_stalls: AtomicU64::new(0),
             append_duration_us: AtomicU64::new(0),
             source_queries: AtomicU64::new(0),
             events_sourced: AtomicU64::new(0),
@@ -100,6 +106,7 @@ impl StoreMetrics {
             dcb_violations: self.dcb_violations.load(ORD),
             append_duration_us: self.append_duration_us.load(ORD),
             ack_degradations: self.ack_degradations.load(ORD),
+            inline_stalls: self.inline_stalls.load(ORD),
             source_queries: self.source_queries.load(ORD),
             events_sourced: self.events_sourced.load(ORD),
             source_duration_us: self.source_duration_us.load(ORD),
@@ -132,6 +139,11 @@ impl StoreMetrics {
     #[inline]
     pub fn record_ack_degradation(&self) {
         self.ack_degradations.fetch_add(1, ORD);
+    }
+
+    #[inline]
+    pub fn record_inline_stall(&self) {
+        self.inline_stalls.fetch_add(1, ORD);
     }
 
     #[inline]
@@ -173,6 +185,7 @@ pub struct MetricsSnapshot {
     pub events_appended: u64,
     pub dcb_violations: u64,
     pub ack_degradations: u64,
+    pub inline_stalls: u64,
     pub append_duration_us: u64,
     pub source_queries: u64,
     pub events_sourced: u64,

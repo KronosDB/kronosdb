@@ -1,0 +1,14 @@
+{
+  "frame": "TailRecords",
+  "stream": 69,
+  "flags": 0,
+  "body": {
+    "epoch": "7",
+    "segment_base": "1000000",
+    "first_position": "1048578",
+    "data": "deadbeef0600000000ffeeddcc11",
+    "stream_bytes_end": "65550",
+    "next_position": "1048579"
+  },
+  "description": "Raw segment bytes: here, one stored record with its CRC."
+}

@@ -1,0 +1,22 @@
+{
+  "description": "Tag bytes need not be UTF-8.",
+  "frame": "Tags",
+  "stream": 19,
+  "flags": 1,
+  "body": {
+    "tags": [
+      {
+        "key": {
+          "utf8": "orderId"
+        },
+        "value": {
+          "utf8": "o-1"
+        }
+      },
+      {
+        "key": "00ff",
+        "value": "deadbeef"
+      }
+    ]
+  }
+}

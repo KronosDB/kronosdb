@@ -1,0 +1,11 @@
+{
+  "frame": "SubscribeQuery",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "instruction_id": "i-5",
+    "query": "com.acme.FindOrder",
+    "result_name": "com.acme.OrderView"
+  },
+  "description": ""
+}

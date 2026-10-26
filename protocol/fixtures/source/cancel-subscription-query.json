@@ -1,0 +1,9 @@
+{
+  "description": "",
+  "frame": "CancelSubscriptionQuery",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "subscription_id": "sub-1"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "frame": "Hello",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "version": 1,
+    "features": "0",
+    "record_format": 3,
+    "client_name": "billing-service",
+    "client_id": "billing-service-7f9c@host-a",
+    "credential_kind": "token",
+    "credential": "s3cret-token"
+  },
+  "description": "A client authenticating with a static token."
+}

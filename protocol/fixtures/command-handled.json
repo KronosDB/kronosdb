@@ -1,0 +1,21 @@
+{
+  "frame": "CommandHandled",
+  "stream": 45,
+  "flags": 0,
+  "body": {
+    "result": {
+      "message_id": "res-1",
+      "request_id": "cmd-1",
+      "error_code": "",
+      "error": null,
+      "payload": {
+        "type_name": "com.acme.OrderPlaced",
+        "revision": "1",
+        "data": "7b226f6b223a747275657d"
+      },
+      "metadata": [],
+      "instructions": []
+    }
+  },
+  "description": ""
+}

@@ -1,0 +1,13 @@
+{
+  "frame": "TailAck",
+  "stream": 69,
+  "flags": 0,
+  "body": {
+    "context": "default",
+    "follower_id": "2",
+    "epoch": "7",
+    "durable_position": "1048600",
+    "durable_bytes": "65536"
+  },
+  "description": ""
+}

@@ -1,0 +1,9 @@
+{
+  "frame": "RaftVoteReply",
+  "stream": 61,
+  "flags": 1,
+  "body": {
+    "data": "d4e5"
+  },
+  "description": ""
+}

@@ -89,9 +89,9 @@ impl std::fmt::Display for CommandError {
 
 /// A command that has been assigned to a handler and is waiting for a response.
 ///
-/// The response sender lives in [`CommandBus::in_flight`] — the gRPC layer
+/// The response sender lives in [`CommandBus::in_flight`] — the service layer
 /// holds the receiver and the bus owns the sender so handler-disconnect
-/// and timeout sweeps can fail callers without the gRPC layer maintaining
+/// and timeout sweeps can fail callers without the service layer maintaining
 /// a parallel map.
 pub struct PendingCommand {
     pub command: Command,
@@ -244,8 +244,16 @@ impl CommandBus {
     /// Grants flow control permits to a client.
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
         let handlers = self.handlers.read();
+        let Some(types) = handlers.grant_permits(client_id, permits) else {
+            // Granted before subscribing anything: nothing waits on it yet.
+            drop(handlers);
+            self.handlers
+                .write()
+                .grant_permits_creating(client_id, permits);
+            return;
+        };
         // Wake the dispatch_wait loops parked on this handler's types.
-        for command_name in handlers.grant_permits(client_id, permits) {
+        for command_name in types {
             if let Some(notify) = self.permit_notify.get(command_name) {
                 notify.notify_waiters();
             }
@@ -257,7 +265,7 @@ impl CommandBus {
     /// Returns a `PendingCommand` (to deliver to the handler) and a oneshot
     /// receiver for the response. The response sender is retained inside
     /// the bus's in-flight map so disconnect/timeout sweeps can fail the
-    /// caller without the gRPC layer keeping a parallel map.
+    /// caller without the service layer keeping a parallel map.
     ///
     /// Checks (in order): capacity (priority-aware) → duplicate → handler
     /// availability → permits.
@@ -297,9 +305,19 @@ impl CommandBus {
             // Register interest before attempting so a grant arriving
             // right after a failed attempt still wakes us.
             let notified = notify.notified();
-            match self.dispatch_inner(command.clone(), false) {
+            match self.admit(&command, false) {
                 Err(CommandError::NoPermitsAvailable { .. }) => {}
-                other => return other,
+                Ok((target_handler, dispatched_at, response_rx)) => {
+                    return Ok((
+                        PendingCommand {
+                            command,
+                            target_handler,
+                            dispatched_at,
+                        },
+                        response_rx,
+                    ));
+                }
+                Err(e) => return Err(e),
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -332,9 +350,19 @@ impl CommandBus {
         let notify = self.permit_notify_for(&command.name);
         loop {
             let notified = notify.notified();
-            match self.dispatch_to_inner(command.clone(), target, false) {
+            match self.admit_to(&command, target, false) {
                 Err(CommandError::NoPermitsAvailable { .. }) => {}
-                other => return other,
+                Ok((target_handler, dispatched_at, response_rx)) => {
+                    return Ok((
+                        PendingCommand {
+                            command,
+                            target_handler,
+                            dispatched_at,
+                        },
+                        response_rx,
+                    ));
+                }
+                Err(e) => return Err(e),
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -354,6 +382,28 @@ impl CommandBus {
         target: &ClientId,
         record_no_permits: bool,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        let (target_handler, dispatched_at, response_rx) =
+            self.admit_to(&command, target, record_no_permits)?;
+        Ok((
+            PendingCommand {
+                command,
+                target_handler,
+                dispatched_at,
+            },
+            response_rx,
+        ))
+    }
+
+    /// Everything dispatch decides before the command moves: capacity,
+    /// duplicates, the handler and its permit, and the in-flight entry.
+    /// Borrowing the command lets the waiting variants retry without
+    /// cloning it per attempt.
+    fn admit_to(
+        &self,
+        command: &Command,
+        target: &ClientId,
+        record_no_permits: bool,
+    ) -> Result<(ClientId, Instant, oneshot::Receiver<CommandResult>), CommandError> {
         let command_name = command.name.clone();
         let message_id = command.message_id.clone();
 
@@ -411,14 +461,7 @@ impl CommandBus {
             },
         );
 
-        Ok((
-            PendingCommand {
-                command,
-                target_handler,
-                dispatched_at: now,
-            },
-            response_rx,
-        ))
+        Ok((target_handler, now, response_rx))
     }
 
     fn dispatch_inner(
@@ -426,6 +469,24 @@ impl CommandBus {
         command: Command,
         record_no_permits: bool,
     ) -> Result<(PendingCommand, oneshot::Receiver<CommandResult>), CommandError> {
+        let (target_handler, dispatched_at, response_rx) =
+            self.admit(&command, record_no_permits)?;
+        Ok((
+            PendingCommand {
+                command,
+                target_handler,
+                dispatched_at,
+            },
+            response_rx,
+        ))
+    }
+
+    /// [`admit_to`](CommandBus::admit_to) for the bus's own handler selection.
+    fn admit(
+        &self,
+        command: &Command,
+        record_no_permits: bool,
+    ) -> Result<(ClientId, Instant, oneshot::Receiver<CommandResult>), CommandError> {
         let command_name = command.name.clone();
         let message_id = command.message_id.clone();
 
@@ -544,13 +605,7 @@ impl CommandBus {
             },
         );
 
-        let pending = PendingCommand {
-            command,
-            target_handler,
-            dispatched_at: now,
-        };
-
-        Ok((pending, response_rx))
+        Ok((target_handler, now, response_rx))
     }
 
     /// Returns detailed handler info + dispatch metrics per command type.
@@ -640,7 +695,7 @@ impl CommandBus {
 
     /// Removes in-flight entries older than `timeout`. Each swept entry
     /// receives a `KRONOSDB-4005` failure. Returns the swept message_ids.
-    /// Safety net for any leak — the gRPC layer handles per-request timeouts.
+    /// Safety net for any leak — the service layer handles per-request timeouts.
     pub fn sweep_timeouts(&self, timeout: Duration) -> Vec<String> {
         let to_sweep: Vec<String> = self
             .in_flight
@@ -698,29 +753,28 @@ impl CommandBus {
 
     // ── Metrics helpers (cheap — just atomic increments) ────────────
 
-    fn get_or_create_metrics(&self, name: &str) {
-        self.metrics.entry(name.to_string()).or_default();
+    /// Counts an event for `name`. A type seen before takes only a shared
+    /// lock to find its counters; the exclusive lock (and the key's
+    /// allocation) is for the first time a type is seen.
+    fn count(&self, name: &str, counter: impl Fn(&MessageTypeMetrics) -> &AtomicU64) {
+        if let Some(m) = self.metrics.get(name) {
+            counter(&m).fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let m = self.metrics.entry(name.to_string()).or_default();
+        counter(&m).fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_dispatched(&self, name: &str) {
-        self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.get(name) {
-            m.dispatched.fetch_add(1, Ordering::Relaxed);
-        }
+        self.count(name, |m| &m.dispatched);
     }
 
     fn record_no_handler(&self, name: &str) {
-        self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.get(name) {
-            m.no_handler.fetch_add(1, Ordering::Relaxed);
-        }
+        self.count(name, |m| &m.no_handler);
     }
 
     fn record_no_permits(&self, name: &str) {
-        self.get_or_create_metrics(name);
-        if let Some(m) = self.metrics.get(name) {
-            m.no_permits.fetch_add(1, Ordering::Relaxed);
-        }
+        self.count(name, |m| &m.no_permits);
     }
 }
 

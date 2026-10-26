@@ -1,0 +1,23 @@
+[package]
+name = "kronosdb-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KronosDB native wire protocol: frames, codecs and stored event records"
+
+[dependencies]
+bytes = "1"
+crc32c = "0.6"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rcgen = "0.13"
+kronosdb-eventstore = { path = "../kronosdb-eventstore" }
+
+[lints]
+workspace = true

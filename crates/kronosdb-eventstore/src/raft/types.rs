@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Node ID type — simple u64.
 pub type NodeId = u64;
 
-/// Node info — address for gRPC transport.
+/// Node info — address for the native protocol transport.
 pub type Node = BasicNode;
 
 // The openraft type config for KronosDB's metadata control plane.

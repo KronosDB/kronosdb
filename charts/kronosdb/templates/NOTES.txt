@@ -1,12 +1,12 @@
 KronosDB {{ .Chart.AppVersion }} — {{ .Values.replicas }} voter(s){{ if gt (int .Values.learners.replicas) 0 }}, {{ .Values.learners.replicas }} learner(s){{ end }}
 
 Endpoints (in-cluster):
-  gRPC:          {{ include "kronosdb.fullname" . }}.{{ .Release.Namespace }}.svc:50051
+  Clients:       {{ include "kronosdb.fullname" . }}.{{ .Release.Namespace }}.svc:50051
   Admin console: http://{{ include "kronosdb.fullname" . }}-admin.{{ .Release.Namespace }}.svc:9240
 
 {{- if not (or .Values.auth.accessToken .Values.auth.existingSecret) }}
 
-!! gRPC is UNAUTHENTICATED — any pod that can reach the service can read
+!! The client port is UNAUTHENTICATED — any pod that can reach the service can read
    and append events. Set auth.accessToken or auth.existingSecret.
 {{- end }}
 {{- if eq .Values.admin.authMode "none" }}

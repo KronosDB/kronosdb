@@ -65,7 +65,7 @@ args:
     export KRONOSDB_CLUSTER_NODE_ID=$(( ${HOSTNAME##*-} + {{ .idOffset }} ))
     exec kronosdb-server
 ports:
-  - { name: grpc, containerPort: 50051 }
+  - { name: client, containerPort: 50051 }
   - { name: admin, containerPort: 9240 }
 env:
   - name: KRONOSDB_NODE_NAME

@@ -10,7 +10,7 @@ use crate::auth::config::{ClientAuth, GrantConfig, IdentityConfig, IssuerConfig,
 #[derive(Parser, Debug)]
 #[command(name = "kronosdb", version, about)]
 struct Cli {
-    /// gRPC listen address (default 127.0.0.1:50051).
+    /// Client and peer listen address (default 127.0.0.1:50051).
     #[arg(long, env = "KRONOSDB_LISTEN")]
     listen: Option<SocketAddr>,
 
@@ -30,13 +30,46 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_SEGMENT_SIZE")]
     segment_size: Option<u64>,
 
-    /// Number of segment indices to cache.
+    /// Most segment indexes to cache (default 0: only --index-cache-bytes
+    /// limits it).
     #[arg(long, env = "KRONOSDB_INDEX_CACHE_SIZE")]
     index_cache_size: Option<usize>,
 
-    /// Number of bloom filters to cache.
+    /// Most bloom filters to cache (default 0: only --bloom-cache-bytes
+    /// limits it).
     #[arg(long, env = "KRONOSDB_BLOOM_CACHE_SIZE")]
     bloom_cache_size: Option<usize>,
+
+    /// How sealed segments are read: "mapped" (default) through a memory
+    /// mapping that re-checks every record's CRC on every read, or "blocks"
+    /// through the cache of verified record blocks.
+    #[arg(long, env = "KRONOSDB_READ_PATH")]
+    read_path: Option<String>,
+
+    /// Memory budget, in bytes, of the cache of verified record blocks that
+    /// sealed segments are read through (default 256 MiB). A record is
+    /// CRC-checked when its block is read from disk and trusted while the
+    /// block stays cached.
+    #[arg(long, env = "KRONOSDB_BLOCK_CACHE_BYTES")]
+    block_cache_bytes: Option<usize>,
+
+    /// Target size in bytes of one cached block (default 16 KiB).
+    #[arg(long, env = "KRONOSDB_BLOCK_SIZE")]
+    block_size: Option<usize>,
+
+    /// Blocks read ahead of a sequential reader (default 16).
+    #[arg(long, env = "KRONOSDB_READAHEAD_BLOCKS")]
+    readahead_blocks: Option<usize>,
+
+    /// Heap budget in bytes for cached segment indexes, in addition to
+    /// --index-cache-size (default 1 GiB).
+    #[arg(long, env = "KRONOSDB_INDEX_CACHE_BYTES")]
+    index_cache_bytes: Option<usize>,
+
+    /// Heap budget in bytes for cached bloom filters, in addition to
+    /// --bloom-cache-size (default 128 MiB).
+    #[arg(long, env = "KRONOSDB_BLOOM_CACHE_BYTES")]
+    bloom_cache_bytes: Option<usize>,
 
     /// Maximum snapshot state size in bytes (default 4MB). Snapshot records
     /// share the log with events; oversized blobs are rejected at the RPC.
@@ -46,11 +79,25 @@ struct Cli {
     /// Append acknowledgement mode. "written": ack once a quorum has
     /// written the events to its log (fsync trails by one group-commit
     /// wave). "durable": ack only once a quorum has fsynced. "auto"
-    /// (default): durable on a single voter, written at two or more — the
-    /// ack is never backed by page cache alone unless "written" is chosen
-    /// explicitly.
+    /// (default): durable on a single voter; at two or more voters durable
+    /// when the startup disk probe measures a fast disk (fdatasync p99 under
+    /// 1 ms), written otherwise. The ack is never backed by page cache alone
+    /// unless "written" is chosen explicitly or the disk is slow.
     #[arg(long, env = "KRONOSDB_ACK_MODE")]
     ack_mode: Option<String>,
+
+    /// Development mode: the startup hardware checks (slow fsync, tmpfs or
+    /// network data dir, macOS, little memory, swap, CPU limits) are logged
+    /// at info instead of warn/error. The checks and `/metrics` still report
+    /// them. Never set it on a production node.
+    #[arg(
+        long,
+        env = "KRONOSDB_DEV",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_flag,
+    )]
+    dev: Option<bool>,
 
     /// Extra group-commit coalescing window in milliseconds. Commits are
     /// event-driven: 0 (default) fsyncs as soon as writes are pending, and
@@ -121,8 +168,8 @@ struct Cli {
     cluster_learners: Vec<String>,
 
     // --- Security options ---
-    /// Access token for gRPC authentication. If set, clients must send this token
-    /// in the `kronosdb-token` metadata header. If not set, auth is disabled.
+    /// Shared access token with full access, the credential peers use. If
+    /// set, clients must present a credential in their handshake.
     #[arg(long, env = "KRONOSDB_ACCESS_TOKEN")]
     access_token: Option<String>,
 
@@ -186,6 +233,20 @@ struct Cli {
     oidc_cookie_secret: Option<String>,
 }
 
+/// A boolean flag that also reads naturally from an environment variable:
+/// `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, and an empty value
+/// (compose passthrough defaults) means off, where clap's own bool parser
+/// accepts only `true` and `false`.
+fn parse_flag(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "invalid value '{other}': expected true/false, 1/0, yes/no, or on/off"
+        )),
+    }
+}
+
 /// TOML config file structure.
 #[derive(Deserialize, Default, Debug)]
 struct ConfigFile {
@@ -197,6 +258,8 @@ struct ConfigFile {
     manifest: Option<String>,
     #[serde(rename = "replication-inflight-bytes")]
     replication_inflight_bytes: Option<u64>,
+    /// Development mode: hardware findings are logged at info, not warn.
+    dev: Option<bool>,
 
     #[serde(default)]
     storage: StorageConfig,
@@ -225,6 +288,18 @@ struct StorageConfig {
     index_cache_size: Option<usize>,
     #[serde(rename = "bloom-cache-size")]
     bloom_cache_size: Option<usize>,
+    #[serde(rename = "read-path")]
+    read_path: Option<String>,
+    #[serde(rename = "block-cache-bytes")]
+    block_cache_bytes: Option<usize>,
+    #[serde(rename = "block-size")]
+    block_size: Option<usize>,
+    #[serde(rename = "readahead-blocks")]
+    readahead_blocks: Option<usize>,
+    #[serde(rename = "index-cache-bytes")]
+    index_cache_bytes: Option<usize>,
+    #[serde(rename = "bloom-cache-bytes")]
+    bloom_cache_bytes: Option<usize>,
     #[serde(rename = "ack-mode")]
     ack_mode: Option<String>,
     #[serde(rename = "max-snapshot-size")]
@@ -386,7 +461,18 @@ pub struct ServerConfig {
     pub index_cache_size: usize,
     /// "auto" (default), "written", or "durable"; see the CLI flag docs.
     pub ack_mode: String,
+    /// Dev mode: hardware findings are logged at info, not warn/error.
+    pub dev: bool,
     pub bloom_cache_size: usize,
+    /// How sealed segments are read.
+    pub read_mode: kronosdb_eventstore::segment::blocks::ReadMode,
+    /// Memory budget of the verified block cache for sealed segments.
+    pub block_cache_bytes: usize,
+    pub block_size: usize,
+    pub readahead_blocks: usize,
+    /// Heap budgets for cached segment indexes and bloom filters.
+    pub index_cache_bytes: usize,
+    pub bloom_cache_bytes: usize,
     /// Maximum snapshot state size in bytes; larger appends are rejected.
     pub max_snapshot_size: u64,
     pub group_commit_ms: u64,
@@ -407,7 +493,7 @@ pub struct ServerConfig {
     pub replication_inflight_bytes: u64,
     pub cluster_peers: Vec<PeerEntry>,
     pub cluster_learners: Vec<PeerEntry>,
-    /// Access token for gRPC auth. None = open access.
+    /// Shared access token (full access, what peers use). None = open access.
     pub access_token: Option<String>,
     /// TLS certificate file path.
     pub tls_cert: Option<PathBuf>,
@@ -418,7 +504,7 @@ pub struct ServerConfig {
     /// Whether the handshake demands a client certificate (only meaningful
     /// with `tls_ca`).
     pub tls_client_auth: ClientAuth,
-    /// gRPC-plane identity: tokens, OIDC issuers, grants.
+    /// Client-plane identity: tokens, OIDC issuers, grants.
     pub identity: IdentityConfig,
     /// Declarative manifest applied at startup, if any.
     pub manifest: Option<PathBuf>,
@@ -452,8 +538,17 @@ impl ServerConfig {
 
         // Defaults.
         const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
-        const DEFAULT_INDEX_CACHE_SIZE: usize = 50;
-        const DEFAULT_BLOOM_CACHE_SIZE: usize = 200;
+        const DEFAULT_INDEX_CACHE_SIZE: usize = 0;
+        const DEFAULT_BLOOM_CACHE_SIZE: usize = 0;
+        const DEFAULT_BLOCK_CACHE_BYTES: usize =
+            kronosdb_eventstore::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES;
+        const DEFAULT_BLOCK_SIZE: usize = kronosdb_eventstore::segment::blocks::DEFAULT_BLOCK_SIZE;
+        const DEFAULT_READAHEAD_BLOCKS: usize =
+            kronosdb_eventstore::segment::blocks::DEFAULT_READAHEAD_BLOCKS;
+        const DEFAULT_INDEX_CACHE_BYTES: usize =
+            kronosdb_eventstore::cache::DEFAULT_INDEX_CACHE_BYTES;
+        const DEFAULT_BLOOM_CACHE_BYTES: usize =
+            kronosdb_eventstore::cache::DEFAULT_BLOOM_CACHE_BYTES;
         const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 30;
         const DEFAULT_COMMAND_TIMEOUT: u64 = 30;
         const DEFAULT_QUERY_TIMEOUT: u64 = 30;
@@ -557,6 +652,32 @@ impl ServerConfig {
                 .bloom_cache_size
                 .or(file_config.storage.bloom_cache_size)
                 .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
+            read_mode: cli
+                .read_path
+                .or(file_config.storage.read_path)
+                .map(|mode| mode.parse::<kronosdb_eventstore::segment::blocks::ReadMode>())
+                .transpose()?
+                .unwrap_or_default(),
+            block_cache_bytes: cli
+                .block_cache_bytes
+                .or(file_config.storage.block_cache_bytes)
+                .unwrap_or(DEFAULT_BLOCK_CACHE_BYTES),
+            block_size: cli
+                .block_size
+                .or(file_config.storage.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE),
+            readahead_blocks: cli
+                .readahead_blocks
+                .or(file_config.storage.readahead_blocks)
+                .unwrap_or(DEFAULT_READAHEAD_BLOCKS),
+            index_cache_bytes: cli
+                .index_cache_bytes
+                .or(file_config.storage.index_cache_bytes)
+                .unwrap_or(DEFAULT_INDEX_CACHE_BYTES),
+            bloom_cache_bytes: cli
+                .bloom_cache_bytes
+                .or(file_config.storage.bloom_cache_bytes)
+                .unwrap_or(DEFAULT_BLOOM_CACHE_BYTES),
             max_snapshot_size: cli
                 .max_snapshot_size
                 .or(file_config.storage.max_snapshot_size)
@@ -568,6 +689,7 @@ impl ServerConfig {
                 .filter(|mode| !mode.is_empty())
                 .or(file_config.storage.ack_mode)
                 .unwrap_or_else(|| "auto".to_string()),
+            dev: cli.dev.or(file_config.dev).unwrap_or(false),
             group_commit_ms: cli.group_commit_ms.unwrap_or(0),
             backup_url: cli.backup_url.or(file_config.backup.url),
             backup_interval_secs: cli
@@ -836,5 +958,36 @@ tls-ca = "/etc/kronosdb/ca.pem"
             config.security.tls_ca.as_deref(),
             Some("/etc/kronosdb/ca.pem")
         );
+    }
+
+    #[test]
+    fn flag_values_read_like_env_vars() {
+        for yes in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert_eq!(parse_flag(yes), Ok(true), "{yes:?}");
+        }
+        for no in ["", "0", "false", "no", "off"] {
+            assert_eq!(parse_flag(no), Ok(false), "{no:?}");
+        }
+        assert!(parse_flag("2").is_err());
+    }
+
+    #[test]
+    fn dev_mode_comes_from_the_flag_env_or_file() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().dev;
+        assert_eq!(parse(&["kronosdb"]), None);
+        assert_eq!(parse(&["kronosdb", "--dev"]), Some(true));
+        assert_eq!(parse(&["kronosdb", "--dev=true"]), Some(true));
+        // An explicit false overrides `dev = true` in the file.
+        assert_eq!(parse(&["kronosdb", "--dev=false"]), Some(false));
+        assert!(Cli::try_parse_from(["kronosdb", "--dev=maybe"]).is_err());
+
+        let file: ConfigFile = toml::from_str("dev = true").unwrap();
+        assert_eq!(file.dev, Some(true));
+        let file: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(file.dev, None);
+        // `dev = true` sits at the top level, not under [storage].
+        let file: ConfigFile =
+            toml::from_str("dev = false\n[storage]\nack-mode = \"auto\"").unwrap();
+        assert_eq!(file.dev, Some(false));
     }
 }

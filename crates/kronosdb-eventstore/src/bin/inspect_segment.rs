@@ -4,6 +4,13 @@
 //!   cargo run -p kronosdb-eventstore --bin inspect_segment -- <path/to/segment.seg>
 //!   cargo run -p kronosdb-eventstore --bin inspect_segment -- <path> --summary
 //!   cargo run -p kronosdb-eventstore --bin inspect_segment -- <path> --from 100 --to 110
+//!   cargo run -p kronosdb-eventstore --bin inspect_segment -- <path> --records
+//!   cargo run -p kronosdb-eventstore --bin inspect_segment -- <path> --diff <other.seg>
+//!
+//! `--records` lists every physical record (byte offset, length, CRC, event or
+//! control) and where the valid prefix ends. `--diff` compares two copies of a
+//! segment on their valid prefix and reports the first differing record and
+//! byte, which is how replicated-log divergence between nodes is diagnosed.
 //!
 //! Walks version-3 event and native control records. `--overhead` accounts
 //! separately for application data, event framing, control records, and unused
@@ -45,6 +52,8 @@ struct Options {
     to: Option<u64>,
     show_payload: bool,
     show_overhead: bool,
+    show_records: bool,
+    diff: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
@@ -54,6 +63,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut to: Option<u64> = None;
     let mut show_payload = false;
     let mut show_overhead = false;
+    let mut show_records = false;
+    let mut diff: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -65,6 +76,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--summary" => summary_only = true,
             "--payload" => show_payload = true,
             "--overhead" => show_overhead = true,
+            "--records" => show_records = true,
+            "--diff" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--diff requires a path".to_string())?;
+                diff = Some(PathBuf::from(v));
+            }
             "--from" => {
                 i += 1;
                 let v = args
@@ -99,6 +118,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         to,
         show_payload,
         show_overhead,
+        show_records,
+        diff,
     })
 }
 
@@ -111,11 +132,19 @@ fn print_usage() {
     eprintln!("  --summary     Only print the header and record count");
     eprintln!("  --overhead    Account for application, format, control, and unused bytes");
     eprintln!("  --payload     Also hex-dump each event's payload bytes");
+    eprintln!("  --records     List every physical record (offset, length, CRC, kind)");
+    eprintln!("  --diff OTHER  Compare the valid prefix with another copy of the segment");
     eprintln!("  --from N      Only show events with position >= N");
     eprintln!("  --to N        Only show events with position <= N");
 }
 
 fn inspect(opts: &Options) -> Result<(), String> {
+    if let Some(other) = &opts.diff {
+        return diff_segments(&opts.path, other);
+    }
+    if opts.show_records {
+        return print_records(&opts.path);
+    }
     let reader = SegmentReader::open(&opts.path).map_err(|e| format!("{e}"))?;
     let file_size = std::fs::metadata(&opts.path).map(|m| m.len()).unwrap_or(0);
 
@@ -374,6 +403,210 @@ fn account_segment(path: &Path) -> Result<OverheadStats, String> {
     }
 
     Ok(stats)
+}
+
+/// One physical record found while walking a segment file.
+struct PhysicalRecord {
+    offset: u64,
+    total_len: u64,
+    crc: u32,
+    flags: u8,
+    what: String,
+}
+
+/// Where a physical walk stopped.
+enum WalkEnd {
+    /// Zero record length: the preallocated tail (or a trimmed end of file).
+    Tail,
+    /// Bytes that are neither a valid record nor preallocated zeros.
+    Torn(String),
+}
+
+struct Walk {
+    header: [u8; SEGMENT_HEADER_SIZE],
+    file_size: u64,
+    records: Vec<PhysicalRecord>,
+    /// Byte offset one past the last valid record.
+    valid_end: u64,
+    end: WalkEnd,
+    /// Whole file contents, for byte-level comparison.
+    bytes: Vec<u8>,
+}
+
+fn walk_segment(path: &Path) -> Result<Walk, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() < SEGMENT_HEADER_SIZE {
+        return Err(format!("{}: shorter than segment header", path.display()));
+    }
+    let mut header = [0u8; SEGMENT_HEADER_SIZE];
+    header.copy_from_slice(&bytes[..SEGMENT_HEADER_SIZE]);
+    let mut offset = SEGMENT_HEADER_SIZE;
+    let mut records = Vec::new();
+    let end = loop {
+        if bytes.len() - offset == 0 {
+            break WalkEnd::Tail;
+        }
+        if bytes.len() - offset < RECORD_HEADER_SIZE {
+            break WalkEnd::Torn("short record header".into());
+        }
+        let raw: [u8; RECORD_HEADER_SIZE] = bytes[offset..offset + RECORD_HEADER_SIZE]
+            .try_into()
+            .unwrap();
+        let Some(record_header) = segment::record::parse_header(&raw).map_err(|e| e.to_string())?
+        else {
+            break WalkEnd::Tail;
+        };
+        let total = record_header.total_len();
+        if bytes.len() - offset < total {
+            break WalkEnd::Torn("short record payload".into());
+        }
+        let payload = &bytes[offset + RECORD_HEADER_SIZE..offset + total];
+        if !segment::record::validate_crc(record_header, payload) {
+            break WalkEnd::Torn(format!("CRC mismatch at byte {offset}"));
+        }
+        let what = match segment::record::decode_native(record_header, payload) {
+            Ok(segment::record::NativeRecord::Event { position }) => {
+                format!("event pos={position}")
+            }
+            Ok(segment::record::NativeRecord::Control(ControlRecord::EpochChange {
+                epoch,
+                leader_id,
+                start_position,
+            })) => format!(
+                "CONTROL EpochChange epoch={epoch} leader={leader_id} start_position={start_position}"
+            ),
+            Ok(segment::record::NativeRecord::Control(ControlRecord::WatermarkCheckpoint {
+                epoch,
+                position,
+            })) => format!("CONTROL WatermarkCheckpoint epoch={epoch} position={position}"),
+            Err(error) => format!("undecodable: {error}"),
+        };
+        records.push(PhysicalRecord {
+            offset: offset as u64,
+            total_len: total as u64,
+            crc: record_header.stored_crc,
+            flags: record_header.flags,
+            what,
+        });
+        offset += total;
+    };
+    Ok(Walk {
+        header,
+        file_size: bytes.len() as u64,
+        records,
+        valid_end: offset as u64,
+        end,
+        bytes,
+    })
+}
+
+fn describe_end(walk: &Walk) -> String {
+    match &walk.end {
+        WalkEnd::Tail => {
+            let tail = &walk.bytes[walk.valid_end as usize..];
+            let nonzero = tail.iter().filter(|b| **b != 0).count();
+            if nonzero == 0 {
+                format!(
+                    "clean end at {} (+{} zero bytes)",
+                    walk.valid_end,
+                    tail.len()
+                )
+            } else {
+                format!(
+                    "end at {} followed by {} bytes of which {nonzero} are NONZERO",
+                    walk.valid_end,
+                    tail.len()
+                )
+            }
+        }
+        WalkEnd::Torn(reason) => format!("TORN at {}: {reason}", walk.valid_end),
+    }
+}
+
+fn base_position(walk: &Walk) -> u64 {
+    u64::from_le_bytes(walk.header[5..13].try_into().unwrap())
+}
+
+fn print_records(path: &Path) -> Result<(), String> {
+    let walk = walk_segment(path)?;
+    println!(
+        "SEGMENT: {} base_position={} file_size={}",
+        path.display(),
+        base_position(&walk),
+        walk.file_size
+    );
+    for (index, record) in walk.records.iter().enumerate() {
+        println!(
+            "  #{index:<5} @{:<10} len={:<5} flags={:#04x} crc={:08x}  {}",
+            record.offset, record.total_len, record.flags, record.crc, record.what
+        );
+    }
+    println!("{} records, {}", walk.records.len(), describe_end(&walk));
+    Ok(())
+}
+
+fn diff_segments(a: &Path, b: &Path) -> Result<(), String> {
+    let left = walk_segment(a)?;
+    let right = walk_segment(b)?;
+    println!("A: {}", a.display());
+    println!(
+        "   base_position={} file_size={} records={} {}",
+        base_position(&left),
+        left.file_size,
+        left.records.len(),
+        describe_end(&left)
+    );
+    println!("B: {}", b.display());
+    println!(
+        "   base_position={} file_size={} records={} {}",
+        base_position(&right),
+        right.file_size,
+        right.records.len(),
+        describe_end(&right)
+    );
+
+    let left_valid = &left.bytes[..left.valid_end as usize];
+    let right_valid = &right.bytes[..right.valid_end as usize];
+    if left_valid == right_valid {
+        println!("IDENTICAL valid prefix ({} bytes)", left_valid.len());
+        return Ok(());
+    }
+
+    let first_byte = left_valid
+        .iter()
+        .zip(right_valid)
+        .position(|(x, y)| x != y)
+        .unwrap_or(left_valid.len().min(right_valid.len()));
+    println!(
+        "DIFFERENT: valid prefixes are {} vs {} bytes; first differing byte at offset {first_byte}",
+        left_valid.len(),
+        right_valid.len()
+    );
+
+    let shared = left
+        .records
+        .iter()
+        .zip(&right.records)
+        .take_while(|(x, y)| x.offset == y.offset && x.total_len == y.total_len && x.crc == y.crc)
+        .count();
+    println!("{shared} leading records are identical");
+    let show = |label: &str, walk: &Walk| {
+        let from = shared.saturating_sub(2);
+        for (index, record) in walk.records.iter().enumerate().skip(from).take(8) {
+            let marker = if index < shared { " " } else { ">" };
+            println!(
+                "  {label} {marker} #{index:<5} @{:<10} len={:<5} flags={:#04x} crc={:08x}  {}",
+                record.offset, record.total_len, record.flags, record.crc, record.what
+            );
+        }
+        let remaining = walk.records.len().saturating_sub(from + 8);
+        if remaining > 0 {
+            println!("  {label}   ... {remaining} more records");
+        }
+    };
+    show("A", &left);
+    show("B", &right);
+    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {

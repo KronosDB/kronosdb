@@ -6,17 +6,19 @@ members = [
     "crates/kronosdb-server",
     "crates/kronosdb-bench",
     "crates/kronosdb-cli",
+    "crates/kronosdb-client",
+    "crates/kronosdb-protocol",
+    "crates/kronosdb-protocol-gen",
 ]
 
 [workspace.lints.clippy]
 # `#[async_trait]` expands each method into a `#[must_use]` fn returning a
 # boxed future, which is already `#[must_use]` on its own. Clippy 1.99 began
-# flagging every one of them — ours and the ones tonic generates from the
-# protos alike. There is nothing to fix at either end.
+# flagging every one of them. There is nothing to fix.
 double_must_use = "allow"
 
 [workspace.package]
-version = "0.10.1"
+version = "0.11.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/theoem/kronosdb"

@@ -89,7 +89,7 @@ enum Command {
         expr: String,
         /// Start at this sequence (default: the beginning).
         #[arg(long, default_value = "0")]
-        from: i64,
+        from: u64,
         /// Stop after this many events.
         #[arg(long)]
         limit: Option<usize>,
@@ -139,7 +139,7 @@ pub enum ProfileCommand {
 #[derive(Args)]
 pub struct ProfileSetArgs {
     pub name: String,
-    /// gRPC endpoint, http:// or https://.
+    /// Server endpoint: http://host:port (plaintext) or https://host:port (TLS).
     #[arg(long)]
     pub endpoint: Option<String>,
     /// Admin HTTP base URL.
@@ -171,7 +171,7 @@ pub struct ProfileSetArgs {
 
 #[derive(Subcommand)]
 enum AuthCommand {
-    /// Print the bearer token (for curl/grpcurl).
+    /// Print the bearer token (for curl).
     Token,
 }
 
@@ -191,7 +191,7 @@ pub enum EventsCommand {
         follow: bool,
         /// Start at this sequence instead of the last N.
         #[arg(long)]
-        from: Option<i64>,
+        from: Option<u64>,
         /// Only events carrying this tag (key=value, repeatable: all must match).
         #[arg(long = "tag")]
         tags: Vec<String>,
@@ -200,7 +200,7 @@ pub enum EventsCommand {
         names: Vec<String>,
     },
     /// One event with its tags, as JSON.
-    Get { sequence: i64 },
+    Get { sequence: u64 },
     /// Append a single event (unconditionally).
     Append {
         /// Event type.

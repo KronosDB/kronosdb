@@ -1,0 +1,19 @@
+{
+  "frame": "TailOpen",
+  "stream": 69,
+  "flags": 0,
+  "body": {
+    "context": "default",
+    "follower_id": "2",
+    "from_position": "1048578",
+    "last_record_crc": 3735928559,
+    "epoch_seen": "7",
+    "segment_base": "1000000",
+    "byte_offset": "4096",
+    "watermark": "1048570",
+    "recovery_source": false,
+    "claim_epoch": "7",
+    "claim_leader_id": "1"
+  },
+  "description": ""
+}

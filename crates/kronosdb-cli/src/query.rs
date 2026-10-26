@@ -18,7 +18,10 @@ use std::collections::BTreeMap;
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
-use crate::client::pb;
+pub use kronosdb_client::Criterion;
+
+/// A tag as the index stores it: opaque key and value bytes.
+pub type Tag = (Vec<u8>, Vec<u8>);
 
 /// One query item. Unknown keys are rejected: `{"tag": ...}` silently
 /// matching every event would be a nasty way to learn about a typo.
@@ -43,7 +46,7 @@ enum EventQuery {
 const SHAPE: &str = r#"expected a query item like {"tags": {"orderId": "o-1"}, "types": ["OrderPlaced"]}, or an array of them"#;
 
 /// Parses a query literal into DCB criteria.
-pub fn parse(input: &str) -> Result<Vec<pb::Criterion>> {
+pub fn parse(input: &str) -> Result<Vec<Criterion>> {
     let query: EventQuery = serde_json::from_str(input.trim())
         .with_context(|| format!("not an event query — {SHAPE}"))?;
     let items = match query {
@@ -63,15 +66,12 @@ pub fn parse(input: &str) -> Result<Vec<pb::Criterion>> {
     }
     Ok(items
         .into_iter()
-        .map(|item| pb::Criterion {
+        .map(|item| Criterion {
             names: item.types,
             tags: item
                 .tags
                 .into_iter()
-                .map(|(key, value)| pb::Tag {
-                    key: key.into_bytes(),
-                    value: value.into_bytes(),
-                })
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
                 .collect(),
         })
         .collect())
@@ -81,7 +81,7 @@ pub fn parse(input: &str) -> Result<Vec<pb::Criterion>> {
 /// `orderId=o-1 type=OrderPaid` — because in the index the type is just
 /// another tag. Several `type=` are alternatives; tags must all match. A
 /// pasted query literal (`{...}` / `[...]`) works too. Empty = no filter.
-pub fn parse_filter(input: &str) -> Result<Vec<pb::Criterion>> {
+pub fn parse_filter(input: &str) -> Result<Vec<Criterion>> {
     let trimmed = input.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return parse(trimmed);
@@ -98,11 +98,11 @@ pub fn parse_filter(input: &str) -> Result<Vec<pb::Criterion>> {
 }
 
 /// Builds criteria from the flag form (`--type A --tag k=v`): one criterion.
-pub fn from_flags(names: &[String], tags: &[String]) -> Result<Vec<pb::Criterion>> {
+pub fn from_flags(names: &[String], tags: &[String]) -> Result<Vec<Criterion>> {
     if names.is_empty() && tags.is_empty() {
         return Ok(vec![]);
     }
-    let mut criterion = pb::Criterion {
+    let mut criterion = Criterion {
         names: names.to_vec(),
         tags: vec![],
     };
@@ -112,25 +112,19 @@ pub fn from_flags(names: &[String], tags: &[String]) -> Result<Vec<pb::Criterion
     Ok(vec![criterion])
 }
 
-pub fn parse_tag(text: &str) -> Result<pb::Tag> {
+pub fn parse_tag(text: &str) -> Result<Tag> {
     let Some((key, value)) = text.split_once('=') else {
         bail!("tag {text:?} is not key=value");
     };
-    Ok(pb::Tag {
-        key: key.as_bytes().to_vec(),
-        value: value.as_bytes().to_vec(),
-    })
+    Ok((key.as_bytes().to_vec(), value.as_bytes().to_vec()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tag(key: &str, value: &str) -> pb::Tag {
-        pb::Tag {
-            key: key.into(),
-            value: value.into(),
-        }
+    fn tag(key: &str, value: &str) -> Tag {
+        (key.into(), value.into())
     }
 
     #[test]
@@ -144,14 +138,14 @@ mod tests {
         assert_eq!(
             parse(r#"{"tags": {"orderId": "o-1", "region": "eu"}, "types": ["OrderPlaced", "OrderPaid"]}"#)
                 .unwrap(),
-            vec![pb::Criterion {
+            vec![Criterion {
                 names: vec!["OrderPlaced".into(), "OrderPaid".into()],
                 tags: vec![tag("orderId", "o-1"), tag("region", "eu")],
             }]
         );
         assert_eq!(
             parse(r#"{"types": ["CustomerRegistered"]}"#).unwrap(),
-            vec![pb::Criterion {
+            vec![Criterion {
                 names: vec!["CustomerRegistered".into()],
                 tags: vec![],
             }]

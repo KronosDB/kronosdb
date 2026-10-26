@@ -1,0 +1,15 @@
+{
+  "frame": "Hello",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "version": 1,
+    "features": "0",
+    "record_format": 3,
+    "client_name": "",
+    "client_id": "",
+    "credential_kind": "none",
+    "credential": ""
+  },
+  "description": "A client identified by its TLS certificate sends no credential."
+}

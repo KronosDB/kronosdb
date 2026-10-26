@@ -2,18 +2,10 @@
 //! production server: env-var config, leader gating, the periodic pass, and
 //! byte-exact archived segments with a consistent manifest.
 
-#![allow(clippy::result_large_err)]
-
 mod crash_harness;
-use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
-use pb::Tag;
 
 use std::time::{Duration, Instant};
-
-use tonic::transport::Channel;
-
-use pb::event_store_client::EventStoreClient;
 
 const SEGMENT_SIZE: u64 = 64 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -53,36 +45,24 @@ async fn run() {
         .expect("server ready");
 
     // Write enough to seal several segments.
-    let channel = Channel::from_shared(format!("http://{}", srv.listen))
-        .unwrap()
-        .connect()
+    let context = connect(srv.listen)
         .await
-        .expect("connect");
-    let mut client = EventStoreClient::new(channel);
+        .expect("connect")
+        .default_context();
     for batch in 0..40 {
-        let events: Vec<pb::TaggedEvent> = (0..16)
-            .map(|i| pb::TaggedEvent {
-                event: Some(pb::Event {
-                    identifier: format!("evt-{batch}-{i}"),
-                    timestamp: 1_712_000_000_000 + batch,
-                    name: "BackedUp".into(),
-                    version: "1.0".into(),
-                    payload: vec![b'x'; 256],
-                    metadata: Default::default(),
-                }),
-                tags: vec![Tag {
-                    key: b"agg".to_vec(),
-                    value: format!("agg-{}", batch % 4).into_bytes(),
-                }],
+        let events: Vec<NewEvent> = (0..16)
+            .map(|i| {
+                event(
+                    format!("evt-{batch}-{i}"),
+                    1_712_000_000_000 + batch,
+                    "BackedUp",
+                    "1.0",
+                    vec![b'x'; 256],
+                    vec![(b"agg".to_vec(), format!("agg-{}", batch % 4).into_bytes())],
+                )
             })
             .collect();
-        client
-            .append(pb::AppendRequest {
-                condition: None,
-                events,
-            })
-            .await
-            .expect("append");
+        context.append(&events, None).await.expect("append");
     }
 
     // Wait for the uploader to ship at least two segments and a manifest.
@@ -124,12 +104,7 @@ async fn run() {
     }
 
     // The active segment must not be archived.
-    let head = client
-        .get_head(pb::GetHeadRequest {})
-        .await
-        .expect("get_head")
-        .into_inner()
-        .sequence as u64;
+    let head = context.head().await.expect("get_head");
     for entry in segments {
         assert!(
             entry["end"].as_u64().unwrap() <= head,

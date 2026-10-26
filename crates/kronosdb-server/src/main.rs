@@ -1,46 +1,33 @@
 mod admin;
 mod auth;
 mod config;
-mod eventstore;
-mod handler_registry;
+mod hub;
 mod manifest;
-mod messaging;
-mod platform;
+mod native;
 mod processor;
-mod proto;
-mod scheduler_service;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::signal;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{error, info, warn};
 
 use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::raft::cluster::{ClusterConfig, ClusterManager, NodeType, PeerConfig};
-use kronosdb_eventstore::raft::network::RAFT_MAX_MESSAGE_BYTES;
-use kronosdb_eventstore::raft::proto::raft_transport_server::RaftTransportServer;
-use kronosdb_eventstore::raft::transport::RaftTransportService;
 use kronosdb_eventstore::raft::types::default_raft_config;
-use kronosdb_eventstore::replication::PEER_MAX_MESSAGE_BYTES;
 use kronosdb_eventstore::replication::peer::{PeerTlsConfig, PeerTransportConfig};
-use kronosdb_eventstore::replication::proto::segment_replication_server::SegmentReplicationServer;
 use kronosdb_eventstore::replication::service::SegmentReplicationService;
 use kronosdb_eventstore::store::StoreOptions;
 use kronosdb_messaging::client::ClientRegistry;
 use kronosdb_messaging::manager::MessagingManager;
 
 use crate::config::ServerConfig;
-use crate::eventstore::service::EventStoreService;
-use crate::messaging::command_service::CommandServiceImpl;
-use crate::messaging::fabric as messaging_fabric;
-use crate::messaging::query_service::QueryServiceImpl;
-use crate::platform::service::{ClientChannelRegistry, PlatformServiceImpl, spawn_reaper};
+use crate::hub::{Hub, HubConfig};
 
-/// Largest gRPC message accepted from or sent to a client on the event
-/// store, command and query services.
-const CLIENT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+// Many small, short-lived allocations cross threads (frames built on one
+// worker, freed on another); glibc's arenas contend on them.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,26 +48,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    // Both `ring` (tonic) and `aws-lc-rs` (object_store) end up compiled in,
+    // Both `ring` (our TLS) and `aws-lc-rs` (object_store) end up compiled in,
     // and rustls refuses to guess between them — without this, the first TLS
     // handshake setup panics. Err just means a provider is already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let config = ServerConfig::parse()?;
-    match config.ack_mode.as_str() {
-        "auto" => kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Auto),
+    let ack_mode = match config.ack_mode.as_str() {
+        "auto" => kronosdb_eventstore::AckMode::Auto,
         // "replicated" is a deprecated alias from the mode's prototype era.
-        "written" | "replicated" => {
-            kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Written)
-        }
-        "durable" => kronosdb_eventstore::configure_ack_mode(kronosdb_eventstore::AckMode::Durable),
+        "written" | "replicated" => kronosdb_eventstore::AckMode::Written,
+        "durable" => kronosdb_eventstore::AckMode::Durable,
         other => {
             return Err(format!(
                 "invalid ack-mode {other:?}: expected \"auto\", \"written\", or \"durable\""
             )
             .into());
         }
-    }
+    };
+    kronosdb_eventstore::configure_ack_mode(ack_mode);
 
     // Native segment quorum topology is required before contexts open: it
     // determines recovery's initial watermark (a clustered node may not treat
@@ -101,6 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mmap_cache_size: config
             .index_cache_size
             .max(kronosdb_eventstore::cache::DEFAULT_MMAP_CACHE_SIZE),
+        index_cache_bytes: config.index_cache_bytes,
+        bloom_cache_bytes: config.bloom_cache_bytes,
+        read_mode: config.read_mode,
+        block_cache_bytes: config.block_cache_bytes,
+        block_size: config.block_size,
+        readahead_blocks: config.readahead_blocks,
         group_commit_interval_ms: config.group_commit_ms,
         node_id,
         voters: voter_ids,
@@ -109,6 +101,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.data_dir,
         store_options,
     )?);
+
+    // Look at the hardware now that the data dir is ours (locked) and before
+    // anything appends: the disk probe decides what `ack-mode = auto` means
+    // in a cluster. Best-effort; this never fails startup.
+    // Blocking is fine here: nothing else is running yet, and the probe is
+    // bounded (it runs on its own thread with a timeout).
+    let hardware = {
+        let report =
+            kronosdb_eventstore::hardware::check(&kronosdb_eventstore::hardware::CheckInput {
+                data_dir: &config.data_dir,
+                index_cache_bytes: config.index_cache_bytes,
+                bloom_cache_bytes: config.bloom_cache_bytes,
+                ack_mode,
+                dev: config.dev,
+            });
+        report.ack.apply();
+        report.log();
+        Arc::new(report)
+    };
+
     if !contexts.context_exists("default") {
         contexts.create_context("default")?;
     }
@@ -205,55 +217,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create the messaging manager (named buses, independent of event store
-    // contexts — ADR-0006) and client registries.
+    // contexts — ADR-0006), the registries the admin console reads, and the
+    // hub that runs commands, queries and the platform over them.
     let messaging = Arc::new(MessagingManager::with_permit_wait(
         config.messaging_permit_wait,
     ));
     let client_registry = Arc::new(ClientRegistry::new());
-    let channel_registry = Arc::new(ClientChannelRegistry::new());
     let processor_registry = Arc::new(processor::ProcessorRegistry::new());
-    let handler_stream_registry = Arc::new(handler_registry::HandlerStreamRegistry::new());
 
-    // Build gRPC services.
-    let event_store_service =
-        EventStoreService::new(Arc::clone(&cluster), config.max_snapshot_size);
-    let scheduler_service = scheduler_service::SchedulerServiceImpl::new(Arc::clone(&cluster));
-    // Command handler delivery channels are shared with the fabric service
-    // so forwarded commands reach locally-connected handlers (ADR-0007).
-    let command_handler_streams: messaging_fabric::CommandHandlerStreams =
-        Arc::new(dashmap::DashMap::new());
-    let query_handler_streams: messaging_fabric::QueryHandlerStreams =
-        Arc::new(dashmap::DashMap::new());
-    let pending_queries: messaging_fabric::PendingQueries = Arc::new(dashmap::DashMap::new());
-    let pending_sub_initials: messaging_fabric::PendingSubscriptionInitials =
-        Arc::new(dashmap::DashMap::new());
-    let fabric_router = Arc::new(messaging_fabric::FabricRouter::new(Arc::clone(&cluster)));
-    let command_service = CommandServiceImpl::new(
-        Arc::clone(&messaging),
-        Duration::from_secs(config.command_timeout_secs),
-        Arc::clone(&channel_registry),
-        Arc::clone(&handler_stream_registry),
-        Arc::clone(&command_handler_streams),
+    let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
+    let heartbeat_timeout = Duration::from_secs(config.heartbeat_timeout_secs);
+    let context_names = {
+        let contexts = Arc::clone(&contexts);
+        Arc::new(move || contexts.list_contexts()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
+    };
+    let hub = Hub::new(
+        HubConfig {
+            node_name: config.node_name.clone(),
+            command_timeout: Duration::from_secs(config.command_timeout_secs),
+            query_timeout: Duration::from_secs(config.query_timeout_secs),
+            heartbeat_interval,
+            heartbeat_timeout,
+        },
+        hub::Shared {
+            manager: Arc::clone(&messaging),
+            client_registry: Arc::clone(&client_registry),
+            processors: Arc::clone(&processor_registry),
+        },
         Arc::clone(&cluster),
-        Arc::clone(&fabric_router),
-    );
-    let query_service = QueryServiceImpl::new(
-        Arc::clone(&messaging),
-        Duration::from_secs(config.query_timeout_secs),
-        Arc::clone(&channel_registry),
-        Arc::clone(&handler_stream_registry),
-        Arc::clone(&query_handler_streams),
-        Arc::clone(&pending_queries),
-        Arc::clone(&pending_sub_initials),
-        Arc::clone(&cluster),
-        Arc::clone(&fabric_router),
-    );
-    let fabric_service = messaging_fabric::FabricServiceImpl::new(
-        Arc::clone(&messaging),
-        Arc::clone(&command_handler_streams),
-        Arc::clone(&query_handler_streams),
-        Arc::clone(&pending_queries),
-        Arc::clone(&pending_sub_initials),
+        Arc::new(native::peers::NativePeers::new(Arc::clone(&cluster))),
+        context_names,
     );
 
     // Drop any handler rows this node stranded in a previous life — a
@@ -274,34 +267,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
-    let heartbeat_timeout = Duration::from_secs(config.heartbeat_timeout_secs);
-
-    let context_names = {
-        let contexts = Arc::clone(&contexts);
-        Arc::new(move || contexts.list_contexts()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
-    };
-    let platform_service = PlatformServiceImpl::new(
-        Arc::clone(&client_registry),
-        Arc::clone(&channel_registry),
-        Arc::clone(&processor_registry),
-        Arc::clone(&messaging),
-        Arc::clone(&handler_stream_registry),
-        Arc::clone(&cluster),
-        context_names,
-        config.node_name.clone(),
-        heartbeat_interval,
-        heartbeat_timeout,
-    );
-
-    // Spawn background heartbeat reaper (cleans dead clients off every bus
-    // and out of the replicated routing table).
-    let _reaper = spawn_reaper(
-        Arc::clone(&client_registry),
-        Arc::clone(&messaging),
-        Arc::clone(&cluster),
-        heartbeat_timeout,
-    );
+    // Clean dead clients off every bus and out of the replicated routing
+    // table.
+    let _reaper = hub.spawn_reaper();
 
     // Background safety-net sweep: any in-flight command older than 2× the
     // per-request timeout gets a KRONOSDB-4005 failure. The dispatch RPC
@@ -341,11 +309,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         messaging: Arc::clone(&messaging),
         cluster: Arc::clone(&cluster),
         processor_registry: Arc::clone(&processor_registry),
-        channel_registry: Arc::clone(&channel_registry),
+        hub: Arc::clone(&hub),
         started_at: std::time::Instant::now(),
         auth: admin_auth,
         identities: Arc::clone(&authenticator),
         activity: Arc::new(admin::activity::ActivityTracker::new()),
+        hardware,
     };
     tokio::spawn(async move {
         if let Err(e) = admin::start_admin_server(admin_state).await {
@@ -362,7 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_methods = authenticator.describe();
     if auth_methods.is_empty() {
         warn!(
-            "gRPC authentication is DISABLED — anyone who can reach the gRPC port can read \
+            "authentication is DISABLED — anyone who can reach the client port can read \
              and append events. Configure [security] access-token, tokens, issuers, or mtls \
              grants before exposing it."
         );
@@ -381,150 +350,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "KronosDB starting"
     );
 
-    // Import generated gRPC server types.
-    use crate::proto::kronosdb::command::command_service_server::CommandServiceServer;
-    use crate::proto::kronosdb::eventstore::event_store_server::EventStoreServer;
-    use crate::proto::kronosdb::platform::platform_service_server::PlatformServiceServer;
-    use crate::proto::kronosdb::query::query_service_server::QueryServiceServer;
-    use crate::proto::kronosdb::scheduler::scheduler_service_server::SchedulerServiceServer;
-
-    // Configure TLS and gRPC keepalive. The ping cadence keeps idle
-    // connector streams from being silently dropped by middleboxes while
-    // tolerating multi-second CPU saturation: a timeout shorter than a bad
-    // scheduling stall turns overload into connection kills for every
-    // stream on the connection. tonic delegates PING handling to h2.
-    let make_builder = || {
-        Server::builder()
-            .http2_keepalive_interval(Some(Duration::from_secs(10)))
-            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .http2_adaptive_window(Some(true))
-            // DCB clients legitimately issue very high rates of short Source
-            // reads and cancel the stream once they have what they need. With
-            // h2's default budget (20), that pattern trips the Rapid-Reset
-            // mitigation ("too_many_internal_resets") and kills the whole
-            // connection under load.
-            .http2_max_pending_accept_reset_streams(Some(2048))
-    };
-
-    let server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
-        let cert = std::fs::read(cert_path)
-            .map_err(|e| format!("failed to read TLS cert '{}': {e}", cert_path.display()))?;
-        let key = std::fs::read(key_path)
-            .map_err(|e| format!("failed to read TLS key '{}': {e}", key_path.display()))?;
-        let identity = Identity::from_pem(&cert, &key);
-
-        let mut tls = ServerTlsConfig::new().identity(identity);
-
-        if let Some(ca_path) = &config.tls_ca {
-            let ca = std::fs::read(ca_path)
-                .map_err(|e| format!("failed to read TLS CA '{}': {e}", ca_path.display()))?;
-            let ca_cert = Certificate::from_pem(&ca);
+    let tls = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => {
             let optional = config.tls_client_auth == auth::config::ClientAuth::Optional;
-            tls = tls.client_ca_root(ca_cert).client_auth_optional(optional);
-            if optional && !authenticator.enabled() {
-                // Optional certificates with nothing else checking identity
-                // would quietly turn the CA into decoration.
-                return Err(
-                    "tls-client-auth = \"optional\" requires [security] authentication \
-                            (tokens, issuers, or mtls grants) to be configured"
-                        .into(),
+            if config.tls_ca.is_some() {
+                if optional && !authenticator.enabled() {
+                    // Optional certificates with nothing else checking
+                    // identity would quietly turn the CA into decoration.
+                    return Err("tls-client-auth = \"optional\" requires [security] \
+                                authentication (tokens, issuers, or mtls grants) to be configured"
+                        .into());
+                }
+                info!(
+                    client_certs = if optional { "optional" } else { "required" },
+                    "mTLS enabled (client certificate verification)"
                 );
             }
-            info!(
-                client_certs = if optional { "optional" } else { "required" },
-                "mTLS enabled (client certificate verification)"
-            );
+            Some(native::tls::acceptor(
+                cert,
+                key,
+                config.tls_ca.as_deref(),
+                optional,
+            )?)
         }
-
-        make_builder().tls_config(tls)?
-    } else {
-        if config.tls_cert.is_some() || config.tls_key.is_some() {
+        (None, None) => None,
+        _ => {
             warn!("both --tls-cert and --tls-key must be set for TLS; running without TLS");
+            None
         }
-        make_builder()
     };
 
-    // One identity layer in front of every service: it authenticates the
-    // caller and authorizes per method (client, peer, and health alike — see
-    // auth::policy::classify). Message limits are set explicitly, like the
-    // internode services': a bulk-load append of many events would otherwise
-    // hit tonic's 4 MiB decode default and have to split into more RPCs than
-    // it needs.
-    let mut router = server
-        .layer(auth::layer::AuthLayer::new(Arc::clone(&authenticator)))
-        .add_service(
-            EventStoreServer::new(event_store_service)
-                .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
-        )
-        .add_service(
-            CommandServiceServer::new(command_service)
-                .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
-        )
-        .add_service(
-            QueryServiceServer::new(query_service)
-                .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES),
-        )
-        .add_service(PlatformServiceServer::new(platform_service))
-        .add_service(SchedulerServiceServer::new(scheduler_service));
-
-    // Raft transport — always enabled (every node is a Raft node).
     let raft_node = cluster
         .raft_node()
         .expect("shared Raft node must be initialized");
-    let raft_transport = RaftTransportService::new(Arc::clone(&raft_node));
-    let raft_server = RaftTransportServer::new(raft_transport)
-        .max_decoding_message_size(RAFT_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RAFT_MAX_MESSAGE_BYTES);
-    router = router.add_service(raft_server);
 
-    // Native segment Tail transport uses the same TLS and message limits as
-    // the metadata control plane; both demand the `peer` role.
-    let segment_replication = SegmentReplicationService::new(
-        Arc::clone(&contexts),
-        cluster.replication_control(),
-        config.replication_inflight_bytes,
-    );
-    let replication_server = SegmentReplicationServer::new(segment_replication)
-        .max_decoding_message_size(PEER_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(PEER_MAX_MESSAGE_BYTES);
-    router = router.add_service(replication_server);
-
-    // Messaging fabric — internode command/query forwarding (ADR-0007).
-    // Same auth and TLS as the other peer transports.
-    use crate::proto::kronosdb::fabric::messaging_fabric_server::MessagingFabricServer;
-    router = router.add_service(MessagingFabricServer::new(fabric_service));
-
-    // grpc.health.v1 — unauthenticated by design (kubelet probes and gRPC
-    // client-side health checking). Overall status tracks Raft leadership:
-    // SERVING only while a leader is known, mirroring the admin `/ready`.
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    router = router.add_service(health_service);
-    {
-        let health_cluster = Arc::clone(&cluster);
-        let reporter = health_reporter.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let serving = health_cluster.native_ready();
-                if serving {
-                    reporter
-                        .set_service_status("", tonic_health::ServingStatus::Serving)
-                        .await;
-                } else {
-                    reporter
-                        .set_service_status("", tonic_health::ServingStatus::NotServing)
-                        .await;
-                }
-            }
-        });
-    }
-
-    let cr = Arc::clone(&channel_registry);
+    let (native_stop, native_stop_rx) = tokio::sync::watch::channel(false);
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let open_connections = Arc::clone(&connections);
+    let shutdown_hub = Arc::clone(&hub);
     let raft_for_shutdown = Arc::clone(&raft_node);
     let contexts_for_shutdown = Arc::clone(&contexts);
     let drain_deadline = Duration::from_secs(config.drain_deadline_secs);
@@ -535,7 +398,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "shutdown signal received: draining"
         );
         // 1. Ask all connected clients to reconnect elsewhere.
-        cr.request_reconnect_all().await;
+        let _ = native_stop.send(true);
+        shutdown_hub.clients.request_reconnect_all().await;
         // 2. Shut the Raft core down cleanly — on multi-node clusters the
         //    peers detect the departure at the next election timeout instead
         //    of waiting on a dead TCP peer.
@@ -543,47 +407,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 3. Stop the engines: new appends are rejected, sync threads do a
         //    final fsync pass releasing in-flight writers.
         contexts_for_shutdown.shutdown_all();
-        // 4. Watchdog: tonic's drain waits for open connections, and the
-        //    platform/command/query streams are indefinitely long-lived. If
-        //    they don't close within the deadline, exit anyway — acked
-        //    writes are already durable, and kubelet's SIGKILL would be
-        //    less orderly than this.
-        tokio::spawn(async move {
-            tokio::time::sleep(drain_deadline).await;
-            tracing::warn!("drain deadline exceeded with connections still open; exiting now");
-            std::process::exit(0);
+        // 4. Give connections the drain deadline to close after GoAway;
+        //    platform/command/query streams are indefinitely long-lived, so
+        //    exit anyway when it passes — acked writes are already durable,
+        //    and kubelet's SIGKILL would be less orderly than this.
+        let drained = tokio::time::timeout(drain_deadline, async {
+            while open_connections.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         });
+        if drained.await.is_err() {
+            warn!("drain deadline exceeded with connections still open; exiting now");
+        }
     };
 
-    // Bind with SO_REUSEADDR so restarts don't fail with "address already in use".
-    let listener = {
-        let socket = socket2::Socket::new(
-            socket2::Domain::for_address(config.listen_addr),
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        socket.set_reuse_address(true)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&config.listen_addr.into())?;
-        socket.listen(1024)?;
-        let std_listener: std::net::TcpListener = socket.into();
-        tokio::net::TcpListener::from_std(std_listener)?
-    };
+    let listener = bind_listener(config.listen_addr)?;
+    let native_service = Arc::new(native::Native::new(native::Deps {
+        cluster: Arc::clone(&cluster),
+        auth: Arc::clone(&authenticator),
+        raft: Arc::clone(&raft_node),
+        replication: Arc::new(SegmentReplicationService::new(
+            Arc::clone(&contexts),
+            cluster.replication_control(),
+            config.replication_inflight_bytes,
+        )),
+        max_snapshot_size: config.max_snapshot_size,
+        hub: Arc::clone(&hub),
+        schedule_projections: Default::default(),
+    }));
+    let native_config = Arc::new(kronosdb_protocol::net::server::ServerConfig {
+        server_name: config.node_name.clone(),
+        tls,
+        ..Default::default()
+    });
+    tokio::spawn(accept_loop(
+        listener,
+        native_service,
+        native_config,
+        native_stop_rx,
+        Arc::clone(&connections),
+    ));
+    info!(addr = %config.listen_addr, "listening");
 
-    // tonic applies tcp_nodelay/tcp_keepalive only to sockets accepted by its
-    // own TcpIncoming; with a user-supplied incoming stream they must be set
-    // per accepted socket here. Without nodelay, Nagle + the client's delayed
-    // ACK holds every response that follows a small h2 frame for ~40ms.
-    let incoming = {
-        use tokio_stream::StreamExt;
-        tokio_stream::wrappers::TcpListenerStream::new(listener).map(|conn| {
-            conn.inspect(|stream| {
-                let _ = stream.set_nodelay(true);
-                let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60));
-                let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
-            })
-        })
-    };
     cluster.start_replication()?;
     if let Some(backup_url) = &config.backup_url {
         cluster.start_backup(kronosdb_eventstore::tier::TierConfig {
@@ -596,12 +461,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref manifest_path) = config.manifest {
         spawn_manifest_watch(Arc::clone(&cluster), manifest_path.clone());
     }
-    router
-        .serve_with_incoming_shutdown(incoming, shutdown)
-        .await?;
+    shutdown.await;
 
     info!("KronosDB shut down gracefully");
     Ok(())
+}
+
+/// Accepts client and peer connections until `stop`, counting the ones
+/// still open so shutdown can wait for them to drain.
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    service: Arc<native::Native>,
+    config: Arc<kronosdb_protocol::net::server::ServerConfig>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    open: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let (tcp, addr) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(_) => continue,
+            },
+            _ = stop.wait_for(|stop| *stop) => return,
+        };
+        // Without nodelay, Nagle + the client's delayed ACK holds every
+        // response that follows a small frame for ~40ms.
+        let _ = tcp.set_nodelay(true);
+        let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60));
+        let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&keepalive);
+        let (service, config, stop, open) = (
+            Arc::clone(&service),
+            Arc::clone(&config),
+            stop.clone(),
+            Arc::clone(&open),
+        );
+        open.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            kronosdb_protocol::net::server::connection(tcp, addr, service, config, stop).await;
+            open.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
+
+/// Binds with SO_REUSEADDR so restarts don't fail with "address already in use".
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 /// Watches the manifest file and applies additions live, so declaring a new
@@ -709,7 +624,8 @@ fn log_durability_summary(cluster: &ClusterConfig, group_commit_ms: u64) {
             durability = "strict",
             voters = voter_count,
             group_commit_ms,
-            "multi-node native durability: every write waits for a quorum-durable segment cursor"
+            "multi-node native durability: every write waits for the quorum's segment cursors; \
+             whether they must be fsynced or only written is the ack mode logged above"
         );
     } else {
         info!(

@@ -1,0 +1,25 @@
+{
+  "frame": "CommandResponse",
+  "stream": 43,
+  "flags": 1,
+  "body": {
+    "result": {
+      "message_id": "res-2",
+      "request_id": "cmd-1",
+      "error_code": "AXONIQ-4002",
+      "error": {
+        "message": "card declined",
+        "location": "billing-1@host-b",
+        "details": [
+          "insufficient funds",
+          "retry later"
+        ],
+        "error_code": "AXONIQ-4002"
+      },
+      "payload": null,
+      "metadata": [],
+      "instructions": []
+    }
+  },
+  "description": ""
+}

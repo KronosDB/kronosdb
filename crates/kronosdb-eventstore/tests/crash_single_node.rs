@@ -7,17 +7,13 @@
 //! remain readable with their original contents and that appends can resume.
 
 mod crash_harness;
-use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
-use pb::Tag;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tonic::transport::Channel;
-
-use pb::event_store_client::EventStoreClient;
 
 const ITERATIONS: usize = 10;
 const AGGREGATES: usize = 8;
@@ -72,7 +68,7 @@ async fn run_one_iteration(iter: usize) {
         let (kill_tx, kill_rx) = watch::channel(false);
         let (first_ack_tx, first_ack_rx) = watch::channel(false);
 
-        let addr = format!("http://{}", srv.listen);
+        let addr = srv.listen.to_string();
         let mut writers = Vec::new();
         for writer_idx in 0..WRITER_TASKS {
             let addr = addr.clone();
@@ -139,55 +135,20 @@ async fn run_one_iteration(iter: usize) {
     );
 
     // ---- Assertion A (CRASH-03): every acked write is present ----
-    let addr = format!("http://{}", srv.listen);
-    let channel = Channel::from_shared(addr.clone())
-        .unwrap()
-        .connect()
+    let client = connect(srv.listen)
         .await
         .expect("connect to restarted server");
-    let mut client = EventStoreClient::new(channel);
+    let context = client.default_context();
 
-    // Source by per-aggregate criterion — empty-criteria Source returns nothing in
-    // this DCB engine (tag_index::matching_bitmap on SourcingCondition with no
-    // criteria resolves to None, which is correct DCB semantics: "match nothing"
-    // is not the same as "match everything"). To enumerate every event written by
-    // the writer loops we union one criterion per aggregate, all tagged `agg=<id>`.
-    let mut events_by_seq: std::collections::HashMap<i64, (String, Vec<u8>)> =
-        std::collections::HashMap::new();
-    let criteria: Vec<pb::Criterion> = (0..AGGREGATES)
-        .map(|i| pb::Criterion {
-            names: vec![],
-            tags: vec![Tag {
-                key: b"agg".to_vec(),
-                value: format!("agg-{i}").into_bytes(),
-            }],
-        })
+    // Source by per-aggregate criterion: one `agg=<id>` criterion per
+    // aggregate the writer loops used, unioned.
+    let criteria = tag_criteria("agg", (0..AGGREGATES).map(|i| format!("agg-{i}")));
+    let events_by_seq: HashMap<i64, (String, Vec<u8>)> = read_events(&context, &criteria)
+        .await
+        .expect("source")
+        .into_iter()
+        .map(|(position, name, payload)| (position as i64, (name, payload)))
         .collect();
-    let req = pb::SourceRequest {
-        from_sequence: 0,
-        criteria,
-        batch_size: 0,
-    };
-    let mut stream = client.source(req).await.expect("source rpc").into_inner();
-    while let Some(resp) = stream.message().await.expect("stream msg") {
-        let Some(batch) = resp.batch else {
-            continue;
-        };
-        for ev in batch.events {
-            let seq = ev.sequence;
-            let name = ev
-                .event
-                .as_ref()
-                .map(|e| e.name.clone())
-                .unwrap_or_default();
-            let payload = ev
-                .event
-                .as_ref()
-                .map(|e| e.payload.clone())
-                .unwrap_or_default();
-            events_by_seq.insert(seq, (name, payload));
-        }
-    }
     for rec in &acked {
         let (_, payload) = events_by_seq.get(&rec.server_sequence).unwrap_or_else(|| {
             panic!(
@@ -222,12 +183,7 @@ async fn run_one_iteration(iter: usize) {
     );
 
     // ---- Assertion C (CRASH-02 phantom) ----
-    let head = client
-        .get_head(pb::GetHeadRequest {})
-        .await
-        .expect("get_head")
-        .into_inner()
-        .sequence;
+    let head = context.head().await.expect("get_head") as i64;
     assert_eq!(
         events_by_seq.len() as i64,
         head,
@@ -260,11 +216,10 @@ async fn writer_loop(
     mut kill_rx: watch::Receiver<bool>,
     first_ack_tx: watch::Sender<bool>,
 ) {
-    let channel = match Channel::from_shared(addr).unwrap().connect().await {
-        Ok(c) => c,
-        Err(_) => return,
+    let Ok(client) = connect(addr).await else {
+        return;
     };
-    let mut client = EventStoreClient::new(channel);
+    let context = client.default_context();
     let mut client_seq: u64 = 0;
 
     loop {
@@ -276,51 +231,34 @@ async fn writer_loop(
         let payload = format!("w{writer_idx}-s{client_seq}-{agg_id}").into_bytes();
         let hash = hash_payload(&payload);
 
-        let tagged = pb::TaggedEvent {
-            event: Some(pb::Event {
-                identifier: format!("evt-{writer_idx}-{client_seq}"),
-                timestamp: 1_712_000_000_000 + client_seq as i64,
-                name: "Incremented".into(),
-                version: "1.0".into(),
-                payload: payload.clone(),
-                metadata: Default::default(),
-            }),
-            tags: vec![Tag {
-                key: b"agg".to_vec(),
-                value: agg_id.clone().into_bytes(),
+        let new_event = event(
+            format!("evt-{writer_idx}-{client_seq}"),
+            1_712_000_000_000 + client_seq as i64,
+            "Incremented",
+            "1.0",
+            payload.clone(),
+            vec![(b"agg".to_vec(), agg_id.clone().into_bytes())],
+        );
+        let condition = (!client_seq.is_multiple_of(3)).then(|| Condition {
+            marker: 0,
+            criteria: vec![Criterion {
+                names: vec!["NeverEmitted".into()],
+                tags: vec![(b"agg".to_vec(), agg_id.clone().into_bytes())],
             }],
-        };
-        let condition = if !client_seq.is_multiple_of(3) {
-            Some(pb::ConsistencyCondition {
-                consistency_marker: 0,
-                criteria: vec![pb::Criterion {
-                    names: vec!["NeverEmitted".into()],
-                    tags: vec![Tag {
-                        key: b"agg".to_vec(),
-                        value: agg_id.clone().into_bytes(),
-                    }],
-                }],
-            })
-        } else {
-            None
-        };
+        });
 
-        let req = pb::AppendRequest {
-            condition,
-            events: vec![tagged],
-        };
+        let events = [new_event];
         let out = tokio::select! {
-            res = client.append(req) => res,
+            res = context.append(&events, condition.as_ref()) => res,
             _ = kill_rx.changed() => return,
         };
         match out {
-            Ok(resp) => {
-                let resp = resp.into_inner();
+            Ok(Appended::Ok { first_position, .. }) => {
                 let rec = AckRecord {
                     aggregate_id: agg_id,
                     client_sequence: client_seq,
                     payload_hash: hash,
-                    server_sequence: resp.first_sequence,
+                    server_sequence: first_position as i64,
                 };
                 if let Err(e) = ack_log.record(rec) {
                     eprintln!("writer {writer_idx}: ack sidecar error: {e}");
@@ -329,9 +267,9 @@ async fn writer_loop(
                 let _ = first_ack_tx.send(true);
                 client_seq += 1;
             }
-            Err(_status) => {
-                return;
-            }
+            // Nothing conflicts with `NeverEmitted`, so a conflict or an
+            // error means the server is going away.
+            Ok(Appended::Conflict { .. }) | Err(_) => return,
         }
     }
 }

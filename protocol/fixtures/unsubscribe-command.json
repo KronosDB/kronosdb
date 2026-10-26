@@ -1,0 +1,10 @@
+{
+  "frame": "UnsubscribeCommand",
+  "stream": 45,
+  "flags": 0,
+  "body": {
+    "instruction_id": "i-4",
+    "command": "com.acme.PlaceOrder"
+  },
+  "description": ""
+}

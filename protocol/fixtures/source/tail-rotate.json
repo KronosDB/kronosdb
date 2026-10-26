@@ -1,0 +1,10 @@
+{
+  "description": "",
+  "frame": "TailRotate",
+  "stream": 69,
+  "flags": 0,
+  "body": {
+    "epoch": "8",
+    "new_segment_base": "1048579"
+  }
+}

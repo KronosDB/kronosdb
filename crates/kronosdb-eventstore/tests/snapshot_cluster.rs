@@ -5,26 +5,20 @@
 //! be readable through every node's local read path — including the fused
 //! read — since snapshot reads never leave the node that serves them.
 
-#![allow(clippy::result_large_err)]
-
 mod crash_harness;
-use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
-use pb::Tag;
 
 use std::time::{Duration, Instant};
-
-use pb::event_store_client::EventStoreClient;
-use tonic::transport::Channel;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const LEADER_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-async fn connect(srv: &ServerHandle) -> EventStoreClient<Channel> {
-    EventStoreClient::connect(format!("http://{}", srv.listen))
+async fn connect_to(srv: &ServerHandle) -> Context {
+    connect(srv.listen)
         .await
         .expect("connect event store client")
+        .default_context()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -78,58 +72,47 @@ async fn run() {
 
     // Seed a user event through the follower (exercises plain forwarding and
     // gives the snapshot a fold marker to reference).
-    let mut follower_client = connect(&srvs[follower]).await;
+    let follower_client = connect_to(&srvs[follower]).await;
     let seeded = follower_client
-        .append(pb::AppendRequest {
-            condition: None,
-            events: vec![pb::TaggedEvent {
-                event: Some(pb::Event {
-                    identifier: "id-created".into(),
-                    timestamp: 0,
-                    name: "CourseCreated".into(),
-                    version: "1".into(),
-                    payload: b"created".to_vec(),
-                    metadata: Default::default(),
-                }),
-                tags: vec![Tag {
-                    key: b"courseId".to_vec(),
-                    value: b"cs-101".to_vec(),
-                }],
-            }],
-        })
+        .append(
+            &[event(
+                "id-created".into(),
+                0,
+                "CourseCreated",
+                "1",
+                b"created".to_vec(),
+                vec![(b"courseId".to_vec(), b"cs-101".to_vec())],
+            )],
+            None,
+        )
         .await
-        .expect("forwarded user append")
-        .into_inner();
-    let fold_marker = seeded.consistency_marker;
+        .expect("forwarded user append");
+    let Appended::Ok {
+        marker: fold_marker,
+        ..
+    } = seeded
+    else {
+        panic!("the seed append conflicted: {seeded:?}");
+    };
 
     // The snapshot append lands through the follower: rejected before the
     // fix that forwards system-framed appends, so this call IS the proof.
-    let record_sequence = follower_client
-        .append_snapshot(pb::AppendSnapshotRequest {
-            key: b"course:cs-101".to_vec(),
-            state: b"replicated state".to_vec(),
-            position: fold_marker,
-        })
+    let record_position = follower_client
+        .append_snapshot(b"course:cs-101", b"replicated state", fold_marker)
         .await
-        .expect("snapshot append via follower must forward to the leader")
-        .into_inner()
-        .sequence;
-    assert!(record_sequence >= fold_marker);
+        .expect("snapshot append via follower must forward to the leader");
+    assert!(record_position >= fold_marker);
 
     // Every node must serve the snapshot from its LOCAL log once the record
     // replicates — leader immediately, followers within the tail's lag.
     for (index, srv) in srvs.iter().enumerate() {
-        let mut client = connect(srv).await;
+        let context = connect_to(srv).await;
         let deadline = Instant::now() + REPLICATION_TIMEOUT;
         let snapshot = loop {
-            let found = client
-                .get_snapshot(pb::GetSnapshotRequest {
-                    key: b"course:cs-101".to_vec(),
-                })
+            let found = context
+                .get_snapshot(b"course:cs-101")
                 .await
-                .expect("get snapshot")
-                .into_inner()
-                .snapshot;
+                .expect("get snapshot");
             if let Some(snapshot) = found {
                 break snapshot;
             }
@@ -140,43 +123,33 @@ async fn run() {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert_eq!(snapshot.state, b"replicated state", "node {}", index + 1);
+        assert_eq!(
+            snapshot.state.as_ref(),
+            b"replicated state",
+            "node {}",
+            index + 1
+        );
         assert_eq!(snapshot.position, fold_marker, "node {}", index + 1);
     }
 
-    // The fused read works on a follower: snapshot frame plus the marker,
-    // with the seeded event already summarized (nothing to replay).
-    let mut stream = follower_client
-        .snapshotted_source(pb::SnapshottedSourceRequest {
-            criteria: vec![pb::Criterion {
-                names: vec![],
-                tags: vec![Tag {
-                    key: b"courseId".to_vec(),
-                    value: b"cs-101".to_vec(),
-                }],
-            }],
-            key: b"course:cs-101".to_vec(),
-            batch_size: 0,
-        })
+    // The fused read works on a follower: the snapshot plus the marker, with
+    // the seeded event already summarized (nothing to replay).
+    let mut source = follower_client
+        .snapshotted_source(b"course:cs-101", &[Criterion::tag("courseId", "cs-101")], 0)
         .await
-        .expect("snapshotted source on follower")
-        .into_inner();
-
-    let mut snapshot_frame = None;
-    let mut events = Vec::new();
+        .expect("snapshotted source on follower");
+    let snapshot = source
+        .snapshot
+        .clone()
+        .expect("fused read on follower returns the snapshot");
+    assert_eq!(snapshot.state.as_ref(), b"replicated state");
+    let mut events = 0;
     let mut marker = None;
-    while let Some(response) = stream.message().await.expect("stream message") {
-        match response.frame.expect("frame") {
-            pb::snapshotted_source_response::Frame::Snapshot(s) => snapshot_frame = Some(s),
-            pb::snapshotted_source_response::Frame::Batch(batch) => {
-                events.extend(batch.events);
-                marker = batch.consistency_marker.or(marker);
-            }
-        }
+    while let Some(batch) = source.next().await.expect("stream message") {
+        events += batch.len();
+        marker = batch.marker().or(marker);
     }
-    let snapshot_frame = snapshot_frame.expect("fused read on follower returns the snapshot");
-    assert_eq!(snapshot_frame.state, b"replicated state");
-    assert!(events.is_empty(), "the seeded event is already summarized");
+    assert_eq!(events, 0, "the seeded event is already summarized");
     assert!(marker.is_some(), "fused read ends with the marker");
 
     for srv in &mut srvs {

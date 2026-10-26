@@ -1,0 +1,347 @@
+package io.kronosdb.protocol;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.function.ToIntFunction;
+
+/**
+ * A minimal JSON reader and writer for the conformance suite, and the helpers
+ * the generated {@link ProtocolJson} bridge is written with.
+ *
+ * <p>Values are {@code Map<String, Object>} (in document order), {@code List<Object>},
+ * {@code String}, {@code Long} for integers, {@code Double} for other numbers,
+ * {@code Boolean} and {@code null}.
+ */
+final class Json {
+
+    private Json() {
+    }
+
+    // ------------------------------------------------------------ parsing
+
+    static Object parse(String text) {
+        Parser p = new Parser(text);
+        p.skip();
+        Object v = p.value();
+        p.skip();
+        if (p.at != text.length()) {
+            throw p.error("trailing characters");
+        }
+        return v;
+    }
+
+    private static final class Parser {
+        final String s;
+        int at;
+
+        Parser(String s) {
+            this.s = s;
+        }
+
+        IllegalArgumentException error(String what) {
+            return new IllegalArgumentException("JSON: " + what + " at offset " + at);
+        }
+
+        void skip() {
+            while (at < s.length() && Character.isWhitespace(s.charAt(at))) {
+                at++;
+            }
+        }
+
+        void expect(char c) {
+            if (at >= s.length() || s.charAt(at) != c) {
+                throw error("expected '" + c + "'");
+            }
+            at++;
+        }
+
+        Object value() {
+            if (at >= s.length()) {
+                throw error("unexpected end");
+            }
+            char c = s.charAt(at);
+            switch (c) {
+                case '{':
+                    return object();
+                case '[':
+                    return array();
+                case '"':
+                    return string();
+                case 't':
+                    literal("true");
+                    return Boolean.TRUE;
+                case 'f':
+                    literal("false");
+                    return Boolean.FALSE;
+                case 'n':
+                    literal("null");
+                    return null;
+                default:
+                    return number();
+            }
+        }
+
+        void literal(String word) {
+            if (!s.startsWith(word, at)) {
+                throw error("expected " + word);
+            }
+            at += word.length();
+        }
+
+        Map<String, Object> object() {
+            expect('{');
+            Map<String, Object> out = new LinkedHashMap<>();
+            skip();
+            if (s.charAt(at) == '}') {
+                at++;
+                return out;
+            }
+            while (true) {
+                skip();
+                String key = string();
+                skip();
+                expect(':');
+                skip();
+                out.put(key, value());
+                skip();
+                if (s.charAt(at) == ',') {
+                    at++;
+                } else {
+                    expect('}');
+                    return out;
+                }
+            }
+        }
+
+        List<Object> array() {
+            expect('[');
+            List<Object> out = new ArrayList<>();
+            skip();
+            if (s.charAt(at) == ']') {
+                at++;
+                return out;
+            }
+            while (true) {
+                skip();
+                out.add(value());
+                skip();
+                if (s.charAt(at) == ',') {
+                    at++;
+                } else {
+                    expect(']');
+                    return out;
+                }
+            }
+        }
+
+        String string() {
+            expect('"');
+            StringBuilder b = new StringBuilder();
+            while (true) {
+                if (at >= s.length()) {
+                    throw error("unterminated string");
+                }
+                char c = s.charAt(at++);
+                if (c == '"') {
+                    return b.toString();
+                }
+                if (c != '\\') {
+                    b.append(c);
+                    continue;
+                }
+                char e = s.charAt(at++);
+                switch (e) {
+                    case '"', '\\', '/' -> b.append(e);
+                    case 'b' -> b.append('\b');
+                    case 'f' -> b.append('\f');
+                    case 'n' -> b.append('\n');
+                    case 'r' -> b.append('\r');
+                    case 't' -> b.append('\t');
+                    case 'u' -> {
+                        b.append((char) Integer.parseInt(s.substring(at, at + 4), 16));
+                        at += 4;
+                    }
+                    default -> throw error("bad escape \\" + e);
+                }
+            }
+        }
+
+        Object number() {
+            int start = at;
+            boolean integral = true;
+            while (at < s.length()) {
+                char c = s.charAt(at);
+                if (c == '.' || c == 'e' || c == 'E') {
+                    integral = false;
+                } else if (!(c == '-' || c == '+' || (c >= '0' && c <= '9'))) {
+                    break;
+                }
+                at++;
+            }
+            String text = s.substring(start, at);
+            if (text.isEmpty()) {
+                throw error("unexpected character '" + s.charAt(at) + "'");
+            }
+            return integral ? (Object) Long.valueOf(text) : (Object) Double.valueOf(text);
+        }
+    }
+
+    // ------------------------------------------------------------ writing
+
+    static String stringify(Object v) {
+        StringBuilder b = new StringBuilder();
+        write(b, v);
+        return b.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void write(StringBuilder b, Object v) {
+        if (v == null) {
+            b.append("null");
+        } else if (v instanceof String s) {
+            b.append('"');
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                switch (c) {
+                    case '"' -> b.append("\\\"");
+                    case '\\' -> b.append("\\\\");
+                    case '\n' -> b.append("\\n");
+                    case '\r' -> b.append("\\r");
+                    case '\t' -> b.append("\\t");
+                    default -> {
+                        if (c < 0x20) {
+                            b.append(String.format("\\u%04x", (int) c));
+                        } else {
+                            b.append(c);
+                        }
+                    }
+                }
+            }
+            b.append('"');
+        } else if (v instanceof Map<?, ?> m) {
+            b.append('{');
+            boolean first = true;
+            for (Map.Entry<String, Object> e : ((Map<String, Object>) m).entrySet()) {
+                if (!first) {
+                    b.append(',');
+                }
+                first = false;
+                write(b, e.getKey());
+                b.append(':');
+                write(b, e.getValue());
+            }
+            b.append('}');
+        } else if (v instanceof List<?> l) {
+            b.append('[');
+            for (int i = 0; i < l.size(); i++) {
+                if (i > 0) {
+                    b.append(',');
+                }
+                write(b, l.get(i));
+            }
+            b.append(']');
+        } else {
+            b.append(v);
+        }
+    }
+
+    // ------------------------------------------------- bridge: value to JSON
+
+    static String hex(ByteBuffer b) {
+        char[] digits = "0123456789abcdef".toCharArray();
+        int base = b.position();
+        int n = b.remaining();
+        char[] out = new char[2 * n];
+        for (int i = 0; i < n; i++) {
+            int x = b.get(base + i) & 0xFF;
+            out[2 * i] = digits[x >> 4];
+            out[2 * i + 1] = digits[x & 15];
+        }
+        return new String(out);
+    }
+
+    static <T> List<Object> list(List<T> items, Function<T, Object> each) {
+        List<Object> out = new ArrayList<>(items.size());
+        for (T item : items) {
+            out.add(each.apply(item));
+        }
+        return out;
+    }
+
+    /** An enum as its variant name, or its number when this version does not know it. */
+    static Object enumName(String name, int value) {
+        return name != null ? name : (Object) Long.valueOf(value);
+    }
+
+    // ----------------------------------------------- bridge: JSON to value
+
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> object(Object j) {
+        return (Map<String, Object>) j;
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T> List<T> map(Object j, Function<Object, T> each) {
+        List<T> out = new ArrayList<>();
+        for (Object item : (List<Object>) j) {
+            out.add(each.apply(item));
+        }
+        return out;
+    }
+
+    static int intValue(Object j) {
+        return ((Number) j).intValue();
+    }
+
+    static long longValue(Object j) {
+        return ((Number) j).longValue();
+    }
+
+    static long i64(Object j) {
+        return j instanceof String s ? Long.parseLong(s) : ((Number) j).longValue();
+    }
+
+    static long u64(Object j) {
+        return j instanceof String s ? Long.parseUnsignedLong(s) : ((Number) j).longValue();
+    }
+
+    static boolean bool(Object j) {
+        return (Boolean) j;
+    }
+
+    static double f64(Object j) {
+        return ((Number) j).doubleValue();
+    }
+
+    static String str(Object j) {
+        return (String) j;
+    }
+
+    static ByteBuffer bytes(Object j) {
+        if (j instanceof Map<?, ?> m && m.get("utf8") instanceof String s) {
+            return ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8));
+        }
+        String s = (String) j;
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(s.substring(2 * i, 2 * i + 2), 16);
+        }
+        return ByteBuffer.wrap(out);
+    }
+
+    static int enumValue(Object j, ToIntFunction<String> byName) {
+        if (j instanceof String name) {
+            int value = byName.applyAsInt(name);
+            if (value < 0) {
+                throw new IllegalArgumentException("unknown enum variant " + name);
+            }
+            return value;
+        }
+        return ((Number) j).intValue();
+    }
+}

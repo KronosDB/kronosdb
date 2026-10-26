@@ -1,0 +1,29 @@
+{
+  "frame": "ScheduleAppend",
+  "stream": 29,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "due": 1761386400000,
+    "token": "",
+    "event": {
+      "flags": 0,
+      "event": {
+        "position": "0",
+        "identifier": "0198a2f4-7c3e-7a11-9b2d-000000000010",
+        "name": "ReminderDue",
+        "version": "1",
+        "timestamp": 0,
+        "metadata": [],
+        "tags": [
+          {
+            "key": "6f726465724964",
+            "value": "6f2d31"
+          }
+        ],
+        "payload": "7b226b696e64223a227061796d656e742d72656d696e646572227d"
+      }
+    }
+  },
+  "description": "An event to append in the future; empty token asks the server for one."
+}

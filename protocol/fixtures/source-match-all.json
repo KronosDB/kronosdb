@@ -1,0 +1,12 @@
+{
+  "frame": "Source",
+  "stream": 9,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "from": "0",
+    "criteria": [],
+    "batch_size": 0
+  },
+  "description": "Empty criteria match every event; batch size left to the server."
+}

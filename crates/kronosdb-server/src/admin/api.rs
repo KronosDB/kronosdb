@@ -1,7 +1,7 @@
 //! JSON read API (`/api/v1/*`) — the machine-readable twin of the console
 //! pages, for the `kronos` CLI/TUI and scripts. Same data calls as the HTML
 //! pages, same auth gate. Counts and topology only, never event payloads
-//! (events are read over gRPC, where per-context grants apply).
+//! (events are read over the native protocol, where per-context grants apply).
 
 use axum::Json;
 use axum::Router;
@@ -74,11 +74,69 @@ fn node(state: &AdminState) -> Value {
         "name": config.node_name,
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": state.started_at.elapsed().as_secs(),
-        "grpc_addr": config.listen_addr.to_string(),
+        "client_addr": config.listen_addr.to_string(),
         "admin_addr": config.admin_listen_addr.to_string(),
         "tls": config.tls_cert.is_some() && config.tls_key.is_some(),
         "auth": state.identities.describe(),
         "ready": state.cluster.native_ready(),
+        "hardware": hardware(state),
+    })
+}
+
+/// What the startup hardware checks measured and found, for the console and
+/// the TUI. `findings` is empty on a machine with nothing to report.
+fn hardware(state: &AdminState) -> Value {
+    let report = &state.hardware;
+    let facts = &report.facts;
+    let micros = |d: std::time::Duration| d.as_micros() as u64;
+    let (probe, probe_error) = match &facts.probe {
+        Ok(p) => (
+            Some(json!({
+                "samples": p.samples,
+                "p50_us": micros(p.p50),
+                "p99_us": micros(p.p99),
+                "max_us": micros(p.max),
+                "elapsed_us": micros(p.elapsed),
+            })),
+            None,
+        ),
+        Err(reason) => (None, Some(reason.clone())),
+    };
+    json!({
+        "dev_mode": report.dev,
+        "platform": facts.platform,
+        "ack": {
+            "configured": state.config.ack_mode,
+            "single_voter": report.ack.single_voter.as_str(),
+            "multi_voter": report.ack.multi_voter.as_str(),
+            "reason": report.ack.reason,
+        },
+        "disk": {
+            "data_dir": facts.data_dir.display().to_string(),
+            "filesystem": facts.filesystem.name,
+            "filesystem_kind": facts.filesystem.kind.as_str(),
+            "mount_point": facts.filesystem.mount_point,
+            "source": facts.filesystem.source,
+            "probe": probe,
+            "probe_error": probe_error,
+        },
+        "memory": {
+            "host_total_bytes": facts.memory.host_total_bytes,
+            "cgroup_limit_bytes": facts.memory.cgroup_limit_bytes,
+            "available_bytes": facts.memory.available_bytes,
+            "swap_used_bytes": facts.memory.swap_used_bytes,
+            "cache_budget_bytes": facts.cache_budget_bytes,
+        },
+        "cpu": {
+            "available": facts.cpu.available,
+            "host": facts.cpu.host,
+            "cgroup_limit": facts.cpu.cgroup_limit,
+        },
+        "findings": report.findings.iter().map(|f| json!({
+            "check": f.check.id(),
+            "severity": f.check.severity().as_str(),
+            "message": f.message,
+        })).collect::<Vec<_>>(),
     })
 }
 

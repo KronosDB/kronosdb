@@ -41,9 +41,7 @@ pub fn validate_crc(header: RecordHeader, payload: &[u8]) -> bool {
     if payload.len() != header.payload_len {
         return false;
     }
-    let mut crc = crc32c::crc32c(&[header.flags]);
-    crc = crc32c::crc32c_append(crc, payload);
-    crc == header.stored_crc
+    super::crc::record_crc(header.flags, payload) == header.stored_crc
 }
 
 /// Validates the native record type and returns its logical meaning.

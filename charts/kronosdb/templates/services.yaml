@@ -11,9 +11,9 @@ spec:
   publishNotReadyAddresses: true
   selector: {{- include "kronosdb.selectorLabels" . | nindent 4 }}
   ports:
-    - { name: grpc, port: 50051, targetPort: grpc }
+    - { name: client, port: 50051, targetPort: client }
 ---
-# Client-facing gRPC service — voters only (learners never serve writes,
+# Client-facing service — voters only (learners never serve writes,
 # and client reads follow the connection's context routing anyway).
 apiVersion: v1
 kind: Service
@@ -26,7 +26,7 @@ spec:
     {{- include "kronosdb.selectorLabels" . | nindent 4 }}
     kronosdb.io/role: voter
   ports:
-    - { name: grpc, port: 50051, targetPort: grpc }
+    - { name: client, port: 50051, targetPort: client }
 ---
 # Admin console / API / metrics.
 apiVersion: v1

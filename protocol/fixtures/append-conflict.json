@@ -1,0 +1,9 @@
+{
+  "frame": "AppendConflict",
+  "stream": 2,
+  "flags": 1,
+  "body": {
+    "conflicting_position": "1048577"
+  },
+  "description": ""
+}

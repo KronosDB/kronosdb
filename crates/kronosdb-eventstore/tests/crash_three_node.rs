@@ -4,21 +4,14 @@
 //! new leader, and writes continue. The killed node then restarts, catches up,
 //! and all three nodes must converge on byte-identical valid segment prefixes.
 
-#![allow(clippy::result_large_err)]
-
 mod crash_harness;
-use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
-use pb::Tag;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tonic::transport::Channel;
-
-use pb::event_store_client::EventStoreClient;
 
 const ITERATIONS: usize = 10;
 const AGGREGATES: usize = 8;
@@ -30,20 +23,33 @@ const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn crash_three_node_ten_iterations() {
-    tokio::time::timeout(Duration::from_secs(300), run_all_iterations())
+    let budget = Duration::from_secs(300) * (iterations() / ITERATIONS).max(1) as u32;
+    tokio::time::timeout(budget, run_all_iterations())
         .await
         .expect("crash_three_node_ten_iterations timed out");
 }
 
+/// `KRONOSDB_CRASH_ITERATIONS` overrides the iteration count, for soak loops.
+fn iterations() -> usize {
+    std::env::var("KRONOSDB_CRASH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ITERATIONS)
+}
+
 async fn run_all_iterations() {
-    for i in 0..ITERATIONS {
-        eprintln!("=== crash_three_node iteration {}/{ITERATIONS} ===", i + 1);
+    let total = iterations();
+    for i in 0..total {
+        eprintln!("=== crash_three_node iteration {}/{total} ===", i + 1);
         run_one_iteration(i).await;
     }
 }
 
 async fn run_one_iteration(iter: usize) {
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Declared before the servers: on a panic they are killed first, then this
+    // copies every node's data dir and server log out of the temp dir.
+    let evidence = EvidenceGuard::new("crash_three_node", iter, tmp.path());
     let acks_path = tmp.path().join("acks.log");
 
     // Allocate 3 listen + 3 admin ports.
@@ -88,9 +94,7 @@ async fn run_one_iteration(iter: usize) {
     let (kill_tx, kill_rx) = watch::channel(false);
     let (first_ack_tx, first_ack_rx) = watch::channel(Option::<usize>::None);
 
-    let addrs: Vec<String> = (0..3)
-        .map(|i| format!("http://127.0.0.1:{}", listen[i]))
-        .collect();
+    let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", listen[i])).collect();
     let mut writers = Vec::new();
     for widx in 0..WRITER_TASKS {
         let addrs = addrs.clone();
@@ -137,6 +141,7 @@ async fn run_one_iteration(iter: usize) {
         ack_log.len()
     );
     srvs[leader_idx].kill();
+    evidence.note(format!("killed node{} (the leader)", leader_idx + 1));
 
     let new_leader = wait_for_raft_leader(&srvs, READY_TIMEOUT)
         .await
@@ -158,6 +163,7 @@ async fn run_one_iteration(iter: usize) {
     post_restart_verify(
         iter,
         &tmp,
+        &evidence,
         &acks_path,
         acks_before_restart,
         &mut srvs,
@@ -171,6 +177,7 @@ async fn run_one_iteration(iter: usize) {
     for srv in srvs.iter_mut() {
         srv.kill();
     }
+    evidence.finish();
     drop(tmp);
 }
 
@@ -182,7 +189,7 @@ async fn writer_loop(
     first_ack_tx: watch::Sender<Option<usize>>,
 ) {
     let mut node_idx = 0;
-    let mut client_opt: Option<EventStoreClient<Channel>> = None;
+    let mut context_opt: Option<Context> = None;
     let mut client_seq: u64 = 0;
 
     loop {
@@ -190,13 +197,9 @@ async fn writer_loop(
             return;
         }
 
-        if client_opt.is_none() {
-            match Channel::from_shared(addrs[node_idx].clone())
-                .unwrap()
-                .connect()
-                .await
-            {
-                Ok(ch) => client_opt = Some(EventStoreClient::new(ch)),
+        if context_opt.is_none() {
+            match connect(&addrs[node_idx]).await {
+                Ok(client) => context_opt = Some(client.default_context()),
                 Err(_) => {
                     node_idx = (node_idx + 1) % 3;
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -204,64 +207,46 @@ async fn writer_loop(
                 }
             }
         }
-        let client = client_opt.as_mut().unwrap();
+        let context = context_opt.as_ref().unwrap();
 
         let agg_idx = (widx + client_seq as usize) % AGGREGATES;
         let agg_id = format!("agg-{agg_idx}");
         let payload = format!("w{widx}-s{client_seq}-{agg_id}").into_bytes();
         let hash = hash_payload(&payload);
-        let tagged = pb::TaggedEvent {
-            event: Some(pb::Event {
-                identifier: format!("evt-{widx}-{client_seq}"),
-                timestamp: 1_712_000_000_000 + client_seq as i64,
-                name: "Incremented".into(),
-                version: "1.0".into(),
-                payload: payload.clone(),
-                metadata: Default::default(),
-            }),
-            tags: vec![Tag {
-                key: b"agg".to_vec(),
-                value: agg_id.clone().into_bytes(),
+        let events = [event(
+            format!("evt-{widx}-{client_seq}"),
+            1_712_000_000_000 + client_seq as i64,
+            "Incremented",
+            "1.0",
+            payload,
+            vec![(b"agg".to_vec(), agg_id.clone().into_bytes())],
+        )];
+        let condition = (!client_seq.is_multiple_of(3)).then(|| Condition {
+            marker: 0,
+            criteria: vec![Criterion {
+                names: vec!["NeverEmitted".into()],
+                tags: vec![(b"agg".to_vec(), agg_id.clone().into_bytes())],
             }],
-        };
-        let condition = if !client_seq.is_multiple_of(3) {
-            Some(pb::ConsistencyCondition {
-                consistency_marker: 0,
-                criteria: vec![pb::Criterion {
-                    names: vec!["NeverEmitted".into()],
-                    tags: vec![Tag {
-                        key: b"agg".to_vec(),
-                        value: agg_id.clone().into_bytes(),
-                    }],
-                }],
-            })
-        } else {
-            None
-        };
+        });
 
-        let req = pb::AppendRequest {
-            condition,
-            events: vec![tagged],
-        };
         let out = tokio::select! {
-            res = client.append(req) => res,
+            res = context.append(&events, condition.as_ref()) => res,
             _ = kill_rx.changed() => return,
         };
         match out {
-            Ok(resp) => {
-                let resp = resp.into_inner();
+            Ok(Appended::Ok { first_position, .. }) => {
                 let rec = AckRecord {
                     aggregate_id: agg_id,
                     client_sequence: client_seq,
                     payload_hash: hash,
-                    server_sequence: resp.first_sequence,
+                    server_sequence: first_position as i64,
                 };
                 ack_log.record(rec).expect("ack sidecar");
                 let _ = first_ack_tx.send(Some(node_idx));
                 client_seq += 1;
             }
-            Err(_status) => {
-                client_opt = None;
+            Ok(Appended::Conflict { .. }) | Err(_) => {
+                context_opt = None;
                 node_idx = (node_idx + 1) % 3;
             }
         }
@@ -272,6 +257,7 @@ async fn writer_loop(
 async fn post_restart_verify(
     iter: usize,
     tmp: &tempfile::TempDir,
+    evidence: &EvidenceGuard,
     acks_path: &std::path::Path,
     acks_before_restart: usize,
     srvs: &mut [ServerHandle],
@@ -323,27 +309,28 @@ async fn post_restart_verify(
     // reconnects from its durable physical cursor.
     {
         let start = Instant::now();
-        let mut clients: Vec<EventStoreClient<Channel>> = Vec::new();
-        for srv in srvs.iter() {
-            let addr = format!("http://{}", srv.listen);
-            let channel = Channel::from_shared(addr)
-                .unwrap()
-                .connect()
-                .await
-                .expect("connect for convergence poll");
-            clients.push(EventStoreClient::new(channel));
+        let mut contexts: Vec<Context> = Vec::new();
+        for (i, srv) in srvs.iter_mut().enumerate() {
+            match connect(srv.listen).await {
+                Ok(client) => contexts.push(client.default_context()),
+                Err(error) => {
+                    let state = srv.state();
+                    evidence.note(format!(
+                        "node{} refused the convergence poll: {state}",
+                        i + 1
+                    ));
+                    panic!(
+                        "iter {iter}: connect for convergence poll to node{}: {error} (node {state})",
+                        i + 1
+                    );
+                }
+            }
         }
         let mut last_log = Instant::now();
         loop {
             let mut heads = Vec::new();
-            for c in clients.iter_mut() {
-                let h = c
-                    .get_head(pb::GetHeadRequest {})
-                    .await
-                    .expect("get_head")
-                    .into_inner()
-                    .sequence;
-                heads.push(h);
+            for context in &contexts {
+                heads.push(context.head().await.expect("get_head"));
             }
             if heads.iter().all(|h| *h == heads[0]) && heads[0] > 1 {
                 eprintln!(
@@ -385,7 +372,7 @@ async fn post_restart_verify(
 
     // For EACH node: scan segments + Source-All + record head.
     let mut per_node_events: Vec<HashMap<i64, Vec<u8>>> = Vec::new();
-    let mut per_node_head: Vec<i64> = Vec::new();
+    let mut per_node_head: Vec<u64> = Vec::new();
     let mut per_node_log_bytes = Vec::new();
 
     for (i, srv) in srvs.iter().enumerate() {
@@ -413,69 +400,28 @@ async fn post_restart_verify(
         per_node_log_bytes
             .push(read_valid_event_log(&data_dir, "default").expect("read valid event log bytes"));
 
-        // Connect + Source-All via per-aggregate criteria (empty criteria returns
-        // nothing in this DCB engine; union one criterion per aggregate mirrors
-        // the 1-node test's read pattern).
-        let addr = format!("http://{}", srv.listen);
-        let channel = Channel::from_shared(addr)
-            .unwrap()
-            .connect()
+        // Connect + Source-All via per-aggregate criteria, mirroring the
+        // 1-node test's read pattern.
+        let context = connect(srv.listen)
             .await
-            .unwrap_or_else(|e| panic!("iter {iter}: connect node{}: {e}", i + 1));
-        let mut client = EventStoreClient::new(channel);
+            .unwrap_or_else(|e| panic!("iter {iter}: connect node{}: {e}", i + 1))
+            .default_context();
 
         // Head was already waited-on above in the convergence loop; this is
         // a direct read now.
-        let head = client
-            .get_head(pb::GetHeadRequest {})
-            .await
-            .expect("get_head")
-            .into_inner()
-            .sequence;
+        let head = context.head().await.expect("get_head");
         per_node_head.push(head);
         eprintln!("iter {iter} node{}: head={head}", i + 1);
 
-        let criteria: Vec<pb::Criterion> = (0..AGGREGATES)
-            .map(|a| pb::Criterion {
-                names: vec![],
-                tags: vec![Tag {
-                    key: b"agg".to_vec(),
-                    value: format!("agg-{a}").into_bytes(),
-                }],
-            })
-            .collect();
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.source(pb::SourceRequest {
-                from_sequence: 0,
-                criteria,
-                batch_size: 0,
-            }),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("iter {iter} node{}: source rpc open timeout", i + 1))
-        .expect("source")
-        .into_inner();
-        let mut events: HashMap<i64, Vec<u8>> = HashMap::new();
-        loop {
-            let msg = tokio::time::timeout(Duration::from_secs(15), stream.message())
+        let criteria = tag_criteria("agg", (0..AGGREGATES).map(|a| format!("agg-{a}")));
+        let events: HashMap<i64, Vec<u8>> =
+            tokio::time::timeout(Duration::from_secs(15), read_events(&context, &criteria))
                 .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "iter {iter} node{}: source stream message timeout (events so far = {})",
-                        i + 1,
-                        events.len()
-                    )
-                })
-                .expect("stream msg");
-            let Some(resp) = msg else { break };
-            if let Some(batch) = resp.batch {
-                for ev in batch.events {
-                    let payload = ev.event.map(|e| e.payload).unwrap_or_default();
-                    events.insert(ev.sequence, payload);
-                }
-            }
-        }
+                .unwrap_or_else(|_| panic!("iter {iter} node{}: source timeout", i + 1))
+                .expect("source")
+                .into_iter()
+                .map(|(position, _, payload)| (position as i64, payload))
+                .collect();
         eprintln!(
             "iter {iter} node{}: Source returned {} events",
             i + 1,
@@ -520,14 +466,20 @@ async fn post_restart_verify(
 
     // The native segment log is the replicated authority: segment boundaries,
     // control records, framing, CRCs, and event bytes must converge exactly.
-    for (i, bytes) in per_node_log_bytes.iter().enumerate().skip(1) {
-        assert_eq!(
-            bytes,
-            &per_node_log_bytes[0],
-            "iter {iter}: byte-exact event log divergence between node1 and node{}",
-            i + 1
-        );
+    for (i, log) in per_node_log_bytes.iter().enumerate() {
+        eprintln!("iter {iter} node{}: log {}", i + 1, describe_log_tail(log));
     }
+    let node_dirs: Vec<_> = (0..3)
+        .map(|i| tmp.path().join(format!("node{}", i + 1)).join("data"))
+        .collect();
+    assert_logs_identical(
+        iter,
+        evidence,
+        &node_dirs,
+        &per_node_log_bytes,
+        CONVERGENCE_TIMEOUT,
+    )
+    .await;
 
     // CRASH-03 under replication: every acked write present on EVERY node.
     for rec in &acked {
@@ -560,29 +512,21 @@ async fn post_restart_verify(
             server.kill();
         }
     }
-    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", listen[isolated_leader]))
-        .unwrap()
-        .connect()
+    let context = connect(format!("127.0.0.1:{}", listen[isolated_leader]))
         .await
-        .expect("connect isolated leader");
-    let mut client = EventStoreClient::new(channel);
-    let request = pb::AppendRequest {
-        condition: None,
-        events: vec![pb::TaggedEvent {
-            event: Some(pb::Event {
-                identifier: format!("quorum-loss-{iter}"),
-                timestamp: 1_712_999_999_999,
-                name: "MustNotAck".into(),
-                version: "1.0".into(),
-                payload: b"uncommitted".to_vec(),
-                metadata: Default::default(),
-            }),
-            tags: vec![],
-        }],
-    };
-    let result = tokio::time::timeout(Duration::from_secs(2), client.append(request)).await;
+        .expect("connect isolated leader")
+        .default_context();
+    let events = [event(
+        format!("quorum-loss-{iter}"),
+        1_712_999_999_999,
+        "MustNotAck",
+        "1.0",
+        b"uncommitted".to_vec(),
+        vec![],
+    )];
+    let result = tokio::time::timeout(Duration::from_secs(2), context.append(&events, None)).await;
     assert!(
-        !matches!(result, Ok(Ok(_))),
+        !matches!(result, Ok(Ok(Appended::Ok { .. }))),
         "iter {iter}: isolated leader acknowledged without a quorum"
     );
 

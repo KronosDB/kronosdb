@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// gRPC endpoint, `http://` or `https://`.
+    /// Server endpoint: `http://host:port` (plaintext) or `https://host:port` (TLS).
     pub endpoint: String,
     /// Admin HTTP base URL. Optional: event commands work without it, the
     /// TUI and topology commands need it.

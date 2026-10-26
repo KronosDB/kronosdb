@@ -21,7 +21,7 @@ use kronosdb_messaging::client::ClientRegistry;
 use kronosdb_messaging::manager::MessagingManager;
 
 use crate::config::ServerConfig;
-use crate::platform::service::ClientChannelRegistry;
+use crate::hub::{Hub, ProcessorAction, ProcessorInstruction};
 use crate::processor::ProcessorRegistry;
 
 #[derive(Embed)]
@@ -37,12 +37,14 @@ pub struct AdminState {
     pub messaging: Arc<MessagingManager>,
     pub cluster: Arc<ClusterManager>,
     pub processor_registry: Arc<ProcessorRegistry>,
-    pub channel_registry: Arc<ClientChannelRegistry>,
+    pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
     pub auth: Arc<auth::AuthRuntime>,
-    /// gRPC-plane identities (metrics, settings page).
+    /// Client-plane identities (metrics, settings page).
     pub identities: Arc<crate::auth::Authenticator>,
     pub activity: Arc<activity::ActivityTracker>,
+    /// What the startup hardware checks measured and found.
+    pub hardware: Arc<kronosdb_eventstore::hardware::HardwareReport>,
 }
 
 /// Starts the admin HTTP server on the configured address.
@@ -207,30 +209,18 @@ async fn context_chart_fragment(State(state): State<AdminState>) -> axum::respon
 
 // ── Processor control API ────────────────────────────────────────────
 
-use crate::proto::kronosdb::platform as pb;
-
 async fn processor_action_pause(
     State(state): State<AdminState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> axum::Json<serde_json::Value> {
-    send_processor_instruction(&state, &name, |n| {
-        pb::platform_outbound::Request::PauseEventProcessor(pb::EventProcessorReference {
-            processor_name: n.to_string(),
-        })
-    })
-    .await
+    send_processor_instruction(&state, &name, ProcessorAction::Pause, 0).await
 }
 
 async fn processor_action_start(
     State(state): State<AdminState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> axum::Json<serde_json::Value> {
-    send_processor_instruction(&state, &name, |n| {
-        pb::platform_outbound::Request::StartEventProcessor(pb::EventProcessorReference {
-            processor_name: n.to_string(),
-        })
-    })
-    .await
+    send_processor_instruction(&state, &name, ProcessorAction::Start, 0).await
 }
 
 async fn processor_action_split(
@@ -248,15 +238,7 @@ async fn processor_action_split(
         .map(|s| s.segment_id)
         .unwrap_or(0);
 
-    send_processor_instruction(&state, &name, |n| {
-        pb::platform_outbound::Request::SplitEventProcessorSegment(
-            pb::EventProcessorSegmentReference {
-                processor_name: n.to_string(),
-                segment_identifier: segment_id,
-            },
-        )
-    })
-    .await
+    send_processor_instruction(&state, &name, ProcessorAction::SplitSegment, segment_id).await
 }
 
 async fn processor_action_merge(
@@ -273,22 +255,15 @@ async fn processor_action_merge(
         .map(|s| s.segment_id)
         .unwrap_or(0);
 
-    send_processor_instruction(&state, &name, |n| {
-        pb::platform_outbound::Request::MergeEventProcessorSegment(
-            pb::EventProcessorSegmentReference {
-                processor_name: n.to_string(),
-                segment_identifier: segment_id,
-            },
-        )
-    })
-    .await
+    send_processor_instruction(&state, &name, ProcessorAction::MergeSegment, segment_id).await
 }
 
 /// Sends a processor instruction to all client instances running the named processor.
 async fn send_processor_instruction(
     state: &AdminState,
     processor_name: &str,
-    make_request: impl Fn(&str) -> pb::platform_outbound::Request,
+    action: ProcessorAction,
+    segment: u32,
 ) -> axum::Json<serde_json::Value> {
     let entries = state.processor_registry.list();
     let client_ids: Vec<String> = entries
@@ -303,14 +278,19 @@ async fn send_processor_instruction(
         );
     }
 
-    let instruction_id = uuid::Uuid::new_v4().to_string();
-    let request = make_request(processor_name);
+    let instruction = ProcessorInstruction {
+        instruction_id: uuid::Uuid::new_v4().to_string(),
+        action,
+        processor_name: processor_name.to_string(),
+        segment,
+    };
 
     let mut sent = 0;
     for client_id in &client_ids {
         if state
-            .channel_registry
-            .send_instruction(client_id, instruction_id.clone(), request.clone())
+            .hub
+            .clients
+            .send_instruction(client_id, instruction.clone())
             .await
         {
             sent += 1;

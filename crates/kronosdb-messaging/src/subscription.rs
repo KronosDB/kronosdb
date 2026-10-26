@@ -365,16 +365,24 @@ impl SubscriptionRegistry {
     /// Removes all subscriptions for a disconnected client
     /// (both as subscriber and as handler).
     pub fn remove_client(&self, client_id: &ClientId) {
-        let mut active = self.active.write();
-
         // Remove as subscriber — the subscriber is gone, nothing to notify.
-        active.retain(|_, sub| &sub.client_id != client_id);
+        self.active
+            .write()
+            .retain(|_, sub| &sub.client_id != client_id);
 
-        // Remove subscriptions whose HANDLER disconnected, telling each
-        // subscriber the stream ended abnormally — a bare channel close
-        // would look like normal completion.
-        active.retain(|sub_id, sub| {
-            if &sub.handler_client_id != client_id {
+        // Remove as handler.
+        self.fail_handler_subscriptions(client_id);
+        let mut handlers = self.handlers.write();
+        handlers.remove_client(client_id);
+    }
+
+    /// Ends the subscriptions `handler` serves, telling each subscriber the
+    /// stream ended abnormally — a bare channel close would look like normal
+    /// completion. For a handler whose stream is gone while its client may
+    /// still be a subscriber itself.
+    pub fn fail_handler_subscriptions(&self, handler: &ClientId) {
+        self.active.write().retain(|sub_id, sub| {
+            if &sub.handler_client_id != handler {
                 return true;
             }
             let _ = sub.update_tx.try_send(SubscriptionUpdate {
@@ -392,12 +400,6 @@ impl SubscriptionRegistry {
             });
             false
         });
-
-        drop(active);
-
-        // Remove as handler.
-        let mut handlers = self.handlers.write();
-        handlers.remove_client(client_id);
     }
 
     /// Returns the number of active subscriptions.
@@ -679,6 +681,46 @@ mod tests {
             Some(crate::error_codes::CONNECTION_TO_HANDLER_LOST)
         );
         assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn a_handler_whose_stream_is_gone_fails_its_subscriptions_but_not_those_it_opened() {
+        let registry = SubscriptionRegistry::new();
+        for handler in ["handler-1", "subscriber"] {
+            registry.subscribe_handler(
+                "GetOrderCount".into(),
+                client(handler),
+                component("order-service"),
+            );
+            registry.handlers.read().grant_permits(&client(handler), 10);
+        }
+        // Both subscriptions are opened by the client "subscriber", which is
+        // also a handler: sub-1 is served by handler-1, sub-2 by itself.
+        let (_p1, mut served_elsewhere) = registry
+            .open_to(
+                make_subscription("sub-1", "GetOrderCount"),
+                &client("handler-1"),
+            )
+            .unwrap();
+        let (_p2, mut served_by_it) = registry
+            .open_to(
+                make_subscription("sub-2", "GetOrderCount"),
+                &client("subscriber"),
+            )
+            .unwrap();
+
+        // The "subscriber" client's handler stream ends: sub-2, which it
+        // served, fails; sub-1, which it only opened, stays.
+        registry.fail_handler_subscriptions(&client("subscriber"));
+
+        let failed = served_by_it.try_recv().unwrap();
+        assert!(failed.complete);
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some(crate::error_codes::CONNECTION_TO_HANDLER_LOST)
+        );
+        assert!(served_elsewhere.try_recv().is_err());
+        assert_eq!(registry.active_count(), 1);
     }
 
     #[test]

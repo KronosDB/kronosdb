@@ -1,0 +1,11 @@
+{
+  "frame": "SubscribeCommand",
+  "stream": 45,
+  "flags": 0,
+  "body": {
+    "instruction_id": "i-3",
+    "command": "com.acme.PlaceOrder",
+    "load_factor": 100
+  },
+  "description": ""
+}

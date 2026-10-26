@@ -1,0 +1,11 @@
+{
+  "frame": "TailEpochChange",
+  "stream": 69,
+  "flags": 0,
+  "body": {
+    "epoch": "8",
+    "leader_id": "3",
+    "start_position": "1048579"
+  },
+  "description": ""
+}

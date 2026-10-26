@@ -1,0 +1,10 @@
+{
+  "frame": "RequestFailed",
+  "stream": 3,
+  "flags": 1,
+  "body": {
+    "code": "permission_denied",
+    "message": "principal token:ci needs the write role for context «orders-eu»"
+  },
+  "description": "A failed request; the message is not ASCII."
+}

@@ -1,0 +1,10 @@
+{
+  "frame": "Reauthenticate",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "credential_kind": "jwt",
+    "credential": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ3b3JrZXIifQ.c2ln"
+  },
+  "description": "A fresh JWT before the old one expires."
+}

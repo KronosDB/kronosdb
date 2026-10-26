@@ -8,21 +8,14 @@
 //! up, promotion must succeed, both nodes must converge on byte-identical
 //! segment files, and appends must keep working under the 2-of-2 quorum.
 
-#![allow(clippy::result_large_err)]
-
 mod crash_harness;
-use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
-use pb::Tag;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tonic::transport::Channel;
-
-use pb::event_store_client::EventStoreClient;
 
 const SEGMENT_SIZE: u64 = 128 * 1024; // small segments => many seals quickly
 const MIN_SEALED_SEGMENTS: usize = 6;
@@ -40,6 +33,9 @@ async fn cold_join_catchup_gate_and_promotion() {
 
 async fn run() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Before the servers: a failure copies their data dirs and logs out of
+    // the temp dir after they are killed.
+    let evidence = EvidenceGuard::new("cold_join", 0, tmp.path());
     let acks_path = tmp.path().join("acks.log");
     let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
     let (listen1, listen2, admin1, admin2) = (ports[0], ports[1], ports[2], ports[3]);
@@ -67,7 +63,7 @@ async fn run() {
     let ack_log = Arc::new(AckLog::create(acks_path.clone()).expect("ack log"));
     let (stop_tx, stop_rx) = watch::channel(false);
     let writer = tokio::spawn(writer_loop(
-        format!("http://127.0.0.1:{listen1}"),
+        format!("127.0.0.1:{listen1}"),
         Arc::clone(&ack_log),
         stop_rx,
     ));
@@ -82,8 +78,10 @@ async fn run() {
         }
         assert!(
             Instant::now() < seal_deadline,
-            "node 1 sealed only {} segments in 60s",
-            count_segments(&data1)
+            "node 1 sealed only {} segments in 60s ({} appends acknowledged, node 1 {})",
+            count_segments(&data1),
+            ack_log.len(),
+            srv1.state()
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -184,12 +182,12 @@ async fn run() {
     drop(ack_log);
 
     // --- Both nodes must converge on the same head.
-    let mut client1 = connect(listen1).await;
-    let mut client2 = connect(listen2).await;
+    let client1 = connect_port(listen1).await;
+    let client2 = connect_port(listen2).await;
     let start = Instant::now();
     loop {
-        let h1 = head(&mut client1).await;
-        let h2 = head(&mut client2).await;
+        let h1 = client1.head().await.expect("get_head");
+        let h2 = client2.head().await.expect("get_head");
         if h1 == h2 && h1 > 0 {
             eprintln!(
                 "cold_join: converged at head={h1} after {:?}",
@@ -235,14 +233,16 @@ async fn run() {
 
     let acked = read_ack_sidecar(&acks_path).expect("read acks");
     assert_eq!(acked.len(), total_acks, "ack sidecar drift");
-    let events2 = source_all(&mut client2).await;
+    let events2 = source_all(&client2).await;
     for rec in &acked {
-        let payload = events2.get(&rec.server_sequence).unwrap_or_else(|| {
-            panic!(
-                "acked seq {} (agg {}) missing on joined node",
-                rec.server_sequence, rec.aggregate_id
-            )
-        });
+        let payload = events2
+            .get(&(rec.server_sequence as u64))
+            .unwrap_or_else(|| {
+                panic!(
+                    "acked seq {} (agg {}) missing on joined node",
+                    rec.server_sequence, rec.aggregate_id
+                )
+            });
         assert_eq!(
             hash_payload(payload),
             rec.payload_hash,
@@ -259,18 +259,19 @@ async fn run() {
     srv1.kill();
     let mut srv2 = srv2;
     srv2.kill();
+    evidence.finish();
 }
 
 async fn writer_loop(addr: String, ack_log: Arc<AckLog>, mut stop_rx: watch::Receiver<bool>) {
-    let mut client: Option<EventStoreClient<Channel>> = None;
+    let mut context: Option<Context> = None;
     let mut batch_seq: u64 = 0;
     loop {
         if *stop_rx.borrow_and_update() {
             return;
         }
-        if client.is_none() {
-            match Channel::from_shared(addr.clone()).unwrap().connect().await {
-                Ok(ch) => client = Some(EventStoreClient::new(ch)),
+        if context.is_none() {
+            match connect(&addr).await {
+                Ok(client) => context = Some(client.default_context()),
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -285,46 +286,36 @@ async fn writer_loop(addr: String, ack_log: Arc<AckLog>, mut stop_rx: watch::Rec
             // Padding inflates the payload so segments seal quickly.
             let payload = format!("cj-b{batch_seq}-i{i}-{agg_id}-{}", "x".repeat(160)).into_bytes();
             hashes.push((agg_id.clone(), hash_payload(&payload)));
-            events.push(pb::TaggedEvent {
-                event: Some(pb::Event {
-                    identifier: format!("evt-{batch_seq}-{i}"),
-                    timestamp: 1_712_000_000_000 + batch_seq as i64,
-                    name: "Incremented".into(),
-                    version: "1.0".into(),
-                    payload,
-                    metadata: Default::default(),
-                }),
-                tags: vec![Tag {
-                    key: b"agg".to_vec(),
-                    value: agg_id.into_bytes(),
-                }],
-            });
+            events.push(event(
+                format!("evt-{batch_seq}-{i}"),
+                1_712_000_000_000 + batch_seq as i64,
+                "Incremented",
+                "1.0",
+                payload,
+                vec![(b"agg".to_vec(), agg_id.into_bytes())],
+            ));
         }
-        let request = pb::AppendRequest {
-            condition: None,
-            events,
-        };
         let result = tokio::select! {
-            res = client.as_mut().unwrap().append(request) => res,
+            res = context.as_ref().unwrap().append(&events, None) => res,
             _ = stop_rx.changed() => return,
         };
         match result {
-            Ok(response) => {
-                let response = response.into_inner();
-                for (i, (agg_id, hash)) in hashes.into_iter().enumerate() {
-                    ack_log
-                        .record(AckRecord {
-                            aggregate_id: agg_id,
-                            client_sequence: batch_seq * EVENTS_PER_APPEND as u64 + i as u64,
-                            payload_hash: hash,
-                            server_sequence: response.first_sequence + i as i64,
-                        })
-                        .expect("ack sidecar");
-                }
+            Ok(Appended::Ok { first_position, .. }) => {
+                let recs = hashes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (agg_id, hash))| AckRecord {
+                        aggregate_id: agg_id,
+                        client_sequence: batch_seq * EVENTS_PER_APPEND as u64 + i as u64,
+                        payload_hash: hash,
+                        server_sequence: first_position as i64 + i as i64,
+                    })
+                    .collect();
+                ack_log.record_batch(recs).expect("ack sidecar");
                 batch_seq += 1;
             }
-            Err(_) => {
-                client = None;
+            Ok(Appended::Conflict { .. }) | Err(_) => {
+                context = None;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -357,58 +348,20 @@ async fn wait_for_tcp(addr: std::net::SocketAddr, timeout: Duration) {
     }
 }
 
-async fn connect(port: u16) -> EventStoreClient<Channel> {
-    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
-        .unwrap()
-        .connect()
+async fn connect_port(port: u16) -> Context {
+    connect(format!("127.0.0.1:{port}"))
         .await
-        .expect("connect");
-    EventStoreClient::new(channel)
+        .expect("connect")
+        .default_context()
 }
 
-async fn head(client: &mut EventStoreClient<Channel>) -> i64 {
-    client
-        .get_head(pb::GetHeadRequest {})
+async fn source_all(context: &Context) -> HashMap<u64, Vec<u8>> {
+    let criteria = tag_criteria("agg", (0..8).map(|a| format!("agg-{a}")));
+    tokio::time::timeout(Duration::from_secs(15), read_events(context, &criteria))
         .await
-        .expect("get_head")
-        .into_inner()
-        .sequence
-}
-
-async fn source_all(client: &mut EventStoreClient<Channel>) -> HashMap<i64, Vec<u8>> {
-    let criteria: Vec<pb::Criterion> = (0..8)
-        .map(|a| pb::Criterion {
-            names: vec![],
-            tags: vec![Tag {
-                key: b"agg".to_vec(),
-                value: format!("agg-{a}").into_bytes(),
-            }],
-        })
-        .collect();
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(15),
-        client.source(pb::SourceRequest {
-            from_sequence: 0,
-            criteria,
-            batch_size: 0,
-        }),
-    )
-    .await
-    .expect("source rpc open timeout")
-    .expect("source")
-    .into_inner();
-    let mut events = HashMap::new();
-    loop {
-        let msg = tokio::time::timeout(Duration::from_secs(15), stream.message())
-            .await
-            .expect("source stream timeout")
-            .expect("source stream");
-        let Some(resp) = msg else { break };
-        if let Some(batch) = resp.batch {
-            for ev in batch.events {
-                events.insert(ev.sequence, ev.event.map(|e| e.payload).unwrap_or_default());
-            }
-        }
-    }
-    events
+        .expect("source timeout")
+        .expect("source")
+        .into_iter()
+        .map(|(position, _, payload)| (position, payload))
+        .collect()
 }

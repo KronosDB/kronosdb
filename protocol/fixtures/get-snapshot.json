@@ -1,0 +1,10 @@
+{
+  "frame": "GetSnapshot",
+  "stream": 25,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "key": "636f757273653a63732d313031"
+  },
+  "description": ""
+}

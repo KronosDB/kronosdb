@@ -1,0 +1,10 @@
+{
+  "frame": "GetTags",
+  "stream": 19,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "position": "1048576"
+  },
+  "description": ""
+}

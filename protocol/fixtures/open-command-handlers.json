@@ -1,0 +1,11 @@
+{
+  "frame": "OpenCommandHandlers",
+  "stream": 45,
+  "flags": 0,
+  "body": {
+    "bus": 1,
+    "client_id": "billing-1@host-b",
+    "component_name": "billing"
+  },
+  "description": ""
+}

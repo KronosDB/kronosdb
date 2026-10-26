@@ -110,6 +110,8 @@ pub struct HandlerRoutingTable {
     /// Bumped on every mutation. Readers cache derived structures (rings)
     /// keyed by this.
     generation: AtomicU64,
+    /// Woken on every mutation, for readers waiting for rows to appear.
+    changed: tokio::sync::Notify,
 }
 
 impl HandlerRoutingTable {
@@ -124,6 +126,13 @@ impl HandlerRoutingTable {
 
     fn bump(&self) {
         self.generation.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    /// Resolves after the next mutation. Enable the future (or poll it once)
+    /// before looking at the table, so a change in between is not missed.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
     }
 
     /// Applies a registration. Replaces any existing row for the same

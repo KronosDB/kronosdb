@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
+use crate::hub::ProcessorReport;
+
 /// In-memory registry of event processor state reported by connected clients.
 ///
-/// Clients periodically send `EventProcessorInfo` on the platform stream.
+/// Clients periodically report their processors on the platform stream.
 /// This registry stores the latest report per (processor_name, client_id) so
 /// the admin console can display processor status, lag, and segment details.
 pub struct ProcessorRegistry {
@@ -28,10 +30,10 @@ pub struct ProcessorEntry {
 /// Status of a single segment within a streaming event processor.
 #[derive(Debug, Clone)]
 pub struct SegmentInfo {
-    pub segment_id: i32,
+    pub segment_id: u32,
     pub caught_up: bool,
     pub replaying: bool,
-    pub one_part_of: i32,
+    pub one_part_of: u32,
     pub token_position: i64,
     pub error_state: String,
 }
@@ -61,38 +63,32 @@ impl ProcessorRegistry {
     }
 
     /// Upsert a processor report from a client.
-    pub fn report(
-        &self,
-        client_id: &str,
-        info: &crate::proto::kronosdb::platform::EventProcessorInfo,
-    ) {
-        let segments: Vec<SegmentInfo> = info
-            .segment_status
-            .iter()
+    pub fn report(&self, client_id: &str, report: ProcessorReport) {
+        let segments: Vec<SegmentInfo> = report
+            .segments
+            .into_iter()
             .map(|s| SegmentInfo {
                 segment_id: s.segment_id,
                 caught_up: s.caught_up,
                 replaying: s.replaying,
                 one_part_of: s.one_part_of,
                 token_position: s.token_position,
-                error_state: s.error_state.clone(),
+                error_state: s.error_state,
             })
             .collect();
 
+        let key = (report.processor_name.clone(), client_id.to_string());
         let entry = ProcessorEntry {
-            processor_name: info.processor_name.clone(),
-            mode: info.mode.clone(),
+            processor_name: report.processor_name,
+            mode: report.mode,
             client_id: client_id.to_string(),
-            running: info.running,
-            error: info.error,
-            is_streaming: info.is_streaming_processor,
-            token_store_identifier: info.token_store_identifier.clone(),
+            running: report.running,
+            error: report.error,
+            is_streaming: report.streaming,
+            token_store_identifier: report.token_store_identifier,
             segments,
         };
-
-        let key = (info.processor_name.clone(), client_id.to_string());
-        let mut entries = self.entries.write();
-        entries.insert(key, entry);
+        self.entries.write().insert(key, entry);
     }
 
     /// Remove all entries for a disconnected client.
@@ -150,18 +146,15 @@ impl ProcessorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::kronosdb::platform::{
-        EventProcessorInfo, event_processor_info::SegmentStatus,
-    };
+    use crate::hub::SegmentReport;
 
-    fn make_info(name: &str, running: bool, position: i64) -> EventProcessorInfo {
-        EventProcessorInfo {
+    fn make_info(name: &str, running: bool, position: i64) -> ProcessorReport {
+        ProcessorReport {
             processor_name: name.to_string(),
             mode: "Tracking".to_string(),
-            active_threads: 1,
             running,
             error: false,
-            segment_status: vec![SegmentStatus {
+            segments: vec![SegmentReport {
                 segment_id: 0,
                 caught_up: position >= 100,
                 replaying: false,
@@ -169,17 +162,16 @@ mod tests {
                 token_position: position,
                 error_state: String::new(),
             }],
-            available_threads: 0,
             token_store_identifier: "default".to_string(),
-            is_streaming_processor: true,
+            streaming: true,
         }
     }
 
     #[test]
     fn report_and_list() {
         let registry = ProcessorRegistry::new();
-        registry.report("client-1", &make_info("OrderProjection", true, 50));
-        registry.report("client-2", &make_info("OrderProjection", true, 45));
+        registry.report("client-1", make_info("OrderProjection", true, 50));
+        registry.report("client-2", make_info("OrderProjection", true, 45));
 
         let entries = registry.list();
         assert_eq!(entries.len(), 2);
@@ -193,8 +185,8 @@ mod tests {
     #[test]
     fn remove_client() {
         let registry = ProcessorRegistry::new();
-        registry.report("client-1", &make_info("Proc1", true, 10));
-        registry.report("client-2", &make_info("Proc1", true, 20));
+        registry.report("client-1", make_info("Proc1", true, 10));
+        registry.report("client-2", make_info("Proc1", true, 20));
 
         registry.remove_client("client-1");
         assert_eq!(registry.list().len(), 1);
@@ -204,8 +196,8 @@ mod tests {
     #[test]
     fn upsert_overwrites() {
         let registry = ProcessorRegistry::new();
-        registry.report("client-1", &make_info("Proc1", true, 10));
-        registry.report("client-1", &make_info("Proc1", true, 50));
+        registry.report("client-1", make_info("Proc1", true, 10));
+        registry.report("client-1", make_info("Proc1", true, 50));
 
         let entries = registry.list();
         assert_eq!(entries.len(), 1);

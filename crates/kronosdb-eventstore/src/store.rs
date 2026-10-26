@@ -5,33 +5,37 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
 
 use crate::api::EventStore;
-use crate::append::{AppendCondition, AppendRequest, AppendResponse};
-use crate::cache::IndexCache;
+use crate::append::{AppendCondition, AppendRequest, AppendResponse, RecordAppend, RecordBatch};
+use crate::cache::{BloomProbe, IndexCache};
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{Position, SequencedEvent, StoredEvent, Tag};
-use crate::stream::{CommitNotification, EventStream};
+use crate::stream::EventStream;
+use crate::subscription::CommitFeed;
 use crate::system::Visibility;
 
+use crate::inline_breaker::{InlineBreaker, Verdict};
 use crate::metrics::{StoreMetrics, Timer};
 use crate::replication::dispatcher::{WaveDescriptor, WavePublisher, WaveSlice};
 use crate::replication::watermark::WatermarkState;
-use crate::segment::reader::SegmentReader;
+use crate::segment::blocks::ReadMode;
+use crate::segment::reader::{RecordReader, SegmentReader};
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::writer::{PendingSeal, SegmentWriter, sync_dir, sync_file};
-use crate::segment::{self, DEFAULT_SEGMENT_SIZE};
+use crate::segment::{self, DEFAULT_SEGMENT_SIZE, format};
 
-/// Default capacity for the commit notification channel.
-const COMMIT_CHANNEL_CAPACITY: usize = 256;
+/// Default cap on the number of segment indices cached: none, the byte
+/// budget decides (`StoreOptions::index_cache_bytes`).
+pub const DEFAULT_INDEX_CACHE_SIZE: usize = 0;
 
-/// Default number of segment indices to cache.
-pub const DEFAULT_INDEX_CACHE_SIZE: usize = 50;
+/// Default cap on the number of bloom filters cached: none, the byte budget
+/// decides (`StoreOptions::bloom_cache_bytes`).
+pub const DEFAULT_BLOOM_CACHE_SIZE: usize = 0;
 
-/// Default number of bloom filters to cache.
-pub const DEFAULT_BLOOM_CACHE_SIZE: usize = 200;
+/// The active segment's cached mapping, keyed by its base position.
+type ActiveMmap = Arc<parking_lot::Mutex<Option<(u64, Arc<memmap2::Mmap>)>>>;
 
 /// Cached list of segment bases, avoiding readdir and stat syscalls on every query.
 ///
@@ -49,6 +53,169 @@ struct SegmentList {
 impl SegmentList {
     fn is_sealed(&self, index: usize) -> bool {
         index < self.sealed_count
+    }
+}
+
+/// Read access to the committed log that owns its handles, so a thread that
+/// outlives any one borrow of the engine (the subscription dispatcher) can
+/// read like the engine does. Shares the engine's segment list, index cache
+/// and active segment: nothing here is a copy.
+#[derive(Clone)]
+pub(crate) struct LogView {
+    dir: PathBuf,
+    segments: Arc<RwLock<SegmentList>>,
+    cache: Arc<IndexCache>,
+    active_index: Arc<parking_lot::RwLock<SegmentIndex>>,
+    active_mmap: ActiveMmap,
+    max_segment_size: u64,
+    watermark: Arc<AtomicU64>,
+}
+
+impl LogView {
+    /// The watermark: positions below it are committed and visible.
+    pub(crate) fn watermark(&self) -> u64 {
+        self.watermark.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn watermark_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.watermark)
+    }
+
+    /// Reader over the active segment, backed by a cached mmap. The mapping
+    /// is created once per active segment and retired when rotation changes
+    /// the base position.
+    ///
+    /// Reusing one mapping for the segment's whole lifetime is only sound
+    /// while the file is already its full length, because a mapping does not
+    /// grow with the file behind it. That is the normal case — segment files
+    /// are grown up front — but it is a property of the file, not something
+    /// to assume: a store carried over from a release that tolerated a failed
+    /// preallocation, or a segment just rotated away from and trimmed to its
+    /// data length, maps short. Those reads remap instead of reporting the
+    /// bytes past the mapping as corruption.
+    fn active_segment_reader(&self, base: u64, path: &Path) -> Result<SegmentReader, Error> {
+        {
+            let cached = self.active_mmap.lock();
+            if let Some((cached_base, mmap)) = cached.as_ref()
+                && *cached_base == base
+                && mmap.len() as u64 >= self.max_segment_size
+            {
+                return SegmentReader::from_shared_mmap(Arc::clone(mmap));
+            }
+        }
+        let file = std::fs::File::open(path)?;
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+        *self.active_mmap.lock() = Some((base, Arc::clone(&mmap)));
+        SegmentReader::from_shared_mmap(mmap)
+    }
+
+    /// The index that answers for segment `base`: the active segment's live
+    /// index when it is still active, otherwise the sealed index from the
+    /// cache (pinned if the seal is in flight, loaded from `.idx` if not).
+    /// A segment-list snapshot may say "active" about a segment that has
+    /// just been rotated away from; this resolves it correctly either way.
+    fn index_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
+        let active = self.active_index.read();
+        if active.base_position() == base {
+            return Ok(IndexRef::Active(active));
+        }
+        drop(active);
+        Ok(IndexRef::Sealed(self.cache.get_index(seg_path, base)?))
+    }
+
+    /// `index_for` for a read that needs only where positions live, or takes
+    /// every event of the segment: a sealed segment answers from its
+    /// position→offset table alone, without loading its tag bitmaps. The
+    /// result must not be asked about tags or event types.
+    fn offsets_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
+        let active = self.active_index.read();
+        if active.base_position() == base {
+            return Ok(IndexRef::Active(active));
+        }
+        drop(active);
+        Ok(IndexRef::Sealed(self.cache.get_offsets(seg_path, base)?))
+    }
+
+    /// The reader matching `index_for`'s answer.
+    fn reader_for(
+        &self,
+        index: &IndexRef<'_>,
+        base: u64,
+        seg_path: &Path,
+    ) -> Result<SegmentReader, Error> {
+        match index {
+            IndexRef::Active(_) => self.active_segment_reader(base, seg_path),
+            IndexRef::Sealed(_) => {
+                SegmentReader::from_shared_mmap(self.cache.get_mmap(seg_path, base)?)
+            }
+        }
+    }
+
+    /// Calls `visit` with the position, event type name, tags and stored
+    /// record of every event in `[from, to)`, in log order, reading the log
+    /// sequentially: one index lookup per segment to find where `from`
+    /// starts, then a walk. `to` must not pass the watermark, which is what
+    /// makes every byte read final.
+    ///
+    /// `visit` returns whether to go on; the result is the position after the
+    /// last event visited, which is `to` unless the visitor stopped early.
+    pub(crate) fn visit_events(
+        &self,
+        from: u64,
+        to: u64,
+        mut visit: impl FnMut(
+            u64,
+            &[u8],
+            format::Tags<'_>,
+            &crate::segment::reader::StoredRecord<'_>,
+        ) -> bool,
+    ) -> Result<u64, Error> {
+        let mut next = from;
+        while next < to {
+            let (base, end) = {
+                let list = self.segments.read();
+                let at = list.bases.partition_point(|&b| b <= next);
+                let Some(i) = at.checked_sub(1) else {
+                    return Err(Error::PositionNotFound { position: next });
+                };
+                (
+                    list.bases[i],
+                    list.bases.get(i + 1).copied().unwrap_or(u64::MAX),
+                )
+            };
+            let path = segment::segment_path(&self.dir, base);
+            let (offset, reader) = {
+                let index = self.offsets_for(base, &path)?;
+                let offset = index
+                    .get_offset(next)
+                    .ok_or(Error::PositionNotFound { position: next })?;
+                (offset, self.reader_for(&index, base, &path)?)
+            };
+            let stop = to.min(end);
+            for record in reader.events_from(offset as usize, Position(stop)) {
+                let (position, record) = record?;
+                if position != next {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "segment {base} holds position {position} where {next} was expected"
+                        ),
+                    });
+                }
+                let scan = format::scan(record.body)?;
+                next += 1;
+                if !visit(position, scan.name, scan.tags(), &record) {
+                    return Ok(next);
+                }
+            }
+            if next < stop {
+                return Err(Error::Internal {
+                    message: format!(
+                        "segment {base} ends at position {next}, below the committed {stop}"
+                    ),
+                });
+            }
+        }
+        Ok(next)
     }
 }
 
@@ -121,13 +288,30 @@ impl SyncState {
     /// that's what orders it against the sync thread's barrier (which resets
     /// the pending count under the same lock, so 0→1 happens once per wave).
     fn mark_pending(&self) -> u64 {
-        let first_of_wave = self.pending_writes.fetch_add(1, Ordering::Relaxed) == 0;
-        let wave = self.wave.load(Ordering::Acquire);
+        let (wave, first_of_wave) = self.register_write();
         if first_of_wave {
-            let _wake = self.wake.lock().unwrap();
-            self.wake_cv.notify_one();
+            self.wake_sync_thread();
         }
         wave
+    }
+
+    /// The registration half of `mark_pending`, for a caller that wakes the
+    /// sync thread itself once it has let go of the writer lock: the wake is
+    /// a futex syscall, and every other appender waits on that lock.
+    /// Returns the wave and whether this write opened it — the caller of the
+    /// first write of a wave owes the wake.
+    fn register_write(&self) -> (u64, bool) {
+        let first_of_wave = self.pending_writes.fetch_add(1, Ordering::Relaxed) == 0;
+        (self.wave.load(Ordering::Acquire), first_of_wave)
+    }
+
+    /// Wakes the sync thread. Safe to run after the writer lock is released:
+    /// the thread re-checks for pending writes under the same mutex, so a
+    /// wake that lands late or after it has already synced the write is a
+    /// no-op round.
+    fn wake_sync_thread(&self) {
+        let _wake = self.wake.lock().unwrap();
+        self.wake_cv.notify_one();
     }
 
     /// Latches shutdown and wakes the sync thread so it runs its final fsync
@@ -313,7 +497,7 @@ fn spawn_sync_thread(
     node_id: crate::replication::watermark::NodeId,
     replication: Arc<WavePublisher>,
     watermark: Arc<WatermarkState>,
-    commit_tx: broadcast::Sender<CommitNotification>,
+    feed: Arc<CommitFeed>,
     coalesce_window: Duration,
     cache: Arc<IndexCache>,
     seals: Arc<SealQueue>,
@@ -420,7 +604,8 @@ fn spawn_sync_thread(
                                 let wm = watermark
                                     .advance(node_id, watermark.epoch(), durable)
                                     .unwrap_or_else(|| watermark.get());
-                                let _ = commit_tx.send(CommitNotification { watermark: wm });
+                                let _ = wm;
+                                feed.committed();
                             }
                             // A rotation in this wave: the sealed file's last
                             // records and the new file's directory entry must
@@ -445,9 +630,11 @@ fn spawn_sync_thread(
                             // quorum of one this IS the watermark bump that
                             // releases ack waiters; under replication
                             // follower cursors join the math.
-                            if let Some(wm) = watermark.advance(node_id, watermark.epoch(), durable)
+                            if watermark
+                                .advance(node_id, watermark.epoch(), durable)
+                                .is_some()
                             {
-                                let _ = commit_tx.send(CommitNotification { watermark: wm });
+                                feed.committed();
                             }
                         }
                         Err(e) => {
@@ -582,15 +769,226 @@ impl StagedAppend {
     }
 }
 
+/// Applies the ack gate's verdict to a staged outcome (see `append_finalize`).
+fn finalize_append(
+    metrics: &StoreMetrics,
+    staged: StagedAppend,
+    wait: Result<(), Error>,
+) -> Result<AppendResponse, Error> {
+    wait?;
+    match staged.outcome {
+        Ok(response) => {
+            metrics.record_append(response.count, staged.timer.elapsed_us());
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Which places an append may be staged in, tried in order: inline on the
+/// async worker, the staging thread, the blocking pool (always available).
+/// Production uses all of them; tests narrow it to exercise each alone.
+#[derive(Clone, Copy)]
+struct Routes {
+    inline: bool,
+    thread: bool,
+}
+
+impl Routes {
+    const ALL: Routes = Routes {
+        inline: true,
+        thread: true,
+    };
+}
+
+/// What a non-blocking staging attempt came to.
+enum Staging {
+    Done(Result<StagedAppend, Error>),
+    /// It would have had to block; the request, untouched, for the pool.
+    NeedsPool(Prepared),
+}
+
+/// An append ready to stage: checked, and its events as records. Everything
+/// after this point is one path, whatever the append arrived as.
+struct Prepared {
+    condition: Option<AppendCondition>,
+    batch: RecordBatch,
+}
+
+/// The pre-lock half's verdict.
+enum Pre {
+    /// A sealed segment holds a conflicting event.
+    Conflict(Position),
+    /// No conflict in the sealed segments; this many were covered.
+    Checked(usize),
+}
+
+enum SealedScan {
+    Conflict(Position),
+    Clear,
+    NeedsDisk,
+}
+
+/// What the staging thread answers a queued append with.
+enum Settled {
+    /// Staged, committed and finalized: nothing left for the caller to do.
+    Final(Result<AppendResponse, Error>),
+    /// The thread could not stage it without reading the disk; the request,
+    /// untouched, for the blocking pool.
+    Pool(Prepared),
+}
+
+/// One append queued for the staging thread.
+struct StageJob {
+    engine: Arc<EventStoreEngine>,
+    prepared: Prepared,
+    reply: tokio::sync::oneshot::Sender<Settled>,
+}
+
+/// Most appends one pass of the staging thread takes before it answers them.
+const STAGE_DRAIN_MAX: usize = 64;
+
+/// What one hold of the writer lock takes on while it stages a group: past
+/// any of these the group is written and the lock let go, so the appenders
+/// and the wave barrier waiting on it are not kept waiting on a long queue.
+const GROUP_MAX_APPENDS: usize = 32;
+const GROUP_MAX_EVENTS: u32 = 256;
+const GROUP_MAX_BYTES: usize = 64 * 1024;
+
+/// Starts a context's staging thread: it takes the appends that found the
+/// writer lock busy, stages whatever has queued in arrival order under as
+/// few holds of the lock as it can, opens the written-ack gate once for the
+/// group, and gives each caller its final answer when the watermark reaches
+/// its place.
+fn spawn_stage_thread() -> std::sync::mpsc::Sender<StageJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<StageJob>();
+    std::thread::Builder::new()
+        .name("kronosdb-stage".into())
+        .spawn(move || {
+            let mut jobs: Vec<StageJob> = Vec::with_capacity(STAGE_DRAIN_MAX);
+            let mut staged: Vec<(tokio::sync::oneshot::Sender<Settled>, StagedAppend)> =
+                Vec::with_capacity(STAGE_DRAIN_MAX);
+            while let Ok(first) = rx.recv() {
+                jobs.push(first);
+                while jobs.len() < STAGE_DRAIN_MAX {
+                    match rx.try_recv() {
+                        Ok(job) => jobs.push(job),
+                        Err(_) => break,
+                    }
+                }
+                // One thread per engine, so a pass is one engine's.
+                let engine = Arc::clone(&jobs[0].engine);
+                let (appends, replies): (Vec<_>, Vec<_>) =
+                    jobs.drain(..).map(|job| (job.prepared, job.reply)).unzip();
+                let mut release: Option<u64> = None;
+                for (reply, staging) in replies.into_iter().zip(engine.stage_group(appends)) {
+                    match staging {
+                        Staging::Done(Ok(append)) => {
+                            release = release.max(append.wait_pos());
+                            staged.push((reply, append));
+                        }
+                        Staging::Done(Err(error)) => {
+                            let _ = reply.send(Settled::Final(Err(error)));
+                        }
+                        Staging::NeedsPool(prepared) => {
+                            let _ = reply.send(Settled::Pool(prepared));
+                        }
+                    }
+                }
+                // One ack-gate advance covers the whole group; then each
+                // append is answered when the watermark reaches it.
+                engine.release_written(release);
+                for (reply, append) in staged.drain(..) {
+                    engine.settle_when_committed(append, reply);
+                }
+            }
+        })
+        .expect("spawn append staging thread");
+    tx
+}
+
+/// Checks a client's events and condition against the `$` namespace. A client
+/// must not be able to forge an event the server claims to have written about
+/// itself.
+fn prepare_client_records(request: RecordAppend) -> Result<Prepared, Error> {
+    request.events.check_client()?;
+    if let Some(condition) = &request.condition {
+        crate::system::validate_client_condition(&condition.criteria)?;
+    }
+    Ok(Prepared {
+        condition: request.condition,
+        batch: request.events,
+    })
+}
+
+/// [`prepare_client_records`] for a client append that arrived as events.
+fn prepare_client_append(request: AppendRequest) -> Result<Prepared, Error> {
+    prepare_client_records(RecordAppend {
+        condition: request.condition,
+        events: RecordBatch::from_events(&request.events),
+    })
+}
+
+/// Validates and stamps the `$` framing of a server-authored append.
+fn prepare_system_append(mut request: AppendRequest) -> Result<Prepared, Error> {
+    // Stamped here rather than trusted from callers: the read path judges
+    // visibility by event type while `visible_head` judges it by this tag,
+    // and a system event missing it would be unreadable yet still counted
+    // in the head clients are shown — phantom lag no consumer can clear.
+    for event in &mut request.events {
+        if !crate::system::is_system_name(&event.name) {
+            continue;
+        }
+        // A system event may only carry `$` tags. DCB checks match by
+        // tag with no visibility filter, so a user tag here would let
+        // invisible state reject client appends — a conflict the client
+        // can neither see nor explain. Correlate through `$` tags only.
+        if let Some(tag) = event
+            .tags
+            .iter()
+            .find(|tag| !crate::system::is_system_tag(tag))
+        {
+            return Err(Error::ReservedNamespace {
+                detail: format!(
+                    "system event '{}' may not carry user tag '{}'",
+                    event.name,
+                    String::from_utf8_lossy(&tag.key)
+                ),
+            });
+        }
+        if !event.tags.iter().any(crate::system::is_marker) {
+            event.tags.push(crate::system::marker());
+        }
+    }
+    Ok(Prepared {
+        batch: RecordBatch::from_events(&request.events),
+        condition: request.condition,
+    })
+}
+
 /// Configuration options for an event store engine.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
     pub max_segment_size: u64,
+    /// Most segment indexes cached; 0 = no cap but `index_cache_bytes`.
     pub index_cache_size: usize,
+    /// Most bloom filters cached; 0 = no cap but `bloom_cache_bytes`.
     pub bloom_cache_size: usize,
     /// Sealed segment mmaps kept open. A wide historical scan over more
     /// segments than this reopens and remaps files as it goes.
     pub mmap_cache_size: usize,
+    /// Heap budget for cached segment indexes, on top of `index_cache_size`.
+    pub index_cache_bytes: usize,
+    /// Heap budget for cached bloom filters, on top of `bloom_cache_size`.
+    pub bloom_cache_bytes: usize,
+    /// How sealed segments are read (prototype switch).
+    pub read_mode: crate::segment::blocks::ReadMode,
+    /// Memory budget of the verified block cache for sealed segments.
+    pub block_cache_bytes: usize,
+    /// Target size of one cached block.
+    pub block_size: usize,
+    /// Blocks read ahead of a sequential reader.
+    pub readahead_blocks: usize,
     /// Extra group-commit coalescing window in milliseconds. The sync thread
     /// is woken by a wave's first write; with 0 (default) it seals and syncs
     /// immediately, and concurrent writes batch on the fdatasync duration.
@@ -609,6 +1007,12 @@ impl Default for StoreOptions {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             bloom_cache_size: DEFAULT_BLOOM_CACHE_SIZE,
             mmap_cache_size: crate::cache::DEFAULT_MMAP_CACHE_SIZE,
+            index_cache_bytes: crate::cache::DEFAULT_INDEX_CACHE_BYTES,
+            bloom_cache_bytes: crate::cache::DEFAULT_BLOOM_CACHE_BYTES,
+            read_mode: crate::segment::blocks::ReadMode::default(),
+            block_cache_bytes: crate::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES,
+            block_size: crate::segment::blocks::DEFAULT_BLOCK_SIZE,
+            readahead_blocks: crate::segment::blocks::DEFAULT_READAHEAD_BLOCKS,
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             node_id: DEFAULT_NODE_ID,
             voters: vec![DEFAULT_NODE_ID],
@@ -622,11 +1026,6 @@ impl StoreOptions {
     /// This is NOT the default — use it explicitly when you know your workload.
     /// The default StoreOptions uses conservative fixed sizes that work for most cases.
     ///
-    /// Priority order (highest ROI first):
-    /// 1. Bloom filters — always cache all (tiny: ~1KB each)
-    /// 2. Index + offset tables — gets the bulk of the budget (~2-8MB each)
-    /// 3. Snapshot cache — small fixed allocation (snapshots are a niche optimization)
-    ///
     /// `num_contexts` is the number of contexts sharing this machine's memory.
     /// Each context gets an equal share of the total budget.
     pub fn auto_scaled(sealed_segment_count: usize, num_contexts: usize) -> Self {
@@ -638,32 +1037,25 @@ impl StoreOptions {
     }
 
     /// Auto-scales cache sizes to fit within a specific per-context byte budget.
+    ///
+    /// Bloom filters are small and consulted on every read of every segment,
+    /// so they get a sixteenth; the block cache a quarter; the segment
+    /// indexes (the large objects: tens of megabytes per 256 MB segment) the
+    /// rest. Nothing is capped by entry count.
     pub fn auto_scaled_with_budget(sealed_segment_count: usize, budget_bytes: usize) -> Self {
         let segments = sealed_segment_count.max(1);
-
-        // Bloom filters: ~1KB each. Always cache all. Cost is negligible.
-        let bloom_cache_size = segments;
-        let bloom_cost = segments * 1_024;
-
-        // Index + offset tables get everything remaining. This is what makes
-        // every source query fast. Estimate ~4MB per segment index.
-        let remaining = budget_bytes.saturating_sub(bloom_cost);
-        let estimated_index_bytes = 4 * 1024 * 1024;
-        let max_index_entries = remaining / estimated_index_bytes;
-        let index_cache_size = segments
-            .min(max_index_entries)
-            .max(DEFAULT_INDEX_CACHE_SIZE);
+        let bloom_cache_bytes = budget_bytes / 16;
+        let block_cache_bytes = budget_bytes / 4;
+        let index_cache_bytes = budget_bytes - bloom_cache_bytes - block_cache_bytes;
 
         Self {
-            max_segment_size: DEFAULT_SEGMENT_SIZE,
-            index_cache_size,
-            bloom_cache_size,
+            index_cache_bytes,
+            bloom_cache_bytes,
+            block_cache_bytes,
             // Mmaps cost address space, not memory: keep every sealed
             // segment mapped, like the bloom filters.
             mmap_cache_size: segments.max(crate::cache::DEFAULT_MMAP_CACHE_SIZE),
-            group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
-            node_id: DEFAULT_NODE_ID,
-            voters: vec![DEFAULT_NODE_ID],
+            ..Self::default()
         }
     }
 }
@@ -790,8 +1182,17 @@ pub struct EventStoreEngine {
     /// ever observe an event that a leader change could truncate.
     watermark: Arc<WatermarkState>,
 
-    /// Broadcast channel for notifying stream subscribers of new commits.
-    commit_tx: broadcast::Sender<CommitNotification>,
+    /// Where each epoch's `EpochChange` sits in this log. A leader reads it to
+    /// find where a returning node's history stops agreeing with its own.
+    epochs: parking_lot::Mutex<crate::replication::epochs::EpochIndex>,
+
+    /// Live subscriptions and the dispatcher that wakes them as commits
+    /// land. Every path that advances the watermark tells it.
+    feed: Arc<CommitFeed>,
+
+    /// What the dispatcher needs to read committed events: shares this
+    /// engine's segment list, index cache and active segment.
+    view: LogView,
 
     /// The active segment's in-memory index (bitmaps + position→offset
     /// table), maintained incrementally by the writer. Lets source queries
@@ -809,7 +1210,7 @@ pub struct EventStoreEngine {
 
     /// Cached segment list — avoids readdir + stat syscalls on every query.
     /// Updated on rotation within the append path (under writer lock).
-    segments: RwLock<SegmentList>,
+    segments: Arc<RwLock<SegmentList>>,
 
     /// Cached mmap of the active segment, keyed by its base position. The
     /// active file is grown to `max_segment_size` when it is created, so one
@@ -817,14 +1218,20 @@ pub struct EventStoreEngine {
     /// committed offsets. Rotation changes the base, which retires the entry
     /// by key mismatch — in-flight readers keep their `Arc<Mmap>` and only
     /// ever touch offsets that existed when they resolved positions.
-    active_mmap: parking_lot::Mutex<Option<(u64, Arc<memmap2::Mmap>)>>,
+    active_mmap: ActiveMmap,
 
-    /// Full length of an active segment file. Only used to tell a mapping
-    /// that covers the segment's whole lifetime from one that does not.
-    max_segment_size: u64,
+    /// How sealed segments are read.
+    read_mode: crate::segment::blocks::ReadMode,
 
     /// Lock-free internal metrics. Shared via Arc for external access.
     metrics: Arc<StoreMetrics>,
+
+    /// Queue to this context's staging thread, started by the first append
+    /// that finds the writer lock busy.
+    stage_tx: std::sync::OnceLock<std::sync::mpsc::Sender<StageJob>>,
+
+    /// Shuts the inline staging route for a while after one stalls.
+    inline_breaker: InlineBreaker,
 }
 
 impl EventStoreEngine {
@@ -850,7 +1257,7 @@ impl EventStoreEngine {
         let seg_writer = SegmentWriter::new(dir, Position(0), opts.max_segment_size)?;
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
-        let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
+        let feed = CommitFeed::new();
 
         let sync_state = Arc::new(SyncState::new());
         let writer = Arc::new(parking_lot::Mutex::new(seg_writer));
@@ -864,11 +1271,20 @@ impl EventStoreEngine {
             opts.voters.clone()
         };
         let watermark = Arc::new(WatermarkState::new(INITIAL_EPOCH, voters, 0));
-        let cache = Arc::new(IndexCache::new(
-            opts.index_cache_size,
-            opts.bloom_cache_size,
-            opts.mmap_cache_size,
-        ));
+        let cache = Arc::new(
+            IndexCache::with_blocks(
+                opts.index_cache_size,
+                opts.bloom_cache_size,
+                opts.mmap_cache_size,
+                crate::segment::blocks::BlockCache::new(
+                    opts.block_cache_bytes,
+                    opts.block_size,
+                    opts.readahead_blocks,
+                ),
+            )
+            .with_byte_budgets(opts.index_cache_bytes, opts.bloom_cache_bytes),
+        );
+        writer.lock().attach_index_cache(Arc::clone(&cache));
         let seals = Arc::new(SealQueue::new());
 
         spawn_sync_thread(
@@ -880,11 +1296,25 @@ impl EventStoreEngine {
             opts.node_id,
             Arc::clone(&replication),
             Arc::clone(&watermark),
-            commit_tx.clone(),
+            Arc::clone(&feed),
             Duration::from_millis(opts.group_commit_interval_ms),
             Arc::clone(&cache),
             Arc::clone(&seals),
         );
+
+        let segments = Arc::new(RwLock::new(SegmentList {
+            bases: vec![active_base],
+            sealed_count: 0,
+        }));
+        let view = LogView {
+            dir: dir.to_path_buf(),
+            segments: Arc::clone(&segments),
+            cache: Arc::clone(&cache),
+            active_index: Arc::clone(&active_index),
+            active_mmap: Arc::new(parking_lot::Mutex::new(None)),
+            max_segment_size: opts.max_segment_size,
+            watermark: watermark.handle(),
+        };
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -895,17 +1325,18 @@ impl EventStoreEngine {
             durable_tail,
             replication,
             watermark,
-            commit_tx,
+            epochs: parking_lot::Mutex::default(),
+            feed,
+            active_mmap: Arc::clone(&view.active_mmap),
+            view,
             active_index,
             cache,
             seals,
-            segments: RwLock::new(SegmentList {
-                bases: vec![active_base],
-                sealed_count: 0,
-            }),
-            active_mmap: parking_lot::Mutex::new(None),
-            max_segment_size: opts.max_segment_size,
+            segments,
+            read_mode: opts.read_mode,
             metrics: Arc::new(StoreMetrics::new()),
+            stage_tx: std::sync::OnceLock::new(),
+            inline_breaker: InlineBreaker::new(),
         })
     }
 
@@ -944,7 +1375,7 @@ impl EventStoreEngine {
         // Writer's head() already returns the next-exclusive position, which
         // is exactly our head_position semantics — no adjustment.
         let head_pos = head.0;
-        let (commit_tx, _) = broadcast::channel(COMMIT_CHANNEL_CAPACITY);
+        let feed = CommitFeed::new();
 
         let sync_state = Arc::new(SyncState::new());
         let writer = Arc::new(parking_lot::Mutex::new(seg_writer));
@@ -960,22 +1391,31 @@ impl EventStoreEngine {
         } else {
             opts.voters.clone()
         };
-        let (recovered_epoch, checkpoint_floor) = recover_native_control_state(dir, head_pos)?;
+        let recovered = recover_native_control_state(dir, head_pos)?;
         let recovered_watermark = if voters.len() == 1 {
             head_pos
         } else {
-            checkpoint_floor
+            recovered.checkpoint
         };
         let watermark = Arc::new(WatermarkState::new(
-            recovered_epoch,
+            recovered.epoch,
             voters,
             recovered_watermark,
         ));
-        let cache = Arc::new(IndexCache::new(
-            opts.index_cache_size,
-            opts.bloom_cache_size,
-            opts.mmap_cache_size,
-        ));
+        let cache = Arc::new(
+            IndexCache::with_blocks(
+                opts.index_cache_size,
+                opts.bloom_cache_size,
+                opts.mmap_cache_size,
+                crate::segment::blocks::BlockCache::new(
+                    opts.block_cache_bytes,
+                    opts.block_size,
+                    opts.readahead_blocks,
+                ),
+            )
+            .with_byte_budgets(opts.index_cache_bytes, opts.bloom_cache_bytes),
+        );
+        writer.lock().attach_index_cache(Arc::clone(&cache));
         let seals = Arc::new(SealQueue::new());
 
         spawn_sync_thread(
@@ -987,11 +1427,25 @@ impl EventStoreEngine {
             opts.node_id,
             Arc::clone(&replication),
             Arc::clone(&watermark),
-            commit_tx.clone(),
+            Arc::clone(&feed),
             Duration::from_millis(opts.group_commit_interval_ms),
             Arc::clone(&cache),
             Arc::clone(&seals),
         );
+
+        let segments = Arc::new(RwLock::new(SegmentList {
+            bases: all_bases,
+            sealed_count,
+        }));
+        let view = LogView {
+            dir: dir.to_path_buf(),
+            segments: Arc::clone(&segments),
+            cache: Arc::clone(&cache),
+            active_index: Arc::clone(&active_index),
+            active_mmap: Arc::new(parking_lot::Mutex::new(None)),
+            max_segment_size: opts.max_segment_size,
+            watermark: watermark.handle(),
+        };
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -1002,17 +1456,18 @@ impl EventStoreEngine {
             durable_tail,
             replication,
             watermark,
-            commit_tx,
+            epochs: parking_lot::Mutex::new(recovered.epochs),
+            feed,
+            active_mmap: Arc::clone(&view.active_mmap),
+            view,
             active_index,
             cache,
             seals,
-            segments: RwLock::new(SegmentList {
-                bases: all_bases,
-                sealed_count,
-            }),
-            active_mmap: parking_lot::Mutex::new(None),
-            max_segment_size: opts.max_segment_size,
+            segments,
+            read_mode: opts.read_mode,
             metrics: Arc::new(StoreMetrics::new()),
+            stage_tx: std::sync::OnceLock::new(),
+            inline_breaker: InlineBreaker::new(),
         })
     }
 
@@ -1024,32 +1479,9 @@ impl EventStoreEngine {
         self.sync_state.begin_shutdown();
     }
 
-    /// Reader over the active segment, backed by a cached mmap. The mapping
-    /// is created once per active segment and retired when rotation changes
-    /// the base position.
-    ///
-    /// Reusing one mapping for the segment's whole lifetime is only sound
-    /// while the file is already its full length, because a mapping does not
-    /// grow with the file behind it. That is the normal case — segment files
-    /// are grown up front — but it is a property of the file, not something
-    /// to assume: a store carried over from a release that tolerated a failed
-    /// preallocation, or a segment just rotated away from and trimmed to its
-    /// data length, maps short. Those reads remap instead of reporting the
-    /// bytes past the mapping as corruption.
+    /// Reader over the active segment; see [`LogView::active_segment_reader`].
     fn active_segment_reader(&self, base: u64, path: &Path) -> Result<SegmentReader, Error> {
-        {
-            let cached = self.active_mmap.lock();
-            if let Some((cached_base, mmap)) = cached.as_ref()
-                && *cached_base == base
-                && mmap.len() as u64 >= self.max_segment_size
-            {
-                return SegmentReader::from_shared_mmap(Arc::clone(mmap));
-            }
-        }
-        let file = std::fs::File::open(path)?;
-        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
-        *self.active_mmap.lock() = Some((base, Arc::clone(&mmap)));
-        SegmentReader::from_shared_mmap(mmap)
+        self.view.active_segment_reader(base, path)
     }
 
     pub fn metrics(&self) -> &Arc<StoreMetrics> {
@@ -1131,11 +1563,25 @@ impl EventStoreEngine {
         if byte_offset > valid_end {
             return Ok(false);
         }
-        Ok(last_physical_record_crc(&path, byte_offset)? == expected_crc)
+        Ok(record_crc_ending_at(&path, byte_offset)? == Some(expected_crc))
     }
 
     pub fn replication_epoch(&self) -> u64 {
         self.watermark.epoch()
+    }
+
+    /// The newest epoch whose `EpochChange` is in this node's log. Unlike
+    /// [`replication_epoch`](Self::replication_epoch), which a node adopts the
+    /// moment it learns of a claim, this says what the log's bytes were
+    /// written under: it is what a leader needs to know to find where this
+    /// node's history stops agreeing with its own.
+    pub fn log_epoch(&self) -> u64 {
+        self.epochs.lock().last_epoch().unwrap_or(INITIAL_EPOCH)
+    }
+
+    /// Where `epoch` ends in this node's log.
+    pub fn epoch_extent(&self, epoch: u64) -> crate::replication::epochs::EpochExtent {
+        self.epochs.lock().extent(epoch)
     }
 
     /// Sources a suffix from an exact verified physical cursor. Unlike the
@@ -1208,8 +1654,12 @@ impl EventStoreEngine {
     }
 
     /// Builds byte ranges that reproduce the local native segment suffix
-    /// beginning at the first event position `from`. Segment headers are
-    /// represented by Rotate boundaries, not data.
+    /// beginning right after the last event before position `from`: the
+    /// control records that follow that event are part of the suffix, because
+    /// a follower cut back to the same event (see
+    /// [`truncate_to_matching`](Self::truncate_to_matching)) holds none of
+    /// this log's. Segment headers are represented by Rotate boundaries, not
+    /// data.
     pub fn replication_catchup_slices(
         &self,
         from: Position,
@@ -1227,19 +1677,21 @@ impl EventStoreEngine {
                 ),
             });
         }
-        if from.0 == local_tail {
-            return Ok((Position(local_tail), Vec::new()));
-        }
+        // No shortcut when `from` is the tail: a leader that has just taken
+        // over rotated to a fresh segment at its head and wrote an EpochChange
+        // there, so bytes can follow the last event without any new position.
+        // A follower cut back to this boundary needs them; when there really
+        // is nothing past the boundary the loop below yields no slice.
 
         let active_base = writer.active_base_position();
         let active_end = writer.write_offset();
         let seg_list = self.segments.read().clone();
         drop(writer);
-        let first_index = match seg_list.bases.binary_search(&from.0) {
-            Ok(index) => index,
-            Err(0) => 0,
-            Err(index) => index - 1,
-        };
+        let (first_index, first_offset) =
+            match locate_event_anchor(&self.dir, &seg_list.bases, from)? {
+                Some(anchor) => (anchor.segment_index, anchor.end_offset),
+                None => (0, segment::SEGMENT_HEADER_SIZE as u64),
+            };
 
         let mut slices = Vec::new();
         for (index, &base) in seg_list.bases.iter().enumerate().skip(first_index) {
@@ -1250,7 +1702,7 @@ impl EventStoreEngine {
                 std::fs::metadata(&path)?.len()
             };
             let byte_start = if index == first_index {
-                find_replication_start(&path, from)?
+                first_offset
             } else {
                 segment::SEGMENT_HEADER_SIZE as u64
             };
@@ -1308,6 +1760,12 @@ impl EventStoreEngine {
             let result = writer.append_raw_replicated(bytes, first_position)?;
             self.local_tail
                 .store(result.durable_position.0, Ordering::Release);
+            if !result.epoch_changes.is_empty() {
+                let mut epochs = self.epochs.lock();
+                for change in &result.epoch_changes {
+                    epochs.record(change.epoch, change.start_position);
+                }
+            }
             (result, wave)
         };
 
@@ -1342,17 +1800,15 @@ impl EventStoreEngine {
         Ok(())
     }
 
-    /// After a writer call that may have rotated: registers every pending
-    /// seal's index in the cache (so the segment answers reads before its
-    /// companions exist) and extends the segment list. Called under the
-    /// writer lock, before any reader can observe the new segment.
+    /// After a writer call that may have rotated: extends the segment list
+    /// with every rotation since the last call. The sealed indexes are
+    /// already in the cache — the writer pins each one in the same step that
+    /// moves the active index on (`SegmentWriter::rotate_segment`), which is
+    /// what readers observe, so they never wait on this.
     fn note_rotation(&self, writer: &SegmentWriter, old_base: u64) {
         let new_base = writer.active_base_position();
         if new_base == old_base {
             return;
-        }
-        for seal in writer.pending_seals() {
-            self.cache.pin_sealed(seal.base, Arc::clone(&seal.index));
         }
         let mut seg_list = self.segments.write();
         for seal in writer.pending_seals() {
@@ -1374,26 +1830,31 @@ impl EventStoreEngine {
         self.truncate_to_matching(pos, None)
     }
 
-    /// Truncates to `pos` and, when the leader supplied its byte-exact
-    /// boundary, heals trailing divergence that position-granular truncation
-    /// cannot see: control records (watermark checkpoints, epoch changes)
-    /// written locally by a deposed leader but never replicated sit *below*
-    /// the position boundary and would otherwise survive forever, leaving the
-    /// node byte-divergent from the cluster.
+    /// Cuts the log back to position `pos` and, when the leader supplied its
+    /// boundary, to exactly the bytes the leader's log has there.
     ///
-    /// `expected_prev` is the leader's view of the record immediately before
-    /// the truncation boundary: `None` = no boundary info (legacy behavior),
-    /// `Some(None)` = the boundary is the segment start, `Some(Some(crc))` =
-    /// the CRC of the leader's preceding record. Mismatching trailing
-    /// *control* records are dropped — they carry no client data and no
-    /// position, so the watermark invariant (no committed event is ever lost)
-    /// holds even though bytes below the position boundary are removed. A
-    /// mismatching *event* record means the committed prefix itself diverges,
-    /// which is unrecoverable here and fails loudly.
+    /// The boundary is the last *event* record before `pos`: `expected_event`
+    /// is `None` when the caller has no boundary information (position-granular
+    /// truncation), `Some(None)` when the leader has no event before `pos`, and
+    /// `Some(Some(crc))` with the stored CRC of the leader's last event before
+    /// `pos`. The events before `pos` are the history both logs claim to share
+    /// (the follower's epoch up to where it ended on the leader, or its
+    /// committed prefix), so the follower's last event there must be the same
+    /// record: a different one is real corruption, unrecoverable here, and
+    /// fails loudly. Control records (watermark checkpoints, epoch changes)
+    /// are not compared. They carry no client data and no position, and each
+    /// node may hold some the other never received, so the follower is cut
+    /// right after that event and drops whatever control records followed it;
+    /// the leader sends its own from the same point
+    /// ([`replication_catchup_slices`](Self::replication_catchup_slices)).
+    /// That can mean reopening a sealed segment, when the last event ends one.
+    /// Dropping control records leaves the watermark invariant intact: no
+    /// committed event is lost. Where the leader puts `pos` is its decision
+    /// (see `replication::service::plan_tail_start`); this only verifies it.
     pub fn truncate_to_matching(
         &self,
         pos: Position,
-        expected_prev: Option<Option<u32>>,
+        expected_event: Option<Option<u32>>,
     ) -> Result<(), Error> {
         self.drain_pending()?;
         let watermark = self.watermark.get();
@@ -1409,94 +1870,58 @@ impl EventStoreEngine {
                 message: format!("truncate target {} exceeds local tail {old_tail}", pos.0),
             });
         }
-        if pos.0 == old_tail && expected_prev.is_none() {
+        if pos.0 == old_tail && expected_event.is_none() {
             return Ok(());
         }
 
         let mut writer = self.writer.lock();
         let mut seg_list = self.segments.write();
-        let target_index = match seg_list.bases.binary_search(&pos.0) {
-            Ok(index) => index,
-            Err(0) => {
-                return Err(Error::Corrupted {
-                    message: format!("no segment contains truncate position {}", pos.0),
-                });
+        let (target_index, truncate_offset) = match expected_event {
+            None => {
+                let target_index = match seg_list.bases.binary_search(&pos.0) {
+                    Ok(index) => index,
+                    Err(0) => {
+                        return Err(Error::Corrupted {
+                            message: format!("no segment contains truncate position {}", pos.0),
+                        });
+                    }
+                    Err(index) => index - 1,
+                };
+                let path = segment::segment_path(&self.dir, seg_list.bases[target_index]);
+                let preceding = scan_replication_boundary(&path, pos)?;
+                (
+                    target_index,
+                    preceding
+                        .last()
+                        .map_or(segment::SEGMENT_HEADER_SIZE as u64, |last| last.end_offset),
+                )
             }
-            Err(index) => index - 1,
+            Some(expected) => {
+                let anchor = locate_event_anchor(&self.dir, &seg_list.bases, pos)?;
+                if expected != anchor.map(|anchor| anchor.crc) {
+                    return Err(Error::Corrupted {
+                        message: format!(
+                            "committed prefix diverges from leader at position {} — the \
+                             last event before that boundary is not the leader's",
+                            pos.0
+                        ),
+                    });
+                }
+                match anchor {
+                    Some(anchor) => (anchor.segment_index, anchor.end_offset),
+                    None => (0, segment::SEGMENT_HEADER_SIZE as u64),
+                }
+            }
         };
         let target_base = seg_list.bases[target_index];
         let target_path = segment::segment_path(&self.dir, target_base);
-        let (position_offset, mut preceding) = scan_replication_boundary(&target_path, pos)?;
-        let mut truncate_offset = position_offset;
 
-        // Byte-exact healing: walk backward over trailing control records
-        // until this node's boundary agrees with the leader's.
-        if let Some(expected) = expected_prev {
-            loop {
-                match (expected, preceding.last().copied()) {
-                    (None, None) if target_index == 0 => break,
-                    (Some(crc), Some(last)) if last.crc == crc => break,
-                    (_, Some(last)) if !last.is_event => {
-                        truncate_offset = last.start_offset;
-                        preceding.pop();
-                    }
-                    (_, None) => {
-                        // The boundary reached this segment's start; the true
-                        // preceding record is the last record of the prior
-                        // segment (comparison only — healing across a sealed
-                        // segment edge is not supported and fails loudly).
-                        let prev_last = if target_index == 0 {
-                            None
-                        } else {
-                            let prev_path =
-                                segment::segment_path(&self.dir, seg_list.bases[target_index - 1]);
-                            scan_replication_boundary(&prev_path, Position(u64::MAX))?
-                                .1
-                                .pop()
-                        };
-                        match (expected, prev_last) {
-                            (None, None) => break,
-                            (Some(crc), Some(last)) if last.crc == crc => break,
-                            (_, Some(last)) if !last.is_event => {
-                                return Err(Error::Corrupted {
-                                    message: format!(
-                                        "trailing control record at the end of sealed \
-                                         segment {} diverges from the leader; sealed-\
-                                         segment healing is not supported — full resync \
-                                         required",
-                                        seg_list.bases[target_index - 1]
-                                    ),
-                                });
-                            }
-                            _ => {
-                                return Err(Error::Corrupted {
-                                    message: format!(
-                                        "committed prefix diverges from leader at \
-                                         position {} (segment base {target_base}) — the \
-                                         record before the boundary does not match the \
-                                         leader's history",
-                                        pos.0
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    (None, Some(_)) | (Some(_), Some(_)) => {
-                        return Err(Error::Corrupted {
-                            message: format!(
-                                "committed prefix diverges from leader at position {} \
-                                 (segment base {target_base}) — an event record below the \
-                                 watermark does not match the leader's history",
-                                pos.0
-                            ),
-                        });
-                    }
-                }
-            }
-            if pos.0 == old_tail && truncate_offset == position_offset {
-                // Boundary already byte-identical: nothing to heal.
-                return Ok(());
-            }
+        if pos.0 == old_tail
+            && target_index + 1 == seg_list.bases.len()
+            && truncate_offset == writer.write_offset()
+        {
+            // Already byte-identical up to the boundary: nothing to heal.
+            return Ok(());
         }
 
         // Seals in flight for the segments about to go: no companion may be
@@ -1522,6 +1947,9 @@ impl EventStoreEngine {
         seg_list.sealed_count = target_index;
         self.local_tail.store(pos.0, Ordering::Release);
         self.durable_tail.store(pos.0, Ordering::Release);
+        // An epoch that took over at or after the cut began in a segment that
+        // is gone.
+        self.epochs.lock().truncate_from(pos.0);
         // The reopened segment may keep its base position, so the cached
         // active mapping cannot be trusted across a truncation — drop it.
         *self.active_mmap.lock() = None;
@@ -1530,38 +1958,13 @@ impl EventStoreEngine {
         Ok(())
     }
 
-    /// The leader's view of the record immediately before position `pos` in
-    /// its own byte layout: `None` when the boundary is the segment start,
-    /// otherwise the stored CRC of the preceding record. Sent with Truncate
-    /// frames so followers can verify — and heal — their boundary byte-exactly.
-    pub fn replication_boundary_prev(&self, pos: Position) -> Result<Option<u32>, Error> {
-        let (target_index, bases) = {
-            let seg_list = self.segments.read();
-            let index = match seg_list.bases.binary_search(&pos.0) {
-                Ok(index) => index,
-                Err(0) => {
-                    return Err(Error::Corrupted {
-                        message: format!("no segment contains boundary position {}", pos.0),
-                    });
-                }
-                Err(index) => index - 1,
-            };
-            (index, seg_list.bases.clone())
-        };
-        let path = segment::segment_path(&self.dir, bases[target_index]);
-        let (_, preceding) = scan_replication_boundary(&path, pos)?;
-        if let Some(record) = preceding.last() {
-            return Ok(Some(record.crc));
-        }
-        // Boundary at a segment start (e.g. the leader sealed at its claim):
-        // the true preceding record is the last record of the prior segment.
-        // Only the very first segment has no predecessor at all.
-        if target_index == 0 {
-            return Ok(None);
-        }
-        let prev_path = segment::segment_path(&self.dir, bases[target_index - 1]);
-        let (_, prev_records) = scan_replication_boundary(&prev_path, Position(u64::MAX))?;
-        Ok(prev_records.last().map(|record| record.crc))
+    /// The leader's side of [`truncate_to_matching`](Self::truncate_to_matching):
+    /// the stored CRC of this log's last event before position `pos`, or
+    /// `None` when there is none. Sent with Truncate frames so followers can
+    /// verify that the history they keep is this log's.
+    pub fn replication_boundary_event(&self, pos: Position) -> Result<Option<u32>, Error> {
+        let bases = self.segments.read().bases.clone();
+        Ok(locate_event_anchor(&self.dir, &bases, pos)?.map(|anchor| anchor.crc))
     }
 
     /// Sealed segments fully covered by the quorum watermark — the archival
@@ -1622,6 +2025,7 @@ impl EventStoreEngine {
                 leader_id,
                 start_position,
             })?;
+            self.epochs.lock().record(epoch, start_position);
             wave
         };
         self.sync_state.wait_for_sync(wave)
@@ -1653,7 +2057,7 @@ impl EventStoreEngine {
     /// append waiters and publishes the new externally-visible bound.
     pub fn acknowledge_replica(&self, node: u64, epoch: u64, pos: Position) -> Option<Position> {
         let watermark = self.watermark.advance(node, epoch, pos.0)?;
-        let _ = self.commit_tx.send(CommitNotification { watermark });
+        self.feed.committed();
         Some(Position(watermark))
     }
 
@@ -1662,8 +2066,8 @@ impl EventStoreEngine {
         if pos.0 > self.local_tail.load(Ordering::Acquire) {
             return; // Never expose bytes this follower has not applied.
         }
-        if let Some(watermark) = self.watermark.adopt(epoch, pos.0) {
-            let _ = self.commit_tx.send(CommitNotification { watermark });
+        if self.watermark.adopt(epoch, pos.0).is_some() {
+            self.feed.committed();
         }
     }
 
@@ -1713,7 +2117,7 @@ impl EventStoreEngine {
     /// 3. Updates the in-memory tag index
     /// 4. Advances the head position (next-exclusive)
     ///
-    /// Blocks until the write is quorum-durable. The gRPC path uses
+    /// Blocks until the write is quorum-durable. The native path uses
     /// `append_stage` + `append_finish_async` instead so no thread is pinned
     /// during the wait.
     pub fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
@@ -1732,16 +2136,24 @@ impl EventStoreEngine {
     /// `append_finish_async` (or the blocking `append` wrapper).
     pub fn append_stage(&self, request: AppendRequest) -> Result<StagedAppend, Error> {
         let timer = Timer::start();
+        self.stage_prepared(prepare_client_append(request)?, timer)
+    }
 
-        // A client must not be able to forge an event the server claims to
-        // have written about itself. Subsystems that legitimately write into
-        // the namespace go through `append_system_stage`.
-        crate::system::validate_client_append(&request.events)?;
-        if let Some(condition) = &request.condition {
-            crate::system::validate_client_condition(&condition.criteria)?;
-        }
+    /// [`append`](Self::append) for events that are already records.
+    pub fn append_records(&self, request: RecordAppend) -> Result<AppendResponse, Error> {
+        let staged = self.append_records_stage(request)?;
+        let wait = match staged.wait_pos() {
+            Some(pos) => self.watermark.wait_for(pos),
+            None => Ok(()),
+        };
+        self.append_finalize(staged, wait)
+    }
 
-        self.append_stage_unchecked(request, timer)
+    /// [`append_stage`](Self::append_stage) for events that are already
+    /// records.
+    pub fn append_records_stage(&self, request: RecordAppend) -> Result<StagedAppend, Error> {
+        let timer = Timer::start();
+        self.stage_prepared(prepare_client_records(request)?, timer)
     }
 
     /// Appends on behalf of the server itself, skipping the checks that stop
@@ -1758,52 +2170,46 @@ impl EventStoreEngine {
 
     /// The synchronous half of [`append_system`]: validates and stamps the
     /// `$` framing, then stages the write. Finish with `append_finish_async`
-    /// — the seam for async callers (the snapshot gRPC path) that must not
+    /// — the seam for async callers (the snapshot native path) that must not
     /// pin a thread through the durability wait.
-    pub fn append_system_stage(&self, mut request: AppendRequest) -> Result<StagedAppend, Error> {
-        // Stamped here rather than trusted from callers: the read path judges
-        // visibility by event type while `visible_head` judges it by this tag,
-        // and a system event missing it would be unreadable yet still counted
-        // in the head clients are shown — phantom lag no consumer can clear.
-        for event in &mut request.events {
-            if !crate::system::is_system_name(&event.name) {
-                continue;
-            }
-            // A system event may only carry `$` tags. DCB checks match by
-            // tag with no visibility filter, so a user tag here would let
-            // invisible state reject client appends — a conflict the client
-            // can neither see nor explain. Correlate through `$` tags only.
-            if let Some(tag) = event
-                .tags
-                .iter()
-                .find(|tag| !crate::system::is_system_tag(tag))
-            {
-                return Err(Error::ReservedNamespace {
-                    detail: format!(
-                        "system event '{}' may not carry user tag '{}'",
-                        event.name,
-                        String::from_utf8_lossy(&tag.key)
-                    ),
-                });
-            }
-            if !event.tags.iter().any(crate::system::is_marker) {
-                event.tags.push(crate::system::marker());
-            }
-        }
-
-        self.append_stage_unchecked(request, Timer::start())
+    pub fn append_system_stage(&self, request: AppendRequest) -> Result<StagedAppend, Error> {
+        self.stage_prepared(prepare_system_append(request)?, Timer::start())
     }
 
-    /// `append_stage` without the reserved-namespace checks. The seam the
-    /// subsystems that own system events write through; nothing reachable
-    /// from a client request may call it.
-    fn append_stage_unchecked(
-        &self,
-        request: AppendRequest,
-        timer: Timer,
-    ) -> Result<StagedAppend, Error> {
-        // Fail fast once poisoned: after an fsync failure nothing written
-        // here can be made durable, so accepting the write would lie.
+    /// Stages an append that has passed its namespace checks (or is the
+    /// server's own, and exempt).
+    fn stage_prepared(&self, prepared: Prepared, timer: Timer) -> Result<StagedAppend, Error> {
+        self.check_writable()?;
+
+        // The sealed half of the DCB check runs before the lock: it is the
+        // half that can wait on the disk, and sealed segments cannot change
+        // under it. What seals in between is re-checked under the lock.
+        let (outcome, owes_wake) = match self.stage_pre(&prepared)? {
+            Pre::Conflict(conflicting_position) => (
+                Err(Error::ConsistencyConditionViolated {
+                    conflicting_position,
+                }),
+                false,
+            ),
+            Pre::Checked(sealed_checked) => {
+                // Lock the writer. DCB check + write + index update must be atomic.
+                let mut writer = self.writer.lock();
+                self.write_staged(&mut writer, &prepared, sealed_checked)
+            }
+        };
+        if owes_wake {
+            self.sync_state.wake_sync_thread();
+        }
+
+        let staged = StagedAppend { outcome, timer };
+        self.release_written(staged.wait_pos());
+        Ok(staged)
+    }
+
+    /// Fail fast once poisoned or shutting down.
+    fn check_writable(&self) -> Result<(), Error> {
+        // After an fsync failure nothing written here can be made durable, so
+        // accepting the write would lie.
         if self.sync_state.is_failed() {
             return Err(self.sync_state.failure_error());
         }
@@ -1815,50 +2221,374 @@ impl EventStoreEngine {
                 "event store is shutting down; append rejected",
             )));
         }
+        Ok(())
+    }
 
-        // The sealed half of the DCB check runs before the lock: it is the
-        // half that can wait on the disk, and sealed segments cannot change
-        // under it. What seals in between is re-checked under the lock.
-        let sealed = match &request.condition {
-            Some(condition) => Some(self.check_dcb_sealed(condition)?),
-            None => None,
+    /// The pre-lock half of an append: the sealed segments' share of the DCB
+    /// check, which may read an evicted index from disk.
+    fn stage_pre(&self, request: &Prepared) -> Result<Pre, Error> {
+        let Some(condition) = &request.condition else {
+            return Ok(Pre::Checked(0));
         };
-        let outcome = match sealed {
-            Some((Some(conflicting_position), _)) => Err(Error::ConsistencyConditionViolated {
-                conflicting_position,
-            }),
-            _ => {
-                let sealed_checked = sealed.map(|(_, count)| count).unwrap_or(0);
-                // Lock the writer. DCB check + write + index update must be atomic.
-                let mut writer = self.writer.lock();
-                self.sync_state.mark_pending();
-                self.append_locked(&mut writer, &request, sealed_checked)
-            }
-        };
+        match self.scan_sealed(condition, 0, true)? {
+            (SealedScan::Conflict(position), _) => Ok(Pre::Conflict(position)),
+            (_, covered) => Ok(Pre::Checked(covered)),
+        }
+    }
 
-        let staged = StagedAppend { outcome, timer };
-        if crate::written_acks(self.watermark.voter_count())
-            && let Some(pos) = staged.wait_pos()
-        {
-            if pos.saturating_sub(self.durable_tail.load(Ordering::Acquire))
-                <= crate::ack_lag_limit()
-            {
-                // Replicated-ack fast path: this node's cursor advances at write
-                // (bytes are already pread-visible — the writer write_alls into
-                // the file). Quorum-of-one opens the ack gate inline; with more
-                // voters the follower cursors still gate the quorum math.
-                let _ = self
-                    .watermark
-                    .advance(self.node_id, self.watermark.epoch(), pos);
-            } else {
-                // Past the lag limit the advance is skipped and release waits
-                // on the sync loop — durable-mode behavior until the disk
-                // catches up. Counted: a rising rate is the disk-is-behind
-                // early warning, before clients notice latency.
-                self.metrics.record_ack_degradation();
+    /// `stage_pre` for a caller that must not wait on the disk: `None` when
+    /// the check needs an index or bloom filter that is not in memory.
+    fn stage_pre_cached(&self, request: &Prepared) -> Option<Result<Pre, Error>> {
+        let Some(condition) = &request.condition else {
+            return Some(Ok(Pre::Checked(0)));
+        };
+        match self.scan_sealed(condition, 0, false) {
+            Err(error) => Some(Err(error)),
+            Ok((SealedScan::NeedsDisk, _)) => None,
+            Ok((SealedScan::Conflict(position), _)) => Some(Ok(Pre::Conflict(position))),
+            Ok((SealedScan::Clear, covered)) => Some(Ok(Pre::Checked(covered))),
+        }
+    }
+
+    /// The writer-lock half of an append: registers the write with the
+    /// current commit wave, then checks, writes and indexes it. The caller
+    /// holds the writer lock, and owes `wake_sync_thread` after releasing it
+    /// when this returns `true` for the second element.
+    fn write_staged(
+        &self,
+        writer: &mut SegmentWriter,
+        request: &Prepared,
+        sealed_checked: usize,
+    ) -> (Result<AppendResponse, Error>, bool) {
+        let (_, owes_wake) = self.sync_state.register_write();
+        (
+            self.append_locked(writer, request, sealed_checked, false),
+            owes_wake,
+        )
+    }
+
+    /// In `written` mode, opens the ack gate for a staged write up to
+    /// `wait_pos`.
+    fn release_written(&self, wait_pos: Option<u64>) {
+        if !crate::written_acks(self.watermark.voter_count()) {
+            return;
+        }
+        let Some(pos) = wait_pos else { return };
+        if pos.saturating_sub(self.durable_tail.load(Ordering::Acquire)) <= crate::ack_lag_limit() {
+            // Replicated-ack fast path: this node's cursor advances at write
+            // (bytes are already pread-visible — the writer write_alls into
+            // the file). Quorum-of-one opens the ack gate inline; with more
+            // voters the follower cursors still gate the quorum math.
+            let _ = self
+                .watermark
+                .advance(self.node_id, self.watermark.epoch(), pos);
+        } else {
+            // Past the lag limit the advance is skipped and release waits
+            // on the sync loop — durable-mode behavior until the disk
+            // catches up. Counted: a rising rate is the disk-is-behind
+            // early warning, before clients notice latency.
+            self.metrics.record_ack_degradation();
+        }
+    }
+
+    /// Appends from async code, to the point the events are committed.
+    ///
+    /// The writer-lock section runs in the first place that can take it
+    /// without stalling anyone: on the calling async worker when the writer
+    /// lock is free, the DCB check needs nothing from the disk and the write
+    /// does not rotate the segment; else on the context's staging thread,
+    /// which stages the appends that queued behind a busy lock together; else
+    /// (the check needs a cold index, or the thread is gone) on the blocking
+    /// pool. No thread is pinned through the durability wait.
+    pub async fn append_async(
+        self: &Arc<Self>,
+        request: AppendRequest,
+        system: bool,
+    ) -> Result<AppendResponse, Error> {
+        self.append_routed(Routes::ALL, request, system).await
+    }
+
+    /// [`append_async`](Self::append_async) for a client's events that are
+    /// already records: the route that never builds an `AppendEvent`.
+    pub async fn append_records_async(
+        self: &Arc<Self>,
+        request: RecordAppend,
+    ) -> Result<AppendResponse, Error> {
+        let prepared = prepare_client_records(request)?;
+        self.route_prepared(Routes::ALL, prepared).await
+    }
+
+    async fn append_routed(
+        self: &Arc<Self>,
+        routes: Routes,
+        request: AppendRequest,
+        system: bool,
+    ) -> Result<AppendResponse, Error> {
+        let prepared = if system {
+            prepare_system_append(request)?
+        } else {
+            prepare_client_append(request)?
+        };
+        self.route_prepared(routes, prepared).await
+    }
+
+    async fn route_prepared(
+        self: &Arc<Self>,
+        routes: Routes,
+        mut prepared: Prepared,
+    ) -> Result<AppendResponse, Error> {
+        if routes.inline {
+            let started = self.inline_breaker.now();
+            if self.inline_breaker.allows(started) {
+                let staging = self.stage_inline(prepared);
+                self.watch_inline_stage(started);
+                match staging {
+                    Staging::Done(Ok(staged)) => {
+                        self.release_written(staged.wait_pos());
+                        return self.append_finish_async(staged).await;
+                    }
+                    Staging::Done(Err(error)) => return Err(error),
+                    Staging::NeedsPool(returned) => prepared = returned,
+                }
             }
         }
-        Ok(staged)
+        if routes.thread {
+            match self.stage_on_thread(prepared).await {
+                Settled::Final(result) => return result,
+                Settled::Pool(returned) => prepared = returned,
+            }
+        }
+        let engine = Arc::clone(self);
+        let staged =
+            tokio::task::spawn_blocking(move || engine.stage_prepared(prepared, Timer::start()))
+                .await
+                .map_err(|error| Error::Internal {
+                    message: format!("append staging worker panicked: {error}"),
+                })??;
+        self.append_finish_async(staged).await
+    }
+
+    /// Judges an inline staging that began at `started` (on the breaker's
+    /// clock). One that stalled counts toward the metric, shuts the inline
+    /// route for the cooldown and, at most every few seconds, logs.
+    fn watch_inline_stage(&self, started: u64) {
+        let ended = self.inline_breaker.now();
+        let Verdict::Stalled { elapsed_ns, warn } = self.inline_breaker.finished(started, ended)
+        else {
+            return;
+        };
+        self.metrics.record_inline_stall();
+        if let Some(stalls) = warn {
+            tracing::warn!(
+                dir = %self.dir.display(),
+                elapsed_ms = elapsed_ns as f64 / 1e6,
+                stalls_since_last_warning = stalls,
+                "an append staged on an async worker stalled; appends use the staging \
+                 thread for {:?} (a slow write path, e.g. a throttled page cache or a \
+                 filesystem commit)",
+                self.inline_breaker.cooldown(),
+            );
+        }
+    }
+
+    /// Answers `reply` with the final result of `staged` once the watermark
+    /// covers it: the staging thread's way to settle an append without the
+    /// caller's task waking twice.
+    fn settle_when_committed(
+        &self,
+        staged: StagedAppend,
+        reply: tokio::sync::oneshot::Sender<Settled>,
+    ) {
+        let metrics = Arc::clone(&self.metrics);
+        match staged.wait_pos() {
+            None => {
+                let _ = reply.send(Settled::Final(finalize_append(&metrics, staged, Ok(()))));
+            }
+            Some(pos) => self.watermark.notify_at(pos, move |verdict| {
+                let _ = reply.send(Settled::Final(finalize_append(&metrics, staged, verdict)));
+            }),
+        }
+    }
+
+    /// The staging that neither reads the disk for the DCB check nor waits
+    /// for the writer lock nor rotates the segment: for an async worker.
+    /// Anything else is handed back as `NeedsPool` with the append intact.
+    /// Does not open the written-ack gate: the caller does.
+    fn stage_inline(&self, prepared: Prepared) -> Staging {
+        let timer = Timer::start();
+        if let Err(error) = self.check_writable() {
+            return Staging::Done(Err(error));
+        }
+        let pre = match self.stage_pre_cached(&prepared) {
+            None => return Staging::NeedsPool(prepared),
+            Some(Err(error)) => return Staging::Done(Err(error)),
+            Some(Ok(pre)) => pre,
+        };
+        let (outcome, owes_wake) = match pre {
+            Pre::Conflict(conflicting_position) => (
+                Err(Error::ConsistencyConditionViolated {
+                    conflicting_position,
+                }),
+                false,
+            ),
+            Pre::Checked(sealed_checked) => {
+                let Some(mut writer) = self.writer.try_lock() else {
+                    return Staging::NeedsPool(prepared);
+                };
+                // A write that rotates the segment creates and preallocates a
+                // file: not for an async worker.
+                if !writer.fits_without_rotation(&prepared.batch) {
+                    drop(writer);
+                    return Staging::NeedsPool(prepared);
+                }
+                self.write_staged(&mut writer, &prepared, sealed_checked)
+            }
+        };
+        if owes_wake {
+            self.sync_state.wake_sync_thread();
+        }
+        Staging::Done(Ok(StagedAppend { outcome, timer }))
+    }
+
+    /// Stages `appends`, in order, for the staging thread: one answer per
+    /// append, in the same order.
+    ///
+    /// What each needs before the lock (the sealed half of its DCB check,
+    /// from memory only) is settled first, for all of them. The rest are
+    /// written under as few holds of the writer lock as the group limits
+    /// allow, each hold with one `write(2)` for everything it staged: the
+    /// appends go through the writer deferred, each seeing the ones before it
+    /// in its DCB check, and the bytes reach the file before the lock is
+    /// let go. Nothing is published to readers before that: the local tail
+    /// moves after the write, and the watermark, which readers are bounded
+    /// by, only moves after that.
+    ///
+    /// A write that fails after other appends were accounted for leaves the
+    /// log and the writer disagreeing, so it poisons the engine, like a
+    /// failed fsync, and fails the appends it took with it.
+    fn stage_group(&self, appends: Vec<Prepared>) -> Vec<Staging> {
+        let mut answers: Vec<Option<Staging>> = (0..appends.len()).map(|_| None).collect();
+        let mut writes: Vec<(usize, Prepared, usize, Timer)> = Vec::with_capacity(appends.len());
+        for (at, prepared) in appends.into_iter().enumerate() {
+            let timer = Timer::start();
+            if let Err(error) = self.check_writable() {
+                answers[at] = Some(Staging::Done(Err(error)));
+                continue;
+            }
+            answers[at] = match self.stage_pre_cached(&prepared) {
+                None => Some(Staging::NeedsPool(prepared)),
+                Some(Err(error)) => Some(Staging::Done(Err(error))),
+                Some(Ok(Pre::Conflict(conflicting_position))) => {
+                    Some(Staging::Done(Ok(StagedAppend {
+                        outcome: Err(Error::ConsistencyConditionViolated {
+                            conflicting_position,
+                        }),
+                        timer,
+                    })))
+                }
+                Some(Ok(Pre::Checked(sealed_checked))) => {
+                    writes.push((at, prepared, sealed_checked, timer));
+                    None
+                }
+            };
+        }
+
+        let mut writes = writes.into_iter().peekable();
+        while writes.peek().is_some() {
+            let mut hold = Vec::new();
+            let (mut events, mut bytes) = (0u32, 0usize);
+            while let Some((_, prepared, _, _)) = writes.peek() {
+                if !hold.is_empty()
+                    && (hold.len() >= GROUP_MAX_APPENDS
+                        || events + prepared.batch.len() > GROUP_MAX_EVENTS
+                        || bytes + prepared.batch.bytes().len() > GROUP_MAX_BYTES)
+                {
+                    break;
+                }
+                events += prepared.batch.len();
+                bytes += prepared.batch.bytes().len();
+                hold.push(writes.next().expect("peeked"));
+            }
+            self.write_group(hold, &mut answers);
+        }
+        answers
+            .into_iter()
+            .map(|answer| answer.expect("every append was answered"))
+            .collect()
+    }
+
+    /// One hold of the writer lock for `group`: see [`stage_group`](Self::stage_group).
+    fn write_group(
+        &self,
+        group: Vec<(usize, Prepared, usize, Timer)>,
+        answers: &mut [Option<Staging>],
+    ) {
+        let mut results: Vec<(usize, Result<AppendResponse, Error>, Timer)> =
+            Vec::with_capacity(group.len());
+        let mut owes_wake = false;
+        let flushed = {
+            let mut writer = self.writer.lock();
+            for (at, prepared, sealed_checked, timer) in group {
+                let (_, first_of_wave) = self.sync_state.register_write();
+                owes_wake |= first_of_wave;
+                results.push((
+                    at,
+                    self.append_locked(&mut writer, &prepared, sealed_checked, true),
+                    timer,
+                ));
+            }
+            let flushed = writer.flush_deferred();
+            // A writer that failed to write an earlier hold has a head that
+            // counts bytes the file never got.
+            if flushed.is_ok() && !writer.is_broken() {
+                self.local_tail.store(writer.head().0, Ordering::Release);
+            }
+            flushed
+        };
+        if owes_wake {
+            self.sync_state.wake_sync_thread();
+        }
+        if let Err(error) = &flushed {
+            tracing::error!(
+                %error,
+                "writing a group of appends FAILED — poisoning event store; \
+                 the log and the writer no longer agree and new appends will be rejected"
+            );
+            self.sync_state.fail_sync(error);
+            self.watermark.abort_all(&error.to_string());
+        }
+        for (at, outcome, timer) in results {
+            let outcome = match &flushed {
+                // Whatever this hold decided rested on bytes that never
+                // reached the file, a conflict with one of them included.
+                Err(error) => Err(Error::Io(io::Error::other(format!(
+                    "append was not written, event store poisoned: {error}"
+                )))),
+                Ok(()) => outcome,
+            };
+            answers[at] = Some(Staging::Done(Ok(StagedAppend { outcome, timer })));
+        }
+    }
+
+    /// Queues the append for this context's staging thread and waits for its
+    /// final answer.
+    async fn stage_on_thread(self: &Arc<Self>, prepared: Prepared) -> Settled {
+        let tx = self.stage_tx.get_or_init(spawn_stage_thread);
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let job = StageJob {
+            engine: Arc::clone(self),
+            prepared,
+            reply,
+        };
+        if let Err(std::sync::mpsc::SendError(job)) = tx.send(job) {
+            return Settled::Pool(job.prepared);
+        }
+        match answer.await {
+            Ok(settled) => settled,
+            Err(_) => Settled::Final(Err(Error::Internal {
+                message: "the append staging thread exited with a request in flight".into(),
+            })),
+        }
     }
 
     /// Awaits a staged append's durability without pinning a thread, then
@@ -1880,72 +2610,80 @@ impl EventStoreEngine {
         staged: StagedAppend,
         wait: Result<(), Error>,
     ) -> Result<AppendResponse, Error> {
-        wait?;
-        match staged.outcome {
-            Ok(response) => {
-                self.metrics
-                    .record_append(response.count, staged.timer.elapsed_us());
-                Ok(response)
-            }
-            Err(error) => Err(error),
-        }
+        finalize_append(&self.metrics, staged, wait)
     }
 
     /// The sealed-segment half of a DCB check, run BEFORE the writer lock:
     /// sealed segments are immutable, so their answer cannot change while the
     /// lock is not held, and this is the half that may touch the disk (an
-    /// index the cache has evicted). Returns the conflict, if any, and how
-    /// many sealed segments were covered; `check_dcb_locked` re-checks any
-    /// segment sealed since, under the lock, from its pinned index.
-    fn check_dcb_sealed(
+    /// index the cache has evicted). Returns the verdict and how many sealed
+    /// segments were covered; `check_dcb_locked` re-checks any segment sealed
+    /// since, under the lock, from its pinned index.
+    ///
+    /// Sealed segments `[from_sealed, sealed_count)` that can hold an event at
+    /// or after the marker are scanned: bloom → index → first match at or
+    /// after the marker. With `disk` false, an index or bloom filter that is
+    /// not in memory ends the scan with `NeedsDisk` instead of being read.
+    fn scan_sealed(
         &self,
         condition: &AppendCondition,
-    ) -> Result<(Option<Position>, usize), Error> {
-        let seg_list = self.segments.read().clone();
-        let conflict = self.check_dcb_sealed_range(condition, &seg_list, 0)?;
-        Ok((conflict, seg_list.sealed_count))
-    }
-
-    /// Sealed segments `[from_sealed, sealed_count)` of `seg_list` against
-    /// the condition: bloom → index → first match at or after the marker.
-    fn check_dcb_sealed_range(
-        &self,
-        condition: &AppendCondition,
-        seg_list: &SegmentList,
         from_sealed: usize,
-    ) -> Result<Option<Position>, Error> {
+        disk: bool,
+    ) -> Result<(SealedScan, usize), Error> {
         let marker = condition.consistency_marker.0;
-        for (i, &base) in seg_list.bases.iter().enumerate().skip(from_sealed) {
-            if !seg_list.is_sealed(i) {
-                break;
-            }
-            // Segment ends below the marker — all its events were
-            // already validated by the caller, skip. seg_end is the
-            // last position in the segment (next base - 1).
-            let seg_end = if i + 1 < seg_list.bases.len() {
-                seg_list.bases[i + 1] - 1
-            } else {
-                continue;
-            };
-            if seg_end < marker {
-                continue;
-            }
-
-            let seg_path = segment::segment_path(&self.dir, base);
-
+        let (window, sealed_count) = self.sealed_window(from_sealed, marker);
+        let probe = BloomProbe::new(&condition.criteria);
+        for base in window {
             // Bloom filter: skip segment if tag definitely not present.
-            if let Some(false) = self.cache.bloom_check(&seg_path, base, &condition.criteria) {
+            let bloom = if disk {
+                self.cache.bloom_check_probe(
+                    || segment::segment_path(&self.dir, base),
+                    base,
+                    &probe,
+                )
+            } else {
+                self.cache.bloom_check_cached(base, &probe)
+            };
+            if let Some(false) = bloom {
                 continue;
             }
 
             // Load index and check for any match after the marker.
-            let seg_index = self.cache.get_index(&seg_path, base)?;
+            let seg_index = if disk {
+                self.cache
+                    .get_index(&segment::segment_path(&self.dir, base), base)?
+            } else {
+                match self.cache.index_cached(base) {
+                    Some(index) => index,
+                    None => return Ok((SealedScan::NeedsDisk, sealed_count)),
+                }
+            };
             if let Some(conflicting_pos) = seg_index.has_match_after(&condition.criteria, marker) {
                 self.metrics.record_dcb_violation();
-                return Ok(Some(conflicting_pos));
+                return Ok((SealedScan::Conflict(conflicting_pos), sealed_count));
             }
         }
-        Ok(None)
+        Ok((SealedScan::Clear, sealed_count))
+    }
+
+    /// Bases of the sealed segments `[from_sealed, sealed_count)` that end at
+    /// or after `marker`, and the sealed count they were taken against. A
+    /// segment that ends below the marker was already validated by the caller;
+    /// segments are ordered, so those are found by search, not by walking a
+    /// list that grows with the log.
+    fn sealed_window(&self, from_sealed: usize, marker: u64) -> (Vec<u64>, usize) {
+        let list = self.segments.read();
+        let sealed_count = list.sealed_count;
+        // Segment i ends where segment i+1 begins.
+        let below_marker = list.bases[1..].partition_point(|&next_base| next_base <= marker);
+        let start = below_marker.max(from_sealed);
+        let end = sealed_count.min(list.bases.len().saturating_sub(1));
+        let window = if start < end {
+            list.bases[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        (window, sealed_count)
     }
 
     /// The half of a DCB check that must run under the writer lock: any
@@ -1956,11 +2694,10 @@ impl EventStoreEngine {
         condition: &AppendCondition,
         sealed_checked: usize,
     ) -> Result<Option<Position>, Error> {
-        let seg_list = self.segments.read().clone();
-        if seg_list.sealed_count > sealed_checked
-            && let Some(pos) = self.check_dcb_sealed_range(condition, &seg_list, sealed_checked)?
+        if let (SealedScan::Conflict(position), _) =
+            self.scan_sealed(condition, sealed_checked, true)?
         {
-            return Ok(Some(pos));
+            return Ok(Some(position));
         }
         let conflict = self
             .active_index
@@ -1978,8 +2715,9 @@ impl EventStoreEngine {
     fn append_locked(
         &self,
         writer: &mut SegmentWriter,
-        request: &AppendRequest,
+        request: &Prepared,
         sealed_checked: usize,
+        defer: bool,
     ) -> Result<AppendResponse, Error> {
         {
             // Step 1: Check DCB condition (the sealed half ran pre-lock).
@@ -1991,12 +2729,18 @@ impl EventStoreEngine {
                 });
             }
 
-            if request.events.is_empty() {
+            if request.batch.is_empty() {
                 let head = writer.head();
                 return Ok(AppendResponse {
                     first_position: head,
                     count: 0,
-                    consistency_marker: Position(self.local_tail.load(Ordering::Acquire)),
+                    // A deferred group has not moved the local tail yet; the
+                    // writer's head counts the appends before this one.
+                    consistency_marker: if defer {
+                        head
+                    } else {
+                        Position(self.local_tail.load(Ordering::Acquire))
+                    },
                 });
             }
 
@@ -2004,10 +2748,14 @@ impl EventStoreEngine {
 
             // Step 2: Write events without fsync. Durability is the sync
             // thread's wave fsync; callers wait on the watermark.
-            let (first_position, count) = writer.write_events(&request.events)?;
+            let (first_position, count) = if defer {
+                writer.write_batch_deferred(&request.batch)?
+            } else {
+                writer.write_batch(&request.batch)?
+            };
 
-            // Step 2b: Detect rotation — pin the sealed index, extend the
-            // segment list. The writer indexed the events as it wrote them.
+            // Step 2b: Detect rotation — extend the segment list. The writer
+            // indexed the events as it wrote them and pinned any sealed index.
             self.note_rotation(writer, old_active_base);
 
             // Step 3: Advance the local tail (next-exclusive: first event's
@@ -2015,7 +2763,9 @@ impl EventStoreEngine {
             // Watermark publication — and with it the subscriber wakeup —
             // happens on the sync thread after the wave's fsync.
             let new_head = first_position.0 + count as u64;
-            self.local_tail.store(new_head, Ordering::Release);
+            if !defer {
+                self.local_tail.store(new_head, Ordering::Release);
+            }
 
             Ok(AppendResponse {
                 first_position,
@@ -2025,32 +2775,57 @@ impl EventStoreEngine {
         }
     }
 
-    /// The index that answers for segment `base`: the active segment's live
-    /// index when it is still active, otherwise the sealed index from the
-    /// cache (pinned if the seal is in flight, loaded from `.idx` if not).
-    /// A segment-list snapshot may say "active" about a segment that has
-    /// just been rotated away from; this resolves it correctly either way.
+    /// The index that answers for segment `base`; see [`LogView::index_for`].
     fn index_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
-        let active = self.active_index.read();
-        if active.base_position() == base {
-            return Ok(IndexRef::Active(active));
-        }
-        drop(active);
-        Ok(IndexRef::Sealed(self.cache.get_index(seg_path, base)?))
+        self.view.index_for(base, seg_path)
     }
 
-    /// The reader matching `index_for`'s answer.
+    /// The index for a read that needs only positions or takes every event;
+    /// see [`LogView::offsets_for`].
+    fn offsets_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
+        self.view.offsets_for(base, seg_path)
+    }
+
+    /// The index for a read of `condition`'s events: positions alone if some
+    /// criterion matches everything (the other criteria add nothing then),
+    /// the full tag index otherwise.
+    fn index_for_condition(
+        &self,
+        base: u64,
+        seg_path: &Path,
+        condition: &SourcingCondition,
+    ) -> Result<IndexRef<'_>, Error> {
+        if matches_everything(condition) {
+            self.offsets_for(base, seg_path)
+        } else {
+            self.index_for(base, seg_path)
+        }
+    }
+
+    /// The reader matching `index_for`'s answer: the active segment is read
+    /// through its mapping with a CRC check per read; a sealed segment through
+    /// the block cache, whose blocks were verified when they were loaded (or
+    /// through its mapping, with a check per read, in `ReadMode::Mapped`).
     fn reader_for(
         &self,
         index: &IndexRef<'_>,
         base: u64,
         seg_path: &Path,
-    ) -> Result<SegmentReader, Error> {
+    ) -> Result<RecordReader, Error> {
         match index {
-            IndexRef::Active(_) => self.active_segment_reader(base, seg_path),
-            IndexRef::Sealed(_) => {
-                SegmentReader::from_shared_mmap(self.cache.get_mmap(seg_path, base)?)
-            }
+            IndexRef::Active(_) => Ok(RecordReader::Mapped(
+                self.active_segment_reader(base, seg_path)?,
+            )),
+            IndexRef::Sealed(sealed) => match self.read_mode {
+                ReadMode::Blocks => Ok(RecordReader::Sealed(self.cache.sealed_reader(
+                    seg_path,
+                    base,
+                    Arc::clone(sealed),
+                )?)),
+                ReadMode::Mapped => Ok(RecordReader::Mapped(SegmentReader::from_shared_mmap(
+                    self.cache.get_mmap(seg_path, base)?,
+                )?)),
+            },
         }
     }
 
@@ -2070,11 +2845,7 @@ impl EventStoreEngine {
         // A match-everything criterion means every position from `from` on:
         // positions are dense within a segment, so that is a range, not a
         // clone of the segment's whole position bitmap per page read.
-        if condition
-            .criteria
-            .iter()
-            .any(|c| c.tags.is_empty() && c.names.is_empty())
-        {
+        if matches_everything(condition) {
             let range = index.position_range();
             let start = range.start.max(from);
             if start >= range.end {
@@ -2110,6 +2881,7 @@ impl EventStoreEngine {
             return false;
         }
         let seg_list = self.segments.read().clone();
+        let probe = BloomProbe::new(condition);
         for (i, &base) in seg_list.bases.iter().enumerate() {
             if base >= to {
                 break;
@@ -2118,12 +2890,16 @@ impl EventStoreEngine {
             if seg_end <= from.0 {
                 continue;
             }
-            let seg_path = segment::segment_path(&self.dir, base);
             if seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+                && let Some(false) = self.cache.bloom_check_probe(
+                    || segment::segment_path(&self.dir, base),
+                    base,
+                    &probe,
+                )
             {
                 continue;
             }
+            let seg_path = segment::segment_path(&self.dir, base);
             match self.index_for(base, &seg_path) {
                 Ok(index) => {
                     if index.any_match_in(condition, from.0, to) {
@@ -2162,14 +2938,14 @@ impl EventStoreEngine {
         let base = seg_list.bases[seg_idx];
         let seg_path = segment::segment_path(&self.dir, base);
 
-        let index = self.index_for(base, &seg_path)?;
+        let index = self.offsets_for(base, &seg_path)?;
         let Some(offset) = index.get_offset(position.0) else {
             return Err(Error::Corrupted {
                 message: format!("event at position {} not found in segment", position.0),
             });
         };
-        let reader = self.reader_for(&index, base, &seg_path)?;
-        let mut event = reader.read_event_at(offset as usize)?;
+        let mut reader = self.reader_for(&index, base, &seg_path)?;
+        let mut event = reader.read_event_at(position.0, offset)?;
         // A system event reports no tags rather than an error: an error
         // would itself tell the caller what lives there.
         if crate::system::is_system_name(&event.name) {
@@ -2226,13 +3002,27 @@ impl EventStoreEngine {
 
     /// Creates a live event stream subscription. Delivery is bounded by the
     /// watermark — subscribers only ever see quorum-committed events.
-    pub fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
+    pub fn subscribe(
+        &self,
+        from_position: Position,
+        condition: SourcingCondition,
+        exclude_names: &[String],
+    ) -> EventStream {
         EventStream::new(
             condition,
             from_position,
-            self.commit_tx.subscribe(),
-            self.watermark.handle(),
+            exclude_names,
+            Arc::clone(&self.feed),
+            &self.view,
         )
+    }
+
+    /// Limits how many live chunks (and bytes) the subscription dispatcher
+    /// keeps for streams at the live tail. A hook for tests of streams that
+    /// fall behind it; the defaults suit everything else.
+    #[doc(hidden)]
+    pub fn limit_live_ring(&self, chunks: usize, bytes: usize) {
+        self.feed.limit_ring(chunks, bytes);
     }
 
     /// Returns the current head position (next position to be assigned;
@@ -2319,16 +3109,21 @@ impl EventStoreEngine {
         }
 
         let seg_list = self.segments.read().clone();
+        let probe = BloomProbe::new(condition);
         for (i, &base) in seg_list.bases.iter().enumerate().rev() {
             if base >= bound {
                 continue;
             }
-            let seg_path = segment::segment_path(&self.dir, base);
             if seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+                && let Some(false) = self.cache.bloom_check_probe(
+                    || segment::segment_path(&self.dir, base),
+                    base,
+                    &probe,
+                )
             {
                 continue;
             }
+            let seg_path = segment::segment_path(&self.dir, base);
             let bitmap = self.index_for(base, &seg_path)?.matching(condition);
             if let Some(mut bitmap) = bitmap {
                 // The index is written before the watermark advances, so
@@ -2369,14 +3164,14 @@ impl EventStoreEngine {
         let base = seg_list.bases[seg_idx];
         let seg_path = segment::segment_path(&self.dir, base);
 
-        let index = self.index_for(base, &seg_path)?;
+        let index = self.offsets_for(base, &seg_path)?;
         let Some(offset) = index.get_offset(position.0) else {
             return Err(Error::Corrupted {
                 message: format!("event at position {} not found in segment", position.0),
             });
         };
         self.reader_for(&index, base, &seg_path)?
-            .read_event_at(offset as usize)
+            .read_event_at(position.0, offset)
     }
 
     /// Returns the tail position (first available event position).
@@ -2413,8 +3208,10 @@ impl EventStoreEngine {
 
         let mut events = Vec::new();
 
+        let probe = BloomProbe::new(condition);
+        let everything = matches_everything(condition);
+
         for (i, &base) in seg_list.bases.iter().enumerate() {
-            let seg_path = segment::segment_path(&self.dir, base);
             let is_last = i + 1 == seg_list.bases.len();
             // seg_end is the last position present in this segment.
             let seg_end = if !is_last {
@@ -2432,8 +3229,14 @@ impl EventStoreEngine {
 
             // Sealed segments: bloom filter first, so a segment that cannot
             // hold a match is skipped without loading its index.
-            if seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            // (A condition that takes everything has nothing to rule out.)
+            if !everything
+                && seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check_probe(
+                    || segment::segment_path(&self.dir, base),
+                    base,
+                    &probe,
+                )
             {
                 self.metrics.record_bloom_check(true);
                 continue;
@@ -2442,13 +3245,14 @@ impl EventStoreEngine {
                 self.metrics.record_bloom_check(false);
             }
 
-            let index = self.index_for(base, &seg_path)?;
+            let seg_path = segment::segment_path(&self.dir, base);
+            let index = self.index_for_condition(base, &seg_path, condition)?;
             let Some(matching_positions) =
                 self.matching_in_segment(&index, condition, from_position.0)
             else {
                 continue; // No matches in this segment.
             };
-            let reader = self.reader_for(&index, base, &seg_path)?;
+            let mut reader = self.reader_for(&index, base, &seg_path)?;
 
             // Direct seek via the offset table — O(K) in matching events.
             self.metrics.record_direct_seek();
@@ -2457,7 +3261,7 @@ impl EventStoreEngine {
                     break;
                 }
                 if let Some(offset) = index.get_offset(pos) {
-                    let stored = reader.read_event_at(offset as usize)?;
+                    let stored = reader.read_event_at(pos, offset)?;
                     if crate::system::is_system_name(&stored.name) {
                         continue;
                     }
@@ -2534,86 +3338,258 @@ impl EventStoreEngine {
         if visibility.hides_system() {
             crate::system::validate_client_condition(condition)?;
         }
-        let head = self.watermark.get();
-        let head = match up_to {
-            Some(bound) => head.min(bound.0),
-            None => head,
-        };
+        let hides_system = visibility.hides_system();
+        let mut events = Vec::new();
+        self.walk_matching(from_position, condition, up_to, |_, record| {
+            let (mut stored, _) = format::deserialize_event(record.body)?;
+            if hides_system {
+                // Skipped before it is counted, so `limit` stays "events the
+                // caller can see" and a filtered page never looks like the end.
+                if crate::system::is_system_name(&stored.name) {
+                    return Ok(Walk::Next);
+                }
+                crate::system::strip_system_tags(&mut stored.tags);
+            }
+            events.push(stored);
+            Ok(if events.len() >= limit {
+                Walk::Stop
+            } else {
+                Walk::Next
+            })
+        })?;
+        Ok(events)
+    }
 
+    /// Copies up to `limit` matching client-visible records with position in
+    /// `[from_position, min(head, up_to))` onto `out` in their wire layout
+    /// (`len | flags | body`), stopping early once `out` grew by `max_bytes`.
+    /// Events named in `exclude_names` are skipped without being counted.
+    ///
+    /// The read path of the native protocol: a record is CRC-checked and
+    /// copied, never decoded, unless it carries a system tag to strip.
+    pub fn read_records(
+        &self,
+        condition: &SourcingCondition,
+        page: &PageBounds<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<RecordPage, Error> {
+        crate::system::validate_client_condition(condition)?;
+        let start = out.len();
+        let bounds = page;
+        let mut page = RecordPage::default();
+        let mut rewrite = Vec::new();
+        self.walk_matching(
+            bounds.from,
+            condition,
+            Some(bounds.up_to),
+            |position, record| {
+                // Skipped events still move the page along.
+                page.scanned_to = Some(Position(position));
+                let peek = format::peek(record.body)?;
+                if peek.is_system_event()
+                    || bounds
+                        .exclude_names
+                        .iter()
+                        .any(|n| n.as_bytes() == peek.name)
+                {
+                    return Ok(Walk::Next);
+                }
+                copy_client_record(out, &record, peek.system_tags, &mut rewrite)?;
+                page.count += 1;
+                if page.count == 1 {
+                    // The first record sizes the page: one allocation for
+                    // the rest instead of doubling a small buffer up to it.
+                    let record = out.len() - start;
+                    let rest = bounds.limit.min(MAX_PAGE_RESERVE_RECORDS).saturating_sub(1);
+                    out.reserve(
+                        record
+                            .saturating_mul(rest)
+                            .min(bounds.max_bytes.saturating_sub(record))
+                            .min(MAX_PAGE_RESERVE_BYTES),
+                    );
+                }
+                page.last_position = Some(Position(position));
+                page.full =
+                    page.count as usize >= bounds.limit || out.len() - start >= bounds.max_bytes;
+                Ok(if page.full { Walk::Stop } else { Walk::Next })
+            },
+        )?;
+        Ok(page)
+    }
+
+    /// Visits every record matching `condition` with position in
+    /// `[from, min(watermark, up_to))`, in log order, CRC-checked, until the
+    /// visitor stops. The one segment walk every read is built on.
+    ///
+    /// Offsets are collected under the index's lock a chunk at a time and the
+    /// records read after it is released, so a long read never holds up the
+    /// writer, which needs the active index to append.
+    fn walk_matching(
+        &self,
+        from: Position,
+        condition: &SourcingCondition,
+        up_to: Option<Position>,
+        mut visit: impl FnMut(u64, crate::segment::reader::StoredRecord<'_>) -> Result<Walk, Error>,
+    ) -> Result<(), Error> {
+        const CHUNK: usize = 256;
+        let head = match up_to {
+            Some(bound) => self.watermark.get().min(bound.0),
+            None => self.watermark.get(),
+        };
         let seg_list = self.segments.read().clone();
         if seg_list.bases.is_empty() || head == 0 {
-            return Ok(vec![]);
+            return Ok(());
         }
-
-        // Returns false for an event this caller may not see; otherwise
-        // prepares it for return. Applied before the event is counted
-        // against `limit`.
-        let hides_system = visibility.hides_system();
-        let admit = move |stored: &mut StoredEvent| -> bool {
-            if !hides_system {
-                return true;
-            }
-            if crate::system::is_system_name(&stored.name) {
-                return false;
-            }
-            crate::system::strip_system_tags(&mut stored.tags);
-            true
-        };
-
-        let mut events = Vec::new();
-
+        let probe = BloomProbe::new(condition);
+        let everything = matches_everything(condition);
+        let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(CHUNK);
         for (i, &base) in seg_list.bases.iter().enumerate() {
-            let seg_path = segment::segment_path(&self.dir, base);
-            let is_last = i + 1 == seg_list.bases.len();
-            let seg_end = if !is_last {
-                seg_list.bases[i + 1] - 1
-            } else {
-                head - 1
-            };
-
             if base >= head {
                 break;
             }
-            if seg_end < from_position.0 {
+            let seg_end = match seg_list.bases.get(i + 1) {
+                Some(next) => next - 1,
+                None => head - 1,
+            };
+            if seg_end < from.0 {
                 continue;
             }
-
-            if seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check(&seg_path, base, condition)
+            if !everything
+                && seg_list.is_sealed(i)
+                && let Some(false) = self.cache.bloom_check_probe(
+                    || segment::segment_path(&self.dir, base),
+                    base,
+                    &probe,
+                )
             {
                 continue;
             }
-
-            let index = self.index_for(base, &seg_path)?;
-            // Already-consumed positions are dropped up front so chunked
-            // callers (cursor advancing through the log) don't re-skip the
-            // prefix one position at a time on every call.
-            let Some(matching_positions) =
-                self.matching_in_segment(&index, condition, from_position.0)
-            else {
-                continue;
+            let seg_path = segment::segment_path(&self.dir, base);
+            let (matching, mut reader) = {
+                let index = self.index_for_condition(base, &seg_path, condition)?;
+                // Already-consumed positions are dropped up front so a cursor
+                // advancing through the log doesn't re-skip the prefix.
+                let Some(matching) = self.matching_in_segment(&index, condition, from.0) else {
+                    continue;
+                };
+                let reader = self.reader_for(&index, base, &seg_path)?;
+                (matching, reader)
             };
-            let reader = self.reader_for(&index, base, &seg_path)?;
-
-            for pos in matching_positions.iter() {
-                if pos >= head {
-                    break;
-                }
-                if let Some(offset) = index.get_offset(pos) {
-                    let mut stored = reader.read_event_at(offset as usize)?;
-                    if !admit(&mut stored) {
-                        continue;
+            let mut positions = matching.iter().take_while(|&p| p < head).peekable();
+            while positions.peek().is_some() {
+                offsets.clear();
+                {
+                    let index = self.index_for_condition(base, &seg_path, condition)?;
+                    for pos in positions.by_ref() {
+                        if let Some(offset) = index.get_offset(pos) {
+                            offsets.push((pos, offset));
+                            if offsets.len() == CHUNK {
+                                break;
+                            }
+                        }
                     }
-                    events.push(stored);
-                    if events.len() >= limit {
-                        return Ok(events);
+                }
+                for &(pos, offset) in &offsets {
+                    if let Walk::Stop = visit(pos, reader.record_at(pos, offset)?)? {
+                        return Ok(());
                     }
                 }
             }
         }
-
-        Ok(events)
+        Ok(())
     }
+}
+
+impl Drop for EventStoreEngine {
+    fn drop(&mut self) {
+        // Stops the subscription dispatcher and lets live streams notice.
+        self.feed.close();
+    }
+}
+
+/// Appends a stored record to `out` the way a client may see it, framed as
+/// `len u32 | flags u8 | body`: exactly as stored, unless it carries system
+/// tags, which are stripped (the record is then re-serialized, using
+/// `scratch`). The caller has already judged the event itself visible.
+pub(crate) fn copy_client_record(
+    out: &mut Vec<u8>,
+    record: &crate::segment::reader::StoredRecord<'_>,
+    system_tags: bool,
+    scratch: &mut Vec<u8>,
+) -> Result<(), Error> {
+    if system_tags {
+        let (mut stored, _) = format::deserialize_event(record.body)?;
+        crate::system::strip_system_tags(&mut stored.tags);
+        scratch.clear();
+        format::serialize_event(&stored, scratch);
+        out.extend_from_slice(&((1 + scratch.len()) as u32).to_le_bytes());
+        out.push(record.flags);
+        out.extend_from_slice(scratch);
+    } else {
+        out.extend_from_slice(record.framed);
+    }
+    Ok(())
+}
+
+/// Most records `read_records` reserves room for once it has seen the first.
+const MAX_PAGE_RESERVE_RECORDS: usize = 1024;
+/// Most bytes it reserves that way.
+const MAX_PAGE_RESERVE_BYTES: usize = 1024 * 1024;
+
+/// Whether some criterion of `condition` matches every event, which makes
+/// every other criterion redundant.
+fn matches_everything(condition: &SourcingCondition) -> bool {
+    condition
+        .criteria
+        .iter()
+        .any(|c| c.tags.is_empty() && c.names.is_empty())
+}
+
+/// What a read's visitor wants next.
+enum Walk {
+    Next,
+    Stop,
+}
+
+/// Which records one page of `read_records` covers.
+#[derive(Debug, Clone, Copy)]
+pub struct PageBounds<'a> {
+    /// First position to consider.
+    pub from: Position,
+    /// Positions at and past this are left out (the read's frozen head).
+    pub up_to: Position,
+    /// Most records to copy.
+    pub limit: usize,
+    /// Stop once this many bytes were copied; at least one record always is.
+    pub max_bytes: usize,
+    /// Event types to skip, without counting them against `limit`.
+    pub exclude_names: &'a [String],
+}
+
+impl PageBounds<'_> {
+    pub fn new(from: Position, up_to: Position) -> Self {
+        PageBounds {
+            from,
+            up_to,
+            limit: usize::MAX,
+            max_bytes: usize::MAX,
+            exclude_names: &[],
+        }
+    }
+}
+
+/// What `read_records` copied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordPage {
+    pub count: u32,
+    /// Position of the last record copied.
+    pub last_position: Option<Position>,
+    /// Position of the last matching record looked at, copied or excluded:
+    /// where a cursor resumes from when every match was excluded.
+    pub scanned_to: Option<Position>,
+    /// The page stopped at its count or byte limit, so more may follow; when
+    /// false the read reached its bound.
+    pub full: bool,
 }
 
 #[async_trait::async_trait]
@@ -2621,6 +3597,10 @@ impl EventStore for EventStoreEngine {
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
         // Delegates to the inherent synchronous native append method.
         self.append(request)
+    }
+
+    async fn append_records(&self, request: RecordAppend) -> Result<AppendResponse, Error> {
+        EventStoreEngine::append_records(self, request)
     }
 
     fn source(
@@ -2641,8 +3621,22 @@ impl EventStore for EventStoreEngine {
         self.source_page(from_position, condition, up_to, limit)
     }
 
-    fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
-        self.subscribe(from_position, condition)
+    fn read_records(
+        &self,
+        condition: &SourcingCondition,
+        page: &PageBounds<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<RecordPage, Error> {
+        self.read_records(condition, page, out)
+    }
+
+    fn subscribe(
+        &self,
+        from_position: Position,
+        condition: SourcingCondition,
+        exclude_names: &[String],
+    ) -> EventStream {
+        self.subscribe(from_position, condition, exclude_names)
     }
 
     fn head(&self) -> Position {
@@ -2718,11 +3712,22 @@ fn count_sealed_segments(dir: &Path, bases: &[u64], active_base: u64) -> usize {
     count
 }
 
-fn recover_native_control_state(dir: &Path, local_tail: u64) -> Result<(u64, u64), Error> {
+/// What a log's control records say, read once at open.
+struct RecoveredControl {
+    /// The highest epoch any control record names.
+    epoch: u64,
+    /// The highest watermark a checkpoint within the log's tail recorded.
+    checkpoint: u64,
+    /// Where each `EpochChange` sits.
+    epochs: crate::replication::epochs::EpochIndex,
+}
+
+fn recover_native_control_state(dir: &Path, local_tail: u64) -> Result<RecoveredControl, Error> {
     use std::io::Read;
 
     let mut recovered_epoch = INITIAL_EPOCH;
     let mut checkpoint = 0u64;
+    let mut epochs = crate::replication::epochs::EpochIndex::default();
     for base in segment::list_segment_files(dir)? {
         let path = segment::segment_path(dir, base);
         let mut file = std::fs::File::open(&path)?;
@@ -2755,8 +3760,13 @@ fn recover_native_control_state(dir: &Path, local_tail: u64) -> Result<(u64, u64
                 continue;
             };
             match control {
-                crate::segment::format::ControlRecord::EpochChange { epoch, .. } => {
+                crate::segment::format::ControlRecord::EpochChange {
+                    epoch,
+                    start_position,
+                    ..
+                } => {
                     recovered_epoch = recovered_epoch.max(epoch);
+                    epochs.record(epoch, start_position);
                 }
                 crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position }
                     if position <= local_tail =>
@@ -2768,14 +3778,32 @@ fn recover_native_control_state(dir: &Path, local_tail: u64) -> Result<(u64, u64
             }
         }
     }
-    Ok((recovered_epoch, checkpoint))
+    Ok(RecoveredControl {
+        epoch: recovered_epoch,
+        checkpoint,
+        epochs,
+    })
 }
 
+/// The stored CRC of the record that ends at `byte_end` in this node's own
+/// segment (0 for an empty segment). `byte_end` falling inside a record is a
+/// broken invariant: it is this node's own end.
 fn last_physical_record_crc(path: &Path, byte_end: u64) -> Result<u32, Error> {
+    record_crc_ending_at(path, byte_end)?.ok_or_else(|| Error::Corrupted {
+        message: format!("invalid physical record boundary in {}", path.display()),
+    })
+}
+
+/// The stored CRC of the record that ends at `byte_end` (0 for an empty
+/// segment), or `None` when no record ends there. Asking about a position
+/// another node reports is how a leader finds out whether that node's log is a
+/// prefix of its own; a log that is not one has its end somewhere else, which
+/// is an answer, not damage.
+fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error> {
     use std::io::{Read, Seek, SeekFrom};
 
     if byte_end <= segment::SEGMENT_HEADER_SIZE as u64 {
-        return Ok(0);
+        return Ok(Some(0));
     }
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(segment::SEGMENT_HEADER_SIZE as u64))?;
@@ -2789,21 +3817,15 @@ fn last_physical_record_crc(path: &Path, byte_end: u64) -> Result<u32, Error> {
                 message: format!("zero record inside physical prefix in {}", path.display()),
             })?;
         if offset + header.total_len() as u64 > byte_end {
-            return Err(Error::Corrupted {
-                message: format!("invalid physical record boundary in {}", path.display()),
-            });
+            return Ok(None);
         }
         last_crc = header.stored_crc;
         file.seek(SeekFrom::Current(header.payload_len as i64))?;
         offset += header.total_len() as u64;
     }
-    Ok(last_crc)
+    Ok(Some(last_crc))
 }
 
-/// Finds the raw native record offset from which a follower at `from` resumes.
-/// Control records before the requested event position remain behind the
-/// cursor; control records at the current physical cursor are preserved by the
-/// exact `(segment_base, byte_offset, crc)` resume path.
 /// One sealed, watermark-covered segment eligible for archival (ADR-0002).
 #[derive(Debug, Clone)]
 pub struct ArchivableSegment {
@@ -2819,25 +3841,66 @@ pub struct ArchivableSegment {
 /// byte-exact truncation can walk trailing control records backward.
 #[derive(Clone, Copy)]
 struct BoundaryRecord {
-    start_offset: u64,
+    end_offset: u64,
     crc: u32,
     is_event: bool,
 }
 
-fn find_replication_start(path: &Path, from: Position) -> Result<u64, Error> {
-    Ok(scan_replication_boundary(path, from)?.0)
+/// The last event record before a position, which is where two logs that
+/// share their events up to that position are known to agree. Control records
+/// around it (checkpoints, epoch changes) are each node's own: they carry no
+/// position and a node may hold some the other never received.
+#[derive(Clone, Copy)]
+struct EventAnchor {
+    /// Index of the segment holding the event in the segment list.
+    segment_index: usize,
+    /// Byte offset just past the event record.
+    end_offset: u64,
+    /// The event record's stored CRC.
+    crc: u32,
 }
 
-/// Locates the byte offset where position `from` starts and returns every
-/// valid record before that boundary (offset, stored CRC, kind). The boundary
-/// is the first event record with position >= `from`; when no such event
-/// exists the boundary is the end of the valid prefix — trailing control
-/// records are then part of `preceding`, which is exactly what byte-exact
-/// truncation needs to heal them.
-fn scan_replication_boundary(
-    path: &Path,
-    from: Position,
-) -> Result<(u64, Vec<BoundaryRecord>), Error> {
+/// Finds the last event record whose position is below `pos`, looking in the
+/// segment containing `pos` and then in earlier ones (a segment that starts
+/// with an `EpochChange` at `pos` holds no earlier event). `None` when the log
+/// has no event before `pos`.
+fn locate_event_anchor(
+    dir: &Path,
+    bases: &[u64],
+    pos: Position,
+) -> Result<Option<EventAnchor>, Error> {
+    let start = match bases.binary_search(&pos.0) {
+        Ok(index) => index,
+        Err(0) => {
+            return Err(Error::Corrupted {
+                message: format!("no segment contains boundary position {}", pos.0),
+            });
+        }
+        Err(index) => index - 1,
+    };
+    for index in (0..=start).rev() {
+        let from = if index == start {
+            pos
+        } else {
+            Position(u64::MAX)
+        };
+        let preceding = scan_replication_boundary(&segment::segment_path(dir, bases[index]), from)?;
+        if let Some(event) = preceding.iter().rev().find(|record| record.is_event) {
+            return Ok(Some(EventAnchor {
+                segment_index: index,
+                end_offset: event.end_offset,
+                crc: event.crc,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Every valid record of the segment before position `from` (where it ends,
+/// stored CRC, kind): up to the first event record with position >= `from`, or
+/// the end of the valid prefix when there is none. A segment that starts at or
+/// after `from` has none.
+fn scan_replication_boundary(path: &Path, from: Position) -> Result<Vec<BoundaryRecord>, Error> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
@@ -2845,7 +3908,7 @@ fn scan_replication_boundary(
     file.read_exact(&mut segment_header)?;
     let base = u64::from_le_bytes(segment_header[5..13].try_into().unwrap());
     if from.0 <= base {
-        return Ok((segment::SEGMENT_HEADER_SIZE as u64, Vec::new()));
+        return Ok(Vec::new());
     }
 
     let mut offset = segment::SEGMENT_HEADER_SIZE as u64;
@@ -2855,13 +3918,13 @@ fn scan_replication_boundary(
         match file.read_exact(&mut header) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                return Ok((offset, preceding));
+                return Ok(preceding);
             }
             Err(error) => return Err(error.into()),
         }
         let header = match crate::segment::record::parse_header(&header)? {
             Some(header) => header,
-            None => return Ok((offset, preceding)),
+            None => return Ok(preceding),
         };
         let record_end = offset + header.total_len() as u64;
         let mut payload = vec![0u8; header.payload_len];
@@ -2874,14 +3937,14 @@ fn scan_replication_boundary(
         let is_event = match crate::segment::record::decode_native(header, &payload)? {
             crate::segment::record::NativeRecord::Event { position } => {
                 if position >= from.0 {
-                    return Ok((offset, preceding));
+                    return Ok(preceding);
                 }
                 true
             }
             crate::segment::record::NativeRecord::Control(_) => false,
         };
         preceding.push(BoundaryRecord {
-            start_offset: offset,
+            end_offset: record_end,
             crc: header.stored_crc,
             is_event,
         });
@@ -2950,6 +4013,86 @@ mod tests {
             metadata: vec![],
             tags,
         }
+    }
+
+    /// The dispatcher's read of the log: names and tags in place, from the
+    /// middle of one segment through several others.
+    #[test]
+    fn visit_events_walks_names_and_tags_across_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        // About seven events per segment.
+        let store = EventStoreEngine::create_with_options(dir.path(), 512).unwrap();
+        for i in 0..200 {
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(
+                        &format!("E{}", i % 5),
+                        vec![tag("k", &i.to_string()), tag("g", &(i % 3).to_string())],
+                    )],
+                })
+                .unwrap();
+        }
+        assert!(
+            store.segments.read().bases.len() > 20,
+            "the log should have rotated many times"
+        );
+
+        let visit = |from: u64, to: u64| {
+            let mut seen = Vec::new();
+            store
+                .view
+                .visit_events(from, to, |position, name, tags, _| {
+                    assert_eq!(position, from + seen.len() as u64);
+                    seen.push((
+                        String::from_utf8(name.to_vec()).unwrap(),
+                        tags.map(|(k, v)| {
+                            (
+                                String::from_utf8(k.to_vec()).unwrap(),
+                                String::from_utf8(v.to_vec()).unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    ));
+                    true
+                })
+                .unwrap();
+            seen
+        };
+        let seen = visit(37, 163);
+        assert_eq!(seen.len(), 126);
+        for (offset, (name, tags)) in seen.iter().enumerate() {
+            let i = 37 + offset;
+            assert_eq!(name, &format!("E{}", i % 5));
+            assert_eq!(
+                tags,
+                &vec![
+                    ("k".to_string(), i.to_string()),
+                    ("g".to_string(), (i % 3).to_string())
+                ]
+            );
+        }
+        assert_eq!(visit(0, 200).len(), 200);
+        assert_eq!(visit(199, 200).len(), 1);
+        assert!(visit(50, 50).is_empty());
+        // A range past the log is an error the dispatcher turns into "wake
+        // everyone", never silence.
+        assert!(
+            store
+                .view
+                .visit_events(199, 201, |_, _, _, _| true)
+                .is_err()
+        );
+        // The visitor can stop early; the result says where.
+        let mut n = 0;
+        let stopped = store
+            .view
+            .visit_events(10, 100, |_, _, _, _| {
+                n += 1;
+                n < 5
+            })
+            .unwrap();
+        assert_eq!((n, stopped), (5, 15));
     }
 
     /// The client read path must not reveal the store's own events. Three
@@ -3172,11 +4315,33 @@ mod tests {
     /// A rotation seals the segment in memory first and writes its
     /// companions in the background. Both before and after the companions
     /// land, tag queries and DCB checks must resolve the sealed positions.
+    /// A store with tiny segments, which force many rotations.
+    fn tiny_segment_store(dir: &Path, read_mode: ReadMode) -> EventStoreEngine {
+        EventStoreEngine::create_with_store_options(
+            dir,
+            &StoreOptions {
+                max_segment_size: 4 * 1024,
+                read_mode,
+                block_size: 4096,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn sealed_segments_answer_queries_and_dcb_after_rotation() {
+        sealed_segments_answer_queries_and_dcb(ReadMode::Mapped);
+    }
+
+    #[test]
+    fn sealed_segments_answer_queries_and_dcb_after_rotation_through_blocks() {
+        sealed_segments_answer_queries_and_dcb(ReadMode::Blocks);
+    }
+
+    fn sealed_segments_answer_queries_and_dcb(read_mode: ReadMode) {
         let dir = tempfile::tempdir().unwrap();
-        // Tiny segments force several rotations.
-        let store = EventStoreEngine::create_with_options(dir.path(), 4 * 1024).unwrap();
+        let store = tiny_segment_store(dir.path(), read_mode);
 
         for i in 0..100 {
             store
@@ -3240,6 +4405,219 @@ mod tests {
             100,
             "the rejected append wrote nothing; every accepted event resolves"
         );
+    }
+
+    /// Readers never take the writer lock, so a rotation must make the
+    /// sealed segment's index reachable in the same step that moves the
+    /// active index on to the new segment. Readers hammering a tag while the
+    /// writer rotates constantly must never fall through to a `.idx` that
+    /// the background seal has not written yet.
+    #[test]
+    fn reads_racing_rotations_always_find_the_sealed_index() {
+        reads_racing_rotations(ReadMode::Mapped);
+    }
+
+    #[test]
+    fn reads_racing_rotations_always_find_the_sealed_index_through_blocks() {
+        reads_racing_rotations(ReadMode::Blocks);
+    }
+
+    fn reads_racing_rotations(read_mode: ReadMode) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tiny_segment_store(dir.path(), read_mode);
+        let hot = SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![tag("orderId", "hot")],
+            }],
+        };
+        let done = std::sync::atomic::AtomicBool::new(false);
+        // Sets `done` however the writer side ends. Without it a failing
+        // append (a full disk, say) panics past the `done.store` below and the
+        // scope waits forever on readers that spin until they are told to stop.
+        struct StopReaders<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopReaders<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the writer did not finish its appends in time"
+                        );
+                        store
+                            .source_page(Position(0), &hot, store.head(), 8192)
+                            .expect("a read raced a rotation and missed the sealed index");
+                    }
+                });
+            }
+            let _stop = StopReaders(&done);
+            for i in 0..200 {
+                let events = (0..20)
+                    .map(|k| {
+                        let id = if k == 0 {
+                            "hot".to_string()
+                        } else {
+                            format!("ord-{i}-{k}")
+                        };
+                        make_event("OrderPlaced", vec![tag("orderId", &id)])
+                    })
+                    .collect();
+                store
+                    .append(AppendRequest {
+                        condition: None,
+                        events,
+                    })
+                    .unwrap();
+            }
+        });
+
+        let segments = store.segments.read().clone();
+        assert!(segments.sealed_count > 50, "expected many rotations");
+        let hot_events = store.source(Position(0), &hot).unwrap();
+        assert_eq!(hot_events.len(), 200);
+    }
+
+    /// `read_records` is `source_page` without the decoding: the same events,
+    /// in the same order, under the same visibility rules, across rotations.
+    #[test]
+    fn read_records_copies_exactly_what_source_page_returns() {
+        read_records_matches_source_page(ReadMode::Mapped);
+    }
+
+    #[test]
+    fn read_records_copies_exactly_what_source_page_returns_through_blocks() {
+        read_records_matches_source_page(ReadMode::Blocks);
+    }
+
+    fn read_records_matches_source_page(read_mode: ReadMode) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tiny_segment_store(dir.path(), read_mode);
+        for i in 0..300u32 {
+            let mut tags = vec![tag("orderId", &format!("o-{}", i % 7))];
+            // A visible event carrying a server-owned tag, as a fired
+            // schedule writes it, must lose the tag.
+            let request = |tags| AppendRequest {
+                condition: None,
+                events: vec![make_event("OrderPlaced", tags)],
+            };
+            if i % 50 == 3 {
+                tags.push(tag("$schedule", "tok"));
+                store.append_system(request(tags)).unwrap();
+            } else {
+                store.append(request(tags)).unwrap();
+            }
+            // System events must never be copied.
+            if i % 40 == 9 {
+                store
+                    .append_system(AppendRequest {
+                        condition: None,
+                        events: vec![make_event(
+                            "$snapshot.written",
+                            vec![crate::system::marker()],
+                        )],
+                    })
+                    .unwrap();
+            }
+        }
+        let head = store.head();
+        for condition in [
+            cond_match_all(),
+            SourcingCondition {
+                criteria: vec![Criterion {
+                    names: vec![],
+                    tags: vec![tag("orderId", "o-3")],
+                }],
+            },
+        ] {
+            let mut cursor = Position(0);
+            let mut copied = Vec::new();
+            loop {
+                let mut out = Vec::new();
+                let page = store
+                    .read_records(
+                        &condition,
+                        &PageBounds {
+                            limit: 13,
+                            ..PageBounds::new(cursor, head)
+                        },
+                        &mut out,
+                    )
+                    .unwrap();
+                let mut at = 0;
+                for _ in 0..page.count {
+                    let len = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+                    let (event, used) =
+                        format::deserialize_event(&out[at + 5..at + 4 + len]).unwrap();
+                    assert_eq!(used, len - 1, "a record is exactly one event");
+                    copied.push(event.into_sequenced());
+                    at += 4 + len;
+                }
+                assert_eq!(at, out.len());
+                match page.last_position {
+                    Some(last) if page.full => cursor = Position(last.0 + 1),
+                    _ => break,
+                }
+            }
+            let sourced = store
+                .source_page(Position(0), &condition, head, usize::MAX)
+                .unwrap();
+            assert_eq!(copied.len(), sourced.len());
+            for (a, b) in copied.iter().zip(&sourced) {
+                assert_eq!(
+                    (a.position, &a.name, &a.payload),
+                    (b.position, &b.name, &b.payload)
+                );
+            }
+        }
+        // Tags travel on the wire, so the stripped one must be gone from the bytes.
+        let mut out = Vec::new();
+        store
+            .read_records(
+                &cond_match_all(),
+                &PageBounds::new(Position(0), head),
+                &mut out,
+            )
+            .unwrap();
+        assert!(!out.windows(9).any(|w| w == b"$schedule"));
+        let everything = out;
+        // Excluded types are skipped without counting against the limit.
+        let mut out = Vec::new();
+        let excluded = store
+            .read_records(
+                &cond_match_all(),
+                &PageBounds {
+                    exclude_names: &["OrderPlaced".to_string()],
+                    ..PageBounds::new(Position(0), head)
+                },
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(excluded.count, 0);
+        assert!(out.is_empty() && !everything.is_empty());
+        assert!(
+            excluded.scanned_to.is_some(),
+            "the cursor still moves past them"
+        );
+        // The byte limit stops a page early but always returns at least one record.
+        let mut out = Vec::new();
+        let page = store
+            .read_records(
+                &cond_match_all(),
+                &PageBounds {
+                    max_bytes: 1,
+                    ..PageBounds::new(Position(0), head)
+                },
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!((page.count, page.full), (1, true));
     }
 
     /// A crash between a rotation and its background seal leaves a sealed
@@ -3692,6 +5070,277 @@ mod tests {
         }
     }
 
+    fn tag_cond(value: &str) -> SourcingCondition {
+        SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![tag("orderId", value)],
+            }],
+        }
+    }
+
+    /// Opens a store that reads sealed segments the given way, with small
+    /// blocks so a segment spans several of them.
+    fn open_store_reading(dir: &Path, read_mode: ReadMode) -> EventStoreEngine {
+        EventStoreEngine::open_with_store_options(
+            dir,
+            &StoreOptions {
+                max_segment_size: 16 * 1024,
+                read_mode,
+                block_size: 4096,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// A byte that went bad on disk in a sealed segment is never served: the
+    /// read that would have returned it gets `Corrupted`, while the rest of
+    /// the log keeps answering. Through the mapping the check is on every
+    /// read; through the block cache it is when the block comes off the disk.
+    #[test]
+    fn a_flipped_byte_in_a_sealed_segment_is_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = EventStoreEngine::create_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 16 * 1024,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            for i in 0..600 {
+                store
+                    .append(AppendRequest {
+                        condition: None,
+                        events: vec![make_event(
+                            "OrderPlaced",
+                            vec![tag("orderId", &format!("ord-{i}"))],
+                        )],
+                    })
+                    .unwrap();
+            }
+            store.seals.wait_idle();
+            assert!(store.segments.read().sealed_count >= 2);
+        }
+
+        // Event 3 lives in the first, sealed segment. Flip one bit in its
+        // body while nothing has the file cached.
+        let seg0 = segment::segment_path(dir.path(), 0);
+        let offset = SegmentIndex::read_idx(&seg0.with_extension("idx"))
+            .unwrap()
+            .get_offset(3)
+            .unwrap();
+        let mut bytes = std::fs::read(&seg0).unwrap();
+        bytes[offset as usize + 40] ^= 0x04;
+        std::fs::write(&seg0, &bytes).unwrap();
+
+        for read_mode in [ReadMode::Blocks, ReadMode::Mapped] {
+            assert_flipped_byte_is_refused(dir.path(), read_mode);
+        }
+    }
+
+    fn assert_flipped_byte_is_refused(dir: &Path, read_mode: ReadMode) {
+        let store = open_store_reading(dir, read_mode);
+        match store.source(Position(0), &tag_cond("ord-3")) {
+            Err(Error::Corrupted { message }) => {
+                assert!(message.contains("CRC mismatch"), "{message}")
+            }
+            other => panic!("expected Corrupted, got {:?}", other.map(|e| e.len())),
+        }
+        assert!(matches!(
+            store.get_tags(Position(3)),
+            Err(Error::Corrupted { .. })
+        ));
+        let mut out = Vec::new();
+        assert!(matches!(
+            store.read_records(
+                &cond_match_all(),
+                &PageBounds::new(Position(0), store.head()),
+                &mut out
+            ),
+            Err(Error::Corrupted { .. })
+        ));
+        // Events elsewhere are untouched and served.
+        assert_eq!(
+            store
+                .source(Position(0), &tag_cond("ord-150"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Everything a store holds reads back, byte for byte the same through
+    /// the block cache as through the per-read-CRC mapping.
+    #[test]
+    fn block_reads_return_what_mapped_reads_return() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = EventStoreEngine::create_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 16 * 1024,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            for i in 0..300 {
+                store
+                    .append(AppendRequest {
+                        condition: None,
+                        events: vec![make_event(
+                            "OrderPlaced",
+                            vec![tag("orderId", &format!("ord-{}", i % 13))],
+                        )],
+                    })
+                    .unwrap();
+            }
+            store.seals.wait_idle();
+        }
+        let read = |mode: ReadMode| {
+            let store = EventStoreEngine::open_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 16 * 1024,
+                    read_mode: mode,
+                    block_size: 4096,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            let mut all = Vec::new();
+            let mut from = Position(0);
+            loop {
+                let mut page = Vec::new();
+                let bounds = PageBounds {
+                    limit: 37,
+                    ..PageBounds::new(from, store.head())
+                };
+                let result = store
+                    .read_records(&cond_match_all(), &bounds, &mut page)
+                    .unwrap();
+                all.extend_from_slice(&page);
+                if !result.full {
+                    break;
+                }
+                from = Position(result.scanned_to.unwrap().0 + 1);
+            }
+            let by_tag = store.source(Position(0), &tag_cond("ord-5")).unwrap();
+            (all, by_tag.len())
+        };
+        let (blocks, blocks_tagged) = read(ReadMode::Blocks);
+        let (mapped, mapped_tagged) = read(ReadMode::Mapped);
+        assert!(!blocks.is_empty());
+        assert_eq!(blocks, mapped);
+        assert_eq!(blocks_tagged, mapped_tagged);
+    }
+
+    /// Replays the whole log in pages the way a client does, returning the
+    /// number of events delivered.
+    fn replay_all(store: &EventStoreEngine, condition: &SourcingCondition) -> usize {
+        let mut events = 0;
+        let mut from = Position(0);
+        loop {
+            let mut page = Vec::new();
+            let bounds = PageBounds {
+                limit: 37,
+                ..PageBounds::new(from, store.head())
+            };
+            let result = store.read_records(condition, &bounds, &mut page).unwrap();
+            events += result.count as usize;
+            if !result.full {
+                return events;
+            }
+            from = Position(result.scanned_to.unwrap().0 + 1);
+        }
+    }
+
+    /// A replay takes every event, so it has no use for a segment's tag
+    /// index: the position→offset table is enough. With an index budget
+    /// that holds none of them, a whole-log replay must not load one, and a
+    /// second and third pass must find the tables cached. (Replaying through
+    /// full indexes under such a budget reloaded every one of them on every
+    /// pass.)
+    #[test]
+    fn replaying_more_segments_than_the_index_budget_holds_loads_no_tag_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let total = 600u64;
+        {
+            let store = EventStoreEngine::create_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 16 * 1024,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            for i in 0..total {
+                store
+                    .append(AppendRequest {
+                        condition: None,
+                        events: vec![make_event(
+                            "OrderPlaced",
+                            vec![tag("orderId", &format!("ord-{}", i % 13))],
+                        )],
+                    })
+                    .unwrap();
+            }
+            store.seals.wait_idle();
+        }
+        for read_mode in [ReadMode::Mapped, ReadMode::Blocks] {
+            let store = EventStoreEngine::open_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 16 * 1024,
+                    index_cache_bytes: 1,
+                    read_mode,
+                    block_size: 4096,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            let sealed = store.segments.read().sealed_count as u64;
+            assert!(sealed >= 3, "need several sealed segments, got {sealed}");
+
+            for pass in 0..3 {
+                assert_eq!(
+                    replay_all(&store, &cond_match_all()),
+                    total as usize,
+                    "{read_mode:?} pass {pass}"
+                );
+            }
+            let misses = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+            assert_eq!(
+                misses(&store.cache.index_misses),
+                0,
+                "{read_mode:?}: a replay loaded a tag index"
+            );
+            assert_eq!(
+                misses(&store.cache.offsets_misses),
+                sealed,
+                "{read_mode:?}: each table loads once and then stays"
+            );
+
+            // A read by tag does need the tag bitmaps, and gets them.
+            let wanted = (0..total).filter(|i| i % 13 == 3).count();
+            assert_eq!(
+                store.source(Position(0), &tag_cond("ord-3")).unwrap().len(),
+                wanted
+            );
+            assert!(misses(&store.cache.index_misses) > 0);
+            assert_eq!(replay_all(&store, &tag_cond("ord-3")), wanted);
+
+            // Point reads by position need only the table, too.
+            let before = misses(&store.cache.index_misses);
+            for position in [0, 1, total / 2, total - 1] {
+                store.get_tags(Position(position)).unwrap();
+            }
+            assert_eq!(misses(&store.cache.index_misses), before);
+        }
+    }
+
     #[test]
     fn head_and_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -3766,5 +5415,771 @@ mod tests {
 
             assert!(result.is_ok(), "condition with fresh marker should pass");
         }
+    }
+    // ---- staging modes ----
+
+    /// An engine with small segments. The default 256 MB segment is
+    /// preallocated, which on a tmpfs temp directory is real memory: a dozen
+    /// tests running side by side would fill it.
+    fn small_engine(dir: &Path) -> EventStoreEngine {
+        EventStoreEngine::create_with_options(dir, 1 << 20).unwrap()
+    }
+
+    fn conditional(marker: u64, orders: &[&str], events: Vec<AppendEvent>) -> AppendRequest {
+        AppendRequest {
+            condition: Some(AppendCondition {
+                consistency_marker: Position(marker),
+                criteria: SourcingCondition {
+                    criteria: orders
+                        .iter()
+                        .map(|order| Criterion {
+                            names: vec![],
+                            tags: vec![tag("orderId", order)],
+                        })
+                        .collect(),
+                },
+            }),
+            events,
+        }
+    }
+
+    fn client(request: AppendRequest) -> Prepared {
+        prepare_client_append(request).unwrap()
+    }
+
+    fn plain(events: Vec<AppendEvent>) -> AppendRequest {
+        AppendRequest {
+            condition: None,
+            events,
+        }
+    }
+
+    /// Finishes a non-blocking staging the way `stage_append` does: a request
+    /// it handed back goes to the blocking path.
+    async fn settle(
+        engine: &Arc<EventStoreEngine>,
+        staging: Staging,
+    ) -> Result<AppendResponse, Error> {
+        let staged = match staging {
+            Staging::Done(result) => result?,
+            Staging::NeedsPool(prepared) => engine.stage_prepared(prepared, Timer::start())?,
+        };
+        engine.append_finish_async(staged).await
+    }
+
+    /// Finishes whatever the staging thread answered with.
+    async fn settle_thread(
+        engine: &Arc<EventStoreEngine>,
+        settled: Settled,
+    ) -> Result<AppendResponse, Error> {
+        match settled {
+            Settled::Final(result) => result,
+            Settled::Pool(prepared) => {
+                let staged = engine.stage_prepared(prepared, Timer::start())?;
+                engine.append_finish_async(staged).await
+            }
+        }
+    }
+
+    fn outcome(result: Result<AppendResponse, Error>) -> Result<(u64, u32, u64), u64> {
+        match result {
+            Ok(r) => Ok((r.first_position.0, r.count, r.consistency_marker.0)),
+            Err(Error::ConsistencyConditionViolated {
+                conflicting_position,
+            }) => Err(conflicting_position.0),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nonblocking_staging_answers_like_the_blocking_path() {
+        let script = |step: usize| -> AppendRequest {
+            match step {
+                0 => plain(vec![
+                    make_event("OrderPlaced", vec![tag("orderId", "A")]),
+                    make_event("OrderPlaced", vec![tag("orderId", "B")]),
+                ]),
+                // Conflicts with position 0 (after marker 0).
+                1 => conditional(
+                    0,
+                    &["A"],
+                    vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+                ),
+                // Clear: nothing for C, and A's event sits below the marker.
+                2 => conditional(
+                    2,
+                    &["A", "C"],
+                    vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+                ),
+                // Conflicts with step 2's own event.
+                3 => conditional(
+                    2,
+                    &["A"],
+                    vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+                ),
+                // Condition only, no events.
+                4 => conditional(3, &["B"], vec![]),
+                _ => plain(vec![make_event("OrderPlaced", vec![tag("orderId", "D")])]),
+            }
+        };
+        let blocking_dir = tempfile::tempdir().unwrap();
+        let inline_dir = tempfile::tempdir().unwrap();
+        let blocking = Arc::new(small_engine(blocking_dir.path()));
+        let inline = Arc::new(small_engine(inline_dir.path()));
+        for step in 0..6 {
+            let expected = outcome(blocking.append(script(step)));
+            let mut staging = inline.stage_inline(client(script(step)));
+            // The sync thread takes the writer lock for an instant after
+            // each write, and a request that finds it held is handed to the
+            // pool, which is right but not what this test is about: offer
+            // it again until the thread has let go.
+            for _ in 0..10_000 {
+                let Staging::NeedsPool(prepared) = staging else {
+                    break;
+                };
+                tokio::task::yield_now().await;
+                staging = inline.stage_inline(prepared);
+            }
+            assert!(
+                matches!(staging, Staging::Done(_)),
+                "step {step}: nothing here needs the pool"
+            );
+            let got = outcome(settle(&inline, staging).await);
+            assert_eq!(got, expected, "step {step}");
+        }
+        assert_eq!(inline.head(), blocking.head());
+        blocking.shutdown();
+        inline.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inline_staging_leaves_a_busy_writer_to_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(small_engine(dir.path()));
+        let request = || plain(vec![make_event("OrderPlaced", vec![tag("orderId", "A")])]);
+        {
+            let _held = engine.writer.lock();
+            let staging = engine.stage_inline(client(request()));
+            let Staging::NeedsPool(returned) = staging else {
+                panic!("a held writer lock must hand the request back");
+            };
+            assert_eq!(returned.batch.len(), 1, "the request comes back intact");
+            assert_eq!(engine.head(), Position(0), "and nothing was written");
+        }
+        // The sync thread takes the lock for an instant when it starts, and
+        // may have been waiting for ours; let it finish.
+        while engine.writer.is_locked() {
+            tokio::task::yield_now().await;
+        }
+        let staging = engine.stage_inline(client(request()));
+        assert!(matches!(staging, Staging::Done(_)));
+        assert_eq!(outcome(settle(&engine, staging).await), Ok((0, 1, 1)));
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inline_staging_leaves_a_rotating_write_to_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            max_segment_size: 1024,
+            ..Default::default()
+        };
+        let engine =
+            Arc::new(EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap());
+        let event = || make_event("OrderPlaced", vec![tag("orderId", "A")]);
+        let mut inline = 0;
+        let mut pooled = 0;
+        for i in 0..20u64 {
+            let staging = engine.stage_inline(client(plain(vec![event()])));
+            match &staging {
+                Staging::Done(_) => inline += 1,
+                Staging::NeedsPool(_) => pooled += 1,
+            }
+            let (first, count, _) = outcome(settle(&engine, staging).await).unwrap();
+            assert_eq!(
+                (first, count),
+                (i, 1),
+                "positions stay dense across rotations"
+            );
+        }
+        assert!(inline > 0, "writes that fit stay inline");
+        assert!(pooled > 0, "the write that would rotate goes to the pool");
+        assert!(engine.metrics().snapshot().segment_rotations > 0);
+        assert_eq!(
+            engine.source(Position(0), &cond_match_all()).unwrap().len(),
+            20
+        );
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inline_staging_never_reads_an_index_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            max_segment_size: 1024,
+            index_cache_size: 1,
+            bloom_cache_size: 1,
+            ..Default::default()
+        };
+        let engine =
+            Arc::new(EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap());
+        for i in 0..40 {
+            engine
+                .append(plain(vec![make_event(
+                    "OrderPlaced",
+                    vec![tag("orderId", &format!("o-{i}"))],
+                )]))
+                .unwrap();
+        }
+        engine.seals.wait_idle();
+        assert!(engine.segments.read().sealed_count > 2);
+
+        // Marker 0 reaches every sealed segment; the cache holds one.
+        let request = || {
+            conditional(
+                0,
+                &["nobody"],
+                vec![make_event("OrderPlaced", vec![tag("orderId", "nobody")])],
+            )
+        };
+        assert!(
+            engine.stage_pre_cached(&client(request())).is_none(),
+            "an evicted index is a reason to leave the async worker"
+        );
+        let staging = engine.stage_inline(client(request()));
+        assert!(matches!(staging, Staging::NeedsPool(_)));
+        // The pool path reads the disk and answers.
+        outcome(settle(&engine, staging).await).unwrap();
+
+        // The conflict a cold segment holds is still found.
+        let conflict = conditional(
+            0,
+            &["o-0"],
+            vec![make_event("OrderPlaced", vec![tag("orderId", "o-0")])],
+        );
+        let staging = engine.stage_inline(client(conflict));
+        assert_eq!(outcome(settle(&engine, staging).await), Err(0));
+        engine.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_staging_thread_orders_every_append_and_one_dcb_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(small_engine(dir.path()));
+
+        let mut tasks = Vec::new();
+        for t in 0..8 {
+            let engine = Arc::clone(&engine);
+            tasks.push(tokio::spawn(async move {
+                for i in 0..25 {
+                    let staging = engine
+                        .stage_on_thread(client(plain(vec![make_event(
+                            &format!("E-{t}-{i}"),
+                            vec![tag("t", &t.to_string())],
+                        )])))
+                        .await;
+                    settle_thread(&engine, staging).await.unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(engine.head(), Position(200));
+        let all = engine.source(Position(0), &cond_match_all()).unwrap();
+        let positions: Vec<u64> = all.iter().map(|e| e.position.0).collect();
+        assert_eq!(positions, (0..200).collect::<Vec<_>>());
+
+        // Sixteen appenders race one condition: the first to stage wins and
+        // every later one sees its event.
+        let mut racers = Vec::new();
+        for r in 0..16 {
+            let engine = Arc::clone(&engine);
+            racers.push(tokio::spawn(async move {
+                let staging = engine
+                    .stage_on_thread(client(conditional(
+                        200,
+                        &["contested"],
+                        vec![make_event(
+                            &format!("Claim-{r}"),
+                            vec![tag("orderId", "contested")],
+                        )],
+                    )))
+                    .await;
+                outcome(settle_thread(&engine, staging).await)
+            }));
+        }
+        let mut winners = 0;
+        for racer in racers {
+            match racer.await.unwrap() {
+                Ok(_) => winners += 1,
+                Err(conflicting) => assert_eq!(conflicting, 200),
+            }
+        }
+        assert_eq!(winners, 1);
+        assert_eq!(engine.head(), Position(201));
+        engine.shutdown();
+    }
+
+    /// Each place an append can be staged, alone and together. The pool is
+    /// always the last resort, so `POOL_ONLY` is every route switched off.
+    const ALL_ROUTES: [(&str, Routes); 4] = [
+        (
+            "pool",
+            Routes {
+                inline: false,
+                thread: false,
+            },
+        ),
+        (
+            "inline",
+            Routes {
+                inline: true,
+                thread: false,
+            },
+        ),
+        (
+            "thread",
+            Routes {
+                inline: false,
+                thread: true,
+            },
+        ),
+        ("all", Routes::ALL),
+    ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_staging_mode_keeps_positions_dense_across_rotations() {
+        for (mode, routes) in ALL_ROUTES {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StoreOptions {
+                max_segment_size: 4096,
+                ..Default::default()
+            };
+            let engine =
+                Arc::new(EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap());
+            let mut tasks = Vec::new();
+            for t in 0..6 {
+                let engine = Arc::clone(&engine);
+                tasks.push(tokio::spawn(async move {
+                    for i in 0..40 {
+                        // Mixed batch sizes, some of which rotate.
+                        let events = (0..1 + (i % 4))
+                            .map(|e| make_event(&format!("E-{t}-{i}-{e}"), vec![tag("t", "x")]))
+                            .collect();
+                        engine
+                            .append_routed(routes, plain(events), false)
+                            .await
+                            .unwrap();
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let expected: u64 = 6 * (0..40u64).map(|i| 1 + (i % 4)).sum::<u64>();
+            assert_eq!(engine.head(), Position(expected), "{mode}");
+            let all = engine.source(Position(0), &cond_match_all()).unwrap();
+            let positions: Vec<u64> = all.iter().map(|e| e.position.0).collect();
+            assert_eq!(positions, (0..expected).collect::<Vec<_>>(), "{mode}");
+            assert!(
+                engine.metrics().snapshot().segment_rotations > 2,
+                "{mode}: the run must have rotated"
+            );
+            engine.shutdown();
+        }
+    }
+
+    fn breaker_engine(dir: &std::path::Path) -> Arc<EventStoreEngine> {
+        Arc::new(EventStoreEngine::create(dir).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_inline_staging_moves_appends_to_the_staging_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = breaker_engine(dir.path());
+        // Any inline staging counts as a stall, and the route stays shut for
+        // the rest of the test.
+        engine
+            .inline_breaker
+            .set_limits(Duration::ZERO, Duration::from_secs(3600));
+        for i in 0..20 {
+            engine
+                .append_routed(
+                    Routes::ALL,
+                    plain(vec![make_event(&format!("E-{i}"), vec![tag("t", "x")])]),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        // Only the first append went inline: had the route stayed open, every
+        // one of the 20 would have stalled and been counted.
+        assert_eq!(engine.metrics().snapshot().inline_stalls, 1);
+        assert_eq!(engine.head(), Position(20));
+        let all = engine.source(Position(0), &cond_match_all()).unwrap();
+        assert_eq!(all.len(), 20);
+        engine.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_staging_resumes_after_the_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = breaker_engine(dir.path());
+        engine
+            .inline_breaker
+            .set_limits(Duration::ZERO, Duration::from_millis(20));
+        for i in 0..2 {
+            engine
+                .append_routed(
+                    Routes::ALL,
+                    plain(vec![make_event(&format!("E-{i}"), vec![tag("t", "x")])]),
+                    false,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        // Each append found the route open again, went inline and stalled.
+        assert_eq!(engine.metrics().snapshot().inline_stalls, 2);
+        engine.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quick_inline_stagings_keep_the_route_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = breaker_engine(dir.path());
+        engine
+            .inline_breaker
+            .set_limits(Duration::from_secs(3600), Duration::from_secs(3600));
+        for i in 0..20 {
+            engine
+                .append_routed(
+                    Routes::ALL,
+                    plain(vec![make_event(&format!("E-{i}"), vec![tag("t", "x")])]),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(engine.metrics().snapshot().inline_stalls, 0);
+        assert!(engine.inline_breaker.allows(engine.inline_breaker.now()));
+        engine.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_staging_mode_gives_a_dcb_race_one_winner() {
+        for (mode, routes) in ALL_ROUTES {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Arc::new(small_engine(dir.path()));
+            let mut racers = Vec::new();
+            for r in 0..16 {
+                let engine = Arc::clone(&engine);
+                racers.push(tokio::spawn(async move {
+                    outcome(
+                        engine
+                            .append_routed(
+                                routes,
+                                conditional(
+                                    0,
+                                    &["contested"],
+                                    vec![make_event(
+                                        &format!("Claim-{r}"),
+                                        vec![tag("orderId", "contested")],
+                                    )],
+                                ),
+                                false,
+                            )
+                            .await,
+                    )
+                }));
+            }
+            let mut winners = 0;
+            for racer in racers {
+                match racer.await.unwrap() {
+                    Ok(_) => winners += 1,
+                    Err(conflicting) => assert_eq!(conflicting, 0, "{mode}"),
+                }
+            }
+            assert_eq!(winners, 1, "{mode}");
+            assert_eq!(engine.head(), Position(1), "{mode}");
+            engine.shutdown();
+        }
+    }
+
+    /// An fsync failure (or an epoch change) must reach an append in every
+    /// staging mode: never a success, whether the append is staged before the
+    /// failure, waiting on it, or arrives after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_staging_mode_refuses_a_write_after_the_engine_is_poisoned() {
+        for (mode, routes) in ALL_ROUTES {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Arc::new(small_engine(dir.path()));
+            engine
+                .append_routed(routes, plain(vec![make_event("Ok", vec![])]), false)
+                .await
+                .unwrap();
+            let failure = Error::Io(io::Error::other("simulated ENOSPC"));
+            engine.sync_state.fail_sync(&failure);
+            engine.watermark.abort_all(&failure.to_string());
+            let refused = engine
+                .append_routed(routes, plain(vec![make_event("Late", vec![])]), false)
+                .await;
+            assert!(refused.is_err(), "{mode}: a poisoned engine must not ack");
+            engine.shutdown();
+        }
+    }
+
+    fn rotating_engine(dir: &Path) -> Arc<EventStoreEngine> {
+        let opts = StoreOptions {
+            max_segment_size: 4096,
+            ..Default::default()
+        };
+        Arc::new(EventStoreEngine::create_with_store_options(dir, &opts).unwrap())
+    }
+
+    /// A mixed run of appends: plain and conditional, several events, none,
+    /// some that conflict with an earlier one in the same run.
+    fn mixed_run() -> Vec<AppendRequest> {
+        (0..70u64)
+            .map(|i| {
+                let order = format!("o-{}", i % 7);
+                let event = |n: u64| {
+                    let mut e = make_event("OrderPlaced", vec![tag("orderId", &order)]);
+                    e.payload = vec![n as u8; 30 + (n as usize * 11) % 120];
+                    e
+                };
+                match i % 6 {
+                    1 => conditional(i / 3, &[&order], vec![event(i)]),
+                    2 => conditional(i, &["nobody"], vec![event(i), event(i + 100)]),
+                    3 => conditional(0, &[&order], vec![]),
+                    4 => plain(vec![]),
+                    _ => plain((0..=i % 3).map(|k| event(i * 10 + k)).collect()),
+                }
+            })
+            .collect()
+    }
+
+    /// Whatever grouping the staging thread happens to find, the log is the
+    /// one the appends would have made one at a time: same answers, same
+    /// positions, the same bytes in the same files, across rotations.
+    #[tokio::test]
+    async fn a_staged_group_makes_the_log_one_at_a_time_would() {
+        let one_dir = tempfile::tempdir().unwrap();
+        let one = rotating_engine(one_dir.path());
+        let mut expected = Vec::new();
+        for request in mixed_run() {
+            expected.push(outcome(one.append(request)));
+        }
+        assert!(
+            expected.iter().any(|o| o.is_err()),
+            "the run has conflicts to find"
+        );
+
+        // Group sizes that split the run in different places, and one that
+        // does not split it at all (the group limits do).
+        for size in [1usize, 2, 7, 70] {
+            let dir = tempfile::tempdir().unwrap();
+            let grouped = rotating_engine(dir.path());
+            let mut got = Vec::new();
+            let mut run = mixed_run().into_iter().peekable();
+            while run.peek().is_some() {
+                let group: Vec<Prepared> = run.by_ref().take(size).map(client).collect();
+                let stagings = grouped.stage_group(group);
+                let mut release = None;
+                for staging in &stagings {
+                    if let Staging::Done(Ok(staged)) = staging {
+                        release = release.max(staged.wait_pos());
+                    }
+                }
+                grouped.release_written(release);
+                for staging in stagings {
+                    got.push(outcome(settle(&grouped, staging).await));
+                }
+            }
+            assert_eq!(got, expected, "groups of {size}");
+            assert_eq!(grouped.head(), one.head());
+            one.seals.wait_idle();
+            grouped.seals.wait_idle();
+            let files = |dir: &Path| {
+                let mut files: Vec<_> = std::fs::read_dir(dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "seg"))
+                    .collect();
+                files.sort();
+                files
+            };
+            let (a, b) = (files(one_dir.path()), files(dir.path()));
+            assert!(a.len() > 2, "the run rotated");
+            assert_eq!(a.len(), b.len(), "groups of {size}");
+            for (x, y) in a.iter().zip(&b) {
+                assert!(
+                    std::fs::read(x).unwrap() == std::fs::read(y).unwrap(),
+                    "groups of {size}: {:?} differs",
+                    x.file_name()
+                );
+            }
+            assert_eq!(
+                grouped
+                    .source(Position(0), &cond_match_all())
+                    .unwrap()
+                    .len(),
+                one.source(Position(0), &cond_match_all()).unwrap().len()
+            );
+            grouped.shutdown();
+        }
+        one.shutdown();
+    }
+
+    /// A group longer than one hold of the writer lock takes is staged in
+    /// several, and still in order.
+    #[tokio::test]
+    async fn a_long_group_stages_every_append_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(small_engine(dir.path()));
+        let group: Vec<Prepared> = (0..100)
+            .map(|i| {
+                client(plain(vec![make_event(
+                    "OrderPlaced",
+                    vec![tag("n", &i.to_string())],
+                )]))
+            })
+            .collect();
+        let stagings = engine.stage_group(group);
+        assert_eq!(stagings.len(), 100);
+        let mut release = None;
+        let mut firsts = Vec::new();
+        for staging in &stagings {
+            let Staging::Done(Ok(staged)) = staging else {
+                panic!("every append stages");
+            };
+            release = release.max(staged.wait_pos());
+            firsts.push(staged.outcome.as_ref().unwrap().first_position.0);
+        }
+        assert_eq!(firsts, (0..100).collect::<Vec<_>>(), "positions in order");
+        engine.release_written(release);
+        for staging in stagings {
+            outcome(settle(&engine, staging).await).unwrap();
+        }
+        assert_eq!(engine.head(), Position(100));
+        engine.shutdown();
+    }
+
+    /// A group whose write fails was accounted for but is not in the log:
+    /// nothing in it may be acknowledged, nothing after it may be accepted,
+    /// and no reader is told the log moved.
+    #[tokio::test]
+    async fn a_failed_group_write_poisons_the_engine_and_acknowledges_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(small_engine(dir.path()));
+        outcome(engine.append(plain(vec![make_event("Before", vec![])]))).unwrap();
+        let before = engine.local_tail();
+
+        engine.writer.lock().fail_next_flush();
+        // More than one hold's worth: the first fails, the rest meet a writer
+        // that has given up.
+        let group: Vec<Prepared> = (0..GROUP_MAX_APPENDS as i32 + 8)
+            .map(|i| {
+                client(plain(vec![make_event(
+                    "Lost",
+                    vec![tag("n", &i.to_string())],
+                )]))
+            })
+            .chain(std::iter::once(client(conditional(
+                0,
+                &["x"],
+                vec![make_event("Lost", vec![tag("orderId", "x")])],
+            ))))
+            .collect();
+        for staging in engine.stage_group(group) {
+            let result = settle(&engine, staging).await;
+            assert!(result.is_err(), "a lost write must not be acknowledged");
+        }
+        assert!(engine.is_poisoned());
+        assert_eq!(engine.local_tail(), before, "readers are not told");
+        assert_eq!(engine.head(), before);
+        let refused = engine
+            .append(plain(vec![make_event("After", vec![])]))
+            .map(|_| ());
+        assert!(refused.is_err(), "a poisoned engine takes no more writes");
+        engine.shutdown();
+    }
+
+    /// A leader that took over and has written no events yet holds only
+    /// control records past its last event: a fresh segment starting with the
+    /// `EpochChange`, at the same event position as its tail. A follower
+    /// rejoining at that position (after cutting an unreplicated suffix) still
+    /// needs those bytes, or it stays byte-divergent for as long as the leader
+    /// stays idle.
+    #[test]
+    fn position_catch_up_at_the_tail_carries_the_new_epochs_control_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+        for i in 0..3 {
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(&format!("E{i}"), vec![tag("k", "v")])],
+                })
+                .unwrap();
+        }
+
+        // Nothing past the last event: nothing to send.
+        let head = store.head();
+        let (tail, slices) = store.replication_catchup_slices(head).unwrap();
+        assert_eq!(tail, head);
+        assert!(slices.is_empty(), "no bytes follow the last event yet");
+
+        // Taking over rotates at the head and writes an EpochChange there.
+        store.begin_replication_epoch(1, [0]).unwrap();
+        store.persist_epoch_change(1, 0).unwrap();
+        assert_eq!(store.head(), head, "control records carry no position");
+
+        let (tail, slices) = store.replication_catchup_slices(head).unwrap();
+        assert_eq!(tail, head);
+        assert_eq!(slices.len(), 1, "the new segment's records must be sent");
+        let slice = &slices[0];
+        assert_eq!(slice.segment_base, head.0);
+        assert_eq!(slice.first_position, head.0);
+        assert_eq!(slice.byte_start, segment::SEGMENT_HEADER_SIZE as u64);
+        assert!(slice.byte_end > slice.byte_start);
+    }
+
+    /// A follower whose log ends somewhere that is not a record boundary of
+    /// this one has a different log; that is an answer to the probe, not
+    /// damage in this node's segment.
+    #[test]
+    fn a_probe_at_an_offset_inside_a_record_is_a_mismatch_not_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStoreEngine::create(dir.path()).unwrap();
+        for i in 0..3 {
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events: vec![make_event(&format!("E{i}"), vec![tag("k", "v")])],
+                })
+                .unwrap();
+        }
+        let cursor = store.replication_cursor().unwrap();
+        assert!(
+            store
+                .verify_replication_probe(
+                    cursor.segment_base,
+                    cursor.byte_offset,
+                    cursor.last_record_crc
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .verify_replication_probe(
+                    cursor.segment_base,
+                    cursor.byte_offset - 3,
+                    cursor.last_record_crc
+                )
+                .unwrap()
+        );
     }
 }

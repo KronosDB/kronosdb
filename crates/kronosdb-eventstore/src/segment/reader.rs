@@ -89,58 +89,176 @@ impl SegmentReader {
         }
     }
 
+    /// The event records from `byte_offset` on, in log order, each CRC-
+    /// checked and borrowed from the mapping, until one at or past `up_to`
+    /// or the end of the written data. Control records are skipped.
+    ///
+    /// `byte_offset` must be the start of a record. The walk is sequential,
+    /// so it costs one pass over the bytes it covers and no index lookups.
+    pub fn events_from(&self, byte_offset: usize, up_to: Position) -> EventRecords<'_> {
+        EventRecords {
+            data: &self.mmap,
+            offset: byte_offset,
+            up_to: up_to.0,
+        }
+    }
+
     /// Reads a single event at the given byte offset within the segment.
     /// Used for direct seeks when the offset table is available.
     ///
     /// This skips all events between the segment header and the target offset,
     /// reading only the one event at the specified location.
     pub fn read_event_at(&self, byte_offset: usize) -> Result<StoredEvent, Error> {
+        let record = self.record_at(byte_offset)?;
+        let (event, _) = format::deserialize_event(record.body)?;
+        Ok(event)
+    }
+
+    /// The record at `byte_offset`, its CRC verified, borrowed from the
+    /// mapping: what a read copies onto the wire without decoding it.
+    pub fn record_at(&self, byte_offset: usize) -> Result<StoredRecord<'_>, Error> {
         let data = &*self.mmap;
-
-        if byte_offset + RECORD_HEADER_SIZE > data.len() {
-            return Err(Error::Corrupted {
-                message: format!("offset {byte_offset} beyond segment bounds"),
-            });
-        }
-
-        // Read record header.
-        let stored_crc = u32::from_le_bytes(data[byte_offset..byte_offset + 4].try_into().unwrap());
-        let record_len =
-            u32::from_le_bytes(data[byte_offset + 4..byte_offset + 8].try_into().unwrap()) as usize;
-        let flags_byte = data[byte_offset + 8];
-
-        if record_len == 0 {
-            return Err(Error::Corrupted {
-                message: format!("zero-length record at offset {byte_offset}"),
-            });
-        }
-
-        let payload_len = record_len - 1;
-        let payload_start = byte_offset + RECORD_HEADER_SIZE;
-        let payload_end = payload_start + payload_len;
-
-        if payload_end > data.len() {
-            return Err(Error::Corrupted {
-                message: format!("record at offset {byte_offset} extends beyond segment"),
-            });
-        }
-
-        let payload = &data[payload_start..payload_end];
-
-        // Verify CRC.
-        let computed_crc = {
-            let digest = crc32c::crc32c(&[flags_byte]);
-            crc32c::crc32c_append(digest, payload)
-        };
-
-        if computed_crc != stored_crc {
+        let (flags, stored_crc, body_start, body_end) = frame_at(data, byte_offset)?;
+        let body = &data[body_start..body_end];
+        if crate::segment::crc::record_crc(flags, body) != stored_crc {
             return Err(Error::Corrupted {
                 message: format!("CRC mismatch at offset {byte_offset}"),
             });
         }
+        Ok(StoredRecord {
+            flags,
+            body,
+            framed: &data[byte_offset + 4..body_end],
+        })
+    }
+}
 
-        let (event, _) = format::deserialize_event(payload)?;
+/// Parses the header of the record at `byte_offset`: its flags, stored CRC,
+/// and the range of its body. Nothing past the header is read.
+fn frame_at(data: &[u8], byte_offset: usize) -> Result<(u8, u32, usize, usize), Error> {
+    if byte_offset + RECORD_HEADER_SIZE > data.len() {
+        return Err(Error::Corrupted {
+            message: format!("offset {byte_offset} beyond segment bounds"),
+        });
+    }
+    let stored_crc = u32::from_le_bytes(data[byte_offset..byte_offset + 4].try_into().unwrap());
+    let record_len =
+        u32::from_le_bytes(data[byte_offset + 4..byte_offset + 8].try_into().unwrap()) as usize;
+    let flags = data[byte_offset + 8];
+    if record_len == 0 {
+        return Err(Error::Corrupted {
+            message: format!("zero-length record at offset {byte_offset}"),
+        });
+    }
+    let body_start = byte_offset + RECORD_HEADER_SIZE;
+    let body_end = body_start + record_len - 1;
+    if body_end > data.len() {
+        return Err(Error::Corrupted {
+            message: format!("record at offset {byte_offset} extends beyond segment"),
+        });
+    }
+    Ok((flags, stored_crc, body_start, body_end))
+}
+
+/// How a read reaches the records of one segment: through a mapping, with a
+/// CRC check on every read (the active segment), or through the block cache,
+/// whose blocks were verified when they were loaded (sealed segments).
+pub enum RecordReader {
+    Mapped(SegmentReader),
+    Sealed(crate::segment::blocks::SealedReader),
+}
+
+impl RecordReader {
+    /// The record for `position`, which the segment's offset table places at
+    /// `offset`, CRC-verified at some point since it left the disk.
+    pub fn record_at(&mut self, position: u64, offset: u64) -> Result<StoredRecord<'_>, Error> {
+        match self {
+            RecordReader::Mapped(reader) => reader.record_at(offset as usize),
+            RecordReader::Sealed(reader) => reader.record_at(position, offset),
+        }
+    }
+
+    pub fn read_event_at(&mut self, position: u64, offset: u64) -> Result<StoredEvent, Error> {
+        let record = self.record_at(position, offset)?;
+        let (event, _) = format::deserialize_event(record.body)?;
         Ok(event)
+    }
+}
+
+/// One stored record, CRC-checked, borrowed from a segment mapping.
+#[derive(Debug, Clone, Copy)]
+pub struct StoredRecord<'a> {
+    pub flags: u8,
+    /// The serialized event (see `format::serialize_event`).
+    pub body: &'a [u8],
+    /// `len u32 | flags u8 | body`: the record without its leading CRC,
+    /// which is exactly how it travels to clients.
+    pub framed: &'a [u8],
+}
+
+/// Event records read sequentially from a byte offset: see
+/// `SegmentReader::events_from`.
+pub struct EventRecords<'a> {
+    data: &'a [u8],
+    offset: usize,
+    up_to: u64,
+}
+
+impl<'a> Iterator for EventRecords<'a> {
+    /// The record's position and the record itself.
+    type Item = Result<(u64, StoredRecord<'a>), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let start = self.offset;
+            if start + RECORD_HEADER_SIZE > self.data.len() {
+                return None;
+            }
+            let stored_crc = u32::from_le_bytes(self.data[start..start + 4].try_into().unwrap());
+            let record_len =
+                u32::from_le_bytes(self.data[start + 4..start + 8].try_into().unwrap()) as usize;
+            let flags_byte = self.data[start + 8];
+            // Zero length: unwritten space.
+            if record_len == 0 {
+                return None;
+            }
+            let body_start = start + RECORD_HEADER_SIZE;
+            let body_end = body_start + record_len - 1;
+            if body_end > self.data.len() {
+                return None;
+            }
+            if !flags::is_event(flags_byte) {
+                self.offset = body_end;
+                continue;
+            }
+            let body = &self.data[body_start..body_end];
+            if body.len() < 8 {
+                return Some(Err(Error::Corrupted {
+                    message: format!("event record at offset {start} has no position"),
+                }));
+            }
+            // The bound comes before the CRC: the active segment is mapped at
+            // full length, so a record past the committed bound may be
+            // half-written and must read as the end, not as corruption.
+            let position = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            if position >= self.up_to {
+                return None;
+            }
+            if crc32c::crc32c_append(crc32c::crc32c(&[flags_byte]), body) != stored_crc {
+                return Some(Err(Error::Corrupted {
+                    message: format!("CRC mismatch at offset {start}"),
+                }));
+            }
+            self.offset = body_end;
+            return Some(Ok((
+                position,
+                StoredRecord {
+                    flags: flags_byte,
+                    body,
+                    framed: &self.data[start + 4..body_end],
+                },
+            )));
+        }
     }
 }
 

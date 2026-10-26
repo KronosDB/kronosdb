@@ -1,4 +1,4 @@
-use crate::append::{AppendRequest, AppendResponse};
+use crate::append::{AppendRequest, AppendResponse, RecordAppend};
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{Position, SequencedEvent, Tag};
@@ -11,7 +11,7 @@ use crate::stream::EventStream;
 /// Extensions (PII encryption, audit logging, metrics, etc.) can decorate this trait
 /// by wrapping an inner implementation and delegating, adding behavior before/after calls.
 ///
-/// The gRPC service layer programs against this trait, not the concrete `EventStore` type.
+/// The native service layer programs against this trait, not the concrete `EventStore` type.
 ///
 /// `append` is async because clustered nodes may forward it to the claimed leader.
 /// All read methods are sync because they operate on local mmap'd data.
@@ -22,6 +22,11 @@ pub trait EventStore: Send + Sync {
     /// In cluster mode, the claimed leader writes the group-commit wave and
     /// acknowledges after native segment cursors reach quorum durability.
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error>;
+
+    /// [`append`](Self::append) for events that are already records, as
+    /// clients send them: the same append, without decoding them into
+    /// events first.
+    async fn append_records(&self, request: RecordAppend) -> Result<AppendResponse, Error>;
 
     /// Reads events matching a sourcing condition from `from_position` up to the current head.
     fn source(
@@ -43,8 +48,25 @@ pub trait EventStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SequencedEvent>, Error>;
 
-    /// Creates a live event stream subscription.
-    fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream;
+    /// Copies one page of matching client-visible records onto `out` in
+    /// their wire layout. The zero-copy counterpart of `source_page`:
+    /// records are CRC-checked and copied, not decoded.
+    fn read_records(
+        &self,
+        condition: &SourcingCondition,
+        page: &crate::store::PageBounds<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<crate::store::RecordPage, Error>;
+
+    /// Creates a live event stream subscription from `from_position`.
+    /// Events named in `exclude_names` never wake it. See [`EventStream`]
+    /// for how a stream is driven.
+    fn subscribe(
+        &self,
+        from_position: Position,
+        condition: SourcingCondition,
+        exclude_names: &[String],
+    ) -> EventStream;
 
     /// Returns the current head position (next position to be assigned).
     ///

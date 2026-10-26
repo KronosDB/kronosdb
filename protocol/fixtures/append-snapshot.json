@@ -1,0 +1,12 @@
+{
+  "frame": "AppendSnapshot",
+  "stream": 23,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "key": "636f757273653a63732d313031",
+    "state": "7b227365617473223a33302c22656e726f6c6c6564223a32387d",
+    "position": "1048578"
+  },
+  "description": ""
+}

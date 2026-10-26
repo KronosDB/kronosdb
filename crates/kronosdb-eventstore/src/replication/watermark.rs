@@ -10,12 +10,12 @@
 //! leader's own durable cursor through the same code path.
 //!
 //! Waiters come in two kinds, both exact-wakeup (no thundering herd):
-//! synchronous callers park on a rendezvous channel; the gRPC append path
+//! synchronous callers park on a rendezvous channel; the native append path
 //! awaits a oneshot instead, so no thread is pinned for the fsync duration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
@@ -42,6 +42,10 @@ enum Waiter {
     /// A task awaiting a oneshot (`wait_for_async`). A dropped receiver
     /// (client went away) makes the send a no-op.
     Async(oneshot::Sender<WakeResult>),
+    /// Code to run when the verdict is in, on whichever thread delivers it
+    /// (the one that advances the watermark, or aborts the ledger). Must be
+    /// short and must not call back into the ledger.
+    Callback(Box<dyn FnOnce(WakeResult) + Send>),
 }
 
 impl Waiter {
@@ -53,6 +57,7 @@ impl Waiter {
             Waiter::Async(tx) => {
                 let _ = tx.send(verdict);
             }
+            Waiter::Callback(callback) => callback(verdict),
         }
     }
 }
@@ -85,6 +90,12 @@ pub struct WatermarkState {
     /// Current voter-set size, updated atomically with epoch changes.
     /// Lock-free read for the per-append ack-mode decision (`auto`).
     voter_count: AtomicU64,
+    /// The current epoch, mirrored out of `inner` (written under its lock) so
+    /// the append path can read it without queueing behind the ledger.
+    epoch: AtomicU64,
+    /// Mirrors `inner.poisoned.is_some()` so a waiter whose position the
+    /// watermark already covers need not take the ledger lock to find out.
+    poisoned: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -98,6 +109,8 @@ impl WatermarkState {
         Self {
             watermark: Arc::new(AtomicU64::new(initial)),
             voter_count: AtomicU64::new(voters.len() as u64),
+            epoch: AtomicU64::new(epoch),
+            poisoned: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 epoch,
                 voters,
@@ -131,12 +144,14 @@ impl WatermarkState {
         }
         abort_locked(&mut inner, &format!("leadership epoch advanced to {epoch}"));
         inner.epoch = epoch;
+        self.epoch.store(epoch, Ordering::Release);
         inner.quorum = voters.len() / 2 + 1;
         self.voter_count
             .store(voters.len() as u64, Ordering::Release);
         inner.voters = voters;
         inner.cursors.clear();
         inner.poisoned = None;
+        self.poisoned.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -145,8 +160,9 @@ impl WatermarkState {
         self.voter_count.load(Ordering::Acquire)
     }
 
+    /// The current epoch. Lock-free.
     pub fn epoch(&self) -> Epoch {
-        self.inner.lock().unwrap().epoch
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// The current watermark.
@@ -247,6 +263,13 @@ impl WatermarkState {
     /// verdicts and poisoning semantics as `wait_for`; only where the caller
     /// waits differs.
     pub async fn wait_for_async(&self, pos: u64) -> Result<(), Error> {
+        // Already covered (the written-ack path advances the watermark before
+        // it gets here): no ledger entry, no lock. A poison latched after
+        // this check is indistinguishable from one latched just after the
+        // watermark moved.
+        if !self.poisoned.load(Ordering::Acquire) && self.watermark.load(Ordering::Acquire) >= pos {
+            return Ok(());
+        }
         let rx: oneshot::Receiver<WakeResult> = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(msg) = &inner.poisoned {
@@ -267,6 +290,34 @@ impl WatermarkState {
         }
     }
 
+    /// Runs `callback` once the watermark reaches `pos` — at once, on the
+    /// calling thread, if it already has — or with the error that poisoned
+    /// the ledger first. The way for a caller that stages many appends to hand
+    /// each its final answer without a second task wake-up per append.
+    pub fn notify_at(&self, pos: u64, callback: impl FnOnce(Result<(), Error>) + Send + 'static) {
+        let verdict = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(msg) = &inner.poisoned {
+                Err(poison_error(msg))
+            } else if self.watermark.load(Ordering::Acquire) >= pos {
+                Ok(())
+            } else {
+                inner
+                    .ledger
+                    .entry(pos)
+                    .or_default()
+                    .push(Waiter::Callback(Box::new(move |verdict| {
+                        callback(match verdict {
+                            Ok(()) => Ok(()),
+                            Err(msg) => Err(poison_error(&msg)),
+                        })
+                    })));
+                return;
+            }
+        };
+        callback(verdict);
+    }
+
     /// Poisons the ledger: every current waiter is woken with an error, and
     /// every future `wait_for` fails fast. Used on fsync failure (the write
     /// may never become durable), epoch loss, and shutdown. The first reason
@@ -276,6 +327,7 @@ impl WatermarkState {
         if inner.poisoned.is_none() {
             inner.poisoned = Some(reason.to_string());
         }
+        self.poisoned.store(true, Ordering::Release);
         abort_locked(&mut inner, reason);
     }
 
@@ -411,5 +463,32 @@ mod tests {
         // Poisoned: future waits fail fast, even for committed positions.
         assert!(wm.is_poisoned());
         assert!(wm.wait_for(0).is_err());
+    }
+    #[test]
+    fn callbacks_run_when_the_watermark_covers_them_or_the_ledger_aborts() {
+        let wm = WatermarkState::new(1, [0], 0);
+        let seen = Arc::new(Mutex::new(Vec::<(&'static str, bool)>::new()));
+        let note = |name: &'static str| {
+            let seen = Arc::clone(&seen);
+            move |verdict: Result<(), Error>| seen.lock().unwrap().push((name, verdict.is_ok()))
+        };
+
+        // Not covered yet: parked until the watermark gets there.
+        wm.notify_at(5, note("five"));
+        wm.notify_at(9, note("nine"));
+        assert!(seen.lock().unwrap().is_empty());
+        wm.advance(0, 1, 5);
+        assert_eq!(*seen.lock().unwrap(), vec![("five", true)]);
+
+        // Already covered: runs at once, on this thread.
+        wm.notify_at(3, note("three"));
+        assert_eq!(seen.lock().unwrap().last(), Some(&("three", true)));
+
+        // An abort answers what is still parked with the failure.
+        wm.abort_all("fsync failed");
+        assert_eq!(seen.lock().unwrap().last(), Some(&("nine", false)));
+        // And a poisoned ledger refuses new ones the same way.
+        wm.notify_at(100, note("late"));
+        assert_eq!(seen.lock().unwrap().last(), Some(&("late", false)));
     }
 }

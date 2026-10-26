@@ -1,0 +1,15 @@
+{
+  "frame": "Welcome",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "version": 1,
+    "features": "0",
+    "record_format": 3,
+    "server_name": "kronosdb-0",
+    "principal": "token:ci",
+    "max_frame": 16777216,
+    "heartbeat": 10000
+  },
+  "description": "The server's answer to Hello."
+}

@@ -15,7 +15,7 @@
 //!   `Authorization: Bearer`, validated against the IdP's JWKS (issuer, exp,
 //!   optional audience, optional required role).
 //!
-//! In every mode except `none`, a bearer credential that the gRPC identity
+//! In every mode except `none`, a bearer credential that the native protocol's identity
 //! layer (`crate::auth`) resolves to a cluster-wide `admin` principal is
 //! accepted too — one credential (a named token, a workload-identity JWT)
 //! works against both planes, which is what CLI tooling needs.
@@ -61,7 +61,7 @@ pub struct AuthRuntime {
     key: Key,
     session_ttl: Duration,
     oidc: Option<OidcRuntime>,
-    /// The gRPC plane's identities; its `admin` principals may use the
+    /// The client plane's identities; its `admin` principals may use the
     /// admin API as well.
     identities: Arc<Authenticator>,
 }
@@ -104,7 +104,7 @@ impl AuthRuntime {
         }
     }
 
-    /// True when `token` is a gRPC-plane credential carrying cluster-wide
+    /// True when `token` is a client-plane credential carrying cluster-wide
     /// `admin`.
     async fn is_identity_admin(&self, token: &str) -> bool {
         match self.identities.authenticate_token(token).await {

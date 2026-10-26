@@ -2,11 +2,12 @@
 //!
 //! The harness belongs to the event-store crate so it runs under the normal
 //! workspace test command. It drives the production `kronosdb-server` binary
-//! over gRPC and verifies the files it leaves on disk.
+//! over the native protocol (through `kronosdb-client`) and verifies the files
+//! it leaves on disk.
 //!
 //! Responsibilities:
 //!   1. Spawn kronosdb-server as a child process with env-var config.
-//!   2. Wait until both gRPC and application readiness succeed.
+//!   2. Wait until both the listener and application readiness succeed.
 //!   3. Persist every successful append in a separately fsynced acknowledgement log.
 //!   4. SIGKILL and reap the child process.
 //!   5. Scan metadata-log and event-segment records for torn writes.
@@ -25,17 +26,66 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Generated client stubs — compiled by crates/kronosdb-eventstore/build.rs
-/// (client-only for eventstore.proto). Usable ONLY from this harness module and
-/// its downstream test files; NOT exported from the library.
-// result_large_err: generated client methods return Result<_, tonic::Status>;
-// clippy 1.98 flags the Status variant's size in code we don't author.
-#[allow(clippy::enum_variant_names, clippy::result_large_err)]
-pub mod pb {
-    tonic::include_proto!("kronosdb");
-    pub mod eventstore {
-        tonic::include_proto!("kronosdb.eventstore");
+#[allow(unused_imports)] // Not every test file uses every name.
+pub use kronosdb_client::{
+    Appended, Client, Condition, ConnectOptions, Context, Criterion, Error as ClientError,
+    ErrorCode, NewEvent,
+};
+
+/// Connection options for tests: a node that is down or frozen fails the
+/// connect quickly instead of holding the test for the library's default.
+pub fn client_options() -> ConnectOptions {
+    ConnectOptions {
+        client_name: "crash-harness".into(),
+        connect_timeout: Duration::from_secs(3),
+        ..ConnectOptions::default()
     }
+}
+
+/// A native client connected to `addr` (`host:port`).
+pub async fn connect(addr: impl std::fmt::Display) -> Result<Client, ClientError> {
+    Client::connect(&addr.to_string(), &client_options()).await
+}
+
+/// An event with the fields the tests care about; the rest are defaulted.
+pub fn event(
+    identifier: String,
+    timestamp: i64,
+    name: &str,
+    version: &str,
+    payload: Vec<u8>,
+    tags: Vec<(Vec<u8>, Vec<u8>)>,
+) -> NewEvent {
+    NewEvent {
+        identifier,
+        name: name.into(),
+        version: version.into(),
+        timestamp,
+        metadata: vec![],
+        tags,
+        payload: payload.into(),
+    }
+}
+
+/// One `key=value` tag criterion per value, so a read unions them.
+pub fn tag_criteria(key: &str, values: impl IntoIterator<Item = String>) -> Vec<Criterion> {
+    values
+        .into_iter()
+        .map(|value| Criterion::tag(key, value))
+        .collect()
+}
+
+/// Every event matching `criteria`, as (position, name, payload).
+pub async fn read_events(
+    context: &Context,
+    criteria: &[Criterion],
+) -> Result<Vec<(u64, String, Vec<u8>)>, ClientError> {
+    let (batches, _marker) = context.source_all(0, criteria).await?;
+    Ok(batches
+        .iter()
+        .flat_map(|batch| batch.iter())
+        .map(|e| (e.position, e.name.to_string(), e.payload.to_vec()))
+        .collect())
 }
 
 pub struct ServerHandle {
@@ -50,6 +100,17 @@ impl ServerHandle {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Whether the child is still running, and how it ended if not — what a
+    /// refused connection needs to be told apart: a node that died (a crash
+    /// worth chasing) from one that is merely not accepting yet (load).
+    pub fn state(&mut self) -> String {
+        match self.child.try_wait() {
+            Ok(None) => format!("pid {} running", self.child.id()),
+            Ok(Some(status)) => format!("pid {} EXITED: {status}", self.child.id()),
+            Err(error) => format!("pid {} state unknown: {error}", self.child.id()),
+        }
     }
 
     /// SIGSTOP the child: the process freezes mid-flight without dying. Its
@@ -144,6 +205,16 @@ fn ensure_server_built() {
     *guard = true;
 }
 
+/// `<data dir's parent>/server-<node id>.log`, opened for appending.
+fn server_log_file(cfg: &SpawnConfig) -> Option<std::fs::File> {
+    let dir = cfg.data_dir.parent()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("server-{}.log", cfg.node_id)))
+        .ok()
+}
+
 /// Spawn kronosdb-server as a child. Returns immediately after spawn — caller must
 /// call `wait_until_ready`.
 pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
@@ -164,6 +235,18 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
         .env("RUST_LOG", "kronosdb=debug,warn");
     if std::env::var_os("KRONOSDB_TEST_LOGS").is_some() {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else if let Some(log) = server_log_file(cfg) {
+        // Kept next to the data dir so evidence preserved from a failing run
+        // carries what each server said. Appended, so a restarted node's log
+        // continues rather than replaces.
+        match log.try_clone() {
+            Ok(clone) => {
+                cmd.stdout(Stdio::from(log)).stderr(Stdio::from(clone));
+            }
+            Err(_) => {
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+        }
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -200,7 +283,7 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     })
 }
 
-/// Polls until the gRPC listener accepts connections and the native write gate
+/// Polls until the native listener accepts connections and the native write gate
 /// reports ready through the admin endpoint.
 pub async fn wait_until_ready(
     listen: SocketAddr,
@@ -350,7 +433,7 @@ impl AckLog {
         })
     }
 
-    /// Record + fsync. Called after every gRPC Ok response.
+    /// Record + fsync. Called after every native Ok response.
     pub fn record(&self, rec: AckRecord) -> std::io::Result<()> {
         let line = format!(
             "{}\t{}\t{}\t{}\n",
@@ -365,6 +448,29 @@ impl AckLog {
             f.sync_all()?;
         }
         self.recs.lock().unwrap().push(rec);
+        Ok(())
+    }
+
+    /// Records several acknowledgements with one fsync. The sidecar only has
+    /// to be durable before the test reads it, and a full fsync per event
+    /// (F_FULLFSYNC on macOS) is what starves a workload under machine load.
+    pub fn record_batch(&self, recs: Vec<AckRecord>) -> std::io::Result<()> {
+        let mut lines = String::new();
+        for rec in &recs {
+            lines.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                rec.aggregate_id,
+                rec.client_sequence,
+                hex_encode(&rec.payload_hash),
+                rec.server_sequence
+            ));
+        }
+        {
+            let mut f = self.file.lock().unwrap();
+            f.write_all(lines.as_bytes())?;
+            f.sync_all()?;
+        }
+        self.recs.lock().unwrap().extend(recs);
         Ok(())
     }
 
@@ -437,6 +543,13 @@ pub fn read_ack_sidecar(path: &Path) -> std::io::Result<Vec<AckRecord>> {
 ///
 /// OS scheduling still varies between runs, so a replay is best-effort — but
 /// the kill delays and any other harness randomness become identical.
+/// The seed `rand_in` started from (0 until the first draw).
+pub fn crash_seed() -> u64 {
+    SEED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SEED: AtomicU64 = AtomicU64::new(0);
+
 fn rng_state() -> &'static AtomicU64 {
     static STATE: OnceLock<AtomicU64> = OnceLock::new();
     STATE.get_or_init(|| {
@@ -459,6 +572,7 @@ fn rng_state() -> &'static AtomicU64 {
             }
         };
         // xorshift must never be seeded with 0.
+        SEED.store(seed.max(1), std::sync::atomic::Ordering::Relaxed);
         AtomicU64::new(seed.max(1))
     })
 }
@@ -732,4 +846,339 @@ pub type Seq = Arc<AtomicU64>;
 
 pub fn new_seq() -> Seq {
     Arc::new(AtomicU64::new(0))
+}
+
+/// Where failing runs leave their data: `KRONOSDB_CRASH_EVIDENCE_DIR`, or
+/// `target/crash-evidence` in the workspace.
+pub fn evidence_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("KRONOSDB_CRASH_EVIDENCE_DIR") {
+        return PathBuf::from(dir);
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&manifest_dir)
+        .join("target")
+        .join("crash-evidence")
+}
+
+/// Copies `src` (a test's whole temp dir: every node's data dir, server logs,
+/// ack sidecar) under the evidence root and writes `EVIDENCE.txt` beside it.
+/// Returns the destination. Nothing here panics: it runs while unwinding.
+pub fn preserve_evidence(test: &str, label: &str, src: &Path, manifest: &str) -> Option<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = evidence_root().join(format!("{test}-{label}-{stamp}-pid{}", std::process::id()));
+    std::fs::create_dir_all(&dest).ok()?;
+    // Reflink where the filesystem supports it: event segments are
+    // preallocated to the full segment size.
+    let attempts: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["-Rc"], &["-R"]]
+    } else {
+        &[&["-R", "--reflink=auto", "--sparse=always"], &["-R"]]
+    };
+    let target = dest.join("data");
+    let mut copied = false;
+    for flags in attempts {
+        let _ = std::fs::remove_dir_all(&target);
+        let status = Command::new("cp")
+            .args(*flags)
+            .arg(src)
+            .arg(&target)
+            .status();
+        if matches!(status, Ok(s) if s.success()) {
+            copied = true;
+            break;
+        }
+    }
+    let _ = std::fs::write(
+        dest.join("EVIDENCE.txt"),
+        format!("{manifest}\ncopied={copied}\nsource={}\n", src.display()),
+    );
+    eprintln!("crash evidence preserved at {}", dest.display());
+    Some(dest)
+}
+
+/// Declared right after an iteration's temp dir and before its servers, so on
+/// a panic or cancellation the servers are killed first (stable files) and the evidence is
+/// copied before the temp dir is deleted.
+pub struct EvidenceGuard {
+    test: &'static str,
+    iter: usize,
+    src: PathBuf,
+    notes: Mutex<Vec<String>>,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl EvidenceGuard {
+    pub fn new(test: &'static str, iter: usize, src: &Path) -> Self {
+        Self {
+            test,
+            iter,
+            src: src.to_path_buf(),
+            notes: Mutex::new(Vec::new()),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Copies the data so far when `KRONOSDB_CRASH_EVIDENCE_ON_LAG` is set, for
+    /// soak runs that want the server logs of a lag that later resolved.
+    pub fn snapshot(&self, label: &str) {
+        if std::env::var_os("KRONOSDB_CRASH_EVIDENCE_ON_LAG").is_none() {
+            return;
+        }
+        let notes = self.notes.lock().map(|n| n.join("\n")).unwrap_or_default();
+        let manifest = format!(
+            "test={}\niteration={}\nseed={}\n{notes}",
+            self.test,
+            self.iter,
+            crash_seed()
+        );
+        preserve_evidence(
+            self.test,
+            &format!("iter{}-{label}", self.iter),
+            &self.src,
+            &manifest,
+        );
+    }
+
+    /// The iteration passed: nothing to keep.
+    pub fn finish(&self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Adds a line to the manifest: which node was killed, which diverged...
+    pub fn note(&self, line: impl Into<String>) {
+        let line = line.into();
+        eprintln!("evidence note: {line}");
+        self.notes.lock().unwrap().push(line);
+    }
+}
+
+impl Drop for EvidenceGuard {
+    fn drop(&mut self) {
+        // Dropped without `finish`: a panic unwound, or the surrounding
+        // timeout cancelled the iteration.
+        if self.finished.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let notes = self.notes.lock().map(|n| n.join("\n")).unwrap_or_default();
+        let manifest = format!(
+            "test={}\niteration={}\nseed={}\n{notes}",
+            self.test,
+            self.iter,
+            crash_seed()
+        );
+        preserve_evidence(
+            self.test,
+            &format!("iter{}", self.iter),
+            &self.src,
+            &manifest,
+        );
+    }
+}
+
+/// How one node's valid segment log relates to another's.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogRelation {
+    Equal,
+    /// The first log is a byte prefix of the second: it only lags.
+    FirstIsPrefix,
+    /// The second log is a byte prefix of the first: it only lags.
+    SecondIsPrefix,
+    /// Each holds bytes the other does not.
+    Diverged,
+}
+
+pub fn relate_logs(a: &[(String, Vec<u8>)], b: &[(String, Vec<u8>)]) -> LogRelation {
+    for i in 0..a.len().min(b.len()) {
+        if a[i].0 != b[i].0 {
+            return LogRelation::Diverged;
+        }
+        if a[i].1 == b[i].1 {
+            continue;
+        }
+        // A shorter copy of a segment is only a lag if nothing follows it.
+        if b[i].1.starts_with(&a[i].1) && i + 1 == a.len() {
+            return LogRelation::FirstIsPrefix;
+        }
+        if a[i].1.starts_with(&b[i].1) && i + 1 == b.len() {
+            return LogRelation::SecondIsPrefix;
+        }
+        return LogRelation::Diverged;
+    }
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Equal => LogRelation::Equal,
+        std::cmp::Ordering::Less => LogRelation::FirstIsPrefix,
+        std::cmp::Ordering::Greater => LogRelation::SecondIsPrefix,
+    }
+}
+
+fn read_all_logs(node_dirs: &[PathBuf]) -> Vec<Vec<(String, Vec<u8>)>> {
+    node_dirs
+        .iter()
+        .map(|dir| read_valid_event_log(dir, "default").unwrap_or_default())
+        .collect()
+}
+
+/// Requires every node's valid segment log to become byte-identical to
+/// node 1's within `CONVERGENCE_TIMEOUT`-like patience.
+///
+/// Head equality (the caller's convergence signal) says nothing about control
+/// records: they sit at an unchanged event position, so a restarted node can
+/// have every event and still be missing the new leader's `EpochChange` or a
+/// trailing `WatermarkCheckpoint` for a moment. A node that only lags (its log
+/// is a byte prefix of the others') is given time to catch up and the lag is
+/// reported; a node holding bytes the others do not, or one that never
+/// catches up, fails the test with the evidence preserved.
+pub async fn assert_logs_identical(
+    iter: usize,
+    guard: &EvidenceGuard,
+    node_dirs: &[PathBuf],
+    first_reads: &[Vec<(String, Vec<u8>)>],
+    patience: Duration,
+) {
+    let Some(first) = describe_log_divergence(first_reads) else {
+        return;
+    };
+    guard.note(format!("byte-exact log difference on first read: {first}"));
+    guard.snapshot("lag");
+    let start = Instant::now();
+    loop {
+        let logs = read_all_logs(node_dirs);
+        let mut diverged = false;
+        for other in logs.iter().skip(1) {
+            if relate_logs(&logs[0], other) == LogRelation::Diverged
+                || logs
+                    .iter()
+                    .any(|l| relate_logs(l, other) == LogRelation::Diverged)
+            {
+                diverged = true;
+            }
+        }
+        if diverged {
+            let now = describe_log_divergence(&logs).unwrap_or_default();
+            guard.note(format!(
+                "after {:?} the logs HOLD DIFFERENT BYTES (not a lag): {now}",
+                start.elapsed()
+            ));
+            panic!("iter {iter}: replicated logs diverged: {now}");
+        }
+        match describe_log_divergence(&logs) {
+            None => {
+                eprintln!(
+                    "iter {iter}: logs were byte-identical only {:?} after the first read (a node lagged by control records only: {first})",
+                    start.elapsed()
+                );
+                return;
+            }
+            Some(still) => {
+                if start.elapsed() > patience {
+                    guard.note(format!(
+                        "after {:?} still lagging (prefix of the others): {still}",
+                        start.elapsed()
+                    ));
+                    panic!(
+                        "iter {iter}: a node never caught up on control records within {patience:?}: {still}"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// `None` when every node's log equals node 1's.
+pub fn describe_log_divergence(logs: &[Vec<(String, Vec<u8>)>]) -> Option<String> {
+    let reference = logs.first()?;
+    let differs: Vec<usize> = (1..logs.len()).filter(|&i| logs[i] != *reference).collect();
+    if differs.is_empty() {
+        return None;
+    }
+    // Majority vote names the odd node out when two agree.
+    let odd = if logs.len() == 3 {
+        if differs.len() == 2 && logs[1] == logs[2] {
+            "node1 is the odd one out".to_string()
+        } else if differs.len() == 1 {
+            format!("node{} is the odd one out", differs[0] + 1)
+        } else {
+            "all three nodes differ".to_string()
+        }
+    } else {
+        format!(
+            "nodes {:?} differ from node1",
+            differs.iter().map(|i| i + 1).collect::<Vec<_>>()
+        )
+    };
+    let i = differs[0];
+    let other = &logs[i];
+    let names = |l: &Vec<(String, Vec<u8>)>| l.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    let mut detail = format!("{odd}; node1 vs node{}: ", i + 1);
+    if names(reference) != names(other) {
+        detail.push_str(&format!(
+            "segment files differ: node1={:?} node{}={:?}",
+            names(reference),
+            i + 1,
+            names(other)
+        ));
+        return Some(detail);
+    }
+    for ((name, a), (_, b)) in reference.iter().zip(other) {
+        if a == b {
+            continue;
+        }
+        let at = a
+            .iter()
+            .zip(b)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()));
+        detail.push_str(&format!(
+            "segment {name}: valid length node1={} node{}={}, first differing byte at offset {at}",
+            a.len(),
+            i + 1,
+            b.len()
+        ));
+        return Some(detail);
+    }
+    Some(detail)
+}
+
+/// One line describing how a node's valid segment log ends: the segment count
+/// and the record kinds after the last event (control records carry no
+/// position, so head equality says nothing about them).
+pub fn describe_log_tail(log: &[(String, Vec<u8>)]) -> String {
+    let mut kinds = Vec::new();
+    let mut controls_total = 0usize;
+    for (_, bytes) in log {
+        let mut offset = 13usize;
+        while offset + 9 <= bytes.len() {
+            let record_len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            let flags = bytes[offset + 8];
+            let kind = match flags {
+                0x21 => {
+                    controls_total += 1;
+                    'E'
+                }
+                0x22 => {
+                    controls_total += 1;
+                    'W'
+                }
+                _ => 'e',
+            };
+            kinds.push(kind);
+            offset += 9 + record_len as usize - 1;
+        }
+    }
+    let trailing_controls = kinds.iter().rev().take_while(|k| **k != 'e').count();
+    let tail: String = kinds.iter().rev().take(6).rev().collect();
+    format!(
+        "{} segments, {} records ({controls_total} control), {trailing_controls} trailing control after last event, tail=...{tail}",
+        log.len(),
+        kinds.len()
+    )
 }

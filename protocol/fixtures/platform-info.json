@@ -1,0 +1,14 @@
+{
+  "frame": "PlatformInfo",
+  "stream": 53,
+  "flags": 1,
+  "body": {
+    "node_name": "kronosdb-0",
+    "version": "0.11.0",
+    "contexts": [
+      "default",
+      "orders-eu"
+    ]
+  },
+  "description": ""
+}

@@ -1,0 +1,22 @@
+{
+  "frame": "Cursors",
+  "stream": 73,
+  "flags": 1,
+  "body": {
+    "node_id": "2",
+    "epoch": "8",
+    "control_epoch": "12",
+    "contexts": [
+      {
+        "context": "default",
+        "durable_position": "1048600",
+        "watermark": "1048579",
+        "segment_base": "1000000",
+        "byte_offset": "65550",
+        "last_record_crc": 4294967295,
+        "log_epoch": "6"
+      }
+    ]
+  },
+  "description": ""
+}

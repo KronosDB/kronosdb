@@ -6,19 +6,15 @@
 //! watermark reaches their next-exclusive position.
 
 pub const PEER_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// The largest frame peers exchange: a message of up to
+/// `PEER_MAX_MESSAGE_BYTES` plus the header and fields around it.
+pub const PEER_MAX_FRAME: u32 = PEER_MAX_MESSAGE_BYTES as u32 + 1024 * 1024;
 pub const MAX_RECORD_BYTES_PER_FRAME: usize = 60 * 1024 * 1024;
 
 pub mod client;
 pub mod control;
 pub mod dispatcher;
+pub mod epochs;
 pub mod peer;
 pub mod service;
 pub mod watermark;
-
-/// Generated protobuf types for the native segment Tail protocol.
-pub mod proto {
-    // Generated service methods return Result<_, tonic::Status>; clippy 1.98
-    // flags the Status variant's size in code we don't author.
-    #![allow(clippy::result_large_err)]
-    tonic::include_proto!("kronosdb.replication");
-}

@@ -1,0 +1,11 @@
+{
+  "frame": "OpenQueryHandlers",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "bus": 0,
+    "client_id": "read-1@host-c",
+    "component_name": "read"
+  },
+  "description": ""
+}

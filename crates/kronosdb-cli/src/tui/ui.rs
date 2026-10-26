@@ -209,9 +209,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             (_, Some(_), _) => format!("match {} of {} ", index + 1, app.events.len()),
             (Some((tail, head)), None, Some(event)) if head > tail => format!(
                 "event {} of {} · {}% ",
-                event.sequence - tail + 1,
+                event.position - tail + 1,
                 head - tail,
-                (event.sequence - tail + 1) * 100 / (head - tail)
+                (event.position - tail + 1) * 100 / (head - tail)
             ),
             _ => format!("{} of {} ", index + 1, app.events.len()),
         };
@@ -524,9 +524,9 @@ fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .skip(top)
         .take(height)
         .map(|(index, event)| {
-            let inner = event.event.clone().unwrap_or_default();
+            let inner = event;
             let is_selected = Some(index) == selected;
-            let fresh = app.is_fresh(event.sequence);
+            let fresh = app.is_fresh(event.position);
             let time = output::timestamp(inner.timestamp);
             let color = theme::type_color(&inner.name);
             let payload_style = if is_selected {
@@ -536,7 +536,7 @@ fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let mut spans = vec![
                 Span::styled(if is_selected { "▌ " } else { "  " }, theme::accent()),
-                Span::styled(format!("{:>9}  ", event.sequence), theme::dim()),
+                Span::styled(format!("{:>9}  ", event.position), theme::dim()),
                 // The date lives in the preview; the list shows the clock.
                 Span::styled(
                     format!("{:<8}  ", time.get(6..).unwrap_or(&time)),
@@ -575,9 +575,9 @@ fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
         (Some((tail, head)), Some(first)) if app.filter.is_none() => scrollbar(
             frame,
             rows,
-            (head - tail).max(0) as usize,
+            head.saturating_sub(tail) as usize,
             height,
-            (first.sequence - tail).max(0) as usize,
+            first.position.saturating_sub(tail) as usize,
         ),
         _ => scrollbar(frame, rows, app.events.len(), height, top),
     }
@@ -677,9 +677,9 @@ fn draw_event_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(event) = app.selected_event().cloned() else {
         return;
     };
-    let inner = event.event.clone().unwrap_or_default();
+    let inner = &event;
 
-    let tag_values: Vec<String> = match app.tags.get(&event.sequence) {
+    let tag_values: Vec<String> = match app.tags.get(&event.position) {
         Some(Ok(tags)) => tags
             .iter()
             .filter_map(|t| t.split_once('=').map(|(_, v)| v.to_string()))
@@ -689,7 +689,7 @@ fn draw_event_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(format!(" #{} ", event.sequence), theme::dim()),
+            Span::styled(format!(" #{} ", event.position), theme::dim()),
             Span::styled(
                 format!(" {} ", inner.name),
                 theme::pill(theme::type_color(&inner.name)),
@@ -711,7 +711,7 @@ fn draw_event_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::raw(""),
         Line::styled(" TAGS", theme::faint()),
     ];
-    match app.tags.get(&event.sequence).cloned() {
+    match app.tags.get(&event.position).cloned() {
         None => lines.push(Line::styled(
             format!(" {} ", SPINNER[app.tick % SPINNER.len()]),
             theme::faint(),
@@ -1180,13 +1180,13 @@ mod tests {
     #[test]
     fn the_events_screen() {
         let mut app = app();
-        app.identity = Some("theo@karma.life".into());
+        app.identity = Some("theo@example.com".into());
         app.set_tags(199, Ok(vec!["orderId=o-7".into()]));
         let screen = render(&mut app);
         assert_shows(
             &screen,
             &[
-                "◆ KRONOSDB   prod  http://localhost:50051  theo@karma.life",
+                "◆ KRONOSDB   prod  http://localhost:50051  theo@example.com",
                 "kronosdb-0 · term 7  leader",
                 " Events 2 ",
                 " Clients 2 ",
@@ -1215,7 +1215,7 @@ mod tests {
         app.push_events(generation, vec![event(200, "OrderPaid")]);
         let screen = render(&mut app);
         assert_shows(&screen, &["1 new · end for live", "READING"]);
-        let sequence = app.selected_event().unwrap().sequence;
+        let sequence = app.selected_event().unwrap().position;
         assert_shows(&screen, &[&format!("event {} of 5000", sequence + 1)]);
     }
 
@@ -1268,9 +1268,9 @@ mod tests {
         render(&mut app);
 
         let row = Rect::new(app.hits.list.x + 4, app.hits.list.y + 2, 1, 1);
-        let expected = app.events[app.hits.list_top + 2].sequence;
+        let expected = app.events[app.hits.list_top + 2].position;
         click(&mut app, row);
-        assert_eq!(app.selected_event().unwrap().sequence, expected);
+        assert_eq!(app.selected_event().unwrap().position, expected);
 
         app.on_key(key(KeyCode::End));
         render(&mut app);

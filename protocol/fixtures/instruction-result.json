@@ -1,0 +1,11 @@
+{
+  "frame": "InstructionResult",
+  "stream": 55,
+  "flags": 0,
+  "body": {
+    "instruction_id": "pi-1",
+    "success": true,
+    "error": null
+  },
+  "description": ""
+}

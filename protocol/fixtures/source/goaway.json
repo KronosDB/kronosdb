@@ -1,0 +1,10 @@
+{
+  "description": "The server is draining.",
+  "frame": "GoAway",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "code": "unavailable",
+    "message": "shutting down; reconnect to another node"
+  }
+}

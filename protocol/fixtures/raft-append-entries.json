@@ -1,0 +1,9 @@
+{
+  "frame": "RaftAppendEntries",
+  "stream": 63,
+  "flags": 1,
+  "body": {
+    "data": ""
+  },
+  "description": ""
+}

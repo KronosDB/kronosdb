@@ -1,0 +1,56 @@
+{
+  "description": "",
+  "frame": "ForwardAppend",
+  "stream": 71,
+  "flags": 1,
+  "body": {
+    "context": "default",
+    "epoch": "8",
+    "leader_id": "3",
+    "system": false,
+    "condition": {
+      "marker": "1048579",
+      "criteria": [
+        {
+          "names": [],
+          "tags": [
+            {
+              "key": {
+                "utf8": "orderId"
+              },
+              "value": {
+                "utf8": "o-1"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "events": [
+      {
+        "flags": 0,
+        "event": {
+          "position": "0",
+          "identifier": "e-9",
+          "name": "OrderShipped",
+          "version": "1",
+          "timestamp": 1761300000999,
+          "metadata": [],
+          "tags": [
+            {
+              "key": {
+                "utf8": "orderId"
+              },
+              "value": {
+                "utf8": "o-1"
+              }
+            }
+          ],
+          "payload": {
+            "utf8": "{}"
+          }
+        }
+      }
+    ]
+  }
+}

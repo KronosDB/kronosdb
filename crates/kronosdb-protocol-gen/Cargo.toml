@@ -1,0 +1,19 @@
+[package]
+name = "kronosdb-protocol-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generates the KronosDB native protocol codecs, spec tables and fixtures from protocol/kronosdb.schema"
+publish = false
+
+[[bin]]
+name = "protocol-gen"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+crc32c = "0.6"
+
+[lints]
+workspace = true

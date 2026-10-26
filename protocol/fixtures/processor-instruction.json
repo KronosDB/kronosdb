@@ -1,0 +1,12 @@
+{
+  "frame": "ProcessorInstruction",
+  "stream": 55,
+  "flags": 0,
+  "body": {
+    "instruction_id": "pi-1",
+    "action": "split_segment",
+    "processor_name": "order-projection",
+    "segment": 1
+  },
+  "description": ""
+}

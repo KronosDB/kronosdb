@@ -1,0 +1,9 @@
+{
+  "name": "@kronosdb/protocol",
+  "private": true,
+  "type": "module",
+  "description": "Generated KronosDB native protocol codec. Zero dependencies; copy kronosdb-protocol.ts into a client or import it.",
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings --test conformance.test.ts"
+  }
+}

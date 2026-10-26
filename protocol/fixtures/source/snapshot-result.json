@@ -1,0 +1,14 @@
+{
+  "description": "",
+  "frame": "SnapshotResult",
+  "stream": 25,
+  "flags": 1,
+  "body": {
+    "snapshot": {
+      "state": {
+        "utf8": "{\"seats\":30,\"enrolled\":28}"
+      },
+      "position": "1048578"
+    }
+  }
+}
