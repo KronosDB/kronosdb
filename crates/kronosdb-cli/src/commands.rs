@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
-use crate::client::{Connection, pb};
+use kronosdb_client::{Appended, Event, NewEvent};
+
+use crate::client::Connection;
 use crate::output::{self, bool_of, items, num_of, str_of, table};
 use crate::profile::{ConfigFile, Profile, config_path};
 use crate::query;
@@ -157,12 +159,9 @@ pub async fn whoami(conn: &Connection, output: Output) -> Result<()> {
             }),
         None => None,
     };
-    let scope = |all: bool, names: &[String]| {
-        if all {
-            "*".to_string()
-        } else {
-            names.join(",")
-        }
+    let scope = |names: &Option<Vec<String>>| match names {
+        None => "*".to_string(),
+        Some(names) => names.join(","),
     };
 
     if output.is_json() {
@@ -176,8 +175,8 @@ pub async fn whoami(conn: &Connection, output: Output) -> Result<()> {
             "expires_in_secs": expires_in,
             "grants": me.grants.iter().map(|g| json!({
                 "roles": g.roles,
-                "contexts": if g.all_contexts { json!("*") } else { json!(g.contexts) },
-                "buses": if g.all_buses { json!("*") } else { json!(g.buses) },
+                "contexts": g.contexts.as_ref().map_or(json!("*"), |c| json!(c)),
+                "buses": g.buses.as_ref().map_or(json!("*"), |b| json!(b)),
             })).collect::<Vec<_>>(),
         }));
         return Ok(());
@@ -204,13 +203,7 @@ pub async fn whoami(conn: &Connection, output: Output) -> Result<()> {
         let rows: Vec<Vec<String>> = me
             .grants
             .iter()
-            .map(|g| {
-                vec![
-                    g.roles.join(","),
-                    scope(g.all_contexts, &g.contexts),
-                    scope(g.all_buses, &g.buses),
-                ]
-            })
+            .map(|g| vec![g.roles.join(","), scope(&g.contexts), scope(&g.buses)])
             .collect();
         println!("\n{}", table(&["ROLES", "CONTEXTS", "BUSES"], &rows));
     }
@@ -514,13 +507,12 @@ pub fn processor_row(p: &Value) -> Vec<String> {
 
 // ────────────────────────────── events ──────────────────────────────
 
-pub fn event_line(event: &pb::SequencedEvent, payload_width: usize) -> String {
-    let inner = event.event.clone().unwrap_or_default();
+pub fn event_line(event: &Event, payload_width: usize) -> String {
     format!(
         "{:>10}  {:<28}  {}",
-        event.sequence,
-        inner.name,
-        output::payload_preview(&inner.payload, payload_width)
+        event.position,
+        event.name,
+        output::payload_preview(&event.payload, payload_width)
     )
 }
 
@@ -532,7 +524,7 @@ pub async fn query(
     conn: &Connection,
     context: &str,
     expr: &str,
-    from: i64,
+    from: u64,
     limit: Option<usize>,
     with_tags: bool,
     follow: bool,
@@ -548,14 +540,14 @@ pub async fn query(
     loop {
         let events = conn.source(context, next, &criteria, remaining).await?;
         for event in &events {
-            next = event.sequence + 1;
+            next = event.position + 1;
             if matches!(output, Output::Table) {
                 println!("{}", event_line(event, 100));
                 continue;
             }
             let mut value = output::event_json(event);
             if with_tags {
-                let tags = conn.tags(context, event.sequence).await?;
+                let tags = conn.tags(context, event.position).await?;
                 value["tags"] = tags.iter().map(output::tag_text).collect();
             }
             match output {
@@ -602,7 +594,7 @@ pub async fn events(
                     // With a filter, "last N matching" needs a scan from the
                     // start; unfiltered, the window is just arithmetic.
                     if criteria.is_empty() {
-                        (head - lines as i64).max(tail)
+                        head.saturating_sub(lines as u64).max(tail)
                     } else {
                         tail
                     }
@@ -621,7 +613,7 @@ pub async fn events(
                     } else {
                         println!("{}", event_line(event, 100));
                     }
-                    next = event.sequence + 1;
+                    next = event.position + 1;
                 }
                 if !follow {
                     return Ok(());
@@ -638,7 +630,7 @@ pub async fn events(
         }
         EventsCommand::Get { sequence } => {
             let events = conn.source(context, sequence, &[], 1).await?;
-            let Some(event) = events.first().filter(|e| e.sequence == sequence) else {
+            let Some(event) = events.first().filter(|e| e.position == sequence) else {
                 bail!("no event at sequence {sequence} in context {context:?}");
             };
             let tags = conn.tags(context, sequence).await?;
@@ -663,36 +655,35 @@ pub async fn events(
                 (None, None) => Vec::new(),
                 (Some(_), Some(_)) => bail!("--payload and --payload-file are exclusive"),
             };
-            let response = conn
-                .append(
-                    context,
-                    pb::AppendRequest {
-                        condition: None,
-                        events: vec![pb::TaggedEvent {
-                            event: Some(pb::Event {
-                                identifier: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)?
-                                    .as_millis() as i64,
-                                name,
-                                version,
-                                payload,
-                                metadata: Default::default(),
-                            }),
-                            tags: tags
-                                .iter()
-                                .map(|t| query::parse_tag(t))
-                                .collect::<Result<_>>()?,
-                        }],
-                    },
-                )
-                .await?;
+            let event = NewEvent {
+                identifier: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as i64,
+                name,
+                version,
+                payload: payload.into(),
+                metadata: vec![],
+                tags: tags
+                    .iter()
+                    .map(|t| query::parse_tag(t))
+                    .collect::<Result<_>>()?,
+            };
+            let (first, count) = match conn.append(context, &[event]).await? {
+                Appended::Ok {
+                    first_position,
+                    count,
+                    ..
+                } => (first_position, count),
+                // Unconditional appends have no condition to conflict with.
+                Appended::Conflict { position } => {
+                    bail!("the append conflicted with the event at {position}")
+                }
+            };
             if output.is_json() {
-                print_json(
-                    &json!({ "sequence": response.first_sequence, "count": response.count }),
-                );
+                print_json(&json!({ "sequence": first, "count": count }));
             } else {
-                println!("Appended at sequence {}.", response.first_sequence);
+                println!("Appended at sequence {first}.");
             }
             Ok(())
         }

@@ -1,0 +1,7 @@
+{
+  "description": "Ends a subscription. A frame with no fields.",
+  "frame": "Cancel",
+  "stream": 5,
+  "flags": 1,
+  "body": {}
+}

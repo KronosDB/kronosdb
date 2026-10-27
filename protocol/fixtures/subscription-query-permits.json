@@ -1,0 +1,10 @@
+{
+  "frame": "SubscriptionQueryPermits",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "subscription_id": "sub-1",
+    "permits": "50"
+  },
+  "description": ""
+}

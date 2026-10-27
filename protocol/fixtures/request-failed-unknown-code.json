@@ -1,0 +1,10 @@
+{
+  "frame": "RequestFailed",
+  "stream": 3,
+  "flags": 1,
+  "body": {
+    "code": 4242,
+    "message": "from a newer server"
+  },
+  "description": "An error code this schema does not know stays a number."
+}

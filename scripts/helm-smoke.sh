@@ -9,8 +9,9 @@
 #   3. a rolling restart (helm upgrade) keeps the cluster available
 #
 # Usage: IMAGE=kronosdb:dev scripts/helm-smoke.sh
-# Requires: docker, kind, helm, kubectl, curl. grpcurl enables the data
-# checks; without it the test still validates cluster formation and failover.
+# Requires: docker, kind, helm, kubectl, curl. The kronos CLI ($KRONOS,
+# default `kronos` on PATH) enables the data checks; without it the test
+# still validates cluster formation and failover.
 
 set -euo pipefail
 
@@ -20,6 +21,12 @@ RELEASE=kdb
 NS=kronosdb-smoke
 
 log() { printf '\n=== %s\n' "$*"; }
+
+KRONOS="${KRONOS:-kronos}"
+# A throwaway CLI profile pointing at the port-forward.
+export KRONOS_CONFIG="$(mktemp -d)/kronos.toml"
+kronos() { "$KRONOS" --profile smoke --context orders "$@"; }
+have_cli() { command -v "$KRONOS" >/dev/null; }
 
 cleanup() {
   kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
@@ -68,17 +75,14 @@ LEADER="$(leader_pod)"
 [ -n "$LEADER" ] || { echo "FAIL: no leader elected"; exit 1; }
 log "leader is $LEADER"
 
-if command -v grpcurl >/dev/null; then
+if have_cli; then
   log "append events through the service"
+  "$KRONOS" profile set smoke --endpoint http://127.0.0.1:55051 --token smoke-token >/dev/null
   kubectl -n "$NS" port-forward "svc/$RELEASE-kronosdb" 55051:50051 >/dev/null 2>&1 &
   PF=$!
   sleep 2
   for i in 1 2 3; do
-    grpcurl -plaintext \
-      -H "kronosdb-token: smoke-token" -H "kronosdb-context: orders" \
-      -import-path proto -proto eventstore.proto \
-      -d "{\"events\": [{\"event\": {\"identifier\": \"smoke-$i\", \"name\": \"SmokeTested\", \"version\": \"1\"}, \"tags\": [{\"key\": \"$(printf smoke | base64)\", \"value\": \"$(printf run | base64)\"}]}]}" \
-      127.0.0.1:55051 kronosdb.eventstore.EventStore/Append >/dev/null
+    kronos events append --type SmokeTested --id "smoke-$i" --tag smoke=run >/dev/null
   done
   kill $PF 2>/dev/null || true
 fi
@@ -91,18 +95,15 @@ NEW_LEADER="$(leader_pod)"
 [ -n "$NEW_LEADER" ] || { echo "FAIL: no leader after failover"; exit 1; }
 log "cluster recovered, leader is $NEW_LEADER"
 
-if command -v grpcurl >/dev/null; then
+if have_cli; then
   log "events survived the failover"
   kubectl -n "$NS" port-forward "svc/$RELEASE-kronosdb" 55051:50051 >/dev/null 2>&1 &
   PF=$!
   sleep 2
-  HEAD=$(grpcurl -plaintext \
-    -H "kronosdb-token: smoke-token" -H "kronosdb-context: orders" \
-    -import-path proto -proto eventstore.proto \
-    -d '{}' 127.0.0.1:55051 kronosdb.eventstore.EventStore/GetHead | grep -o '[0-9]\+' || echo 0)
+  COUNT=$(kronos -o ndjson query '{"tags": {"smoke": "run"}}' | wc -l | tr -d ' ')
   kill $PF 2>/dev/null || true
-  [ "$HEAD" -ge 3 ] || { echo "FAIL: expected head >= 3 after failover, got $HEAD"; exit 1; }
-  log "head=$HEAD — data intact"
+  [ "$COUNT" -ge 3 ] || { echo "FAIL: expected 3 smoke events after failover, got $COUNT"; exit 1; }
+  log "$COUNT smoke events — data intact"
 fi
 
 log "rolling restart (upgrade path: one pod at a time behind the PDB)"

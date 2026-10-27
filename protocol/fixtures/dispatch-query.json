@@ -1,0 +1,30 @@
+{
+  "frame": "DispatchQuery",
+  "stream": 47,
+  "flags": 1,
+  "body": {
+    "bus": 0,
+    "query": {
+      "message_id": "q-1",
+      "name": "com.acme.FindOrder",
+      "timestamp": 1761300000000,
+      "payload": {
+        "type_name": "com.acme.FindOrder",
+        "revision": "1",
+        "data": "7b226f726465724964223a226f2d31227d"
+      },
+      "metadata": [],
+      "instructions": [
+        {
+          "key": "nr_of_results",
+          "value": {
+            "number": "1"
+          }
+        }
+      ],
+      "client_id": "web-1@host-a",
+      "component_name": "web"
+    }
+  },
+  "description": ""
+}

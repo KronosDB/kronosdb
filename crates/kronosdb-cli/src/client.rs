@@ -1,219 +1,247 @@
-//! One connection to a KronosDB node: gRPC for events, admin HTTP for
-//! topology. Both planes get the same bearer token.
+//! One connection to a KronosDB node: the native protocol for events,
+//! admin HTTP for topology. Both planes get the same bearer token.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
-use tonic::{Code, Request, Status};
+use kronosdb_client::{
+    Appended, Client, ConnectOptions, Credential, Criterion, ErrorCode, Event, NewEvent, Whoami,
+};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::profile::Profile;
 use crate::token::TokenSource;
-
-// Generated code refers to sibling packages through `super::`, so the
-// module tree has to mirror the proto package tree.
-// dead_code: the generated packages carry messages this client never sends.
-#[allow(dead_code, clippy::enum_variant_names, clippy::result_large_err)]
-pub mod proto {
-    tonic::include_proto!("kronosdb");
-    pub mod eventstore {
-        tonic::include_proto!("kronosdb.eventstore");
-    }
-    pub mod platform {
-        tonic::include_proto!("kronosdb.platform");
-    }
-}
-pub use proto::eventstore as pb;
-
-use pb::event_store_client::EventStoreClient;
-use proto::platform::platform_service_client::PlatformServiceClient;
 
 pub struct Connection {
     pub profile_name: String,
     pub profile: Profile,
     pub tokens: TokenSource,
-    channel: Channel,
+    /// `host:port` the native client dials.
+    address: String,
+    tls: Option<(TlsConnector, ServerName<'static>)>,
+    client: tokio::sync::Mutex<Option<Client>>,
     http: reqwest::Client,
+}
+
+/// `http://host:port` or `https://host:port` (the profile's endpoint) as the
+/// address to dial and whether to use TLS.
+fn parse_endpoint(endpoint: &str) -> Result<(String, String, bool)> {
+    let (tls, rest) = match endpoint.split_once("://") {
+        Some(("https", rest)) => (true, rest),
+        Some(("http", rest)) => (false, rest),
+        Some((scheme, _)) => {
+            bail!("endpoint {endpoint:?}: unknown scheme {scheme:?}; use http:// or https://")
+        }
+        None => (false, endpoint),
+    };
+    let authority = rest.trim_end_matches('/');
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        _ => authority,
+    };
+    let address = if host == authority {
+        format!("{authority}:50051")
+    } else {
+        authority.to_string()
+    };
+    Ok((address, host.trim_matches(['[', ']']).to_string(), tls))
+}
+
+fn tls_connector(profile: &Profile, host: &str) -> Result<(TlsConnector, ServerName<'static>)> {
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    if let Some(path) = &profile.ca_file {
+        for cert in CertificateDer::pem_file_iter(path)
+            .with_context(|| format!("reading ca-file {}", path.display()))?
+        {
+            roots
+                .add(cert.with_context(|| format!("reading ca-file {}", path.display()))?)
+                .with_context(|| format!("invalid certificate in ca-file {}", path.display()))?;
+        }
+    }
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots);
+    let config = match (&profile.cert_file, &profile.key_file) {
+        (Some(cert), Some(key)) => {
+            let chain = CertificateDer::pem_file_iter(cert)
+                .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+                .with_context(|| format!("reading cert-file {}", cert.display()))?;
+            let key = PrivateKeyDer::from_pem_file(key)
+                .with_context(|| format!("reading key-file {}", key.display()))?;
+            builder.with_client_auth_cert(chain, key)?
+        }
+        _ => builder.with_no_client_auth(),
+    };
+    let name = profile
+        .tls_domain
+        .clone()
+        .unwrap_or_else(|| host.to_string());
+    let name = ServerName::try_from(name.clone())
+        .with_context(|| format!("bad TLS server name {name:?}"))?;
+    Ok((TlsConnector::from(Arc::new(config)), name))
 }
 
 impl Connection {
     /// Lazy: nothing touches the network until the first call.
     pub fn open(profile_name: String, profile: Profile) -> Result<Self> {
-        let mut endpoint = Channel::from_shared(profile.endpoint.clone())
-            .with_context(|| format!("bad endpoint {:?}", profile.endpoint))?
-            .connect_timeout(Duration::from_secs(5))
-            .tcp_nodelay(true);
+        let (address, host, use_tls) = parse_endpoint(&profile.endpoint)?;
         let mut http = reqwest::Client::builder().timeout(Duration::from_secs(10));
-
-        if profile.endpoint.starts_with("https://") {
-            let mut tls = ClientTlsConfig::new().with_native_roots();
+        let tls = if use_tls {
             if let Some(path) = &profile.ca_file {
                 let pem = std::fs::read(path)
                     .with_context(|| format!("reading ca-file {}", path.display()))?;
                 http = http.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
-                tls = tls.ca_certificate(Certificate::from_pem(pem));
             }
-            if let (Some(cert), Some(key)) = (&profile.cert_file, &profile.key_file) {
-                let cert = std::fs::read(cert)
-                    .with_context(|| format!("reading cert-file {}", cert.display()))?;
-                let key = std::fs::read(key)
-                    .with_context(|| format!("reading key-file {}", key.display()))?;
-                tls = tls.identity(Identity::from_pem(cert, key));
-            }
-            if let Some(domain) = &profile.tls_domain {
-                tls = tls.domain_name(domain.clone());
-            }
-            endpoint = endpoint.tls_config(tls)?;
-        }
-
+            Some(tls_connector(&profile, &host)?)
+        } else {
+            None
+        };
         let tokens = TokenSource::for_profile(&profile_name, &profile);
         Ok(Self {
             profile_name,
             profile,
             tokens,
-            channel: endpoint.connect_lazy(),
+            address,
+            tls,
+            client: tokio::sync::Mutex::new(None),
             http: http.build()?,
         })
     }
 
-    /// Runs a gRPC call with the current token; when the server rejects a
-    /// token that can be re-fetched (file, command), fetches once more.
-    async fn grpc<T, F, Fut>(&self, context: &str, call: F) -> Result<T>
+    /// The live client, connecting (again) if there is none.
+    async fn client(&self) -> Result<Client, kronosdb_client::Error> {
+        let mut slot = self.client.lock().await;
+        if let Some(client) = slot.as_ref().filter(|c| !c.connection().is_closed()) {
+            return Ok(client.clone());
+        }
+        let credential = match self.tokens.token().await.map_err(|e| {
+            kronosdb_client::Error::Failed(kronosdb_client::Failure::new(
+                ErrorCode::UNAUTHENTICATED,
+                e.to_string(),
+            ))
+        })? {
+            Some(token) => Credential::Token(token),
+            None => Credential::None,
+        };
+        let options = ConnectOptions {
+            client_name: "kronos".into(),
+            client_id: format!("kronos-{}", std::process::id()),
+            credential,
+            tls: self.tls.clone(),
+            connect_timeout: Duration::from_secs(5),
+            ..ConnectOptions::default()
+        };
+        let client = Client::connect(&self.address, &options).await?;
+        *slot = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Runs a call with the current token; when the server rejects a token
+    /// that can be re-fetched (file, command), fetches once more.
+    async fn call<T, F, Fut>(&self, call: F) -> Result<T>
     where
-        F: Fn(Channel, tonic::metadata::MetadataMap) -> Fut,
-        Fut: Future<Output = Result<T, Status>>,
+        F: Fn(Client) -> Fut,
+        Fut: Future<Output = Result<T, kronosdb_client::Error>>,
     {
         for attempt in 0..2 {
-            let mut metadata = tonic::metadata::MetadataMap::new();
-            metadata.insert("kronosdb-context", context.parse()?);
-            if let Some(token) = self.tokens.token().await? {
-                metadata.insert(
-                    "authorization",
-                    format!("Bearer {token}")
-                        .parse()
-                        .map_err(|_| anyhow!("token contains characters invalid in a header"))?,
-                );
-            }
-            match call(self.channel.clone(), metadata).await {
+            let result = match self.client().await {
+                Ok(client) => call(client).await,
+                Err(e) => Err(e),
+            };
+            match result {
                 Ok(value) => return Ok(value),
-                Err(status)
-                    if status.code() == Code::Unauthenticated
+                Err(e)
+                    if e.failure()
+                        .is_some_and(|f| f.code == ErrorCode::UNAUTHENTICATED)
                         && attempt == 0
                         && self.tokens.refreshable() =>
                 {
                     self.tokens.invalidate().await;
+                    // The credential is the connection's: dial again with the new one.
+                    *self.client.lock().await = None;
                 }
-                Err(status) => return Err(self.explain(status)),
+                Err(e) => return Err(self.explain(e)),
             }
         }
         unreachable!("second attempt always returns")
     }
 
     /// Says what went wrong in the caller's terms. The server's message is
-    /// the explanation; the gRPC code only decides how to frame it.
-    fn explain(&self, status: Status) -> anyhow::Error {
-        // A status with a source never came from the server: tonic built it
-        // from a transport failure (refused, DNS, TLS, timeout).
-        let transport = std::error::Error::source(&status).is_some();
-        let message = status.message();
-        match status.code() {
-            Code::Unavailable if transport => anyhow!(
-                "cannot reach {} — is the server running and the endpoint right? ({message})",
+    /// the explanation; the error code only decides how to frame it.
+    fn explain(&self, e: kronosdb_client::Error) -> anyhow::Error {
+        let Some(failure) = e.failure() else {
+            return anyhow!(
+                "cannot reach {} — is the server running and the endpoint right? ({e})",
                 self.profile.endpoint
-            ),
-            // The server answered: it is up, just not able to serve this yet.
-            Code::Unavailable => anyhow!("{message}"),
-            Code::Unauthenticated => {
+            );
+        };
+        let message = &failure.message;
+        match failure.code {
+            ErrorCode::UNAUTHENTICATED => {
                 anyhow!("not authenticated ({}): {message}", self.tokens.describe())
             }
-            Code::PermissionDenied => anyhow!("permission denied: {message}"),
-            Code::DeadlineExceeded => anyhow!(
-                "{} did not answer in time ({message})",
+            ErrorCode::PERMISSION_DENIED => anyhow!("permission denied: {message}"),
+            ErrorCode::INTERNAL | ErrorCode::CORRUPTED => anyhow!("server error: {message}"),
+            ErrorCode::PROTOCOL_VIOLATION => anyhow!(
+                "the server at {} does not understand this client — one of them is \
+                 probably out of date ({message})",
                 self.profile.endpoint
             ),
-            Code::Unimplemented => anyhow!(
-                "the server at {} does not support this call — it is probably older \
-                 than this CLI ({message})",
-                self.profile.endpoint
-            ),
-            Code::Internal | Code::Unknown | Code::DataLoss => {
-                anyhow!("server error: {message}")
-            }
-            // NotFound, AlreadyExists, InvalidArgument, FailedPrecondition,
-            // Aborted…: the message already says it; the code adds nothing.
+            // The message already says it; the code adds nothing.
             _ => anyhow!("{message}"),
         }
     }
 
     /// Who the server resolved this credential to, and with which grants.
-    pub async fn whoami(&self) -> Result<proto::platform::WhoAmIResponse> {
-        self.grpc("default", |channel, metadata| async move {
-            let mut req = Request::new(proto::platform::WhoAmIRequest {});
-            *req.metadata_mut() = metadata;
-            Ok(PlatformServiceClient::new(channel)
-                .who_am_i(req)
-                .await?
-                .into_inner())
-        })
-        .await
+    pub async fn whoami(&self) -> Result<Whoami> {
+        self.call(|client| async move { client.who_am_i().await })
+            .await
     }
 
-    pub async fn head(&self, context: &str) -> Result<i64> {
-        self.grpc(context, |channel, metadata| async move {
-            let mut client = EventStoreClient::new(channel);
-            let mut req = Request::new(pb::GetHeadRequest {});
-            *req.metadata_mut() = metadata;
-            Ok(client.get_head(req).await?.into_inner().sequence)
-        })
-        .await
+    pub async fn head(&self, context: &str) -> Result<u64> {
+        self.call(|client| async move { client.context(context).await?.head().await })
+            .await
     }
 
-    pub async fn tail(&self, context: &str) -> Result<i64> {
-        self.grpc(context, |channel, metadata| async move {
-            let mut client = EventStoreClient::new(channel);
-            let mut req = Request::new(pb::GetTailRequest {});
-            *req.metadata_mut() = metadata;
-            Ok(client.get_tail(req).await?.into_inner().sequence)
-        })
-        .await
+    pub async fn tail(&self, context: &str) -> Result<u64> {
+        self.call(|client| async move { client.context(context).await?.tail().await })
+            .await
     }
 
-    pub async fn tags(&self, context: &str, sequence: i64) -> Result<Vec<pb::Tag>> {
-        self.grpc(context, |channel, metadata| async move {
-            let mut client = EventStoreClient::new(channel);
-            let mut req = Request::new(pb::GetTagsRequest { sequence });
-            *req.metadata_mut() = metadata;
-            Ok(client.get_tags(req).await?.into_inner().tags)
-        })
-        .await
+    pub async fn tags(&self, context: &str, position: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.call(|client| async move { client.context(context).await?.tags(position).await })
+            .await
     }
 
     /// Reads events from `from` up to the current head, at most `limit`.
     pub async fn source(
         &self,
         context: &str,
-        from: i64,
-        criteria: &[pb::Criterion],
+        from: u64,
+        criteria: &[Criterion],
         limit: usize,
-    ) -> Result<Vec<pb::SequencedEvent>> {
-        self.grpc(context, |channel, metadata| async move {
-            let mut client = EventStoreClient::new(channel);
-            let mut req = Request::new(pb::SourceRequest {
-                from_sequence: from,
-                criteria: criteria.to_vec(),
-                batch_size: 0,
-            });
-            *req.metadata_mut() = metadata;
-            let mut stream = client.source(req).await?.into_inner();
+    ) -> Result<Vec<Event>> {
+        self.call(|client| async move {
+            let mut source = client
+                .context(context)
+                .await?
+                .source(from, criteria, 0)
+                .await?;
             let mut events = Vec::new();
-            while let Some(response) = stream.message().await? {
-                if let Some(batch) = response.batch {
-                    events.extend(batch.events);
-                }
+            while let Some(batch) = source.next().await? {
+                events.extend(batch.to_events());
                 if events.len() >= limit {
                     events.truncate(limit);
-                    // Dropping the stream cancels the rest of the read.
+                    // Dropping the read cancels the rest of it.
                     break;
                 }
             }
@@ -222,21 +250,9 @@ impl Connection {
         .await
     }
 
-    pub async fn append(
-        &self,
-        context: &str,
-        request: pb::AppendRequest,
-    ) -> Result<pb::AppendResponse> {
-        self.grpc(context, |channel, metadata| {
-            let request = request.clone();
-            async move {
-                let mut client = EventStoreClient::new(channel);
-                let mut req = Request::new(request);
-                *req.metadata_mut() = metadata;
-                Ok(client.append(req).await?.into_inner())
-            }
-        })
-        .await
+    pub async fn append(&self, context: &str, events: &[NewEvent]) -> Result<Appended> {
+        self.call(|client| async move { client.context(context).await?.append(events, None).await })
+            .await
     }
 
     fn admin_url(&self, path: &str) -> Result<String> {

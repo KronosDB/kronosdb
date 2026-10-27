@@ -5,8 +5,8 @@ description: >-
   nodes as a StatefulSet, with optional passive-backup learners, tiered
   segment backup to object storage, and the admin console.
 type: application
-version: 0.1.0
-appVersion: "0.7.0"
+version: 0.11.0
+appVersion: "0.11.0"
 home: https://github.com/KronosDB/kronosdb
 sources:
   - https://github.com/KronosDB/kronosdb

@@ -38,9 +38,21 @@ persistence:
   size: 100Gi
 
 config:
-  # auto = written acks with 2+ voters (quorum has the bytes; fsync trails
-  # one group-commit wave), durable fsync-before-ack on a single voter.
-  # Override to "durable" to force fsync-before-ack everywhere.
+  # auto = durable (fsync-before-ack) on a single voter. With 2+ voters each
+  # node measures its data disk at startup (a ~100-write fdatasync probe) and
+  # acks durably when the p99 is under 1 ms (local NVMe: ~0.2 ms, where durable
+  # costs 3-19% throughput); on a slower disk (network volumes: 1-4 ms, where
+  # durable costs 30-36%) it keeps written acks (quorum has the bytes; fsync
+  # trails one group-commit wave). The measurement and the resulting mode are
+  # logged at startup and exposed as kronosdb_disk_fsync_microseconds and
+  # kronosdb_ack_durable on /metrics. "durable" forces fsync-before-ack
+  # everywhere, "written" forces quorum-written acks; neither consults the
+  # probe.
+  #
+  # Startup hardware warnings (slow fsync, tmpfs or network data dir, little
+  # memory, swap, CPU limits) are logged at warn/error and exposed as
+  # kronosdb_hardware_finding on /metrics. A throwaway dev cluster can quiet
+  # them to info with KRONOSDB_DEV=1 via extraEnv below; never on production.
   ackMode: auto
   # Seconds the server waits for connections to drain on shutdown. The pod's
   # terminationGracePeriodSeconds is derived from this (+10).
@@ -74,13 +86,13 @@ backup:
   credentialsSecret: ""
 
 auth:
-  # Client access token for the gRPC API. Empty = unauthenticated gRPC
+  # Client access token. Empty = an unauthenticated client port
   # (the chart will tell you so at install). Ignored if existingSecret set.
   accessToken: ""
   # Secret with key "access-token". Takes precedence over accessToken.
   existingSecret: ""
 
-# Identity layer (ADR-0008): who may call the gRPC API, and as what. Rendered
+# Identity layer (ADR-0008): who may connect to the client port, and as what. Rendered
 # verbatim into the server's [security] config, so keys are the TOML keys.
 # Everything is optional and combines with auth.accessToken (which peers
 # keep using unless an mtls grant gives them the "peer" role).
@@ -126,7 +138,7 @@ admin:
 
 tls:
   # Name of a kubernetes.io/tls Secret (tls.crt / tls.key, optional ca.crt)
-  # for the gRPC port. Empty = plaintext.
+  # for the client port. Empty = plaintext.
   secretName: ""
   # Verify client certificates against the Secret's ca.crt (mTLS).
   #   "" = off | required = every connection needs a certificate |
@@ -135,7 +147,7 @@ tls:
   clientAuth: ""
 
 service:
-  # Client-facing gRPC service.
+  # Client-facing service.
   type: ClusterIP
 
 podDisruptionBudget:

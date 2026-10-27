@@ -1,14 +1,14 @@
-//! Identity and authorization for the gRPC plane.
+//! Identity and authorization for the client and peer plane.
 //!
-//! One tower layer ([`layer::AuthLayer`]) sits in front of every service. It
-//! turns whatever credential the caller presents into a [`Principal`], checks
-//! the principal's grants against what the method needs ([`policy`]), and
-//! stores the principal in the request extensions for handlers.
+//! A native connection authenticates once, in its handshake: whatever
+//! credential it presents becomes a [`Principal`], and every request is then
+//! checked against what its kind needs ([`policy::demand`]). The admin plane
+//! shares the JWT verifier.
 //!
 //! Credentials, all optional, all combinable on one port:
 //! - **Static tokens** — legacy `[security] access-token` (full access, the
 //!   credential peers use) and named `[[security.tokens]]` with their own
-//!   roles. Sent as `kronosdb-token: <t>` or `authorization: Bearer <t>`.
+//!   roles, sent as the handshake's token credential.
 //! - **OIDC JWTs** — any number of trusted `[[security.issuers]]`. Human SSO
 //!   and workload identity are the same mechanism: Google / Entra / Keycloak
 //!   ID tokens, Kubernetes projected service-account tokens (GKE, EKS, AKS
@@ -22,7 +22,6 @@
 
 pub mod config;
 pub mod jwt;
-pub mod layer;
 pub mod mtls;
 pub mod policy;
 
@@ -67,7 +66,7 @@ impl Principal {
 
     pub fn allows(&self, access: Access, scope: Scope, target: &str) -> bool {
         // Reaching this point at all means the caller was verified.
-        matches!(access, Access::Public | Access::Authenticated)
+        access == Access::Authenticated
             || self.grants.iter().any(|g| g.allows(access, scope, target))
     }
 
@@ -81,14 +80,12 @@ impl Principal {
 pub enum AuthError {
     /// No credential, or one that doesn't verify.
     Unauthenticated(String),
-    /// A verified caller without a grant covering the request.
-    PermissionDenied(String),
 }
 
 /// What a request carries that could identify its sender.
 #[derive(Default)]
 pub struct Credentials<'a> {
-    /// From `authorization: Bearer` or `kronosdb-token`.
+    /// The handshake's token or JWT credential.
     pub token: Option<&'a str>,
     /// Leaf client certificate (DER), already chain-verified by rustls.
     pub client_cert: Option<&'a [u8]>,
@@ -303,8 +300,8 @@ impl Authenticator {
             self.authenticate_cert(der)
         } else {
             Err(AuthError::Unauthenticated(
-                "no credential: send authorization: Bearer <token>, kronosdb-token, or a \
-                 client certificate"
+                "no credential: send a token or JWT in Hello, or connect with a client \
+                 certificate"
                     .into(),
             ))
         };
@@ -450,33 +447,10 @@ impl Authenticator {
         Ok(principal)
     }
 
-    /// Checks `principal` against what `path` needs.
-    pub fn authorize(
-        &self,
-        principal: &Principal,
-        path: &str,
-        context: &str,
-        bus: &str,
-    ) -> Result<(), AuthError> {
-        let (access, scope) = policy::classify(path);
-        let target = match scope {
-            Scope::Context => context,
-            Scope::Bus => bus,
-            Scope::Global => "",
-        };
-        if principal.allows(access, scope, target) {
-            return Ok(());
-        }
+    /// Counts a request refused for lacking a grant (the
+    /// `permission_denied` auth metric).
+    pub fn record_denied(&self) {
         self.stats.denied.fetch_add(1, Ordering::Relaxed);
-        let on = match scope {
-            Scope::Context => format!(" on context {target:?}"),
-            Scope::Bus => format!(" on bus {target:?}"),
-            Scope::Global => String::new(),
-        };
-        Err(AuthError::PermissionDenied(format!(
-            "{} ({}) lacks {access:?} access{on}",
-            principal.subject, principal.source
-        )))
     }
 }
 

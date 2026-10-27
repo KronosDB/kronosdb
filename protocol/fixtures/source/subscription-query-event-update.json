@@ -1,0 +1,26 @@
+{
+  "description": "",
+  "frame": "SubscriptionQueryEvent",
+  "stream": 51,
+  "flags": 0,
+  "body": {
+    "subscription_id": "sub-1",
+    "event": {
+      "update": {
+        "message_id": "u-1",
+        "payload": {
+          "type_name": "com.acme.OrderView",
+          "revision": "1",
+          "data": {
+            "utf8": "{\"status\":\"shipped\"}"
+          }
+        },
+        "metadata": [],
+        "client_id": "read-1@host-c",
+        "component_name": "read",
+        "error_code": "",
+        "error": null
+      }
+    }
+  }
+}

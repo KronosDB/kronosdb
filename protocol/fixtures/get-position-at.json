@@ -1,0 +1,10 @@
+{
+  "frame": "GetPositionAt",
+  "stream": 21,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "timestamp": -86400000
+  },
+  "description": "A negative timestamp is before 1970."
+}

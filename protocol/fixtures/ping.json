@@ -1,0 +1,9 @@
+{
+  "frame": "Ping",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "nonce": "18446744073709551615"
+  },
+  "description": "Client liveness check."
+}

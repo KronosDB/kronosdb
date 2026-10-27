@@ -10,7 +10,7 @@ use crate::types::{ClientId, ComponentName};
 /// Boxed future returned by [`CommandDispatcher::dispatch_command_wait`].
 ///
 /// Hand-rolled instead of `async fn` so the trait stays object-safe — the
-/// gRPC layer programs against `Arc<dyn MessagingPlatform>`.
+/// service layer programs against `Arc<dyn MessagingPlatform>`.
 pub type DispatchFuture<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -171,11 +171,15 @@ pub trait SubscriptionQueryDispatcher: Send + Sync {
     /// Returns the handler's client id if the subscription existed, so the
     /// caller can notify that handler to stop emitting updates.
     fn cancel_subscription(&self, subscription_id: &str) -> Option<ClientId>;
+
+    /// Ends the subscriptions `handler` serves with the handler-lost error,
+    /// for a handler whose stream is gone.
+    fn fail_handler_subscriptions(&self, handler: &ClientId);
 }
 
 /// Combined messaging platform interface.
 ///
-/// The gRPC layer programs against this trait. Implementations can be
+/// The service layer programs against this trait. Implementations can be
 /// the direct engine or a cluster-aware decorator that forwards to remote nodes.
 pub trait MessagingPlatform:
     CommandDispatcher + QueryDispatcher + SubscriptionQueryDispatcher

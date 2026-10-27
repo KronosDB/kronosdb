@@ -11,21 +11,14 @@
 //! bug: a stale leader that evaluated a DCB condition against a stale index
 //! could accept an append that contradicts a committed one.
 
-#![allow(clippy::result_large_err)]
-
 mod crash_harness;
-use crash_harness::pb::eventstore as pb;
 use crash_harness::*;
-use pb::Tag;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tonic::transport::Channel;
-
-use pb::event_store_client::EventStoreClient;
 
 const ITERATIONS: usize = 3;
 const AGGREGATES: usize = 8;
@@ -87,9 +80,7 @@ async fn run_one_iteration(iter: usize) {
 
     let ack_log = Arc::new(AckLog::create(acks_path.clone()).expect("ack log"));
     let (stop_tx, stop_rx) = watch::channel(false);
-    let addrs: Vec<String> = (0..3)
-        .map(|i| format!("http://127.0.0.1:{}", listen[i]))
-        .collect();
+    let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", listen[i])).collect();
     let mut writers = Vec::new();
     for widx in 0..WRITER_TASKS {
         writers.push(tokio::spawn(writer_loop(
@@ -177,26 +168,21 @@ async fn run_one_iteration(iter: usize) {
     drop(ack_log);
 
     // All three nodes — including the fenced ex-leader — must converge.
-    let mut clients = Vec::new();
+    let mut contexts = Vec::new();
     for srv in srvs.iter() {
-        let channel = Channel::from_shared(format!("http://{}", srv.listen))
-            .unwrap()
-            .connect()
-            .await
-            .expect("connect for convergence");
-        clients.push(EventStoreClient::new(channel));
+        contexts.push(
+            connect(srv.listen)
+                .await
+                .expect("connect for convergence")
+                .default_context(),
+        );
     }
     let start = Instant::now();
     loop {
         let mut heads = Vec::new();
-        for client in clients.iter_mut() {
-            let head = tokio::time::timeout(
-                Duration::from_secs(5),
-                client.get_head(pb::GetHeadRequest {}),
-            )
-            .await;
-            match head {
-                Ok(Ok(response)) => heads.push(response.into_inner().sequence),
+        for context in &contexts {
+            match tokio::time::timeout(Duration::from_secs(5), context.head()).await {
+                Ok(Ok(head)) => heads.push(head as i64),
                 _ => heads.push(-1),
             }
         }
@@ -255,9 +241,9 @@ async fn run_one_iteration(iter: usize) {
             }
         }
     }
-    let events = source_all(&mut clients[old_leader]).await;
+    let events = source_all(&contexts[old_leader]).await;
     for rec in &acked {
-        let payload = events.get(&rec.server_sequence).unwrap_or_else(|| {
+        let payload = events.get(&(rec.server_sequence as u64)).unwrap_or_else(|| {
             panic!(
                 "iter {iter}: acked seq {} vanished after stale-leader fencing — ACKED WRITE LOST",
                 rec.server_sequence
@@ -290,16 +276,15 @@ async fn writer_loop(
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut node_idx = widx % addrs.len();
-    let mut client: Option<EventStoreClient<Channel>> = None;
+    let mut context: Option<Context> = None;
     let mut client_seq: u64 = 0;
     loop {
         if *stop_rx.borrow_and_update() {
             return;
         }
-        if client.is_none() {
-            let endpoint = Channel::from_shared(addrs[node_idx].clone()).unwrap();
-            match tokio::time::timeout(Duration::from_secs(1), endpoint.connect()).await {
-                Ok(Ok(ch)) => client = Some(EventStoreClient::new(ch)),
+        if context.is_none() {
+            match tokio::time::timeout(Duration::from_secs(1), connect(&addrs[node_idx])).await {
+                Ok(Ok(client)) => context = Some(client.default_context()),
                 _ => {
                     node_idx = (node_idx + 1) % addrs.len();
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -307,25 +292,28 @@ async fn writer_loop(
                 }
             }
         }
-        let (request, agg_id, hash) = build_append(widx, client_seq);
+        let (events, agg_id, hash) = build_append(widx, client_seq);
         let result = tokio::select! {
-            res = tokio::time::timeout(Duration::from_secs(5), client.as_mut().unwrap().append(request)) => res,
+            res = tokio::time::timeout(
+                Duration::from_secs(5),
+                context.as_ref().unwrap().append(&events, None),
+            ) => res,
             _ = stop_rx.changed() => return,
         };
         match result {
-            Ok(Ok(response)) => {
+            Ok(Ok(Appended::Ok { first_position, .. })) => {
                 ack_log
                     .record(AckRecord {
                         aggregate_id: agg_id,
                         client_sequence: client_seq,
                         payload_hash: hash,
-                        server_sequence: response.into_inner().first_sequence,
+                        server_sequence: first_position as i64,
                     })
                     .expect("ack sidecar");
                 client_seq += 1;
             }
             _ => {
-                client = None;
+                context = None;
                 node_idx = (node_idx + 1) % addrs.len();
             }
         }
@@ -339,105 +327,71 @@ async fn writer_loop_pinned(
     ack_log: Arc<AckLog>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
-    let mut client: Option<EventStoreClient<Channel>> = None;
+    let mut context: Option<Context> = None;
     let mut client_seq: u64 = 0;
     loop {
         if *stop_rx.borrow_and_update() {
             return;
         }
-        if client.is_none() {
-            let endpoint = Channel::from_shared(addr.clone()).unwrap();
-            match tokio::time::timeout(Duration::from_secs(1), endpoint.connect()).await {
-                Ok(Ok(ch)) => client = Some(EventStoreClient::new(ch)),
+        if context.is_none() {
+            match tokio::time::timeout(Duration::from_secs(1), connect(&addr)).await {
+                Ok(Ok(client)) => context = Some(client.default_context()),
                 _ => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             }
         }
-        let (request, agg_id, hash) = build_append(9, client_seq);
+        let (events, agg_id, hash) = build_append(9, client_seq);
         let result = tokio::select! {
-            res = tokio::time::timeout(Duration::from_secs(5), client.as_mut().unwrap().append(request)) => res,
+            res = tokio::time::timeout(
+                Duration::from_secs(5),
+                context.as_ref().unwrap().append(&events, None),
+            ) => res,
             _ = stop_rx.changed() => return,
         };
         match result {
-            Ok(Ok(response)) => {
+            Ok(Ok(Appended::Ok { first_position, .. })) => {
                 ack_log
                     .record(AckRecord {
                         aggregate_id: agg_id,
                         client_sequence: client_seq,
                         payload_hash: hash,
-                        server_sequence: response.into_inner().first_sequence,
+                        server_sequence: first_position as i64,
                     })
                     .expect("ack sidecar");
                 client_seq += 1;
             }
             _ => {
-                client = None;
+                context = None;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
 }
 
-fn build_append(widx: usize, client_seq: u64) -> (pb::AppendRequest, String, Vec<u8>) {
+fn build_append(widx: usize, client_seq: u64) -> ([NewEvent; 1], String, Vec<u8>) {
     let agg_id = format!("agg-{}", (widx + client_seq as usize) % AGGREGATES);
     let payload = format!("sl-w{widx}-s{client_seq}-{agg_id}").into_bytes();
     let hash = hash_payload(&payload);
-    let request = pb::AppendRequest {
-        condition: None,
-        events: vec![pb::TaggedEvent {
-            event: Some(pb::Event {
-                identifier: format!("evt-{widx}-{client_seq}"),
-                timestamp: 1_712_000_000_000 + client_seq as i64,
-                name: "Incremented".into(),
-                version: "1.0".into(),
-                payload,
-                metadata: Default::default(),
-            }),
-            tags: vec![Tag {
-                key: b"agg".to_vec(),
-                value: agg_id.clone().into_bytes(),
-            }],
-        }],
-    };
-    (request, agg_id, hash)
+    let events = [event(
+        format!("evt-{widx}-{client_seq}"),
+        1_712_000_000_000 + client_seq as i64,
+        "Incremented",
+        "1.0",
+        payload,
+        vec![(b"agg".to_vec(), agg_id.clone().into_bytes())],
+    )];
+    (events, agg_id, hash)
 }
 
-async fn source_all(client: &mut EventStoreClient<Channel>) -> HashMap<i64, Vec<u8>> {
-    let criteria: Vec<pb::Criterion> = (0..AGGREGATES)
-        .map(|a| pb::Criterion {
-            names: vec![],
-            tags: vec![Tag {
-                key: b"agg".to_vec(),
-                value: format!("agg-{a}").into_bytes(),
-            }],
-        })
-        .collect();
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(15),
-        client.source(pb::SourceRequest {
-            from_sequence: 0,
-            criteria,
-            batch_size: 0,
-        }),
-    )
-    .await
-    .expect("source rpc open timeout")
-    .expect("source")
-    .into_inner();
-    let mut events = HashMap::new();
-    loop {
-        let msg = tokio::time::timeout(Duration::from_secs(15), stream.message())
-            .await
-            .expect("source stream timeout")
-            .expect("source stream");
-        let Some(resp) = msg else { break };
-        if let Some(batch) = resp.batch {
-            for ev in batch.events {
-                events.insert(ev.sequence, ev.event.map(|e| e.payload).unwrap_or_default());
-            }
-        }
-    }
-    events
+async fn source_all(context: &Context) -> HashMap<u64, Vec<u8>> {
+    let criteria = tag_criteria("agg", (0..AGGREGATES).map(|a| format!("agg-{a}")));
+    tokio::time::timeout(Duration::from_secs(15), read_events(context, &criteria))
+        .await
+        .expect("source timeout")
+        .expect("source")
+        .into_iter()
+        .map(|(position, _, payload)| (position, payload))
+        .collect()
 }

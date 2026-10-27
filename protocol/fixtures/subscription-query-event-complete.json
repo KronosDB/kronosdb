@@ -1,0 +1,15 @@
+{
+  "frame": "SubscriptionQueryEvent",
+  "stream": 51,
+  "flags": 1,
+  "body": {
+    "subscription_id": "sub-1",
+    "event": {
+      "complete": {
+        "client_id": "read-1@host-c",
+        "component_name": "read"
+      }
+    }
+  },
+  "description": ""
+}

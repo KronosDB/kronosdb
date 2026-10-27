@@ -1,0 +1,75 @@
+{
+  "frame": "DispatchCommand",
+  "stream": 43,
+  "flags": 1,
+  "body": {
+    "bus": 0,
+    "command": {
+      "message_id": "cmd-1",
+      "name": "com.acme.PlaceOrder",
+      "timestamp": 1761300000000,
+      "payload": {
+        "type_name": "com.acme.PlaceOrder",
+        "revision": "1",
+        "data": "7b226f726465724964223a226f2d31227d"
+      },
+      "metadata": [
+        {
+          "key": "traceId",
+          "value": {
+            "text": "4bf92f3577b34da6"
+          }
+        },
+        {
+          "key": "attempt",
+          "value": {
+            "number": "-3"
+          }
+        },
+        {
+          "key": "replay",
+          "value": {
+            "boolean": true
+          }
+        },
+        {
+          "key": "ratio",
+          "value": {
+            "double": 0.125
+          }
+        },
+        {
+          "key": "principal",
+          "value": {
+            "object": {
+              "type_name": "com.acme.User",
+              "revision": "1",
+              "data": "7b226964223a377d"
+            }
+          }
+        }
+      ],
+      "instructions": [
+        {
+          "key": "routing_key",
+          "value": {
+            "text": "o-1"
+          }
+        },
+        {
+          "key": "timeout",
+          "value": {
+            "number": "30000"
+          }
+        },
+        {
+          "key": "priority",
+          "value": null
+        }
+      ],
+      "client_id": "web-1@host-a",
+      "component_name": "web"
+    }
+  },
+  "description": "Every MetadataValue variant and an absent instruction value."
+}

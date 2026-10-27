@@ -1,0 +1,9 @@
+{
+  "frame": "RaftVote",
+  "stream": 61,
+  "flags": 1,
+  "body": {
+    "data": "a1b2c3"
+  },
+  "description": "Opaque openraft bytes."
+}

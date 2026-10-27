@@ -1,0 +1,26 @@
+{
+  "description": "A small DCB read of one aggregate.",
+  "frame": "Source",
+  "stream": 11,
+  "flags": 1,
+  "body": {
+    "context": 1,
+    "from": "0",
+    "criteria": [
+      {
+        "names": [],
+        "tags": [
+          {
+            "key": {
+              "utf8": "orderId"
+            },
+            "value": {
+              "utf8": "o-1"
+            }
+          }
+        ]
+      }
+    ],
+    "batch_size": 512
+  }
+}

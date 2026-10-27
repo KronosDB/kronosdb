@@ -16,7 +16,7 @@
 
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
-use crate::event::{AppendEvent, StoredEvent, Tag};
+use crate::event::{StoredEvent, Tag};
 
 /// Prefix reserved for event type names and tag keys owned by the server.
 pub const SYSTEM_PREFIX: u8 = b'$';
@@ -75,7 +75,12 @@ impl Visibility {
 
 /// Whether an event type name is in the reserved namespace.
 pub fn is_system_name(name: &str) -> bool {
-    name.as_bytes().first() == Some(&SYSTEM_PREFIX)
+    is_system_name_bytes(name.as_bytes())
+}
+
+/// [`is_system_name`] for a name read in place from a record.
+pub fn is_system_name_bytes(name: &[u8]) -> bool {
+    name.first() == Some(&SYSTEM_PREFIX)
 }
 
 /// Whether a tag key is in the reserved namespace.
@@ -95,31 +100,6 @@ pub fn is_client_visible(event: &StoredEvent) -> bool {
 /// Removes reserved tags from a tag list bound for a client.
 pub fn strip_system_tags(tags: &mut Vec<Tag>) {
     tags.retain(|tag| !is_system_tag(tag));
-}
-
-/// Rejects a client append that would write into the reserved namespace.
-///
-/// Applies to event types and tag keys alike: provenance is the definition of
-/// a system event, so a client must not be able to forge one.
-pub fn validate_client_append(events: &[AppendEvent]) -> Result<(), Error> {
-    for event in events {
-        if is_system_name(&event.name) {
-            return Err(Error::ReservedNamespace {
-                detail: format!("event type '{}' uses the reserved '$' prefix", event.name),
-            });
-        }
-        for tag in &event.tags {
-            if is_system_tag(tag) {
-                return Err(Error::ReservedNamespace {
-                    detail: format!(
-                        "tag key '{}' uses the reserved '$' prefix",
-                        String::from_utf8_lossy(&tag.key)
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Rejects a client query that reaches into the reserved namespace.
@@ -153,7 +133,13 @@ pub fn validate_client_condition(condition: &SourcingCondition) -> Result<(), Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::append::RecordBatch;
     use crate::criteria::Criterion;
+    use crate::event::AppendEvent;
+
+    fn validate_client_append(events: &[AppendEvent]) -> Result<(), Error> {
+        RecordBatch::from_events(events).check_client()
+    }
 
     fn event(name: &str, tags: Vec<Tag>) -> AppendEvent {
         AppendEvent {

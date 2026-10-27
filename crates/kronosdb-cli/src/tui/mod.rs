@@ -24,7 +24,9 @@ use ratatui::crossterm::execute;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::client::{Connection, pb};
+use kronosdb_client::Criterion;
+
+use crate::client::Connection;
 use crate::output;
 use crate::profile::ConfigFile;
 use crate::token::jwt_claims;
@@ -39,7 +41,7 @@ const TICK: Duration = Duration::from_millis(100);
 struct Target {
     generation: u64,
     context: String,
-    criteria: Vec<pb::Criterion>,
+    criteria: Vec<Criterion>,
 }
 
 enum Msg {
@@ -50,12 +52,12 @@ enum Msg {
     Snapshot(Result<Value, String>),
     Identity(String),
     /// (generation, newer events)
-    Events(u64, Vec<pb::SequencedEvent>),
+    Events(u64, Vec<kronosdb_client::Event>),
     /// (generation, older page, reached the start)
-    Older(u64, Vec<pb::SequencedEvent>, bool),
+    Older(u64, Vec<kronosdb_client::Event>, bool),
     EventsError(u64, String),
     /// (sequence, its tags)
-    Tags(i64, Result<Vec<String>, String>),
+    Tags(u64, Result<Vec<String>, String>),
 }
 
 /// Messages carry the session they came from; after a profile switch,
@@ -318,7 +320,7 @@ async fn follow_events(
     mut target_rx: watch::Receiver<Target>,
 ) {
     let mut target = target_rx.borrow_and_update().clone();
-    let mut next: Option<i64> = None;
+    let mut next: Option<u64> = None;
     loop {
         let read = async {
             // `at_start`: this read began at the oldest event there is, so
@@ -329,7 +331,7 @@ async fn follow_events(
                     let tail = conn.tail(&target.context).await?;
                     if target.criteria.is_empty() {
                         let head = conn.head(&target.context).await?;
-                        let from = (head - PAGE as i64).max(tail);
+                        let from = head.saturating_sub(PAGE as u64).max(tail);
                         (from, from <= tail)
                     } else {
                         (tail, true)
@@ -343,7 +345,7 @@ async fn follow_events(
         };
         let pause = match read.await {
             Ok((from, at_start, events)) => {
-                next = Some(events.last().map(|e| e.sequence + 1).unwrap_or(from));
+                next = Some(events.last().map(|e| e.position + 1).unwrap_or(from));
                 let busy = !events.is_empty();
                 if at_start {
                     let _ = tx.send((session, Msg::Older(target.generation, vec![], true)));
@@ -385,14 +387,14 @@ async fn load_older(
     session: u64,
     generation: u64,
     context: String,
-    before: i64,
+    before: u64,
 ) {
     let read = async {
         let tail = conn.tail(&context).await?;
-        let from = (before - PAGE as i64).max(tail);
+        let from = before.saturating_sub(PAGE as u64).max(tail);
         let wanted = (before - from) as usize;
         let mut events = conn.source(&context, from, &[], wanted).await?;
-        events.retain(|e| e.sequence < before);
+        events.retain(|e| e.position < before);
         anyhow::Ok((events, from <= tail))
     };
     let msg = match read.await {
@@ -407,7 +409,7 @@ async fn load_tags(
     tx: mpsc::UnboundedSender<Tagged>,
     session: u64,
     context: String,
-    sequence: i64,
+    sequence: u64,
 ) {
     let tags = conn
         .tags(&context, sequence)

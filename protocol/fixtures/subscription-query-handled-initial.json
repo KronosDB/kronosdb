@@ -1,0 +1,24 @@
+{
+  "frame": "SubscriptionQueryHandled",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "subscription_id": "sub-1",
+    "event": {
+      "initial_result": {
+        "message_id": "qr-1",
+        "request_id": "q-1",
+        "error_code": "",
+        "error": null,
+        "payload": {
+          "type_name": "com.acme.OrderView",
+          "revision": "1",
+          "data": "7b22737461747573223a22706c61636564227d"
+        },
+        "metadata": [],
+        "instructions": []
+      }
+    }
+  },
+  "description": ""
+}

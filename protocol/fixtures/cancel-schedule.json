@@ -1,0 +1,10 @@
+{
+  "frame": "CancelSchedule",
+  "stream": 31,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "token": "sch_01J9Z7"
+  },
+  "description": ""
+}

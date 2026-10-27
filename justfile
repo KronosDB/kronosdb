@@ -5,9 +5,10 @@
 stop:
     @pkill -f 'target.*kronosdb-server' 2>/dev/null && sleep 2 && pkill -9 -f 'target.*kronosdb-server' 2>/dev/null; echo "Stopped kronosdb-server" || echo "No kronosdb-server running"
 
-# Run the server (kills existing instance, rebuilds, starts)
+# Run the server (kills existing instance, rebuilds, starts). Dev mode logs
+# hardware findings (macOS, slow fsync) at info; --dev=false to see them loud.
 run *ARGS: stop
-    cargo run --bin kronosdb-server -- {{ARGS}}
+    KRONOSDB_DEV=1 cargo run --bin kronosdb-server -- {{ARGS}}
 
 # The kronos CLI; bare `just kronos` opens the terminal UI
 kronos *ARGS:
@@ -40,7 +41,7 @@ test-crate CRATE:
 # Wipe data and run fresh
 fresh *ARGS: stop
     rm -rf data/
-    cargo run --bin kronosdb-server -- {{ARGS}}
+    KRONOSDB_DEV=1 cargo run --bin kronosdb-server -- {{ARGS}}
 
 # Check compilation without producing a binary
 check:
@@ -50,17 +51,6 @@ check:
 lint:
     cargo clippy --all-targets -- -D warnings
 
-# Build the Axon connector (uses shared proto/ files)
-connector-build:
-    mvn -f connectors/axon/pom.xml compile
-
-# Install the Axon connector to local Maven repo
-connector-install:
-    mvn -f connectors/axon/pom.xml install -DskipTests
-
-# Build everything (server + connector)
-build-all: build connector-install
-
 # Inspect a .seg file (dumps events or summary)
 inspect-segment *ARGS:
     cargo run -q -p kronosdb-eventstore --bin inspect_segment -- {{ARGS}}
@@ -69,3 +59,14 @@ inspect-segment *ARGS:
 # Run after changing Tailwind classes in crates/kronosdb-server/src/admin.
 css:
     cd crates/kronosdb-server/assets && bun install && bun x @tailwindcss/cli -i app.css -o ../static/css/app.min.css --minify
+
+# Regenerate the native protocol codecs, spec tables and fixtures from protocol/kronosdb.schema
+protocol:
+    cargo run -q -p kronosdb-protocol-gen -- gen
+
+# Fail if anything generated from the protocol schema is stale, then run the conformance suites (Rust, TypeScript, Java)
+protocol-check:
+    cargo run -q -p kronosdb-protocol-gen -- check
+    cargo test -q -p kronosdb-protocol
+    cd protocol/ts && node --experimental-strip-types --no-warnings --test conformance.test.ts
+    mvn -q -f protocol/java/pom.xml verify

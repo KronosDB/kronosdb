@@ -1,0 +1,9 @@
+{
+  "frame": "Reauthenticated",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "principal": "oidc:gke:system:serviceaccount:prod:worker"
+  },
+  "description": ""
+}

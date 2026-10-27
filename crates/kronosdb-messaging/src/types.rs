@@ -70,7 +70,7 @@ pub struct ComponentName(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RoutingKey(pub String);
 
-/// Structured error detail. Mirrors the gRPC ErrorMessage so the full error
+/// Structured error detail. Mirrors the wire error message so the full error
 /// context (exception class, stack trace, location) survives the round-trip
 /// through KronosDB without being flattened to a string.
 #[derive(Debug, Clone)]

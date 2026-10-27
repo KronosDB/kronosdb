@@ -1,13 +1,11 @@
-//! Authorization: what each gRPC method needs, and whether a principal's
+//! Authorization: what each request needs, and whether a principal's
 //! grants cover it.
 
 use super::config::Role;
 
-/// What a gRPC method demands of its caller.
+/// What a request demands of its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// No credential needed (health probes).
-    Public,
     /// Any verified caller, grants or not (`WhoAmI`).
     Authenticated,
     Read,
@@ -17,63 +15,63 @@ pub enum Access {
     Peer,
 }
 
-/// Which routing header scopes the method.
+/// What the request is scoped to: the context or bus it is bound to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// `kronosdb-context` (event store, scheduler).
+    /// An event store context (event store, scheduler).
     Context,
-    /// `kronosdb-bus` (commands, queries).
+    /// A messaging bus (commands, queries).
     Bus,
     /// Not tied to a context or bus.
     Global,
 }
 
-/// Classifies a gRPC path (`/package.Service/Method`). Anything unrecognized
-/// demands `admin`: a service added later is closed until it is classified.
-pub fn classify(path: &str) -> (Access, Scope) {
-    let mut parts = path.trim_start_matches('/').splitn(2, '/');
-    let service = parts.next().unwrap_or("");
-    let method = parts.next().unwrap_or("");
-
-    match service {
-        "grpc.health.v1.Health" => (Access::Public, Scope::Global),
-        "kronosdb.eventstore.EventStore" => match method {
-            "Append" | "AppendSnapshot" => (Access::Write, Scope::Context),
-            "Source" | "Stream" | "GetHead" | "GetTail" | "GetTags" | "GetSequenceAt"
-            | "SnapshottedSource" | "GetSnapshot" => (Access::Read, Scope::Context),
-            _ => (Access::Admin, Scope::Context),
-        },
-        "kronosdb.scheduler.SchedulerService" => match method {
-            "ListSchedules" => (Access::Read, Scope::Context),
-            "ScheduleAppend" | "CancelSchedule" => (Access::Write, Scope::Context),
-            _ => (Access::Admin, Scope::Context),
-        },
-        "kronosdb.command.CommandService" => match method {
-            // Handling commands and dispatching them both change state.
-            "OpenStream" | "Dispatch" => (Access::Write, Scope::Bus),
-            _ => (Access::Admin, Scope::Bus),
-        },
-        "kronosdb.query.QueryService" => match method {
-            "Query" | "Subscription" => (Access::Read, Scope::Bus),
-            // Answering queries is serving data to others, not reading it.
-            "OpenStream" => (Access::Write, Scope::Bus),
-            _ => (Access::Admin, Scope::Bus),
-        },
-        "kronosdb.platform.PlatformService" => match method {
-            "WhoAmI" => (Access::Authenticated, Scope::Global),
-            // Lifecycle/heartbeats: any client with a grant.
-            _ => (Access::Read, Scope::Global),
-        },
-        "kronosdb.raft.RaftTransport"
-        | "kronosdb.replication.SegmentReplication"
-        | "kronosdb.fabric.MessagingFabric" => (Access::Peer, Scope::Global),
+/// What a request needs, by the kind of its first frame. Unknown
+/// kinds demand `admin`: a request added later is closed until it is
+/// classified here.
+pub fn demand(kind: u16) -> (Access, Scope) {
+    use kronosdb_protocol as p;
+    match kind {
+        p::Append::KIND | p::AppendSnapshot::KIND => (Access::Write, Scope::Context),
+        p::Source::KIND
+        | p::Subscribe::KIND
+        | p::GetHead::KIND
+        | p::GetTail::KIND
+        | p::GetTags::KIND
+        | p::GetPositionAt::KIND
+        | p::GetSnapshot::KIND
+        | p::SnapshottedSource::KIND
+        | p::ListSchedules::KIND => (Access::Read, Scope::Context),
+        p::ScheduleAppend::KIND | p::CancelSchedule::KIND => (Access::Write, Scope::Context),
+        // Binding checks the scope's own rights; the request itself only
+        // needs a verified caller.
+        p::BindContext::KIND | p::BindBus::KIND | p::Reauthenticate::KIND | p::WhoAmI::KIND => {
+            (Access::Authenticated, Scope::Global)
+        }
+        // Handling commands and dispatching them both change state.
+        p::DispatchCommand::KIND | p::OpenCommandHandlers::KIND => (Access::Write, Scope::Bus),
+        p::DispatchQuery::KIND | p::OpenSubscriptionQuery::KIND => (Access::Read, Scope::Bus),
+        // Answering queries is serving data to others, not reading it.
+        p::OpenQueryHandlers::KIND => (Access::Write, Scope::Bus),
+        // Lifecycle and processor status: any client with a grant.
+        p::GetPlatformInfo::KIND | p::OpenPlatform::KIND => (Access::Read, Scope::Global),
+        p::RaftVote::KIND
+        | p::RaftAppendEntries::KIND
+        | p::RaftInstallSnapshot::KIND
+        | p::ForwardWrite::KIND
+        | p::TailOpen::KIND
+        | p::ForwardAppend::KIND
+        | p::GetCursors::KIND
+        | p::ForwardCommand::KIND
+        | p::ForwardQuery::KIND
+        | p::RelaySubscription::KIND => (Access::Peer, Scope::Global),
         _ => (Access::Admin, Scope::Global),
     }
 }
 
 fn role_satisfies(role: Role, access: Access) -> bool {
     match access {
-        Access::Public | Access::Authenticated => true,
+        Access::Authenticated => true,
         Access::Read => matches!(role, Role::Read | Role::Write | Role::Admin),
         Access::Write => matches!(role, Role::Write | Role::Admin),
         Access::Admin => role == Role::Admin,
@@ -124,7 +122,7 @@ impl Grant {
 }
 
 /// `*` matches any run of characters (including none); everything else is
-/// literal. Enough for `orders-*`, `*@karma.life`, `spiffe://prod/*`.
+/// literal. Enough for `orders-*`, `*@example.com`, `spiffe://prod/*`.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let (p, t) = (pattern.as_bytes(), text.as_bytes());
     let (mut pi, mut ti) = (0, 0);
@@ -159,8 +157,8 @@ mod tests {
         assert!(glob_match("orders-*", "orders-eu"));
         assert!(glob_match("orders-*", "orders-"));
         assert!(!glob_match("orders-*", "billing-eu"));
-        assert!(glob_match("*@karma.life", "theo@karma.life"));
-        assert!(!glob_match("*@karma.life", "theo@karma.life.evil.io"));
+        assert!(glob_match("*@example.com", "theo@example.com"));
+        assert!(!glob_match("*@example.com", "theo@example.com.evil.io"));
         assert!(glob_match(
             "spiffe://prod/*/sa/orders",
             "spiffe://prod/ns/x/sa/orders"
@@ -174,36 +172,17 @@ mod tests {
 
     #[test]
     fn classification() {
+        use kronosdb_protocol as p;
+        assert_eq!(demand(p::Append::KIND), (Access::Write, Scope::Context));
+        assert_eq!(demand(p::Source::KIND), (Access::Read, Scope::Context));
+        assert_eq!(demand(p::DispatchQuery::KIND), (Access::Read, Scope::Bus));
         assert_eq!(
-            classify("/kronosdb.eventstore.EventStore/Append"),
-            (Access::Write, Scope::Context)
-        );
-        assert_eq!(
-            classify("/kronosdb.eventstore.EventStore/Source"),
-            (Access::Read, Scope::Context)
-        );
-        assert_eq!(
-            classify("/kronosdb.query.QueryService/Query"),
-            (Access::Read, Scope::Bus)
-        );
-        assert_eq!(
-            classify("/kronosdb.raft.RaftTransport/Vote"),
+            demand(p::ForwardCommand::KIND),
             (Access::Peer, Scope::Global)
         );
-        assert_eq!(
-            classify("/kronosdb.platform.PlatformService/WhoAmI").0,
-            Access::Authenticated
-        );
-        assert_eq!(
-            classify("/grpc.health.v1.Health/Check"),
-            (Access::Public, Scope::Global)
-        );
-        // Unknown services and unknown methods on known services stay closed.
-        assert_eq!(classify("/some.New/Thing").0, Access::Admin);
-        assert_eq!(
-            classify("/kronosdb.eventstore.EventStore/Truncate").0,
-            Access::Admin
-        );
+        assert_eq!(demand(p::WhoAmI::KIND).0, Access::Authenticated);
+        // A kind nothing classified stays closed.
+        assert_eq!(demand(0x7ffe).0, Access::Admin);
     }
 
     #[test]

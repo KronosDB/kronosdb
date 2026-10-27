@@ -1,0 +1,13 @@
+{
+  "frame": "NodeInfo",
+  "stream": 55,
+  "flags": 0,
+  "body": {
+    "node_name": "kronosdb-1",
+    "version": "0.11.0",
+    "contexts": [
+      "default"
+    ]
+  },
+  "description": ""
+}

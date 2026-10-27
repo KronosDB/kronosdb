@@ -1,0 +1,13 @@
+{
+  "frame": "ClientAck",
+  "stream": 41,
+  "flags": 0,
+  "body": {
+    "ack": {
+      "instruction_id": "i-1",
+      "success": true,
+      "error": null
+    }
+  },
+  "description": ""
+}

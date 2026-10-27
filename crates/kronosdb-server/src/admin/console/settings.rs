@@ -33,7 +33,7 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
 
     let server_rows = [
         setting("Node Name", &html_escape(&config.node_name)),
-        setting("gRPC Address", &config.listen_addr.to_string()),
+        setting("Client Address", &config.listen_addr.to_string()),
         setting("Admin Address", &config.admin_listen_addr.to_string()),
         setting(
             "Data Directory",
@@ -94,7 +94,7 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     let auth_methods = state.identities.describe();
     let security_rows = [
         setting(
-            "gRPC Authentication",
+            "Client Authentication",
             &if auth_methods.is_empty() {
                 "none (open access)".to_string()
             } else {

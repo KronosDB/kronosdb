@@ -1,0 +1,24 @@
+{
+  "frame": "Identity",
+  "stream": 57,
+  "flags": 1,
+  "body": {
+    "subject": "system:serviceaccount:prod:worker",
+    "source": "gke",
+    "grants": [
+      {
+        "roles": [
+          "write"
+        ],
+        "contexts": [
+          "orders-*"
+        ],
+        "all_contexts": false,
+        "buses": [],
+        "all_buses": true
+      }
+    ],
+    "authentication_enabled": true
+  },
+  "description": ""
+}

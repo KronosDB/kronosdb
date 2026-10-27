@@ -1,34 +1,47 @@
+use std::error::Error as StdError;
+use std::sync::Arc;
+
+use kronosdb_protocol as p;
+use kronosdb_protocol::Frame;
+use kronosdb_protocol::net::OwnedFrame;
 use openraft::BasicNode;
-use openraft::error::{InstallSnapshotError, RPCError, RaftError};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use tonic::transport::Channel;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-use super::proto;
-use super::proto::raft_transport_client::RaftTransportClient;
 use super::types::{NodeId, TypeConfig};
-use crate::replication::peer::PeerTransportConfig;
+use crate::replication::peer::{PeerPool, PeerTransportConfig};
 
 type RaftRPCError<E = openraft::error::Infallible> =
     RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
 
 /// Message-size ceiling for raft peer traffic (both directions). Must stay
 /// well above the proposer's per-entry byte cap (`MAX_BATCH_BYTES` in
-/// cluster.rs) plus framing, and above `snapshot_max_chunk_size`.
+/// cluster.rs) plus framing, and above `snapshot_max_chunk_size`. Peer
+/// connections carry frames of up to `PEER_MAX_FRAME`, which covers it.
 pub const RAFT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Factory that creates gRPC network connections to peer nodes.
+const _: () = assert!(RAFT_MAX_MESSAGE_BYTES <= crate::replication::PEER_MAX_MESSAGE_BYTES);
+
+/// Factory that creates native network connections to peer nodes.
+///
+/// Raft keeps connections of its own, apart from forwarded appends and
+/// cursor queries: a heartbeat must not wait behind a large frame.
 #[derive(Clone)]
 pub struct NetworkFactory {
-    transport: PeerTransportConfig,
+    pool: Arc<PeerPool>,
 }
 
 impl NetworkFactory {
     pub fn new(transport: PeerTransportConfig) -> Self {
-        Self { transport }
+        Self {
+            pool: Arc::new(PeerPool::new(transport)),
+        }
     }
 }
 
@@ -38,8 +51,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     async fn new_client(&mut self, _target: NodeId, node: &BasicNode) -> Self::Network {
         NetworkConnection {
             addr: node.addr.clone(),
-            transport: self.transport.clone(),
-            client: None,
+            pool: Arc::clone(&self.pool),
         }
     }
 }
@@ -47,31 +59,46 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
 /// A single network connection to a peer node.
 pub struct NetworkConnection {
     addr: String,
-    transport: PeerTransportConfig,
-    client: Option<RaftTransportClient<Channel>>,
+    pool: Arc<PeerPool>,
+}
+
+fn network<R>(error: &(impl StdError + 'static)) -> RPCError<NodeId, BasicNode, R>
+where
+    R: StdError,
+{
+    RPCError::Network(NetworkError::new(error))
 }
 
 impl NetworkConnection {
-    // tonic's `Status` fixes the large error type.
+    /// Serializes `rpc`, sends it in the frame `wrap` builds, and
+    /// deserializes the answer `unwrap` extracts from the reply frame.
+    // openraft's `RPCError` fixes the large error type.
     #[allow(clippy::result_large_err)]
-    async fn get_client(&mut self) -> Result<&mut RaftTransportClient<Channel>, tonic::Status> {
-        if self.client.is_none() {
-            let channel = self
-                .transport
-                .connect(&self.addr)
-                .await
-                .map_err(|e| tonic::Status::unavailable(format!("connect failed: {e}")))?;
-            // Raft traffic can carry coalesced append entries and snapshot
-            // chunks; keep limits well above the proposer's byte cap so
-            // replication can never wedge on message size (a rejected
-            // AppendEntries retries forever — a cluster-wide write livelock).
-            self.client = Some(
-                RaftTransportClient::new(channel)
-                    .max_decoding_message_size(RAFT_MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(RAFT_MAX_MESSAGE_BYTES),
-            );
-        }
-        Ok(self.client.as_mut().unwrap())
+    async fn call<Rq, Rs, R>(
+        &self,
+        rpc: &Rq,
+        wrap: for<'a> fn(&'a [u8]) -> Frame<'a>,
+        unwrap: for<'a> fn(&'a Frame<'a>) -> Option<&'a [u8]>,
+    ) -> Result<Rs, RPCError<NodeId, BasicNode, R>>
+    where
+        Rq: Serialize,
+        Rs: DeserializeOwned,
+        R: StdError,
+    {
+        let data = bincode::serialize(rpc).map_err(|e| network(&e))?;
+        let reply: OwnedFrame = self
+            .pool
+            .request(&self.addr, &wrap(&data))
+            .await
+            .map_err(|e| network(&e))?;
+        let frame = reply.decode().map_err(|e| network(&e))?;
+        let data = unwrap(&frame).ok_or_else(|| {
+            network(&p::net::NetError::Unexpected {
+                kind: reply.kind(),
+                context: "instead of the Raft reply",
+            })
+        })?;
+        bincode::deserialize(data).map_err(|e| network(&e))
     }
 }
 
@@ -81,27 +108,15 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RaftRPCError> {
-        let data = bincode::serialize(&rpc)
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-        let request = self
-            .transport
-            .request(proto::RaftAppendEntriesRequest { data })
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let resp = client
-            .append_entries(request)
-            .await
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let response: AppendEntriesResponse<NodeId> = bincode::deserialize(&resp.into_inner().data)
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        Ok(response)
+        self.call(
+            &rpc,
+            |data| Frame::RaftAppendEntries(p::RaftAppendEntries { data }),
+            |frame| match frame {
+                Frame::RaftAppendEntriesReply(r) => Some(r.data),
+                _ => None,
+            },
+        )
+        .await
     }
 
     async fn install_snapshot(
@@ -112,28 +127,15 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let data = bincode::serialize(&rpc)
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-        let request = self
-            .transport
-            .request(proto::RaftInstallSnapshotRequest { data })
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let resp = client
-            .install_snapshot(request)
-            .await
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let response: InstallSnapshotResponse<NodeId> =
-            bincode::deserialize(&resp.into_inner().data)
-                .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        Ok(response)
+        self.call(
+            &rpc,
+            |data| Frame::RaftInstallSnapshot(p::RaftInstallSnapshot { data }),
+            |frame| match frame {
+                Frame::RaftInstallSnapshotReply(r) => Some(r.data),
+                _ => None,
+            },
+        )
+        .await
     }
 
     async fn vote(
@@ -141,26 +143,14 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RaftRPCError> {
-        let data = bincode::serialize(&rpc)
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-        let request = self
-            .transport
-            .request(proto::RaftVoteRequest { data })
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let resp = client
-            .vote(request)
-            .await
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        let response: VoteResponse<NodeId> = bincode::deserialize(&resp.into_inner().data)
-            .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
-
-        Ok(response)
+        self.call(
+            &rpc,
+            |data| Frame::RaftVote(p::RaftVote { data }),
+            |frame| match frame {
+                Frame::RaftVoteReply(r) => Some(r.data),
+                _ => None,
+            },
+        )
+        .await
     }
 }

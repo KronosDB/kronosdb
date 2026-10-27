@@ -3,8 +3,8 @@
 //! A single-node deployment is simply a one-voter Raft cluster that instantly
 //! self-elects. When peers join, the cluster scales up without any mode switch.
 //!
-//! The gRPC layer always calls `cluster_manager.get_store(context)` and gets
-//! an `Arc<dyn EventStore>` backed by the native segment data plane.
+//! The protocol layers always call `cluster_manager.get_store(context)` and
+//! get an `Arc<dyn EventStore>` backed by the native segment data plane.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -12,23 +12,22 @@ use std::sync::atomic::AtomicBool;
 
 use openraft::{BasicNode, Config, Raft};
 use parking_lot::RwLock;
-use tonic::transport::Channel;
 
 use crate::api::EventStore;
 use crate::context::ContextManager;
 use crate::error::Error;
+use crate::wire;
 
 use super::handler_registry::{HandlerKind, HandlerRegistration, HandlerRoutingTable};
 use super::log_store::{LogStore, LogStoreConfig};
 use super::network::NetworkFactory;
-use super::proto;
-use super::proto::raft_transport_client::RaftTransportClient;
 use super::routed_engine::NativeEngine;
 use super::snapshot_store::SnapshotStore;
 use super::state_machine::{AppliedControlState, EventStoreStateMachine};
 use super::types::{NodeId, RaftRequest, RaftResponse, TypeConfig};
 use crate::replication::control::ReplicationControl;
-use crate::replication::peer::PeerTransportConfig;
+use crate::replication::peer::{PeerPool, PeerTransportConfig};
+use kronosdb_protocol as p;
 
 /// Node type determines how a node participates in the cluster.
 #[derive(Debug, Clone, PartialEq)]
@@ -96,8 +95,9 @@ pub struct ClusterManager {
     pub(super) known_peers: RwLock<HashMap<NodeId, PeerConfig>>,
     /// Serializes catch-up/claim establishment with membership changes.
     pub(super) topology_lock: tokio::sync::Mutex<()>,
-    /// Cached peer channels keyed by advertised address.
-    forward_channels: Arc<tokio::sync::RwLock<HashMap<String, Channel>>>,
+    /// Native connections to peers: forwarded appends, forwarded control
+    /// writes and cursor queries.
+    pub(super) peers: Arc<PeerPool>,
     /// Replicated messaging-handler routing table (ADR-0007). Written by
     /// the state machine, read by the server's dispatch paths.
     handler_routing: Arc<HandlerRoutingTable>,
@@ -133,7 +133,7 @@ impl ClusterManager {
             active_voters: Arc::new(RwLock::new(cluster_config.voters.clone())),
             known_peers: RwLock::new(known_peers),
             topology_lock: tokio::sync::Mutex::new(()),
-            forward_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            peers: Arc::new(PeerPool::new(cluster_config.peer_transport.clone())),
             handler_routing: Arc::new(HandlerRoutingTable::new()),
             handler_clear_once: tokio::sync::OnceCell::new(),
             coordinator_started: AtomicBool::new(false),
@@ -218,8 +218,7 @@ impl ClusterManager {
             context_name.to_string(),
             Arc::clone(&self.control),
             Arc::clone(&self.active_voters),
-            self.cluster_config.peer_transport.clone(),
-            Arc::clone(&self.forward_channels),
+            Arc::clone(&self.peers),
         ));
         self.stores.write().insert(context_name.to_string(), store);
         Ok(())
@@ -360,15 +359,10 @@ impl ClusterManager {
             .map(|p| p.addr.clone())
     }
 
-    /// A cached, authenticated gRPC channel to a peer address. Used by the
-    /// messaging fabric to forward commands/queries between nodes.
-    pub async fn peer_channel(&self, address: &str) -> Result<Channel, Error> {
-        self.cached_channel(address).await
-    }
-
-    /// Wraps a peer request with this cluster's auth token / TLS identity.
-    pub fn peer_request<T>(&self, message: T) -> Result<tonic::Request<T>, Error> {
-        self.cluster_config.peer_transport.request(message)
+    /// The native connections to peers, authenticated with this cluster's
+    /// peer credentials.
+    pub fn peers(&self) -> Arc<PeerPool> {
+        Arc::clone(&self.peers)
     }
 
     pub(super) async fn submit_control_request(
@@ -395,18 +389,6 @@ impl ClusterManager {
         }
     }
 
-    pub(super) async fn cached_channel(&self, address: &str) -> Result<Channel, Error> {
-        if let Some(channel) = self.forward_channels.read().await.get(address).cloned() {
-            return Ok(channel);
-        }
-        let channel = self.cluster_config.peer_transport.connect(address).await?;
-        self.forward_channels
-            .write()
-            .await
-            .insert(address.to_string(), channel.clone());
-        Ok(channel)
-    }
-
     async fn forward_control_request(
         &self,
         raft: &Raft<TypeConfig>,
@@ -423,22 +405,24 @@ impl ClusterManager {
             .ok_or_else(|| Error::Unavailable {
                 message: format!("leader {leader_id} address missing from membership"),
             })?;
-        let channel = self.cached_channel(&leader.addr).await?;
-        let mut client = RaftTransportClient::new(channel);
         let data = bincode::serialize(request).map_err(|error| Error::Internal {
             message: format!("serialize control request: {error}"),
         })?;
-        let request = self
-            .cluster_config
-            .peer_transport
-            .request(proto::ForwardWriteRequest { data })?;
-        let response = client
-            .forward_write(request)
+        let reply = self
+            .peers
+            .request(
+                &leader.addr,
+                &p::Frame::ForwardWrite(p::ForwardWrite { data: &data }),
+            )
             .await
-            .map_err(|error| Error::Unavailable {
-                message: format!("forward control request: {error}"),
-            })?;
-        bincode::deserialize(&response.into_inner().data).map_err(|error| Error::Internal {
+            .map_err(|error| wire::with_context(error, "forward control request"))?;
+        let Ok(p::Frame::ForwardWriteReply(reply)) = reply.decode() else {
+            return Err(Error::Internal {
+                message: "the leader answered a forwarded control request with something else"
+                    .into(),
+            });
+        };
+        bincode::deserialize(reply.data).map_err(|error| Error::Internal {
             message: format!("deserialize control response: {error}"),
         })
     }
@@ -464,7 +448,7 @@ impl ClusterManager {
         })
     }
 
-    /// Shared claimed-leader gate used by the native data plane and its gRPC service.
+    /// Shared claimed-leader gate used by the native data plane and its services.
     pub fn replication_control(&self) -> Arc<ReplicationControl> {
         Arc::clone(&self.control)
     }

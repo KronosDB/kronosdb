@@ -1,0 +1,28 @@
+{
+  "description": "",
+  "frame": "SnapshottedSource",
+  "stream": 27,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "criteria": [
+      {
+        "names": [],
+        "tags": [
+          {
+            "key": {
+              "utf8": "orderId"
+            },
+            "value": {
+              "utf8": "o-1"
+            }
+          }
+        ]
+      }
+    ],
+    "key": {
+      "utf8": "order:o-1"
+    },
+    "batch_size": 0
+  }
+}

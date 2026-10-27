@@ -1,0 +1,9 @@
+{
+  "frame": "ForwardAppendRetry",
+  "stream": 71,
+  "flags": 1,
+  "body": {
+    "reason": "leadership moved to node 4"
+  },
+  "description": ""
+}

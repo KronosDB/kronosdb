@@ -2,7 +2,7 @@
 /reference
 /data
 /benchmarks
-connectors/axon/target
+protocol/java/target
 
 *.swp
 *.swo

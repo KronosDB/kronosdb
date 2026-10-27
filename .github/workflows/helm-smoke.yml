@@ -24,10 +24,12 @@ jobs:
         with:
           install_only: true
 
-      - name: Install grpcurl
-        run: |
-          curl -sSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin grpcurl
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the kronos CLI
+        run: cargo build --release -p kronosdb-cli
 
       - name: Run smoke test
-        run: IMAGE=kronosdb:smoke scripts/helm-smoke.sh
+        run: IMAGE=kronosdb:smoke KRONOS=target/release/kronos scripts/helm-smoke.sh

@@ -5,7 +5,7 @@
 //! acquisition, and in-flight registration. Each iteration cancels the
 //! command afterwards so the in-flight map stays bounded — the measured
 //! unit is a full register/deregister cycle, which is what every real
-//! dispatch pays. gRPC transport and handler execution are out of scope.
+//! dispatch pays. Transport and handler execution are out of scope.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use kronosdb_messaging::command::{Command, CommandBus};

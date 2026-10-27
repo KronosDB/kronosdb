@@ -1,0 +1,1017 @@
+// The KronosDB native protocol, version 1.
+//
+// This file is the source of truth for every byte on the wire. The Rust and
+// TypeScript codecs, the message tables in README.md, and the golden fixtures
+// are all generated from it by `just protocol`; CI fails when they drift.
+//
+// Everything is little-endian and fixed-width. Fields are written in the
+// order they are declared, with no field tags and no varints.
+//
+//   u8 u16 u32 u64 i64   unsigned / signed integers
+//   bool                 u8, 0 or 1
+//   millis               i64 milliseconds since the Unix epoch
+//   str16 / str32        u16 / u32 byte length, then that many bytes of UTF-8
+//   bytes16 / bytes32    u16 / u32 byte length, then the bytes
+//   list16<T>            u16 element count, then the elements
+//   list32<T>            u32 element count, then the elements
+//   f64                  IEEE 754 double
+//   opt<T>               u8 0 (absent) or 1 followed by T
+//   record               one event record in its stored layout (see EventRecord)
+//   records              u32 record count, then that many records back to back
+//
+// A `union` is a u8 tag naming the variant, followed by that variant's value.
+// Unions cannot gain variants within a version: a decoder cannot skip a value
+// it does not know the size of.
+//
+// `///` comments are documentation and are carried into the generated code
+// and the spec. Frame kinds with the high bit set (0x8000) are sent by the
+// server; all others by the client.
+
+protocol kronosdb 1
+
+/// Why a request failed. Unknown codes must be treated as `internal`.
+enum ErrorCode: u16 {
+  /// Not ready, failing over, or unreachable. Safe to retry.
+  unavailable = 1
+  /// The server's state or configuration forbids this otherwise valid request.
+  rejected = 2
+  /// The request is malformed or names something invalid.
+  invalid_argument = 3
+  /// The named position, context, snapshot or schedule does not exist.
+  not_found = 4
+  /// The named context or schedule token already exists.
+  already_exists = 5
+  /// The connection has no valid credentials.
+  unauthenticated = 6
+  /// The principal lacks the role this request needs.
+  permission_denied = 7
+  /// Stored bytes failed an integrity check. Never a false alarm.
+  corrupted = 8
+  /// A broken server invariant.
+  internal = 9
+  /// The client cancelled the stream.
+  cancelled = 10
+  /// A size or rate limit was exceeded.
+  resource_exhausted = 11
+  /// The peer sent bytes that violate this protocol. The connection closes.
+  protocol_violation = 12
+}
+
+/// How the client proves who it is.
+enum CredentialKind: u8 {
+  /// No credentials: only accepted when the server runs without auth.
+  none = 0
+  /// A static bearer token.
+  token = 1
+  /// A JWT from a trusted OIDC issuer.
+  jwt = 2
+}
+
+// ---------------------------------------------------------------------------
+// Shared structures
+
+/// One tag: an opaque key/value pair the index is built from.
+struct Tag {
+  key: bytes16
+  value: bytes16
+}
+
+/// One metadata entry on an event.
+struct MetadataEntry {
+  key: str16
+  value: str16
+}
+
+/// Matches events whose type is one of `names` (any type when empty) and
+/// that carry every tag in `tags`.
+struct Criterion {
+  names: list16<str16>
+  tags: list16<Tag>
+}
+
+/// "Reject the append if any event matching `criteria` exists at or after
+/// `marker`." The marker is the opaque value a read or append returned.
+struct Condition {
+  marker: u64
+  criteria: list16<Criterion>
+}
+
+/// The body of a stored event record. This is the on-disk layout, byte for
+/// byte: reads copy records straight from the segment, and appends are
+/// written to disk as sent once the server has validated them and set the
+/// position. Clients send `position` as 0.
+///
+/// A record on the wire is `len u32 | flags u8 | body`, where `len` counts
+/// `flags` plus the body and `flags` is 0 for an event. On disk the record
+/// is preceded by its CRC32C; the server verifies it on every read and
+/// computes it on every append, and it does not travel to clients.
+struct EventRecord {
+  position: u64
+  identifier: str16
+  name: str16
+  version: str16
+  timestamp: millis
+  metadata: list16<MetadataEntry>
+  tags: list16<Tag>
+  payload: bytes32
+}
+
+/// Opaque state a client folded from the log, and the log position it
+/// summarizes up to (next-exclusive).
+struct Snapshot {
+  state: bytes32
+  position: u64
+}
+
+/// One pending schedule.
+struct Schedule {
+  token: str16
+  due: millis
+  event_name: str16
+}
+
+// ---------------------------------------------------------------------------
+// Connection. Hello, Welcome, the pings and GoAway travel on stream 0;
+// BindContext, BindBus and Reauthenticate are requests on their own stream.
+
+/// First frame of every connection, after the 8-byte preface `KRONOSDB`.
+frame Hello = 0x0001 {
+  /// Highest protocol version the client speaks.
+  version: u16
+  /// Feature bits the client would like to use. None are defined in version 1.
+  features: u64
+  /// Stored record layout the client decodes. Version 1 knows layout 3.
+  record_format: u8
+  /// Application name, shown in the admin console.
+  client_name: str16
+  /// This instance, unique per process.
+  client_id: str16
+  credential_kind: CredentialKind
+  credential: str32
+}
+
+/// The server accepted the connection.
+frame Welcome = 0x8001 {
+  /// The protocol version both sides will use.
+  version: u16
+  /// The subset of the requested features the server granted.
+  features: u64
+  record_format: u8
+  server_name: str16
+  /// The authenticated principal, for display and debugging.
+  principal: str16
+  /// Largest frame either side may send, header included.
+  max_frame: u32
+  /// The server pings an idle connection this often and closes it after
+  /// two missed pongs.
+  heartbeat: u32
+}
+
+/// Liveness check. The receiver answers with a Pong carrying the same nonce.
+frame Ping = 0x0002 {
+  nonce: u64
+}
+
+frame Pong = 0x8002 {
+  nonce: u64
+}
+
+/// The server's own liveness check on an idle connection. The client
+/// answers with a ClientPong carrying the same nonce.
+frame ServerPing = 0x8003 {
+  nonce: u64
+}
+
+frame ClientPong = 0x0003 {
+  nonce: u64
+}
+
+/// Replaces the connection's credentials, before a token expires.
+frame Reauthenticate = 0x0004 {
+  credential_kind: CredentialKind
+  credential: str32
+}
+
+frame Reauthenticated = 0x8004 {
+  principal: str16
+}
+
+/// Binds a small integer to a context name for the life of the connection.
+/// Requests name their context by this id. Id 0 is bound to "default" from
+/// the start. Binding checks that the context exists and that the principal
+/// may use it; rebinding an id to another name is not allowed.
+frame BindContext = 0x0005 {
+  id: u16
+  name: str16
+}
+
+frame ContextBound = 0x8005 {
+  id: u16
+}
+
+/// The server is shutting down or draining: no new streams will be
+/// accepted, open ones are finished, then the connection closes.
+frame GoAway = 0x8006 {
+  code: ErrorCode
+  message: str16
+}
+
+/// Ends a stream the client opened. The server answers with RequestFailed
+/// with code `cancelled` unless the stream already ended.
+frame Cancel = 0x0006 {
+}
+
+/// The request on this stream failed. Always ends the stream.
+frame RequestFailed = 0x8007 {
+  code: ErrorCode
+  message: str32
+}
+
+// ---------------------------------------------------------------------------
+// Event store
+
+/// Appends events, optionally under a consistency condition.
+frame Append = 0x0100 {
+  context: u16
+  condition: opt<Condition>
+  events: records
+}
+
+/// The events are durable. `marker` is the consistency marker for the next
+/// conditional append.
+frame Appended = 0x8100 {
+  first_position: u64
+  count: u32
+  marker: u64
+}
+
+/// The condition failed: an event matching it exists at `conflicting_position`.
+/// Nothing was written.
+frame AppendConflict = 0x8101 {
+  conflicting_position: u64
+}
+
+/// Reads matching events from `from` up to the head as of the request.
+/// Answered by Events frames; the last one carries END and the marker.
+frame Source = 0x0101 {
+  context: u16
+  from: u64
+  /// Empty matches every event.
+  criteria: list16<Criterion>
+  /// Most events per frame; 0 lets the server choose.
+  batch_size: u32
+}
+
+/// A batch of events in log order. `marker` is present only on the final
+/// frame of a Source.
+frame Events = 0x8102 {
+  events: records
+  marker: opt<u64>
+}
+
+/// Opens a live subscription from `from`. The server sends Events frames as
+/// matching events become durable, never more events than the client has
+/// granted credits for.
+frame Subscribe = 0x0102 {
+  context: u16
+  from: u64
+  /// Empty matches every event.
+  criteria: list16<Criterion>
+  /// Events of these types are skipped even when the criteria match.
+  exclude_names: list16<str16>
+  /// Events the server may send before the first Credit frame.
+  credits: u32
+  batch_size: u32
+  /// Send a Progress frame at most this often while nothing matches; 0
+  /// disables them.
+  progress_interval: u32
+}
+
+/// Grants the server this many more events on a subscription, updates on a
+/// subscription query, or messages on a handler stream.
+frame Credit = 0x0103 {
+  credits: u32
+}
+
+/// Every event before `position` that matches the subscription has been
+/// delivered. Lets a selective subscriber advance its token without events.
+frame Progress = 0x8103 {
+  position: u64
+}
+
+frame GetHead = 0x0104 {
+  context: u16
+}
+
+/// The next position a client-visible event will get.
+frame Head = 0x8104 {
+  position: u64
+}
+
+frame GetTail = 0x0105 {
+  context: u16
+}
+
+/// The first position still stored.
+frame Tail = 0x8105 {
+  position: u64
+}
+
+frame GetTags = 0x0106 {
+  context: u16
+  position: u64
+}
+
+frame Tags = 0x8106 {
+  tags: list16<Tag>
+}
+
+/// Finds the first event at or after `timestamp`.
+frame GetPositionAt = 0x0107 {
+  context: u16
+  timestamp: millis
+}
+
+frame PositionAt = 0x8107 {
+  /// Absent when no event is that recent.
+  position: opt<u64>
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots (ADR-0005)
+
+frame AppendSnapshot = 0x0108 {
+  context: u16
+  key: bytes16
+  state: bytes32
+  /// The marker of the read the state was folded from.
+  position: u64
+}
+
+frame SnapshotAppended = 0x8108 {
+  position: u64
+}
+
+frame GetSnapshot = 0x0109 {
+  context: u16
+  key: bytes16
+}
+
+/// The latest snapshot under the key, if any.
+frame SnapshotResult = 0x8109 {
+  snapshot: opt<Snapshot>
+}
+
+/// A Source that starts from the latest snapshot under `key`: answered with
+/// one SnapshotResult, then Events frames from the snapshot's position.
+frame SnapshottedSource = 0x010A {
+  context: u16
+  criteria: list16<Criterion>
+  key: bytes16
+  batch_size: u32
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler
+
+/// Has the store append `event` at `due`. Idempotent on `token`; an empty
+/// token asks the server to generate one.
+frame ScheduleAppend = 0x0110 {
+  context: u16
+  due: millis
+  token: str16
+  event: record
+}
+
+frame Scheduled = 0x8110 {
+  token: str16
+}
+
+frame CancelSchedule = 0x0111 {
+  context: u16
+  token: str16
+}
+
+frame ScheduleCancelled = 0x8111 {
+}
+
+frame ListSchedules = 0x0112 {
+  context: u16
+}
+
+frame Schedules = 0x8112 {
+  schedules: list32<Schedule>
+}
+
+// ---------------------------------------------------------------------------
+// Messaging (ADR-0006/0007). Commands go to exactly one handler; queries
+// scatter to every handler of their type; subscription queries add live
+// updates. Requests name their bus by an id bound with BindBus.
+
+/// Binds a small integer to a messaging bus name for the life of the
+/// connection, like BindContext. Id 0 is bound to "default" from the start.
+frame BindBus = 0x0008 {
+  id: u16
+  name: str16
+}
+
+frame BusBound = 0x8008 {
+  id: u16
+}
+
+/// Acknowledges an instruction (a subscription, a processor control
+/// request) by its id. Either side may send one on a stream that uses them.
+struct Ack {
+  instruction_id: str16
+  success: bool
+  error: opt<ErrorDetail>
+}
+
+frame ClientAck = 0x0007 {
+  ack: Ack
+}
+
+frame ServerAck = 0x8009 {
+  ack: Ack
+}
+
+/// A serialized application object: its type, the revision of its
+/// serialized form, and the bytes. Opaque to the server.
+struct Payload {
+  type_name: str16
+  revision: str16
+  data: bytes32
+}
+
+/// A metadata value, typed so any runtime can carry its values losslessly.
+union MetadataValue {
+  text = 1: str32
+  number = 2: i64
+  boolean = 3: bool
+  double = 4: f64
+  object = 5: Payload
+}
+
+struct MessageMetadata {
+  key: str16
+  value: MetadataValue
+}
+
+/// A routing or delivery hint on a command or query.
+enum ProcessingKey: u8 {
+  /// Commands with the same routing key go to the same handler.
+  routing_key = 0
+  priority = 1
+  /// Milliseconds the sender will wait.
+  timeout = 2
+  /// How many query results the sender wants.
+  nr_of_results = 3
+}
+
+struct ProcessingInstruction {
+  key: ProcessingKey
+  value: opt<MetadataValue>
+}
+
+/// Why an application handler failed.
+struct ErrorDetail {
+  message: str32
+  location: str16
+  details: list16<str32>
+  error_code: str16
+}
+
+struct Command {
+  message_id: str16
+  name: str16
+  timestamp: millis
+  payload: Payload
+  metadata: list16<MessageMetadata>
+  instructions: list16<ProcessingInstruction>
+  client_id: str16
+  component_name: str16
+}
+
+/// What a command handler answered. `error_code` is empty on success.
+struct CommandResult {
+  message_id: str16
+  request_id: str16
+  error_code: str16
+  error: opt<ErrorDetail>
+  payload: opt<Payload>
+  metadata: list16<MessageMetadata>
+  instructions: list16<ProcessingInstruction>
+}
+
+/// Sends a command to its handler and waits for the result. Unary.
+frame DispatchCommand = 0x0200 {
+  bus: u16
+  command: Command
+}
+
+/// The handler's answer to DispatchCommand or ForwardCommand.
+frame CommandResponse = 0x8200 {
+  result: CommandResult
+}
+
+/// Opens a command handler stream. The client then subscribes to command
+/// types and grants the server credits; the server sends commands, at most
+/// one per credit, and the client answers each with CommandHandled. Credits
+/// belong to the stream, not to a command type: one credit is one command of
+/// any type the stream handles, and credits granted before the first
+/// subscription count. Closing the stream unsubscribes everything it
+/// subscribed.
+frame OpenCommandHandlers = 0x0201 {
+  bus: u16
+  client_id: str16
+  component_name: str16
+}
+
+/// Handles `command` on this stream. The server answers with ServerAck.
+frame SubscribeCommand = 0x0202 {
+  instruction_id: str16
+  command: str16
+  /// Relative share of this command type's traffic.
+  load_factor: u32
+}
+
+frame UnsubscribeCommand = 0x0203 {
+  instruction_id: str16
+  command: str16
+}
+
+/// A command for this handler. Answer it with CommandHandled.
+frame HandleCommand = 0x8201 {
+  command: Command
+}
+
+frame CommandHandled = 0x0204 {
+  result: CommandResult
+}
+
+struct Query {
+  message_id: str16
+  name: str16
+  timestamp: millis
+  payload: Payload
+  metadata: list16<MessageMetadata>
+  instructions: list16<ProcessingInstruction>
+  client_id: str16
+  component_name: str16
+}
+
+/// One handler's answer to a query. `error_code` is empty on success.
+struct QueryResult {
+  message_id: str16
+  request_id: str16
+  error_code: str16
+  error: opt<ErrorDetail>
+  payload: opt<Payload>
+  metadata: list16<MessageMetadata>
+  instructions: list16<ProcessingInstruction>
+}
+
+/// Sends a query to every handler of its type. Answered by QueryResponse
+/// frames, one per result, then QueryEnd, which carries END.
+frame DispatchQuery = 0x0300 {
+  bus: u16
+  query: Query
+}
+
+frame QueryResponse = 0x8300 {
+  result: QueryResult
+}
+
+/// Every handler has answered or timed out.
+frame QueryEnd = 0x8301 {
+}
+
+/// Opens a query handler stream: the query counterpart of OpenCommandHandlers.
+frame OpenQueryHandlers = 0x0301 {
+  bus: u16
+  client_id: str16
+  component_name: str16
+}
+
+/// Handles queries named `query` that produce `result_name`. The server
+/// answers with ServerAck.
+frame SubscribeQuery = 0x0302 {
+  instruction_id: str16
+  query: str16
+  result_name: str16
+}
+
+frame UnsubscribeQuery = 0x0303 {
+  instruction_id: str16
+  query: str16
+  result_name: str16
+}
+
+/// A query for this handler. Answer with QueryHandled frames, then QueryDone.
+frame HandleQuery = 0x8302 {
+  query: Query
+}
+
+frame QueryHandled = 0x0304 {
+  result: QueryResult
+}
+
+/// The handler has sent every result for `request_id`.
+frame QueryDone = 0x0305 {
+  message_id: str16
+  request_id: str16
+}
+
+/// The sender gave up on `request_id`; stop working on it.
+frame CancelQuery = 0x8303 {
+  request_id: str16
+}
+
+/// The handler may send `permits` more results for a streaming query.
+frame QueryPermits = 0x8304 {
+  request_id: str16
+  permits: u64
+}
+
+/// A query whose result is kept up to date.
+struct SubscriptionQuery {
+  subscription_id: str16
+  query: Query
+  /// Updates the handler may send before the first credit.
+  permits: u64
+}
+
+/// Opens a subscription query: an initial result, then updates as the
+/// handler sends them, then a completion. The client grants update credits
+/// with Credit and ends the subscription with Cancel.
+frame OpenSubscriptionQuery = 0x0306 {
+  bus: u16
+  subscription: SubscriptionQuery
+}
+
+/// Asks this handler for a subscription's initial result and updates.
+frame HandleSubscriptionQuery = 0x8305 {
+  subscription: SubscriptionQuery
+}
+
+/// The subscriber granted more update credits.
+frame SubscriptionQueryPermits = 0x8306 {
+  subscription_id: str16
+  permits: u64
+}
+
+/// The subscriber went away; stop sending updates.
+frame CancelSubscriptionQuery = 0x8307 {
+  subscription_id: str16
+}
+
+struct QueryUpdate {
+  message_id: str16
+  payload: opt<Payload>
+  metadata: list16<MessageMetadata>
+  client_id: str16
+  component_name: str16
+  error_code: str16
+  error: opt<ErrorDetail>
+}
+
+/// How a subscription query progresses, from the handler to the subscriber.
+union SubscriptionEvent {
+  initial_result = 1: QueryResult
+  update = 2: QueryUpdate
+  complete = 3: SubscriptionEnd
+  complete_exceptionally = 4: SubscriptionFailure
+}
+
+struct SubscriptionEnd {
+  client_id: str16
+  component_name: str16
+}
+
+struct SubscriptionFailure {
+  client_id: str16
+  component_name: str16
+  error_code: str16
+  error: opt<ErrorDetail>
+}
+
+/// From a handler, on its handler stream: progress on a subscription.
+frame SubscriptionQueryHandled = 0x0307 {
+  subscription_id: str16
+  event: SubscriptionEvent
+}
+
+/// To a subscriber, on its subscription stream.
+frame SubscriptionQueryEvent = 0x8308 {
+  subscription_id: str16
+  event: SubscriptionEvent
+}
+
+// ---------------------------------------------------------------------------
+// Platform: client registration, processor status and control.
+
+/// Who a client is, for the admin console and topology.
+struct ClientIdentity {
+  client_id: str16
+  component_name: str16
+  version: str16
+  tags: list16<MetadataEntry>
+}
+
+frame GetPlatformInfo = 0x0400 {
+  client: ClientIdentity
+}
+
+frame PlatformInfo = 0x8400 {
+  node_name: str16
+  version: str16
+  contexts: list16<str16>
+}
+
+/// Opens the platform stream. The client reports its processors on it and
+/// the server sends control instructions; the client acknowledges each with
+/// InstructionResult.
+frame OpenPlatform = 0x0401 {
+  client: ClientIdentity
+}
+
+frame PlatformHeartbeat = 0x0402 {
+}
+
+frame ServerHeartbeat = 0x8401 {
+}
+
+struct SegmentStatus {
+  segment_id: u32
+  caught_up: bool
+  replaying: bool
+  one_part_of: u32
+  token_position: i64
+  error_state: str16
+}
+
+frame ProcessorStatus = 0x0403 {
+  processor_name: str16
+  mode: str16
+  active_threads: u32
+  available_threads: u32
+  running: bool
+  error: bool
+  streaming: bool
+  token_store_identifier: str16
+  segments: list16<SegmentStatus>
+}
+
+/// The outcome of a control instruction.
+frame InstructionResult = 0x0404 {
+  instruction_id: str16
+  success: bool
+  error: opt<ErrorDetail>
+}
+
+/// What the server asks of a processor.
+enum ProcessorAction: u8 {
+  pause = 1
+  start = 2
+  release_segment = 3
+  report_status = 4
+  split_segment = 5
+  merge_segment = 6
+}
+
+frame ProcessorInstruction = 0x8402 {
+  instruction_id: str16
+  action: ProcessorAction
+  processor_name: str16
+  /// The segment the action applies to; 0 when it applies to the processor.
+  segment: u32
+}
+
+/// The cluster changed: reconnect to rebalance.
+frame RequestReconnect = 0x8403 {
+}
+
+/// A handler registration appeared or went away somewhere in the cluster.
+frame TopologyChange = 0x8404 {
+  change_type: str16
+  message_type: str16
+  handler_kind: str16
+  client_id: str16
+  component_name: str16
+}
+
+frame NodeInfo = 0x8405 {
+  node_name: str16
+  version: str16
+  contexts: list16<str16>
+}
+
+frame WhoAmI = 0x0405 {
+}
+
+struct AccessGrant {
+  roles: list16<str16>
+  contexts: list16<str16>
+  all_contexts: bool
+  buses: list16<str16>
+  all_buses: bool
+}
+
+frame Identity = 0x8406 {
+  subject: str16
+  source: str16
+  grants: list16<AccessGrant>
+  authentication_enabled: bool
+}
+
+// ---------------------------------------------------------------------------
+// Internode. Only principals with the `peer` role may send these.
+
+/// openraft messages, serialized by openraft's own serde types.
+frame RaftVote = 0x1000 {
+  data: bytes32
+}
+
+frame RaftVoteReply = 0x9000 {
+  data: bytes32
+}
+
+frame RaftAppendEntries = 0x1001 {
+  data: bytes32
+}
+
+frame RaftAppendEntriesReply = 0x9001 {
+  data: bytes32
+}
+
+frame RaftInstallSnapshot = 0x1002 {
+  data: bytes32
+}
+
+frame RaftInstallSnapshotReply = 0x9002 {
+  data: bytes32
+}
+
+/// A control-plane write forwarded to the leader.
+frame ForwardWrite = 0x1003 {
+  data: bytes32
+}
+
+frame ForwardWriteReply = 0x9003 {
+  data: bytes32
+}
+
+/// Opens a segment tail: the leader streams the context's log bytes from
+/// the follower's position, and the follower acknowledges what it made
+/// durable with TailAck.
+frame TailOpen = 0x1100 {
+  context: str16
+  follower_id: u64
+  from_position: u64
+  last_record_crc: u32
+  /// The epoch of the newest EpochChange in the follower's log. A diverged
+  /// follower is cut back to where this epoch ends in the leader's log. A
+  /// claimant recovering from a peer (`recovery_source`) sends it too, and
+  /// the peer refuses to serve if its own log's epoch is lower.
+  epoch_seen: u64
+  segment_base: u64
+  byte_offset: u64
+  watermark: u64
+  recovery_source: bool
+  claim_epoch: u64
+  claim_leader_id: u64
+}
+
+frame TailAck = 0x1101 {
+  context: str16
+  follower_id: u64
+  epoch: u64
+  durable_position: u64
+  durable_bytes: u64
+}
+
+/// Raw segment bytes, CRCs included, written by the follower byte for byte.
+frame TailRecords = 0x9100 {
+  epoch: u64
+  segment_base: u64
+  first_position: u64
+  data: bytes32
+  stream_bytes_end: u64
+  next_position: u64
+}
+
+frame TailEpochChange = 0x9101 {
+  epoch: u64
+  leader_id: u64
+  start_position: u64
+}
+
+frame TailRotate = 0x9102 {
+  epoch: u64
+  new_segment_base: u64
+}
+
+frame TailWatermark = 0x9103 {
+  epoch: u64
+  position: u64
+}
+
+/// The follower is behind what the leader still has: it must restore.
+frame TailNeedSnapshot = 0x9104 {
+  context: str16
+  available_from: u64
+  watermark: u64
+  reason: str16
+}
+
+/// The follower must drop its log from `position` on. With a boundary, the
+/// cut is right after the follower's last event record before `position`,
+/// which must be the leader's: `prev_record_crc` is that event record's
+/// stored CRC on the leader, or `prev_at_segment_start` says the leader has
+/// no event before `position`. Control records are not compared: the follower
+/// drops the ones that followed the event and the leader's follow in the
+/// bytes that come next.
+frame TailTruncate = 0x9105 {
+  epoch: u64
+  position: u64
+  has_boundary: bool
+  prev_record_crc: u32
+  prev_at_segment_start: bool
+}
+
+/// An append a follower received, forwarded to the fenced leader.
+frame ForwardAppend = 0x1102 {
+  context: str16
+  epoch: u64
+  leader_id: u64
+  system: bool
+  condition: opt<Condition>
+  events: records
+}
+
+frame ForwardAppended = 0x9106 {
+  first_position: u64
+  count: u32
+  marker: u64
+  epoch: u64
+}
+
+frame ForwardAppendConflict = 0x9107 {
+  conflicting_position: u64
+}
+
+/// Not the leader any more, or not yet: retry against the current one.
+frame ForwardAppendRetry = 0x9108 {
+  reason: str16
+}
+
+frame GetCursors = 0x1103 {
+}
+
+struct ContextCursor {
+  context: str16
+  durable_position: u64
+  watermark: u64
+  segment_base: u64
+  byte_offset: u64
+  last_record_crc: u32
+  /// The epoch of the newest EpochChange in this node's log for the context
+  /// (0 when it holds none). Tails are only comparable within one epoch: a
+  /// claimant ranks voters by (log_epoch, durable_position), as Raft ranks
+  /// logs by (term, index).
+  log_epoch: u64
+}
+
+frame Cursors = 0x9109 {
+  node_id: u64
+  epoch: u64
+  control_epoch: u64
+  contexts: list16<ContextCursor>
+}
+
+/// A command whose handler is connected to this node, from another node.
+/// Answered with CommandResponse.
+frame ForwardCommand = 0x1200 {
+  bus: str16
+  target_client_id: str16
+  command: Command
+  timeout_ms: u64
+}
+
+/// A query for handlers connected to this node, from another node.
+/// Answered like DispatchQuery.
+frame ForwardQuery = 0x1201 {
+  bus: str16
+  target_client_ids: list16<str16>
+  query: Query
+  timeout_ms: u64
+}
+
+/// A subscription query for a handler connected to this node, from another
+/// node. Answered with SubscriptionQueryEvent frames; the opening node
+/// grants credits with Credit and ends it with Cancel.
+frame RelaySubscription = 0x1202 {
+  bus: str16
+  target_client_id: str16
+  subscription: SubscriptionQuery
+}

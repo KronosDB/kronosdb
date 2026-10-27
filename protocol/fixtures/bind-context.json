@@ -1,0 +1,10 @@
+{
+  "frame": "BindContext",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "id": 1,
+    "name": "orders-eu"
+  },
+  "description": "Binds id 1 to a context."
+}

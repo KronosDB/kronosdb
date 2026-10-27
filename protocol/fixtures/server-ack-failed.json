@@ -1,0 +1,21 @@
+{
+  "frame": "ServerAck",
+  "stream": 41,
+  "flags": 0,
+  "body": {
+    "ack": {
+      "instruction_id": "i-2",
+      "success": false,
+      "error": {
+        "message": "card declined",
+        "location": "billing-1@host-b",
+        "details": [
+          "insufficient funds",
+          "retry later"
+        ],
+        "error_code": "AXONIQ-4002"
+      }
+    }
+  },
+  "description": "A rejected subscription."
+}

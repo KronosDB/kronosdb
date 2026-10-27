@@ -18,11 +18,3 @@ pub mod types;
 
 #[cfg(feature = "bench-instrumentation")]
 pub mod bench_instrumentation;
-
-/// Generated protobuf types for Raft transport.
-pub mod proto {
-    // Generated service methods return Result<_, tonic::Status>; clippy 1.98
-    // flags the Status variant's size in code we don't author.
-    #![allow(clippy::result_large_err)]
-    tonic::include_proto!("kronosdb.raft");
-}

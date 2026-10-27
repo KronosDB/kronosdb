@@ -1,0 +1,23 @@
+{
+  "description": "",
+  "frame": "QueryHandled",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "result": {
+      "message_id": "qr-1",
+      "request_id": "q-1",
+      "error_code": "",
+      "error": null,
+      "payload": {
+        "type_name": "com.acme.OrderView",
+        "revision": "1",
+        "data": {
+          "utf8": "{\"status\":\"placed\"}"
+        }
+      },
+      "metadata": [],
+      "instructions": []
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "description": "",
+  "frame": "RaftInstallSnapshot",
+  "stream": 65,
+  "flags": 1,
+  "body": {
+    "data": "ff"
+  }
+}

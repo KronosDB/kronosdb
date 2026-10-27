@@ -1,0 +1,19 @@
+{
+  "frame": "GetPlatformInfo",
+  "stream": 53,
+  "flags": 1,
+  "body": {
+    "client": {
+      "client_id": "web-1@host-a",
+      "component_name": "web",
+      "version": "2.3.0",
+      "tags": [
+        {
+          "key": "region",
+          "value": "eu-north"
+        }
+      ]
+    }
+  },
+  "description": ""
+}

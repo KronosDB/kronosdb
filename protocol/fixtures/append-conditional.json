@@ -1,0 +1,68 @@
+{
+  "frame": "Append",
+  "stream": 2,
+  "flags": 1,
+  "body": {
+    "context": 1,
+    "condition": {
+      "marker": "1048576",
+      "criteria": [
+        {
+          "names": [],
+          "tags": [
+            {
+              "key": "6f726465724964",
+              "value": "6f2d31"
+            }
+          ]
+        },
+        {
+          "names": [
+            "OrderPlaced",
+            "OrderShipped"
+          ],
+          "tags": [
+            {
+              "key": "637573746f6d65724964",
+              "value": "632d3432"
+            }
+          ]
+        }
+      ]
+    },
+    "events": [
+      {
+        "flags": 0,
+        "event": {
+          "position": "0",
+          "identifier": "0198a2f4-7c3e-7a11-9b2d-000000000003",
+          "name": "OrderShipped",
+          "version": "2",
+          "timestamp": 1761300000999,
+          "metadata": [
+            {
+              "key": "causationId",
+              "value": "0198a2f4-7c3e-7a11-9b2d-000000000001"
+            },
+            {
+              "key": "user",
+              "value": "ünïcødé ✓"
+            }
+          ],
+          "tags": [
+            {
+              "key": "6f726465724964",
+              "value": "6f2d31"
+            },
+            {
+              "key": "637573746f6d65724964",
+              "value": "632d3432"
+            }
+          ],
+          "payload": "7b2263617272696572223a22706f73746e6f7264227d"
+        }
+      }
+    ]
+  },
+  "description": "The DCB case: reject if anything matching either criterion exists after the marker."
+}

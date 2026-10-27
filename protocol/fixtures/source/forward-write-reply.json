@@ -1,0 +1,9 @@
+{
+  "description": "",
+  "frame": "ForwardWriteReply",
+  "stream": 67,
+  "flags": 1,
+  "body": {
+    "data": "0304"
+  }
+}

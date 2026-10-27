@@ -1,0 +1,12 @@
+{
+  "description": "",
+  "frame": "GetSnapshot",
+  "stream": 25,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "key": {
+      "utf8": "course:cs-101"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "frame": "Source",
+  "stream": 11,
+  "flags": 1,
+  "body": {
+    "context": 1,
+    "from": "0",
+    "criteria": [
+      {
+        "names": [],
+        "tags": [
+          {
+            "key": "6f726465724964",
+            "value": "6f2d31"
+          }
+        ]
+      }
+    ],
+    "batch_size": 512
+  },
+  "description": "A small DCB read of one aggregate."
+}

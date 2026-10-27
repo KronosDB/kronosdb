@@ -1,37 +1,6 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = "../../proto";
-
-    // Existing: raft.proto — server+client for Raft transport.
-    tonic_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .compile_protos(&[format!("{proto_dir}/raft.proto")], &[proto_dir])?;
-
-    // Native segment replication — both sides live in the eventstore crate:
-    // the leader serves Tail and followers run the generated client.
-    tonic_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .bytes([".kronosdb.replication.Records.data"])
-        .compile_protos(&[format!("{proto_dir}/replication.proto")], &[proto_dir])?;
-
-    // Compile eventstore.proto as client-only stubs so the crash-test harness can
-    // drive the server via gRPC without depending on the server crate.
-    // The server crate still compiles its own server+client stubs via its own build.rs —
-    // this is a second, independent compilation into kronosdb-eventstore's OUT_DIR.
-    tonic_build::configure()
-        .build_server(false)
-        .build_client(true)
-        .compile_protos(
-            &[
-                format!("{proto_dir}/common.proto"),
-                format!("{proto_dir}/eventstore.proto"),
-            ],
-            &[proto_dir],
-        )?;
-
     // Export the path where the `kronosdb-server` binary is expected to live so
     // integration tests can spawn it without an artifact dependency.
     // Stable Cargo does not expose `CARGO_BIN_EXE_*` for cross-package bins, and
@@ -40,18 +9,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // re-entrant through the eventstore → server → eventstore dependency edge.
     // Instead the crash harness (tests/crash_harness/mod.rs) ensures the binary is
     // built once at the start of each test run via `cargo build -p kronosdb-server`.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root two levels above kronosdb-eventstore manifest");
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    // `OUT_DIR` is `<target dir>/<profile>/build/<package>-<hash>/out`, so the
+    // profile directory holding the workspace's binaries is three levels up.
+    // Deriving it from there (rather than assuming `<workspace>/target`) keeps
+    // the harness working under `CARGO_TARGET_DIR`, a configured `target-dir`,
+    // or a shared target directory; assuming the default made every spawn fail
+    // with `NotFound` in those setups.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let profile_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .expect("OUT_DIR is <target>/<profile>/build/<package>/out");
     let bin_name = if cfg!(windows) {
         "kronosdb-server.exe"
     } else {
         "kronosdb-server"
     };
-    let bin_path = workspace_root.join("target").join(&profile).join(bin_name);
+    let bin_path = profile_dir.join(bin_name);
 
     println!("cargo:rustc-env=KRONOSDB_SERVER_BIN={}", bin_path.display());
     println!("cargo:rerun-if-changed=build.rs");

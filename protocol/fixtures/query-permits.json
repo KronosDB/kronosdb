@@ -1,0 +1,10 @@
+{
+  "frame": "QueryPermits",
+  "stream": 49,
+  "flags": 0,
+  "body": {
+    "request_id": "q-1",
+    "permits": "10"
+  },
+  "description": ""
+}

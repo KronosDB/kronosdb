@@ -16,9 +16,9 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 
-use crate::client::pb;
 use crate::output::{self, items, str_of};
 use crate::query;
+use kronosdb_client::{Criterion, Event};
 
 /// Events kept in memory for the open context. Live arrivals past this drop
 /// the oldest; scrolling back reloads them on demand.
@@ -78,11 +78,11 @@ pub enum Action {
     SwitchProfile(String),
     /// Fetch the page of events before this sequence.
     LoadOlder {
-        before: i64,
+        before: u64,
     },
     /// Fetch this event's tags for the preview.
     LoadTags {
-        sequence: i64,
+        sequence: u64,
     },
     /// Put this text on the system clipboard.
     Copy(String),
@@ -92,7 +92,7 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
     pub text: String,
-    pub criteria: Vec<pb::Criterion>,
+    pub criteria: Vec<Criterion>,
 }
 
 /// One entry of the `/` command palette.
@@ -159,7 +159,7 @@ pub struct App {
     /// Bumped whenever context or filter changes; answers from an older
     /// generation are dropped.
     pub generation: u64,
-    pub events: Vec<pb::SequencedEvent>,
+    pub events: Vec<Event>,
     pub events_error: Option<String>,
     /// Selected event. `None` = live: pinned to the newest.
     pub cursor: Option<usize>,
@@ -170,9 +170,9 @@ pub struct App {
     pub reached_start: bool,
     /// `true` until the first answer for this generation arrives.
     pub loading: bool,
-    pub tags: HashMap<i64, Result<Vec<String>, String>>,
+    pub tags: HashMap<u64, Result<Vec<String>, String>>,
     /// Events from this sequence on arrived live, at this instant.
-    pub fresh: Option<(i64, Instant)>,
+    pub fresh: Option<(u64, Instant)>,
 
     /// Selected row per non-event view.
     pub selected: [usize; View::ALL.len()],
@@ -253,7 +253,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub fn is_fresh(&self, sequence: i64) -> bool {
+    pub fn is_fresh(&self, sequence: u64) -> bool {
         self.fresh
             .is_some_and(|(since, at)| sequence >= since && at.elapsed() < FRESH_FOR)
     }
@@ -269,22 +269,22 @@ impl App {
             .flat_map(|c| {
                 c.tags
                     .iter()
-                    .map(|t| String::from_utf8_lossy(&t.value).into_owned())
+                    .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
             })
             .filter(|v| v.len() >= 2)
             .collect()
     }
 
     /// (tail, head) of the open context: the extent of its whole log.
-    pub fn log_span(&self) -> Option<(i64, i64)> {
+    pub fn log_span(&self) -> Option<(u64, u64)> {
         let context = self
             .contexts()
             .into_iter()
             .find(|c| str_of(c, "name") == self.events_context)?;
-        let head = (output::num_of(&context, "head") as i64)
+        let head = output::num_of(&context, "head")
             // The snapshot trails the event feed by up to a second.
-            .max(self.events.last().map(|e| e.sequence + 1).unwrap_or(0));
-        Some((output::num_of(&context, "tail") as i64, head))
+            .max(self.events.last().map(|e| e.position + 1).unwrap_or(0));
+        Some((output::num_of(&context, "tail"), head))
     }
 
     /// Rows of a non-event view, narrowed by whatever is typed.
@@ -345,7 +345,7 @@ impl App {
     }
 
     /// Newly read events, in order, newer than everything held.
-    pub fn push_events(&mut self, generation: u64, events: Vec<pb::SequencedEvent>) {
+    pub fn push_events(&mut self, generation: u64, events: Vec<Event>) {
         if generation != self.generation {
             return; // An answer for a context or filter we've moved on from.
         }
@@ -355,7 +355,7 @@ impl App {
         {
             let since = match self.fresh {
                 Some((seq, at)) if at.elapsed() < FRESH_FOR => seq,
-                _ => first.sequence,
+                _ => first.position,
             };
             self.fresh = Some((since, Instant::now()));
         }
@@ -377,12 +377,7 @@ impl App {
 
     /// An older page, to go in front of everything held. An empty page with
     /// `reached_start` is how the loader says "that was everything".
-    pub fn prepend_older(
-        &mut self,
-        generation: u64,
-        older: Vec<pb::SequencedEvent>,
-        reached_start: bool,
-    ) {
+    pub fn prepend_older(&mut self, generation: u64, older: Vec<Event>, reached_start: bool) {
         if generation != self.generation {
             return;
         }
@@ -404,7 +399,7 @@ impl App {
         }
     }
 
-    pub fn set_tags(&mut self, sequence: i64, tags: Result<Vec<String>, String>) {
+    pub fn set_tags(&mut self, sequence: u64, tags: Result<Vec<String>, String>) {
         if self.tags.len() > 512 {
             self.tags.clear();
         }
@@ -421,7 +416,7 @@ impl App {
         (!self.events.is_empty()).then(|| self.cursor.unwrap_or(self.events.len() - 1))
     }
 
-    pub fn selected_event(&self) -> Option<&pb::SequencedEvent> {
+    pub fn selected_event(&self) -> Option<&Event> {
         self.events.get(self.selected_index()?)
     }
 
@@ -493,12 +488,12 @@ impl App {
             return None;
         }
         let first = self.events.first()?;
-        if first.sequence <= 0 {
+        if first.position == 0 {
             return None;
         }
         self.loading_older = true;
         Some(Action::LoadOlder {
-            before: first.sequence,
+            before: first.position,
         })
     }
 
@@ -547,7 +542,7 @@ impl App {
         if self.view == View::Events
             && let Some(event) = self.selected_event()
         {
-            if let Some(Ok(tags)) = self.tags.get(&event.sequence) {
+            if let Some(Ok(tags)) = self.tags.get(&event.position) {
                 for tag in tags {
                     push(
                         format!("filter {tag}"),
@@ -556,9 +551,8 @@ impl App {
                     );
                 }
             }
-            if let Some(name) = event.event.as_ref().map(|e| e.name.clone())
-                && !name.contains(char::is_whitespace)
-            {
+            let name = &event.name;
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
                 push(
                     format!("filter type={name}"),
                     "every event of this type",
@@ -640,10 +634,10 @@ impl App {
     fn copy_selected(&mut self) -> Option<Action> {
         let event = self.selected_event()?;
         let mut value = output::event_json(event);
-        if let Some(Ok(tags)) = self.tags.get(&event.sequence) {
+        if let Some(Ok(tags)) = self.tags.get(&event.position) {
             value["tags"] = tags.iter().cloned().collect();
         }
-        self.toast = Some((format!("copied event {}", event.sequence), Instant::now()));
+        self.toast = Some((format!("copied event {}", event.position), Instant::now()));
         Some(Action::Copy(
             serde_json::to_string_pretty(&value).unwrap_or_default(),
         ))
@@ -674,10 +668,10 @@ impl App {
             self.tags_due = None;
             if self.view == View::Events
                 && let Some(event) = self.selected_event()
-                && !self.tags.contains_key(&event.sequence)
+                && !self.tags.contains_key(&event.position)
             {
                 return Some(Action::LoadTags {
-                    sequence: event.sequence,
+                    sequence: event.position,
                 });
             }
         }
@@ -937,15 +931,16 @@ pub mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    pub fn event(sequence: i64, name: &str) -> pb::SequencedEvent {
-        pb::SequencedEvent {
-            sequence,
-            event: Some(pb::Event {
-                name: name.into(),
-                payload: format!(r#"{{"n":{sequence}}}"#).into_bytes(),
-                timestamp: 1_789_899_641_000,
-                ..Default::default()
-            }),
+    pub fn event(position: u64, name: &str) -> Event {
+        Event {
+            position,
+            identifier: String::new(),
+            name: name.into(),
+            version: String::new(),
+            timestamp: 1_789_899_641_000,
+            metadata: vec![],
+            tags: vec![],
+            payload: format!(r#"{{"n":{position}}}"#).into_bytes().into(),
         }
     }
 
@@ -991,11 +986,11 @@ pub mod tests {
     fn arrows_move_the_selection_and_the_view_follows() {
         let mut app = app();
         assert!(app.is_live());
-        assert_eq!(app.selected_event().unwrap().sequence, 199);
+        assert_eq!(app.selected_event().unwrap().position, 199);
         assert_eq!(app.viewport_top(10), 90);
 
         app.on_key(key(KeyCode::Up));
-        assert_eq!(app.selected_event().unwrap().sequence, 198);
+        assert_eq!(app.selected_event().unwrap().position, 198);
         assert!(!app.is_live());
 
         // A page up keeps the selection inside the view, with padding.
@@ -1017,7 +1012,7 @@ pub mod tests {
 
         app.on_key(key(KeyCode::End));
         assert!(app.is_live() && app.unseen == 0);
-        assert_eq!(app.selected_event().unwrap().sequence, 201);
+        assert_eq!(app.selected_event().unwrap().position, 201);
     }
 
     #[test]
@@ -1027,7 +1022,7 @@ pub mod tests {
         wheel(&mut app, MouseEventKind::ScrollUp, 10, 8);
         assert_eq!(app.viewport_top(10), 87);
         assert_eq!(
-            app.selected_event().unwrap().sequence,
+            app.selected_event().unwrap().position,
             199,
             "selection untouched"
         );
@@ -1041,7 +1036,7 @@ pub mod tests {
         // Click a row: it becomes the selection.
         app.hits.list_top = 90;
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 7);
-        assert_eq!(app.selected_event().unwrap().sequence, 192);
+        assert_eq!(app.selected_event().unwrap().position, 192);
     }
 
     #[test]
@@ -1060,7 +1055,7 @@ pub mod tests {
             false,
         );
         assert_eq!(
-            app.selected_event().unwrap().sequence,
+            app.selected_event().unwrap().position,
             100,
             "same event selected"
         );
@@ -1182,7 +1177,7 @@ pub mod tests {
         );
         app.on_key(key(KeyCode::Left));
         assert_eq!(
-            app.selected_event().unwrap().sequence,
+            app.selected_event().unwrap().position,
             197,
             "←/→ walk events"
         );
@@ -1224,17 +1219,17 @@ pub mod tests {
     fn buffer_is_bounded_and_positions_survive_trimming() {
         let mut app = app();
         app.on_key(key(KeyCode::Up));
-        let sequence = app.selected_event().unwrap().sequence;
+        let sequence = app.selected_event().unwrap().position;
         let generation = app.generation;
         app.push_events(
             generation,
-            (200..200 + MAX_EVENTS as i64)
+            (200..200 + MAX_EVENTS as u64)
                 .map(|s| event(s, "X"))
                 .collect(),
         );
         assert_eq!(app.events.len(), MAX_EVENTS);
         // The parked event itself was trimmed away; the cursor stays valid.
-        assert!(app.selected_event().unwrap().sequence > sequence);
+        assert!(app.selected_event().unwrap().position > sequence);
         assert!(!app.reached_start);
     }
 }

@@ -1,0 +1,10 @@
+{
+  "frame": "Events",
+  "stream": 11,
+  "flags": 1,
+  "body": {
+    "events": [],
+    "marker": "1048578"
+  },
+  "description": "The last frame of a Source: no more events, and the marker."
+}

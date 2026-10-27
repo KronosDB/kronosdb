@@ -2,7 +2,9 @@
 
 use serde_json::Value;
 
-use crate::client::pb;
+use kronosdb_client::Event;
+
+use crate::query::Tag;
 
 /// Left-aligned columns padded to the widest cell.
 pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -108,27 +110,32 @@ pub fn payload_preview(payload: &[u8], max: usize) -> String {
     }
 }
 
-pub fn tag_text(tag: &pb::Tag) -> String {
+pub fn tag_text((key, value): &Tag) -> String {
     format!(
         "{}={}",
-        String::from_utf8_lossy(&tag.key),
-        String::from_utf8_lossy(&tag.value)
+        String::from_utf8_lossy(key),
+        String::from_utf8_lossy(value)
     )
 }
 
-pub fn event_json(event: &pb::SequencedEvent) -> Value {
-    let inner = event.event.clone().unwrap_or_default();
-    let payload = match std::str::from_utf8(&inner.payload) {
+/// `sequence` stays the JSON key: it is what scripts reading `-o json` know.
+pub fn event_json(event: &Event) -> Value {
+    let payload = match std::str::from_utf8(&event.payload) {
         Ok(text) => serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())),
-        Err(_) => Value::String(format!("<{} bytes binary>", inner.payload.len())),
+        Err(_) => Value::String(format!("<{} bytes binary>", event.payload.len())),
     };
+    let metadata: serde_json::Map<String, Value> = event
+        .metadata
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
     serde_json::json!({
-        "sequence": event.sequence,
-        "id": inner.identifier,
-        "name": inner.name,
-        "version": inner.version,
-        "timestamp": inner.timestamp,
-        "metadata": inner.metadata,
+        "sequence": event.position,
+        "id": event.identifier,
+        "name": event.name,
+        "version": event.version,
+        "timestamp": event.timestamp,
+        "metadata": metadata,
         "payload": payload,
     })
 }

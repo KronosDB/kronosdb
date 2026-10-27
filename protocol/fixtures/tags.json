@@ -1,0 +1,18 @@
+{
+  "frame": "Tags",
+  "stream": 19,
+  "flags": 1,
+  "body": {
+    "tags": [
+      {
+        "key": "6f726465724964",
+        "value": "6f2d31"
+      },
+      {
+        "key": "00ff",
+        "value": "deadbeef"
+      }
+    ]
+  },
+  "description": "Tag bytes need not be UTF-8."
+}

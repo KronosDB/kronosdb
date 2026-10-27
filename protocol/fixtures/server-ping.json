@@ -1,0 +1,9 @@
+{
+  "frame": "ServerPing",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "nonce": "1"
+  },
+  "description": "Server liveness check."
+}

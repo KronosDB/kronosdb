@@ -1,3 +1,5 @@
+pub mod blocks;
+pub mod crc;
 pub mod format;
 pub mod reader;
 pub mod record;

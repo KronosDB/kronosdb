@@ -54,7 +54,7 @@ mod tests {
         let mut params =
             rcgen::CertificateParams::new(vec!["orders.prod.svc".to_string()]).expect("params");
         params.subject_alt_names.push(rcgen::SanType::URI(
-            "spiffe://karma.life/ns/prod/sa/orders".try_into().unwrap(),
+            "spiffe://example.com/ns/prod/sa/orders".try_into().unwrap(),
         ));
         params
             .distinguished_name
@@ -66,12 +66,12 @@ mod tests {
         assert_eq!(
             identity.names,
             vec![
-                "spiffe://karma.life/ns/prod/sa/orders".to_string(),
+                "spiffe://example.com/ns/prod/sa/orders".to_string(),
                 "orders.prod.svc".to_string(),
                 "orders".to_string(),
             ]
         );
-        assert_eq!(identity.primary(), "spiffe://karma.life/ns/prod/sa/orders");
+        assert_eq!(identity.primary(), "spiffe://example.com/ns/prod/sa/orders");
     }
 
     #[test]

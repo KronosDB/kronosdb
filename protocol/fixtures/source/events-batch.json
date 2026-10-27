@@ -1,0 +1,72 @@
+{
+  "description": "Two stored records as the server sends them.",
+  "frame": "Events",
+  "stream": 11,
+  "flags": 0,
+  "body": {
+    "events": [
+      {
+        "flags": 0,
+        "event": {
+          "position": "1048576",
+          "identifier": "0198a2f4-7c3e-7a11-9b2d-000000000001",
+          "name": "OrderPlaced",
+          "version": "1",
+          "timestamp": 1761300000123,
+          "metadata": [
+            {
+              "key": "correlationId",
+              "value": "0198a2f4-7c3e-7a11-9b2d-0000000000ff"
+            }
+          ],
+          "tags": [
+            {
+              "key": {
+                "utf8": "orderId"
+              },
+              "value": {
+                "utf8": "o-1"
+              }
+            },
+            {
+              "key": {
+                "utf8": "customerId"
+              },
+              "value": {
+                "utf8": "c-42"
+              }
+            }
+          ],
+          "payload": {
+            "utf8": "{\"sku\":\"A-1\",\"qty\":3}"
+          }
+        }
+      },
+      {
+        "flags": 0,
+        "event": {
+          "position": "1048577",
+          "identifier": "0198a2f4-7c3e-7a11-9b2d-000000000002",
+          "name": "ItemAdded",
+          "version": "1",
+          "timestamp": 1761300000124,
+          "metadata": [],
+          "tags": [
+            {
+              "key": {
+                "utf8": "orderId"
+              },
+              "value": {
+                "utf8": "o-1"
+              }
+            }
+          ],
+          "payload": {
+            "utf8": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        }
+      }
+    ],
+    "marker": null
+  }
+}

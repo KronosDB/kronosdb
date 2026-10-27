@@ -1,0 +1,25 @@
+{
+  "frame": "Subscribe",
+  "stream": 13,
+  "flags": 0,
+  "body": {
+    "context": 0,
+    "from": "1048578",
+    "criteria": [
+      {
+        "names": [
+          "OrderPlaced",
+          "OrderShipped"
+        ],
+        "tags": []
+      }
+    ],
+    "exclude_names": [
+      "LegacyAudit"
+    ],
+    "credits": 1000,
+    "batch_size": 256,
+    "progress_interval": 5000
+  },
+  "description": "A processor subscription: two event types, progress every 5 s."
+}

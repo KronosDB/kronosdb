@@ -155,6 +155,12 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         "Appends that fell back from written-ack to durable pacing (disk behind)",
         ack_degradations
     );
+    engine_family!(
+        "kronosdb_inline_stage_stalls_total",
+        "counter",
+        "Appends staged on an async worker that exceeded the stall limit (inline staging then pauses for a cooldown)",
+        inline_stalls
+    );
     family(
         &mut out,
         "kronosdb_engine_poisoned",
@@ -300,7 +306,80 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         )],
     );
 
-    // ── gRPC identity layer ──
+    // ── Startup hardware checks (measured once, at boot) ──
+    {
+        use kronosdb_eventstore::AckKind;
+        use kronosdb_eventstore::hardware::Check;
+        let hw = &state.hardware;
+        family(
+            &mut out,
+            "kronosdb_dev_mode",
+            "gauge",
+            "1 when the node runs in dev mode (hardware findings logged at info, not warn)",
+            &[(String::new(), hw.dev as u64)],
+        );
+        family(
+            &mut out,
+            "kronosdb_disk_probe_ok",
+            "gauge",
+            "1 when the startup fdatasync probe of the data directory completed",
+            &[(String::new(), hw.facts.probe.is_ok() as u64)],
+        );
+        if let Ok(probe) = &hw.facts.probe {
+            let quantile = |q: &str, d: std::time::Duration| {
+                (format!("{{quantile=\"{q}\"}}"), d.as_micros() as u64)
+            };
+            family(
+                &mut out,
+                "kronosdb_disk_fsync_microseconds",
+                "gauge",
+                "fdatasync latency of the data directory's disk, measured once at startup",
+                &[
+                    quantile("0.5", probe.p50),
+                    quantile("0.99", probe.p99),
+                    quantile("1", probe.max),
+                ],
+            );
+        }
+        let durable = |kind: AckKind| (kind == AckKind::Durable) as u64;
+        family(
+            &mut out,
+            "kronosdb_ack_durable",
+            "gauge",
+            "1 when appends are acknowledged only after fsync in this topology (0 = after quorum write), as resolved from ack-mode and the disk probe",
+            &[
+                (
+                    "{topology=\"single_voter\"}".to_string(),
+                    durable(hw.ack.single_voter),
+                ),
+                (
+                    "{topology=\"multi_voter\"}".to_string(),
+                    durable(hw.ack.multi_voter),
+                ),
+            ],
+        );
+        family(
+            &mut out,
+            "kronosdb_hardware_finding",
+            "gauge",
+            "1 when a startup hardware check found something suboptimal; see the logs or /api/v1/node for the message",
+            &Check::ALL
+                .iter()
+                .map(|check| {
+                    (
+                        format!(
+                            "{{check=\"{}\",severity=\"{}\"}}",
+                            check.id(),
+                            check.severity().as_str()
+                        ),
+                        hw.has(*check) as u64,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // ── Identity layer (native protocol) ──
     {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = &state.identities.stats;
@@ -309,7 +388,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             &mut out,
             "kronosdb_auth_authenticated_total",
             "counter",
-            "gRPC requests authenticated, by credential type",
+            "Native protocol authentications (Hello and Reauthenticate), by credential type",
             &[
                 (method("token"), stats.token.load(Relaxed)),
                 (method("jwt"), stats.jwt.load(Relaxed)),
@@ -320,7 +399,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             &mut out,
             "kronosdb_auth_rejected_total",
             "counter",
-            "gRPC requests rejected by the identity layer",
+            "Native protocol requests rejected by the identity layer",
             &[
                 (
                     "{reason=\"unauthenticated\"}".to_string(),

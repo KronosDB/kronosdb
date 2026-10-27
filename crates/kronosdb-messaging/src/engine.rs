@@ -55,6 +55,17 @@ impl MessagingEngine {
         }
     }
 
+    /// The command bus, for callers that dispatch without the trait's boxed
+    /// futures.
+    pub fn command_bus(&self) -> &CommandBus {
+        &self.command_bus
+    }
+
+    /// The query bus, likewise.
+    pub fn query_bus(&self) -> &QueryBus {
+        &self.query_bus
+    }
+
     /// Returns detailed command handler info + dispatch metrics per command type.
     pub fn command_details(&self) -> Vec<MessageTypeDetail> {
         self.command_bus.handler_details()
@@ -215,6 +226,10 @@ impl SubscriptionQueryDispatcher for MessagingEngine {
 
     fn cancel_subscription(&self, subscription_id: &str) -> Option<ClientId> {
         self.subscriptions.cancel(subscription_id)
+    }
+
+    fn fail_handler_subscriptions(&self, handler: &ClientId) {
+        self.subscriptions.fail_handler_subscriptions(handler);
     }
 }
 

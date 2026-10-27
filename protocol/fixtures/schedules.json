@@ -1,0 +1,20 @@
+{
+  "frame": "Schedules",
+  "stream": 33,
+  "flags": 1,
+  "body": {
+    "schedules": [
+      {
+        "token": "sch_01J9Z7",
+        "due": 1761386400000,
+        "event_name": "ReminderDue"
+      },
+      {
+        "token": "sch_01J9Z8",
+        "due": 9007199254740991,
+        "event_name": "FarFuture"
+      }
+    ]
+  },
+  "description": ""
+}

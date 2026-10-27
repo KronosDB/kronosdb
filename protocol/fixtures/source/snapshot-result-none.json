@@ -1,0 +1,9 @@
+{
+  "description": "No snapshot under the key: replay from the beginning.",
+  "frame": "SnapshotResult",
+  "stream": 25,
+  "flags": 1,
+  "body": {
+    "snapshot": null
+  }
+}

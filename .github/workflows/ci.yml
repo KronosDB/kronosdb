@@ -15,9 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -30,6 +27,33 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets
+
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+          cache-dependency-path: protocol/java/pom.xml
+      - name: Generated protocol code is up to date
+        run: cargo run -q -p kronosdb-protocol-gen -- check
+      - name: Rust conformance
+        run: cargo test -p kronosdb-protocol
+      - name: TypeScript conformance
+        working-directory: protocol/ts
+        run: node --experimental-strip-types --no-warnings --test conformance.test.ts
+      - name: Java conformance
+        run: mvn -B -f protocol/java/pom.xml verify
 
   fmt:
     runs-on: ubuntu-latest

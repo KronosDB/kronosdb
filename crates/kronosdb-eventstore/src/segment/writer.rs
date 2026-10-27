@@ -5,9 +5,12 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::append::RecordBatch;
+use crate::cache::IndexCache;
 use crate::error::Error;
 use crate::event::{AppendEvent, Position};
 
+use crate::replication::epochs::EpochStart;
 use crate::segment::format::EventIndexFields;
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::{
@@ -33,6 +36,8 @@ pub struct RawAppendResult {
     /// Index projections for the applied events. The engine feeds these into
     /// its active `TagIndex`; payloads are absent by design.
     pub events: Vec<EventIndexFields>,
+    /// The `EpochChange` records in the frame, in order.
+    pub epoch_changes: Vec<EpochStart>,
 }
 
 /// Writes events to segmented append-only log files.
@@ -70,6 +75,20 @@ pub struct SegmentWriter {
     /// fdatasync, the directory sync that makes the new file's name durable,
     /// and the `.idx`/`.bloom` companions — is the sync thread's, off the lock.
     pending_seals: Vec<PendingSeal>,
+    /// Where a rotated-away segment's index is published for readers until
+    /// its companions are on disk. Set by the engine; a standalone writer
+    /// has no readers to publish to.
+    index_cache: Option<Arc<IndexCache>>,
+    /// Bytes at the end of `record_buf` that `write_batch_deferred` has
+    /// accounted for (offsets, positions, index entries) but not yet written
+    /// to the file. Zero outside a deferred group; see `flush_deferred`.
+    deferred: usize,
+    /// A deferred write failed: the file no longer matches the writer's
+    /// offsets and positions, so nothing more may be written through it.
+    broken: bool,
+    /// Test hook: the next flush of deferred bytes fails.
+    #[cfg(test)]
+    fail_next_flush: bool,
 }
 
 /// A segment the writer has rotated away from but whose seal is not yet on
@@ -115,6 +134,11 @@ impl SegmentWriter {
             record_buf: Vec::with_capacity(64 * 1024),
             active_index: Arc::new(RwLock::new(SegmentIndex::new(base_position))),
             pending_seals: Vec::new(),
+            index_cache: None,
+            deferred: 0,
+            broken: false,
+            #[cfg(test)]
+            fail_next_flush: false,
         })
     }
 
@@ -185,6 +209,11 @@ impl SegmentWriter {
             record_buf: Vec::with_capacity(64 * 1024),
             active_index: Arc::new(RwLock::new(active_index)),
             pending_seals: Vec::new(),
+            index_cache: None,
+            deferred: 0,
+            broken: false,
+            #[cfg(test)]
+            fail_next_flush: false,
         })
     }
 
@@ -209,65 +238,190 @@ impl SegmentWriter {
     /// Call `sync()` after to make them durable. This enables group commit:
     /// multiple callers write events, then a single `sync()` makes them all durable.
     pub fn write_events(&mut self, events: &[AppendEvent]) -> Result<(Position, u32), Error> {
-        if events.is_empty() {
+        self.write_batch(&RecordBatch::from_events(events))
+    }
+
+    /// Writes a batch of event records WITHOUT fsyncing: each record is
+    /// copied behind its CRC with its position set, and its type and tags are
+    /// indexed by reading them in place. [`write_events`](Self::write_events)
+    /// without the serialization.
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(Position, u32), Error> {
+        self.write_batch_inner(batch, false)
+    }
+
+    /// [`write_batch`](Self::write_batch) that leaves the bytes in memory,
+    /// for a caller that stages several appends under one hold of the writer
+    /// lock and wants them in the file with one syscall: positions, offsets
+    /// and index entries move on as usual, so the next append sees this one,
+    /// but the file has nothing of it until
+    /// [`flush_deferred`](Self::flush_deferred). The caller must flush before
+    /// it lets go of the writer (anyone who then takes the lock — the wave
+    /// barrier above all — expects every byte below `write_offset` to be in
+    /// the file) and must not publish a position to readers before it has.
+    /// Fails like `write_batch` does; and a flush that fails leaves the
+    /// writer unusable, which the caller answers by poisoning the engine.
+    pub fn write_batch_deferred(&mut self, batch: &RecordBatch) -> Result<(Position, u32), Error> {
+        self.write_batch_inner(batch, true)
+    }
+
+    /// Writes the bytes `write_batch_deferred` left in memory, in one
+    /// syscall. A no-op when there are none.
+    pub fn flush_deferred(&mut self) -> Result<(), Error> {
+        if self.deferred == 0 {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let injected = std::mem::take(&mut self.fail_next_flush);
+        #[cfg(not(test))]
+        let injected = false;
+        let written = if injected {
+            Err(io::Error::other("injected write failure"))
+        } else {
+            self.active_file.write_all(&self.record_buf)
+        };
+        self.record_buf.clear();
+        self.deferred = 0;
+        if let Err(error) = written {
+            self.broken = true;
+            return Err(Error::Io(error));
+        }
+        Ok(())
+    }
+
+    /// A deferred write failed: the writer's books and the file disagree.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Bytes waiting for `flush_deferred`.
+    pub fn deferred_len(&self) -> usize {
+        self.deferred
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_flush(&mut self) {
+        self.fail_next_flush = true;
+    }
+
+    fn check_writable(&self) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io(io::Error::other(
+                "the segment writer is unusable after a failed write",
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_batch_inner(
+        &mut self,
+        batch: &RecordBatch,
+        defer: bool,
+    ) -> Result<(Position, u32), Error> {
+        if batch.is_empty() {
             return Ok((self.next_position, 0));
+        }
+        self.check_writable()?;
+        if !defer {
+            // Whatever a deferred group left is older than this write and
+            // goes to the file first.
+            self.flush_deferred()?;
         }
 
         let first_position = self.next_position;
+        let records = batch.bytes();
+
+        // A record larger than a whole segment is refused up front, rather
+        // than after the records before it were written.
+        let mut at = 0;
+        while at < records.len() {
+            let wire_len = wire_record_len(records, at);
+            let needed = (4 + wire_len) as u64;
+            if SEGMENT_HEADER_SIZE as u64 + needed > self.max_segment_size {
+                return Err(Error::Io(io::Error::other(format!(
+                    "event record of {needed} bytes exceeds the segment size"
+                ))));
+            }
+            at += wire_len;
+        }
 
         // The batch is framed into one buffer and written with one syscall
         // per segment it lands in: a 1000-event append is one `write_all`,
         // not a thousand. Index entries are published after the bytes are
         // in the file, under one index lock per run, so a reader that sees
-        // an entry can always read its record.
+        // an entry can always read its record. (A deferred batch publishes
+        // its entries before its bytes are in the file; see
+        // `write_batch_deferred` for why that is safe.)
         let mut run_start = 0;
-        while run_start < events.len() {
-            self.record_buf.clear();
-            let mut indexed: Vec<(u64, u64, usize)> = Vec::new(); // (position, offset, event idx)
+        while run_start < records.len() {
+            if self.deferred == 0 {
+                self.record_buf.clear();
+            }
             let mut position = self.next_position;
             let mut offset = self.write_offset;
-            let mut i = run_start;
-            while i < events.len() {
-                self.serialize_buf.clear();
-                format::serialize_append_event(position, &events[i], &mut self.serialize_buf);
-                let record_size = (RECORD_HEADER_SIZE + self.serialize_buf.len()) as u64;
-                if offset + record_size > self.max_segment_size {
+            let mut cursor = run_start;
+            while cursor < records.len() {
+                let wire_len = wire_record_len(records, cursor);
+                let stored = 4 + wire_len;
+                if offset + stored as u64 > self.max_segment_size {
                     break;
                 }
-                frame_record(flags::EVENT, &self.serialize_buf, &mut self.record_buf);
-                indexed.push((position.0, offset, i));
-                offset += record_size;
+                // CRC (filled in below), then the record as it arrived, then
+                // the position the client left for the server to set.
+                let start = self.record_buf.len();
+                self.record_buf.extend_from_slice(&[0; 4]);
+                self.record_buf
+                    .extend_from_slice(&records[cursor..cursor + wire_len]);
+                self.record_buf[start + RECORD_HEADER_SIZE..start + RECORD_HEADER_SIZE + 8]
+                    .copy_from_slice(&position.0.to_le_bytes());
+                // flags and body: everything after the length.
+                let crc = crc32c::crc32c(&self.record_buf[start + 8..]);
+                self.record_buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+                offset += stored as u64;
                 position = position.next();
-                i += 1;
+                cursor += wire_len;
             }
 
-            if i == run_start {
+            if cursor == run_start {
                 // The next record does not fit: seal this segment and retry
-                // it in the fresh one. A record larger than a whole segment
-                // is refused rather than looping forever.
-                let needed = (RECORD_HEADER_SIZE + self.serialize_buf.len()) as u64;
-                if SEGMENT_HEADER_SIZE as u64 + needed > self.max_segment_size {
-                    return Err(Error::Io(io::Error::other(format!(
-                        "event record of {needed} bytes exceeds the segment size"
-                    ))));
-                }
+                // it in the fresh one.
                 self.rotate_segment()?;
                 continue;
             }
 
-            self.active_file.write_all(&self.record_buf)?;
+            if defer {
+                self.deferred = self.record_buf.len();
+            } else {
+                self.active_file.write_all(&self.record_buf)?;
+            }
+            let mut record_offset = self.write_offset;
+            let mut indexed_position = self.next_position.0;
             self.write_offset = offset;
             self.next_position = position;
             {
                 let mut index = self.active_index.write();
-                for &(pos, record_offset, idx) in &indexed {
-                    index.insert_event(pos, record_offset, &events[idx].name, &events[idx].tags);
+                let mut at = run_start;
+                while at < cursor {
+                    let wire_len = wire_record_len(records, at);
+                    let scan = format::scan(&records[at + 5..at + wire_len])
+                        .expect("the batch's records were checked when it was built");
+                    index.insert_scanned(indexed_position, record_offset, &scan);
+                    record_offset += 4 + wire_len as u64;
+                    indexed_position += 1;
+                    at += wire_len;
                 }
             }
-            run_start = i;
+            run_start = cursor;
         }
 
-        Ok((first_position, events.len() as u32))
+        Ok((first_position, batch.len()))
+    }
+
+    /// Whether `batch` fits in the active segment as it stands. A batch that
+    /// does not fit rotates the segment mid-write, which creates and
+    /// preallocates a file: work for a thread that may block, not for an
+    /// async worker.
+    pub fn fits_without_rotation(&self, batch: &RecordBatch) -> bool {
+        self.write_offset + batch.stored_len() <= self.max_segment_size
     }
 
     /// Segments rotated away from since the last barrier, with the sealed
@@ -313,6 +467,8 @@ impl SegmentWriter {
         bytes: &[u8],
         first_position: Position,
     ) -> Result<RawAppendResult, Error> {
+        self.check_writable()?;
+        self.flush_deferred()?;
         if first_position != self.next_position {
             return Err(Error::Corrupted {
                 message: format!(
@@ -336,6 +492,7 @@ impl SegmentWriter {
         let mut cursor = 0usize;
         let mut expected = first_position;
         let mut events: Vec<(usize, EventIndexFields)> = Vec::new();
+        let mut epoch_changes = Vec::new();
         while cursor < bytes.len() {
             if bytes.len() - cursor < RECORD_HEADER_SIZE {
                 return Err(Error::Corrupted {
@@ -389,6 +546,17 @@ impl SegmentWriter {
                 }
                 expected = expected.next();
                 events.push((record_start, fields));
+            } else if flags_byte == flags::CONTROL_EPOCH_CHANGE
+                && let format::ControlRecord::EpochChange {
+                    epoch,
+                    start_position,
+                    ..
+                } = format::deserialize_control(flags_byte, payload)?
+            {
+                epoch_changes.push(EpochStart {
+                    epoch,
+                    start_position,
+                });
             }
             cursor = record_end;
         }
@@ -420,6 +588,7 @@ impl SegmentWriter {
             byte_start,
             byte_end: self.write_offset,
             events: projections,
+            epoch_changes,
         })
     }
 
@@ -443,6 +612,8 @@ impl SegmentWriter {
     /// Returns the byte offset of the record header within the (possibly
     /// freshly rotated) active segment.
     fn write_record(&mut self, flags_byte: u8, payload: &[u8]) -> Result<u64, Error> {
+        self.check_writable()?;
+        self.flush_deferred()?;
         let total_record_size = RECORD_HEADER_SIZE + payload.len();
 
         if self.write_offset + total_record_size as u64 > self.max_segment_size {
@@ -540,41 +711,70 @@ impl SegmentWriter {
         Arc::clone(&self.active_index)
     }
 
+    /// Publishes every future rotation's sealed index to `cache` (see
+    /// `rotate_segment`). The engine attaches its cache before any reader
+    /// exists.
+    pub fn attach_index_cache(&mut self, cache: Arc<IndexCache>) {
+        self.index_cache = Some(cache);
+    }
+
     /// Rotates to a new segment file.
     ///
-    /// Under the writer lock this is metadata only: trim the old file to its
-    /// data length, swap in a fresh index, create and preallocate the new
-    /// file. Every appender waits on this lock, so nothing here may wait on
+    /// Under the writer lock this is metadata only: create and preallocate
+    /// the new file, trim the old one to its data length, swap in a fresh
+    /// index. Every appender waits on this lock, so nothing here may wait on
     /// the disk. The sealed segment's fdatasync, the directory sync for the
     /// new file's name, and its `.idx`/`.bloom` companions are left as a
     /// `PendingSeal` for the group-commit thread, which does them off the
     /// lock in the wave that carries the rotation.
     fn rotate_segment(&mut self) -> Result<(), Error> {
-        // Truncate the sealed segment to its actual data size. It was
-        // preallocated to max_segment_size; a length change is a metadata
-        // op, not a flush.
-        self.active_file.set_len(self.write_offset)?;
+        // What deferred appends left waiting belongs in the file being sealed.
+        self.check_writable()?;
+        self.flush_deferred()?;
 
         // New segment starts at the current next_position.
         let new_base = self.next_position.0;
 
-        // Swap in a fresh index for the new segment. The old one was built
-        // incrementally at append time and is complete.
-        let sealed_index = {
-            let mut idx = self.active_index.write();
-            std::mem::replace(&mut *idx, SegmentIndex::new(new_base))
-        };
+        // Everything that can fail runs before any state changes, so a
+        // failed rotation leaves the writer on the old segment, intact.
         let path = segment_path(&self.dir, new_base);
         let mut file = create_segment_file(&path)?;
-        write_segment_header(&mut file, new_base)?;
-        preallocate(&file, self.max_segment_size)?;
+        let prepared = (|| -> Result<(), Error> {
+            write_segment_header(&mut file, new_base)?;
+            preallocate(&file, self.max_segment_size)?;
+            // Truncate the sealed segment to its actual data size. It was
+            // preallocated to max_segment_size; a length change is a
+            // metadata op, not a flush.
+            self.active_file.set_len(self.write_offset)?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            // A half-made file would fail the next attempt's create_new.
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+
+        // Swap in a fresh index for the new segment. The old one was built
+        // incrementally at append time and is complete. Readers do not take
+        // the writer lock: one that sees the new active base resolves the old
+        // segment through the cache, and its `.idx` is not on disk until the
+        // background seal writes it. So the sealed index is published before
+        // the guard is released — whoever sees the swap also finds it.
+        let sealed_index = {
+            let mut active = self.active_index.write();
+            let sealed = Arc::new(std::mem::replace(&mut *active, SegmentIndex::new(new_base)));
+            if let Some(cache) = &self.index_cache {
+                cache.pin_sealed(self.active_base_position, Arc::clone(&sealed));
+            }
+            sealed
+        };
 
         let sealed_file = std::mem::replace(&mut self.active_file, file);
         self.pending_seals.push(PendingSeal {
             base: self.active_base_position,
             file: sealed_file,
             len: self.write_offset,
-            index: Arc::new(sealed_index),
+            index: sealed_index,
         });
         self.active_base_position = new_base;
         self.write_offset = SEGMENT_HEADER_SIZE as u64;
@@ -604,6 +804,11 @@ fn create_segment_file(path: &Path) -> Result<File, io::Error> {
 /// carries a rotation, never under the writer lock.
 pub(crate) fn sync_dir(dir: &Path) -> Result<(), io::Error> {
     File::open(dir)?.sync_all()
+}
+
+/// Length of the record at `at` in a batch, its length field included.
+fn wire_record_len(records: &[u8], at: usize) -> usize {
+    4 + u32::from_le_bytes(records[at..at + 4].try_into().unwrap()) as usize
 }
 
 /// Frames one record — CRC, length, flags, payload — onto `out`.
@@ -711,7 +916,7 @@ fn recover_segment(file: &mut File) -> Result<(u64, Position), Error> {
 /// a file that is not full-length maps short and every later append lands
 /// outside the mapping. That is why a failure here is an error rather than
 /// something to shrug off.
-fn preallocate(file: &File, size: u64) -> Result<(), Error> {
+pub(crate) fn preallocate(file: &File, size: u64) -> Result<(), Error> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -740,7 +945,7 @@ pub(crate) fn sync_file(file: &File) -> Result<(), crate::error::Error> {
     Ok(())
 }
 
-fn fdatasync(file: &File) -> Result<(), io::Error> {
+pub(crate) fn fdatasync(file: &File) -> Result<(), io::Error> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -819,6 +1024,82 @@ mod tests {
 
         let recovered = SegmentWriter::open(dir.path(), DEFAULT_SEGMENT_SIZE).unwrap();
         assert_eq!(recovered.head(), Position(3));
+    }
+
+    /// Deferred batches are in the writer's books at once and in the file
+    /// only at the flush, which writes what the same batches would have
+    /// written one by one — across a rotation too.
+    #[test]
+    fn deferred_batches_reach_the_file_at_the_flush_and_match_immediate_writes() {
+        let max = SEGMENT_HEADER_SIZE as u64 + 1100;
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|i| {
+                RecordBatch::from_events(&[
+                    make_event(&format!("E{i}"), &[i as u8; 60]),
+                    make_event(&format!("F{i}"), &[i as u8; 90]),
+                ])
+            })
+            .collect();
+
+        let immediate_dir = tempfile::tempdir().unwrap();
+        let mut immediate = SegmentWriter::new(immediate_dir.path(), Position(0), max).unwrap();
+        for batch in &batches {
+            immediate.write_batch(batch).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), max).unwrap();
+        // Three batches fit in the first segment: nothing of them is in the file.
+        for batch in &batches[..3] {
+            writer.write_batch_deferred(batch).unwrap();
+        }
+        assert_eq!(writer.head(), Position(6));
+        assert!(writer.deferred_len() > 0);
+        let file = std::fs::read(segment_path(dir.path(), 0)).unwrap();
+        assert!(file[SEGMENT_HEADER_SIZE..].iter().all(|&b| b == 0));
+        // The rest rotate, which puts the waiting bytes in the segment they
+        // belong to before the next one starts.
+        for batch in &batches[3..] {
+            writer.write_batch_deferred(batch).unwrap();
+        }
+        let sealed = std::fs::read(segment_path(dir.path(), 0)).unwrap();
+        assert_eq!(
+            sealed,
+            std::fs::read(segment_path(immediate_dir.path(), 0)).unwrap()
+        );
+        writer.flush_deferred().unwrap();
+        assert_eq!(writer.deferred_len(), 0);
+        assert_eq!(writer.head(), immediate.head());
+        let (a, b) = (
+            list_segments(dir.path()),
+            list_segments(immediate_dir.path()),
+        );
+        let (mut a, mut b) = (a.unwrap(), b.unwrap());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert!(a.len() >= 2);
+        for base in a {
+            assert!(
+                std::fs::read(segment_path(dir.path(), base)).unwrap()
+                    == std::fs::read(segment_path(immediate_dir.path(), base)).unwrap(),
+                "segment {base} differs"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_makes_the_writer_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::new(dir.path(), Position(0), DEFAULT_SEGMENT_SIZE).unwrap();
+        writer
+            .write_batch_deferred(&RecordBatch::from_events(&[make_event("A", b"x")]))
+            .unwrap();
+        writer.fail_next_flush();
+        assert!(writer.flush_deferred().is_err());
+        let batch = RecordBatch::from_events(&[make_event("B", b"y")]);
+        assert!(writer.write_batch(&batch).is_err());
+        assert!(writer.write_batch_deferred(&batch).is_err());
     }
 
     #[test]

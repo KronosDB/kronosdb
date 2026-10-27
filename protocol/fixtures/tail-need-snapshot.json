@@ -1,0 +1,12 @@
+{
+  "frame": "TailNeedSnapshot",
+  "stream": 69,
+  "flags": 1,
+  "body": {
+    "context": "default",
+    "available_from": "2000000",
+    "watermark": "2100000",
+    "reason": "segments below 2000000 were tiered out"
+  },
+  "description": ""
+}

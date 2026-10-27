@@ -1,0 +1,9 @@
+{
+  "description": "Client answer to ServerPing.",
+  "frame": "ClientPong",
+  "stream": 0,
+  "flags": 0,
+  "body": {
+    "nonce": "1"
+  }
+}

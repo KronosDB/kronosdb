@@ -1,4 +1,4 @@
-//! JWT verification against an issuer's JWKS. Shared by the gRPC identity
+//! JWT verification against an issuer's JWKS. Shared by the native protocol's identity
 //! layer and the admin console's OIDC mode.
 
 use std::path::PathBuf;

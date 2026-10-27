@@ -85,12 +85,24 @@ impl ClientRegistry {
         }
     }
 
-    /// Registers a new client. Replaces any existing entry with the same client_id
-    /// (reconnect scenario).
+    /// Registers a client, or updates the name and version of one already
+    /// registered. An existing entry keeps its platform stream state: a
+    /// client may introduce itself and open its platform stream at the same
+    /// time, and whichever lands second must not mark an open stream closed.
+    /// (A client whose platform stream ended was removed, so a reconnect
+    /// starts a fresh entry.)
     pub fn register(&self, client_id: ClientId, component_name: ComponentName, version: String) {
-        let client = ConnectedClient::new(client_id.clone(), component_name, version);
         let mut clients = self.clients.write();
-        clients.insert(client_id, client);
+        match clients.get_mut(&client_id) {
+            Some(existing) => {
+                existing.component_name = component_name;
+                existing.version = version;
+            }
+            None => {
+                let client = ConnectedClient::new(client_id.clone(), component_name, version);
+                clients.insert(client_id, client);
+            }
+        }
     }
 
     /// Unregisters a client. Returns true if the client was found and removed.
@@ -289,5 +301,20 @@ mod tests {
             let c = clients.get(&client("node-1")).unwrap();
             assert!(c.has_active_stream());
         }
+    }
+
+    #[test]
+    fn introducing_itself_after_opening_its_stream_keeps_the_client_streaming() {
+        let registry = ClientRegistry::new();
+        // The platform stream opens first ...
+        registry.register(client("app-1"), component("orders"), "1.0.0".into());
+        registry.set_stream_active(&client("app-1"), true);
+        // ... and the separate registration request lands after it.
+        registry.register(client("app-1"), component("orders"), "1.0.1".into());
+
+        let clients = registry.list_client_details();
+        assert_eq!(clients.len(), 1);
+        assert!(clients[0].has_active_stream);
+        assert_eq!(clients[0].version, "1.0.1");
     }
 }

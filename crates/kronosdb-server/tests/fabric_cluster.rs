@@ -4,35 +4,24 @@
 //! Two real server processes form a Raft cluster. The handler registers on
 //! B only; its registration replicates through the metadata Raft into A's
 //! routing table, A's dispatch resolves the remote owner and forwards over
-//! the fabric service. Node death is asserted to fail fast (retriable
-//! error), not hang.
+//! a native peer connection. Queries gather across nodes, subscriptions
+//! relay, and node death is asserted to fail fast (retriable error), not
+//! hang.
 
 use std::net::TcpListener;
 use std::process::{Child, Command as ProcCommand, Stdio};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Channel;
-
-// Generated proto code; same allows as src/proto.rs.
-#[allow(clippy::enum_variant_names, clippy::result_large_err)]
-mod pb {
-    tonic::include_proto!("kronosdb");
-    pub mod command {
-        tonic::include_proto!("kronosdb.command");
-    }
-    pub mod query {
-        tonic::include_proto!("kronosdb.query");
-    }
-}
-
-use pb::command::command_service_client::CommandServiceClient;
-use pb::query::query_service_client::QueryServiceClient;
+use bytes::Bytes;
+use kronosdb_client::{
+    Client, Command, ConnectOptions, ErrorCode, Payload, Query, QueryHandlerEvent, Reply,
+    SubscriptionEvent,
+};
 
 struct Node {
     child: Child,
-    grpc_addr: String,
+    addr: String,
+    admin: String,
 }
 
 impl Drop for Node {
@@ -43,11 +32,24 @@ impl Drop for Node {
 }
 
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    // The kernel can hand a port it just released straight back, so ports this
+    // process already gave out are skipped: two nodes must never share one.
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut given = GIVEN.lock().unwrap();
+    loop {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
-fn spawn_node(node_id: u64, grpc_port: u16, admin_port: u16, peers: &[(u64, u16)]) -> Node {
+fn spawn_node(node_id: u64, port: u16, admin_port: u16, peers: &[(u64, u16)]) -> Node {
     let data_dir = format!(
         "{}/fabric-{}-node-{}",
         env!("CARGO_TARGET_TMPDIR"),
@@ -61,7 +63,9 @@ fn spawn_node(node_id: u64, grpc_port: u16, admin_port: u16, peers: &[(u64, u16)
         .join(",");
 
     let mut cmd = ProcCommand::new(env!("CARGO_BIN_EXE_kronosdb-server"));
-    cmd.env("KRONOSDB_LISTEN", format!("127.0.0.1:{grpc_port}"))
+    // The client port is also the address the cluster advertises: peers
+    // reach each other's handlers there.
+    cmd.env("KRONOSDB_LISTEN", format!("127.0.0.1:{port}"))
         .env("KRONOSDB_ADMIN_LISTEN", format!("127.0.0.1:{admin_port}"))
         .env("KRONOSDB_DATA_DIR", &data_dir)
         .env("KRONOSDB_NODE_NAME", format!("fabric-node-{node_id}"))
@@ -73,275 +77,128 @@ fn spawn_node(node_id: u64, grpc_port: u16, admin_port: u16, peers: &[(u64, u16)
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let child = cmd.spawn().expect("spawn kronosdb-server");
     Node {
-        child,
-        grpc_addr: format!("http://127.0.0.1:{grpc_port}"),
+        child: cmd.spawn().expect("spawn kronosdb-server"),
+        addr: format!("127.0.0.1:{port}"),
+        admin: format!("127.0.0.1:{admin_port}"),
     }
 }
 
-async fn connect(addr: &str) -> Channel {
-    for _ in 0..100 {
-        if let Ok(channel) = Channel::from_shared(addr.to_string())
-            .unwrap()
-            .connect()
-            .await
+/// Waits until the node can serve: a leader claim is committed.
+async fn wait_ready(node: &Node) {
+    for _ in 0..300 {
+        if let Ok(response) = reqwest::get(format!("http://{}/ready", node.admin)).await
+            && response.status().is_success()
         {
-            return channel;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{} never became ready", node.addr);
+}
+
+async fn connect(node: &Node) -> Client {
+    for _ in 0..100 {
+        if let Ok(client) = Client::connect(&node.addr, &ConnectOptions::default()).await {
+            return client;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    panic!("could not connect to {addr}");
+    panic!("could not connect to {}", node.addr);
 }
 
-/// Opens a command handler stream on `channel`, subscribes to
-/// `command_name`, grants permits, and echoes every received command's
-/// payload back as its response.
-async fn start_echo_handler(channel: Channel, command_name: &str, client_id: &str) {
-    let mut client = CommandServiceClient::new(channel);
-    let (tx, rx) = mpsc::channel(64);
+fn payload(text: &str) -> Payload {
+    Payload::new("String", Bytes::from(text.to_string()))
+}
 
-    tx.send(pb::command::CommandHandlerOutbound {
-        request: Some(pb::command::command_handler_outbound::Request::Subscribe(
-            pb::command::CommandSubscription {
-                message_id: "sub-1".into(),
-                command: command_name.into(),
-                component_name: "fabric-test".into(),
-                client_id: client_id.into(),
-                load_factor: 100,
-            },
-        )),
-        instruction_id: String::new(),
-    })
-    .await
-    .unwrap();
-    tx.send(pb::command::CommandHandlerOutbound {
-        request: Some(pb::command::command_handler_outbound::Request::FlowControl(
-            pb::FlowControl {
-                client_id: client_id.into(),
-                permits: 1_000,
-            },
-        )),
-        instruction_id: String::new(),
-    })
-    .await
-    .unwrap();
+fn text(reply: &Reply) -> String {
+    String::from_utf8_lossy(&reply.payload.as_ref().expect("a payload").data).to_string()
+}
 
-    let mut inbound = client
-        .open_stream(ReceiverStream::new(rx))
+/// Serves `command_name` on `client`: echoes every command's payload back.
+async fn start_echo_handler(client: &Client, command_name: &str, client_id: &str) {
+    let mut handlers = client
+        .default_bus()
+        .command_handlers(client_id, "fabric-test", 1_000)
         .await
-        .expect("open handler stream")
-        .into_inner();
-
+        .unwrap();
+    handlers.subscribe(command_name, 100).await.unwrap();
     tokio::spawn(async move {
-        while let Ok(Some(msg)) = inbound.message().await {
-            if let Some(pb::command::command_handler_inbound::Request::Command(cmd)) = msg.request {
-                let response = pb::command::CommandHandlerOutbound {
-                    request: Some(
-                        pb::command::command_handler_outbound::Request::CommandResponse(
-                            pb::command::CommandResponse {
-                                message_identifier: format!("resp-{}", cmd.message_identifier),
-                                request_identifier: cmd.message_identifier,
-                                error_code: String::new(),
-                                error_message: None,
-                                payload: cmd.payload,
-                                metadata: Default::default(),
-                                processing_instructions: vec![],
-                            },
-                        ),
-                    ),
-                    instruction_id: String::new(),
-                };
-                if tx.send(response).await.is_err() {
-                    break;
-                }
+        while let Ok(Some(incoming)) = handlers.next().await {
+            let reply = Reply::ok(
+                incoming.command.message_id.clone(),
+                incoming.command.payload.clone(),
+            );
+            if incoming.respond(&reply).await.is_err() {
+                break;
             }
         }
     });
 }
 
-fn make_command(seq: u32, name: &str, routing_key: Option<&str>) -> pb::command::Command {
-    let processing_instructions = routing_key
-        .map(|key| {
-            vec![pb::ProcessingInstruction {
-                key: pb::ProcessingKey::RoutingKey as i32,
-                value: Some(pb::MetadataValue {
-                    data: Some(pb::metadata_value::Data::TextValue(key.to_string())),
-                }),
-            }]
-        })
-        .unwrap_or_default();
-    pb::command::Command {
-        message_identifier: format!("fabric-cmd-{seq}"),
-        name: name.into(),
-        timestamp: 0,
-        payload: Some(pb::SerializedObject {
-            r#type: name.into(),
-            revision: "1".into(),
-            data: format!("payload-{seq}").into(),
-        }),
-        metadata: Default::default(),
-        processing_instructions,
-        client_id: "fabric-dispatcher".into(),
-        component_name: "fabric-test".into(),
-    }
+fn make_command(seq: u32, name: &str, routing_key: Option<&str>) -> Command {
+    let mut command = Command::new(
+        format!("fabric-cmd-{seq}"),
+        name,
+        payload(&format!("payload-{seq}")),
+    );
+    command.client_id = "fabric-dispatcher".into();
+    command.component_name = "fabric-test".into();
+    command.routing_key = routing_key.map(str::to_string);
+    command
 }
 
 /// Retries dispatch until the handler registration has replicated and the
 /// cluster has settled — registration rides a Raft round and leader
 /// election takes a moment after spawn.
-async fn dispatch_until_ok(
-    client: &mut CommandServiceClient<Channel>,
-    name: &str,
-    routing_key: Option<&str>,
-) -> pb::command::CommandResponse {
-    let mut seq = 0u32;
-    for _ in 0..150 {
-        seq += 1;
-        match client.dispatch(make_command(seq, name, routing_key)).await {
-            Ok(response) => return response.into_inner(),
+async fn dispatch_until_ok(client: &Client, name: &str, routing_key: Option<&str>) -> Reply {
+    for seq in 1..=150 {
+        match client
+            .default_bus()
+            .dispatch_command(&make_command(seq, name, routing_key))
+            .await
+        {
+            Ok(reply) => return reply,
             Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
         }
     }
     panic!("dispatch never succeeded for {name}");
 }
 
-/// Opens a query handler stream, subscribes to `query_name`, grants
-/// permits, and answers every query with one response (tagged with this
-/// handler's id) followed by QueryComplete.
-async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str) {
-    let mut client = QueryServiceClient::new(channel);
-    let (tx, rx) = mpsc::channel(64);
-
-    tx.send(pb::query::QueryHandlerOutbound {
-        request: Some(pb::query::query_handler_outbound::Request::Subscribe(
-            pb::query::QuerySubscription {
-                message_id: "qsub-1".into(),
-                query: query_name.into(),
-                result_name: "String".into(),
-                component_name: "fabric-test".into(),
-                client_id: client_id.into(),
-            },
-        )),
-        instruction_id: String::new(),
-    })
-    .await
-    .unwrap();
-    tx.send(pb::query::QueryHandlerOutbound {
-        request: Some(pb::query::query_handler_outbound::Request::FlowControl(
-            pb::FlowControl {
-                client_id: client_id.into(),
-                permits: 1_000,
-            },
-        )),
-        instruction_id: String::new(),
-    })
-    .await
-    .unwrap();
-
-    let mut inbound = client
-        .open_stream(ReceiverStream::new(rx))
+/// Serves `query_name`: answers every query with one result tagged with this
+/// handler's id; answers a subscription query with an initial result and one
+/// update.
+async fn start_query_handler(client: &Client, query_name: &str, client_id: &str) {
+    let mut handlers = client
+        .default_bus()
+        .query_handlers(client_id, "fabric-test", 1_000)
         .await
-        .expect("open query handler stream")
-        .into_inner();
-
-    let responder_id = client_id.to_string();
+        .unwrap();
+    handlers.subscribe(query_name, "String").await.unwrap();
+    let responder = client_id.to_string();
     tokio::spawn(async move {
-        while let Ok(Some(msg)) = inbound.message().await {
-            // Subscription queries: answer with an initial result, then
-            // push one update.
-            if let Some(pb::query::query_handler_inbound::Request::SubscriptionQueryRequest(
-                sub_req,
-            )) = &msg.request
-                && let Some(pb::query::subscription_query_request::Request::Subscribe(sub)) =
-                    &sub_req.request
-            {
-                let sub_id = sub.subscription_identifier.clone();
-                let initial = pb::query::QueryHandlerOutbound {
-                    request: Some(pb::query::query_handler_outbound::Request::QueryResponse(
-                        pb::query::QueryResponse {
-                            message_identifier: format!("init-{sub_id}"),
-                            error_code: String::new(),
-                            error_message: None,
-                            payload: Some(pb::SerializedObject {
-                                r#type: "String".into(),
-                                revision: "1".into(),
-                                data: format!("initial-from-{responder_id}").into(),
-                            }),
-                            metadata: Default::default(),
-                            processing_instructions: vec![],
-                            request_identifier: sub_id.clone(),
-                        },
-                    )),
-                    instruction_id: String::new(),
-                };
-                let update = pb::query::QueryHandlerOutbound {
-                    request: Some(
-                        pb::query::query_handler_outbound::Request::SubscriptionQueryResponse(
-                            pb::query::SubscriptionQueryResponse {
-                                message_identifier: format!("upd-{sub_id}"),
-                                subscription_identifier: sub_id,
-                                response: Some(
-                                    pb::query::subscription_query_response::Response::Update(
-                                        pb::query::QueryUpdate {
-                                            message_identifier: String::new(),
-                                            payload: Some(pb::SerializedObject {
-                                                r#type: "String".into(),
-                                                revision: "1".into(),
-                                                data: format!("update-from-{responder_id}").into(),
-                                            }),
-                                            metadata: Default::default(),
-                                            client_id: String::new(),
-                                            component_name: String::new(),
-                                            error_code: String::new(),
-                                            error_message: None,
-                                        },
-                                    ),
-                                ),
-                            },
-                        ),
-                    ),
-                    instruction_id: String::new(),
-                };
-                if tx.send(initial).await.is_err() || tx.send(update).await.is_err() {
-                    break;
+        while let Ok(Some(event)) = handlers.next().await {
+            match event {
+                QueryHandlerEvent::Subscription(sub) => {
+                    let id = sub.subscription_id.clone();
+                    let initial = Reply::ok(id, payload(&format!("initial-from-{responder}")));
+                    if sub.initial(&initial).await.is_err()
+                        || sub
+                            .update(payload(&format!("update-from-{responder}")))
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
                 }
-                continue;
-            }
-            if let Some(pb::query::query_handler_inbound::Request::Query(q)) = msg.request {
-                let response = pb::query::QueryHandlerOutbound {
-                    request: Some(pb::query::query_handler_outbound::Request::QueryResponse(
-                        pb::query::QueryResponse {
-                            message_identifier: format!("qresp-{}", q.message_identifier),
-                            error_code: String::new(),
-                            error_message: None,
-                            payload: Some(pb::SerializedObject {
-                                r#type: "String".into(),
-                                revision: "1".into(),
-                                data: format!("answer-from-{responder_id}").into(),
-                            }),
-                            metadata: Default::default(),
-                            processing_instructions: vec![],
-                            request_identifier: q.message_identifier.clone(),
-                        },
-                    )),
-                    instruction_id: String::new(),
-                };
-                if tx.send(response).await.is_err() {
-                    break;
+                QueryHandlerEvent::Query(incoming) => {
+                    let id = incoming.query.message_id.clone();
+                    let answer = Reply::ok(id, payload(&format!("answer-from-{responder}")));
+                    if incoming.respond(&answer).await.is_err() {
+                        break;
+                    }
                 }
-                let complete = pb::query::QueryHandlerOutbound {
-                    request: Some(pb::query::query_handler_outbound::Request::QueryComplete(
-                        pb::query::QueryComplete {
-                            message_id: format!("qc-{}", q.message_identifier),
-                            request_id: q.message_identifier,
-                        },
-                    )),
-                    instruction_id: String::new(),
-                };
-                if tx.send(complete).await.is_err() {
-                    break;
-                }
+                _ => {}
             }
         }
     });
@@ -350,36 +207,20 @@ async fn start_query_handler(channel: Channel, query_name: &str, client_id: &str
 /// Retries a scatter-gather query until it yields at least
 /// `expected_responses` answers within one collection window.
 async fn query_until_responses(
-    channel: Channel,
+    client: &Client,
     query_name: &str,
     expected_responses: usize,
 ) -> Vec<String> {
-    let mut client = QueryServiceClient::new(channel);
     for attempt in 0..150u32 {
-        let request = pb::query::QueryRequest {
-            message_identifier: format!("fabric-query-{attempt}"),
-            query: query_name.into(),
-            timestamp: 0,
-            payload: Some(pb::SerializedObject {
-                r#type: query_name.into(),
-                revision: "1".into(),
-                data: bytes::Bytes::new(),
-            }),
-            metadata: Default::default(),
-            processing_instructions: vec![],
-            client_id: "fabric-querier".into(),
-            component_name: "fabric-test".into(),
-        };
-        if let Ok(response) = client.query(request).await {
-            let mut stream = response.into_inner();
-            let mut answers = Vec::new();
-            while let Ok(Ok(Some(resp))) =
-                tokio::time::timeout(Duration::from_secs(5), stream.message()).await
-            {
-                if let Some(payload) = resp.payload {
-                    answers.push(String::from_utf8_lossy(&payload.data).to_string());
-                }
-            }
+        let mut query = Query::new(format!("fabric-query-{attempt}"), query_name, payload(""));
+        query.client_id = "fabric-querier".into();
+        query.component_name = "fabric-test".into();
+        if let Ok(results) = client.default_bus().dispatch_query(&query).await
+            && let Ok(results) =
+                tokio::time::timeout(Duration::from_secs(5), results.collect()).await
+            && let Ok(results) = results
+        {
+            let answers: Vec<String> = results.iter().map(text).collect();
             if answers.len() >= expected_responses {
                 return answers;
             }
@@ -391,62 +232,33 @@ async fn query_until_responses(
 
 /// Opens a subscription query and collects events until an initial result
 /// AND an update arrive; retries while registrations replicate.
-async fn subscribe_until_events(channel: Channel, query_name: &str) -> Vec<String> {
+async fn subscribe_until_events(client: &Client, query_name: &str) -> Vec<String> {
     for attempt in 0..150u32 {
-        let sub_id = format!("fabric-sub-{attempt}");
-        let (tx, rx) = mpsc::channel(16);
-        tx.send(pb::query::SubscriptionQueryRequest {
-            request: Some(pb::query::subscription_query_request::Request::Subscribe(
-                pb::query::SubscriptionQuery {
-                    subscription_identifier: sub_id.clone(),
-                    number_of_permits: 64,
-                    query_request: Some(pb::query::QueryRequest {
-                        message_identifier: sub_id.clone(),
-                        query: query_name.into(),
-                        timestamp: 0,
-                        payload: Some(pb::SerializedObject {
-                            r#type: query_name.into(),
-                            revision: "1".into(),
-                            data: bytes::Bytes::new(),
-                        }),
-                        metadata: Default::default(),
-                        processing_instructions: vec![],
-                        client_id: "fabric-subscriber".into(),
-                        component_name: "fabric-test".into(),
-                    }),
-                },
-            )),
-        })
-        .await
-        .unwrap();
-
-        let mut client = QueryServiceClient::new(channel.clone());
-        if let Ok(response) = client.subscription(ReceiverStream::new(rx)).await {
-            let mut stream = response.into_inner();
+        let id = format!("fabric-sub-{attempt}");
+        let mut query = Query::new(id.clone(), query_name, payload(""));
+        query.client_id = "fabric-subscriber".into();
+        query.component_name = "fabric-test".into();
+        if let Ok(mut stream) = client
+            .default_bus()
+            .subscription_query(&id, &query, 64)
+            .await
+        {
             let mut events = Vec::new();
-            while let Ok(Ok(Some(msg))) =
-                tokio::time::timeout(Duration::from_secs(3), stream.message()).await
+            while let Ok(Ok(Some(event))) =
+                tokio::time::timeout(Duration::from_secs(3), stream.next()).await
             {
-                match msg.response {
-                    Some(pb::query::subscription_query_response::Response::InitialResult(r)) => {
-                        if let Some(p) = r.payload {
-                            events.push(String::from_utf8_lossy(&p.data).to_string());
-                        }
-                    }
-                    Some(pb::query::subscription_query_response::Response::Update(u)) => {
-                        if let Some(p) = u.payload {
-                            events.push(String::from_utf8_lossy(&p.data).to_string());
-                        }
-                    }
+                match event {
+                    SubscriptionEvent::Initial(r) => events.push(text(&r)),
+                    SubscriptionEvent::Update {
+                        payload: Some(p), ..
+                    } => events.push(String::from_utf8_lossy(&p.data).to_string()),
                     _ => {}
                 }
                 if events.len() >= 2 {
-                    drop(tx);
                     return events;
                 }
             }
         }
-        drop(tx);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     panic!("subscription never yielded initial+update for {query_name}");
@@ -454,42 +266,42 @@ async fn subscribe_until_events(channel: Channel, query_name: &str) -> Vec<Strin
 
 #[tokio::test(flavor = "multi_thread")]
 async fn command_dispatched_on_a_reaches_handler_on_b() {
-    let grpc_a = free_port();
-    let grpc_b = free_port();
+    let port_a = free_port();
+    let port_b = free_port();
     let admin_a = free_port();
     let admin_b = free_port();
-    let peers = [(1u64, grpc_a), (2u64, grpc_b)];
+    let peers = [(1u64, port_a), (2u64, port_b)];
 
-    let node_a = spawn_node(1, grpc_a, admin_a, &peers);
-    let node_b = spawn_node(2, grpc_b, admin_b, &peers);
+    let node_a = spawn_node(1, port_a, admin_a, &peers);
+    let node_b = spawn_node(2, port_b, admin_b, &peers);
 
-    let channel_a = connect(&node_a.grpc_addr).await;
-    let channel_b = connect(&node_b.grpc_addr).await;
+    wait_ready(&node_a).await;
+    wait_ready(&node_b).await;
+    let client_a = connect(&node_a).await;
+    let client_b = connect(&node_b).await;
 
     // Handler lives ONLY on node B.
-    start_echo_handler(channel_b.clone(), "FabricEcho", "handler-on-b").await;
+    start_echo_handler(&client_b, "FabricEcho", "handler-on-b").await;
 
-    // Dispatch through node A: routing table says the owner is on B, so
+    // Dispatch through node A: the routing table says the owner is on B, so
     // the command crosses the fabric and the response crosses back.
-    let mut dispatcher = CommandServiceClient::new(channel_a.clone());
-    let response = dispatch_until_ok(&mut dispatcher, "FabricEcho", None).await;
-    let payload = response.payload.expect("echoed payload");
+    let reply = dispatch_until_ok(&client_a, "FabricEcho", None).await;
     assert!(
-        String::from_utf8_lossy(&payload.data).starts_with("payload-"),
-        "expected echoed payload, got {payload:?}"
+        text(&reply).starts_with("payload-"),
+        "expected echoed payload, got {reply:?}"
     );
 
     // Keyed dispatch takes the ring path to the same remote handler.
-    let response = dispatch_until_ok(&mut dispatcher, "FabricEcho", Some("order-42")).await;
-    assert!(response.payload.is_some());
+    let reply = dispatch_until_ok(&client_a, "FabricEcho", Some("order-42")).await;
+    assert!(reply.is_ok() && reply.payload.is_some(), "{reply:?}");
 
     // ── Scatter-gather across the fabric ────────────────────────────
     // Query handlers on BOTH nodes; a query through node A must gather
     // answers from the local handler and the remote one.
-    start_query_handler(channel_a.clone(), "FabricGather", "query-handler-a").await;
-    start_query_handler(channel_b.clone(), "FabricGather", "query-handler-b").await;
+    start_query_handler(&client_a, "FabricGather", "query-handler-a").await;
+    start_query_handler(&client_b, "FabricGather", "query-handler-b").await;
 
-    let answers = query_until_responses(channel_a.clone(), "FabricGather", 2).await;
+    let answers = query_until_responses(&client_a, "FabricGather", 2).await;
     assert!(
         answers.iter().any(|a| a == "answer-from-query-handler-a"),
         "missing local answer: {answers:?}"
@@ -500,15 +312,15 @@ async fn command_dispatched_on_a_reaches_handler_on_b() {
     );
 
     // Remote-only point-to-point: handler exists ONLY on B, query via A.
-    start_query_handler(channel_b.clone(), "FabricRemoteOnly", "query-handler-b2").await;
-    let answers = query_until_responses(channel_a.clone(), "FabricRemoteOnly", 1).await;
+    start_query_handler(&client_b, "FabricRemoteOnly", "query-handler-b2").await;
+    let answers = query_until_responses(&client_a, "FabricRemoteOnly", 1).await;
     assert_eq!(answers, vec!["answer-from-query-handler-b2".to_string()]);
 
     // ── Subscription relay across the fabric ────────────────────────
     // Subscription-query handler ONLY on B; subscriber connects to A.
     // Initial result and update must relay B → A → subscriber.
-    start_query_handler(channel_b.clone(), "FabricSubQ", "sub-handler-b").await;
-    let events = subscribe_until_events(channel_a.clone(), "FabricSubQ").await;
+    start_query_handler(&client_b, "FabricSubQ", "sub-handler-b").await;
+    let events = subscribe_until_events(&client_a, "FabricSubQ").await;
     assert!(
         events.contains(&"initial-from-sub-handler-b".to_string()),
         "missing relayed initial result: {events:?}"
@@ -525,12 +337,41 @@ async fn command_dispatched_on_a_reaches_handler_on_b() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        CommandServiceClient::new(channel_a).dispatch(make_command(9_999, "FabricEcho", None)),
+        client_a
+            .default_bus()
+            .dispatch_command(&make_command(9_999, "FabricEcho", None)),
     )
     .await;
     match result {
-        Ok(Err(_)) => {}
-        Ok(Ok(_)) => panic!("dispatch succeeded against a dead handler node"),
+        Ok(Err(e)) => assert_eq!(
+            e.failure().map(|f| f.code),
+            Some(ErrorCode::UNAVAILABLE),
+            "retriable: {e}"
+        ),
+        Ok(Ok(reply)) => panic!("dispatch succeeded against a dead handler node: {reply:?}"),
         Err(_) => panic!("dispatch hung after handler node death"),
     }
+}
+
+/// A handler that registers while the cluster has no leader (here: one of
+/// two voters is not up yet, so there is no quorum) still reaches the
+/// routing table once a leader exists — the only way a command dispatched on
+/// the other node can find it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_registered_before_a_leader_exists_is_routed_once_there_is_one() {
+    let (port_a, port_b) = (free_port(), free_port());
+    let (admin_a, admin_b) = (free_port(), free_port());
+    let peers = [(11u64, port_a), (12u64, port_b)];
+
+    let node_a = spawn_node(11, port_a, admin_a, &peers);
+    let client_a = connect(&node_a).await;
+    start_echo_handler(&client_a, "LateEcho", "handler-before-leader").await;
+    // Long enough for the first registration attempts to find no leader.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let node_b = spawn_node(12, port_b, admin_b, &peers);
+    let client_b = connect(&node_b).await;
+    let reply = dispatch_until_ok(&client_b, "LateEcho", None).await;
+    assert!(text(&reply).starts_with("payload-"), "{reply:?}");
+    drop(node_a);
 }

@@ -170,8 +170,16 @@ impl QueryBus {
     /// Grants flow control permits to a client.
     pub fn grant_permits(&self, client_id: &ClientId, permits: i64) {
         let handlers = self.handlers.read();
+        let Some(types) = handlers.grant_permits(client_id, permits) else {
+            // Granted before subscribing anything: nothing waits on it yet.
+            drop(handlers);
+            self.handlers
+                .write()
+                .grant_permits_creating(client_id, permits);
+            return;
+        };
         // Wake the dispatch_wait loops parked on this handler's types.
-        for query_name in handlers.grant_permits(client_id, permits) {
+        for query_name in types {
             if let Some(notify) = self.permit_notify.get(query_name) {
                 notify.notify_waiters();
             }
@@ -203,12 +211,22 @@ impl QueryBus {
     /// Dispatches a query.
     ///
     /// Returns a `PendingQuery` with the target handler client IDs.
-    /// The gRPC layer is responsible for sending the query to each handler's
+    /// The service layer is responsible for sending the query to each handler's
     /// stream and collecting responses.
     ///
     /// - `expected_results = 1`: point-to-point (first available handler)
     /// - `expected_results = -1`: scatter-gather (all handlers)
     pub fn dispatch(&self, query: Query) -> Result<PendingQuery, QueryError> {
+        let target_handlers = self.select(&query)?;
+        Ok(PendingQuery {
+            query,
+            target_handlers,
+        })
+    }
+
+    /// The handlers `query` goes to, with a permit taken from each. Borrows
+    /// the query so the waiting variants can retry without cloning it.
+    fn select(&self, query: &Query) -> Result<Vec<ClientId>, QueryError> {
         let query_name = query.name.clone();
         let handlers = self.handlers.read();
         let handler_list = handlers.get_handlers(&query.name).ok_or_else(|| {
@@ -260,10 +278,7 @@ impl QueryBus {
         // Record dispatch.
         self.record_dispatched(&query_name);
 
-        Ok(PendingQuery {
-            query,
-            target_handlers,
-        })
+        Ok(target_handlers)
     }
 
     /// Dispatches a query, waiting up to `max_wait` for a flow-control
@@ -283,9 +298,15 @@ impl QueryBus {
         let notify = self.permit_notify_for(&query.name);
         loop {
             let notified = notify.notified();
-            match self.dispatch(query.clone()) {
+            match self.select(&query) {
                 Err(QueryError::NoPermitsAvailable { .. }) => {}
-                other => return other,
+                Ok(target_handlers) => {
+                    return Ok(PendingQuery {
+                        query,
+                        target_handlers,
+                    });
+                }
+                Err(e) => return Err(e),
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -313,9 +334,15 @@ impl QueryBus {
         let notify = self.permit_notify_for(&query.name);
         loop {
             let notified = notify.notified();
-            match self.dispatch_to(query.clone(), targets) {
+            match self.select_to(&query, targets) {
                 Err(QueryError::NoPermitsAvailable { .. }) => {}
-                other => return other,
+                Ok(target_handlers) => {
+                    return Ok(PendingQuery {
+                        query,
+                        target_handlers,
+                    });
+                }
+                Err(e) => return Err(e),
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -338,6 +365,15 @@ impl QueryBus {
         query: Query,
         targets: &[ClientId],
     ) -> Result<PendingQuery, QueryError> {
+        let target_handlers = self.select_to(&query, targets)?;
+        Ok(PendingQuery {
+            query,
+            target_handlers,
+        })
+    }
+
+    /// [`select`](QueryBus::select) for named targets.
+    fn select_to(&self, query: &Query, targets: &[ClientId]) -> Result<Vec<ClientId>, QueryError> {
         let query_name = query.name.clone();
         let handlers = self.handlers.read();
         let handler_list = handlers.get_handlers(&query.name).ok_or_else(|| {
@@ -363,36 +399,32 @@ impl QueryBus {
         }
 
         self.record_dispatched(&query_name);
-        Ok(PendingQuery {
-            query,
-            target_handlers: accepted,
-        })
+        Ok(accepted)
     }
 
     // ── Metrics helpers ─────────────────────────────────────────────
 
+    /// Counts an event for `name`. A type seen before takes only a shared
+    /// lock to find its counters (see `CommandBus::count`).
+    fn count(&self, name: &str, counter: impl Fn(&MessageTypeMetrics) -> &AtomicU64) {
+        if let Some(m) = self.metrics.get(name) {
+            counter(&m).fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let m = self.metrics.entry(name.to_string()).or_default();
+        counter(&m).fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_dispatched(&self, name: &str) {
-        self.metrics
-            .entry(name.to_string())
-            .or_default()
-            .dispatched
-            .fetch_add(1, Ordering::Relaxed);
+        self.count(name, |m| &m.dispatched);
     }
 
     fn record_no_handler(&self, name: &str) {
-        self.metrics
-            .entry(name.to_string())
-            .or_default()
-            .no_handler
-            .fetch_add(1, Ordering::Relaxed);
+        self.count(name, |m| &m.no_handler);
     }
 
     fn record_no_permits(&self, name: &str) {
-        self.metrics
-            .entry(name.to_string())
-            .or_default()
-            .no_permits
-            .fetch_add(1, Ordering::Relaxed);
+        self.count(name, |m| &m.no_permits);
     }
 }
 

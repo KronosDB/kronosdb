@@ -1,0 +1,22 @@
+{
+  "frame": "SnapshottedSource",
+  "stream": 27,
+  "flags": 1,
+  "body": {
+    "context": 0,
+    "criteria": [
+      {
+        "names": [],
+        "tags": [
+          {
+            "key": "6f726465724964",
+            "value": "6f2d31"
+          }
+        ]
+      }
+    ],
+    "key": "6f726465723a6f2d31",
+    "batch_size": 0
+  },
+  "description": ""
+}

@@ -1,0 +1,18 @@
+[package]
+name = "kronosdb-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust client for KronosDB over its native protocol"
+
+[dependencies]
+kronosdb-protocol = { path = "../kronosdb-protocol" }
+bytes = "1"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

@@ -8,9 +8,30 @@ use super::config::{GrantConfig, IdentityConfig, IssuerConfig, Role, TokenConfig
 use super::*;
 
 const ISSUER: &str = "https://idp.test";
-const APPEND: &str = "/kronosdb.eventstore.EventStore/Append";
-const SOURCE: &str = "/kronosdb.eventstore.EventStore/Source";
-const VOTE: &str = "/kronosdb.raft.RaftTransport/Vote";
+const APPEND: u16 = kronosdb_protocol::Append::KIND;
+const SOURCE: u16 = kronosdb_protocol::Source::KIND;
+const VOTE: u16 = kronosdb_protocol::RaftVote::KIND;
+/// A kind no request starts with.
+const UNKNOWN: u16 = 0x7ffe;
+
+#[derive(Debug)]
+struct Denied;
+
+/// Whether `principal` may make a request of frame `kind` on `context` or
+/// `bus`, as the native server decides it.
+fn authorize(principal: &Principal, kind: u16, context: &str, bus: &str) -> Result<(), Denied> {
+    let (access, scope) = policy::demand(kind);
+    let target = match scope {
+        policy::Scope::Context => context,
+        policy::Scope::Bus => bus,
+        policy::Scope::Global => "",
+    };
+    if principal.allows(access, scope, target) {
+        Ok(())
+    } else {
+        Err(Denied)
+    }
+}
 
 /// An ES256 signing key plus the JWKS file that publishes its public half.
 struct TestIdp {
@@ -67,7 +88,7 @@ impl TestIdp {
             "aud": "kronosdb",
             "sub": "u-123",
             "email": email,
-            "hd": "karma.life",
+            "hd": "example.com",
             "email_verified": true,
             "groups": ["eng", "platform"],
             "exp": now_unix() + 600,
@@ -114,11 +135,10 @@ async fn nothing_configured_is_open_access() {
     let auth = Authenticator::new(&IdentityConfig::default()).unwrap();
     assert!(!auth.enabled());
     let principal = auth.authenticate(Credentials::default()).await.unwrap();
-    for path in [APPEND, SOURCE, VOTE, "/some.Unknown/Method"] {
-        auth.authorize(&principal, path, "default", "default")
-            .unwrap();
+    for kind in [APPEND, SOURCE, VOTE, UNKNOWN] {
+        authorize(&principal, kind, "default", "default").unwrap();
     }
-    // The admin plane must never mistake "gRPC auth is off" for a credential.
+    // The admin plane must never mistake "client auth is off" for a credential.
     assert!(auth.authenticate_token("anything").await.is_err());
 }
 
@@ -132,10 +152,8 @@ async fn legacy_access_token_is_admin_and_peer() {
 
     let principal = auth.authenticate(token_creds("secret123")).await.unwrap();
     assert!(principal.is_admin());
-    auth.authorize(&principal, APPEND, "default", "default")
-        .unwrap();
-    auth.authorize(&principal, VOTE, "default", "default")
-        .unwrap();
+    authorize(&principal, APPEND, "default", "default").unwrap();
+    authorize(&principal, VOTE, "default", "default").unwrap();
 
     unauthenticated(auth.authenticate(token_creds("secret124")).await);
     unauthenticated(auth.authenticate(token_creds("")).await);
@@ -159,20 +177,16 @@ async fn named_token_is_scoped() {
 
     let principal = auth.authenticate(token_creds("ci-secret")).await.unwrap();
     assert_eq!(principal.subject, "orders-ci");
-    auth.authorize(&principal, APPEND, "orders-eu", "default")
-        .unwrap();
+    authorize(&principal, APPEND, "orders-eu", "default").unwrap();
     assert!(matches!(
-        auth.authorize(&principal, APPEND, "billing", "default"),
-        Err(AuthError::PermissionDenied(_))
+        authorize(&principal, APPEND, "billing", "default"),
+        Err(Denied)
     ));
+    assert!(authorize(&principal, VOTE, "orders-eu", "default").is_err());
     assert!(
-        auth.authorize(&principal, VOTE, "orders-eu", "default")
-            .is_err()
-    );
-    assert!(
-        auth.authorize(
+        authorize(
             &principal,
-            "/kronosdb.command.CommandService/Dispatch",
+            kronosdb_protocol::DispatchCommand::KIND,
             "orders-eu",
             "default"
         )
@@ -203,10 +217,10 @@ async fn token_file_is_trimmed() {
 #[tokio::test]
 async fn jwt_grants_by_subject_and_claims() {
     let idp = TestIdp::new();
-    let mut by_claims = grant("test", "*@karma.life", vec![Role::Write]);
+    let mut by_claims = grant("test", "*@example.com", vec![Role::Write]);
     by_claims
         .claims
-        .insert("hd".into(), toml::Value::String("karma.life".into()));
+        .insert("hd".into(), toml::Value::String("example.com".into()));
     by_claims
         .claims
         .insert("email_verified".into(), toml::Value::Boolean(true));
@@ -222,16 +236,12 @@ async fn jwt_grants_by_subject_and_claims() {
     })
     .unwrap();
 
-    let token = idp.sign(idp.claims("theo@karma.life"));
+    let token = idp.sign(idp.claims("theo@example.com"));
     let principal = auth.authenticate(token_creds(&token)).await.unwrap();
-    assert_eq!(principal.subject, "theo@karma.life");
+    assert_eq!(principal.subject, "theo@example.com");
     assert_eq!(principal.source, "test");
-    auth.authorize(&principal, APPEND, "orders", "default")
-        .unwrap();
-    assert!(
-        auth.authorize(&principal, APPEND, "billing", "default")
-            .is_err()
-    );
+    authorize(&principal, APPEND, "orders", "default").unwrap();
+    assert!(authorize(&principal, APPEND, "billing", "default").is_err());
 
     // Second call is served from the verified-token cache.
     let again = auth.authenticate(token_creds(&token)).await.unwrap();
@@ -241,13 +251,10 @@ async fn jwt_grants_by_subject_and_claims() {
     let outsider = idp.sign(idp.claims("eve@evil.io"));
     let principal = auth.authenticate(token_creds(&outsider)).await.unwrap();
     assert!(principal.grants.is_empty());
-    assert!(
-        auth.authorize(&principal, SOURCE, "orders", "default")
-            .is_err()
-    );
+    assert!(authorize(&principal, SOURCE, "orders", "default").is_err());
 
     // Right subject, one claim off.
-    let mut claims = idp.claims("mallory@karma.life");
+    let mut claims = idp.claims("mallory@example.com");
     claims["email_verified"] = serde_json::json!(false);
     let principal = auth
         .authenticate(token_creds(&idp.sign(claims)))
@@ -265,7 +272,7 @@ async fn jwt_role_map() {
     })
     .unwrap();
 
-    let mut claims = idp.claims("ops@karma.life");
+    let mut claims = idp.claims("ops@example.com");
     claims["realm_access"] = serde_json::json!({ "roles": ["kronos-admins", "unrelated"] });
     let principal = auth
         .authenticate(token_creds(&idp.sign(claims)))
@@ -273,10 +280,7 @@ async fn jwt_role_map() {
         .unwrap();
     assert!(principal.is_admin());
     // admin never implies peer.
-    assert!(
-        auth.authorize(&principal, VOTE, "default", "default")
-            .is_err()
-    );
+    assert!(authorize(&principal, VOTE, "default", "default").is_err());
 }
 
 #[tokio::test]
@@ -289,15 +293,15 @@ async fn jwt_rejections() {
     })
     .unwrap();
 
-    let mut wrong_aud = idp.claims("a@karma.life");
+    let mut wrong_aud = idp.claims("a@example.com");
     wrong_aud["aud"] = serde_json::json!("some-other-service");
     unauthenticated(auth.authenticate(token_creds(&idp.sign(wrong_aud))).await);
 
-    let mut expired = idp.claims("a@karma.life");
+    let mut expired = idp.claims("a@example.com");
     expired["exp"] = serde_json::json!(now_unix() - 3600);
     unauthenticated(auth.authenticate(token_creds(&idp.sign(expired))).await);
 
-    let mut other_issuer = idp.claims("a@karma.life");
+    let mut other_issuer = idp.claims("a@example.com");
     other_issuer["iss"] = serde_json::json!("https://evil.test");
     let msg = unauthenticated(
         auth.authenticate(token_creds(&idp.sign(other_issuer)))
@@ -308,7 +312,7 @@ async fn jwt_rejections() {
     // Right issuer and kid, signed by somebody else's key.
     let impostor = TestIdp::new();
     unauthenticated(
-        auth.authenticate(token_creds(&impostor.sign(idp.claims("a@karma.life"))))
+        auth.authenticate(token_creds(&impostor.sign(idp.claims("a@example.com"))))
             .await,
     );
 
@@ -317,7 +321,7 @@ async fn jwt_rejections() {
     header.kid = Some("k1".into());
     let forged = jsonwebtoken::encode(
         &header,
-        &idp.claims("a@karma.life"),
+        &idp.claims("a@example.com"),
         &jsonwebtoken::EncodingKey::from_secret(&idp.public_raw),
     )
     .unwrap();
@@ -325,7 +329,7 @@ async fn jwt_rejections() {
     assert!(msg.contains("symmetric"), "{msg}");
 
     // Unsigned.
-    let body = URL_SAFE_NO_PAD.encode(idp.claims("a@karma.life").to_string());
+    let body = URL_SAFE_NO_PAD.encode(idp.claims("a@example.com").to_string());
     let none = format!(
         "{}.{body}.",
         URL_SAFE_NO_PAD.encode(r#"{"alg":"none","kid":"k1"}"#)
@@ -338,14 +342,14 @@ async fn mtls_identity_and_precedence() {
     let auth = Authenticator::new(&IdentityConfig {
         access_token: Some("secret".into()),
         grants: vec![
-            grant("mtls", "spiffe://karma.life/kronosdb/*", vec![Role::Peer]),
-            grant("mtls", "spiffe://karma.life/ns/prod/*", vec![Role::Write]),
+            grant("mtls", "spiffe://example.com/kronosdb/*", vec![Role::Peer]),
+            grant("mtls", "spiffe://example.com/ns/prod/*", vec![Role::Write]),
         ],
         ..Default::default()
     })
     .unwrap();
 
-    let node = client_cert("spiffe://karma.life/kronosdb/node-2");
+    let node = client_cert("spiffe://example.com/kronosdb/node-2");
     let principal = auth
         .authenticate(Credentials {
             token: None,
@@ -354,15 +358,11 @@ async fn mtls_identity_and_precedence() {
         .await
         .unwrap();
     assert_eq!(principal.source, "mtls");
-    assert_eq!(principal.subject, "spiffe://karma.life/kronosdb/node-2");
-    auth.authorize(&principal, VOTE, "default", "default")
-        .unwrap();
-    assert!(
-        auth.authorize(&principal, APPEND, "default", "default")
-            .is_err()
-    );
+    assert_eq!(principal.subject, "spiffe://example.com/kronosdb/node-2");
+    authorize(&principal, VOTE, "default", "default").unwrap();
+    assert!(authorize(&principal, APPEND, "default", "default").is_err());
 
-    let workload = client_cert("spiffe://karma.life/ns/prod/sa/orders");
+    let workload = client_cert("spiffe://example.com/ns/prod/sa/orders");
     let principal = auth
         .authenticate(Credentials {
             token: None,
@@ -370,12 +370,8 @@ async fn mtls_identity_and_precedence() {
         })
         .await
         .unwrap();
-    auth.authorize(&principal, APPEND, "default", "default")
-        .unwrap();
-    assert!(
-        auth.authorize(&principal, VOTE, "default", "default")
-            .is_err()
-    );
+    authorize(&principal, APPEND, "default", "default").unwrap();
+    assert!(authorize(&principal, VOTE, "default", "default").is_err());
 
     // A valid certificate nobody granted anything to.
     let stranger = client_cert("spiffe://other.org/x");
@@ -479,8 +475,8 @@ role-map = { kronosdb-admin = "admin", kronosdb-reader = "read" }
 
 [[security.grants]]
 source = "google"
-subject = "*@karma.life"
-claims = { hd = "karma.life", email_verified = true }
+subject = "*@example.com"
+claims = { hd = "example.com", email_verified = true }
 roles = ["read"]
 
 [[security.grants]]
@@ -492,7 +488,7 @@ buses = ["default"]
 
 [[security.grants]]
 source = "mtls"
-subject = "spiffe://karma.life/kronosdb/*"
+subject = "spiffe://example.com/kronosdb/*"
 roles = ["peer"]
 "#,
     )
@@ -503,7 +499,7 @@ roles = ["peer"]
         file.security.issuers[2].role_map["kronosdb-admin"],
         Role::Admin
     );
-    assert_eq!(file.security.grants[0].subject, "*@karma.life");
+    assert_eq!(file.security.grants[0].subject, "*@example.com");
     assert_eq!(file.security.grants[2].roles, vec![Role::Peer]);
 
     // Typos fail loudly instead of silently granting nothing.

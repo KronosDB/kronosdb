@@ -10,8 +10,8 @@ use openraft::{BasicNode, RaftMetrics};
 use crate::error::Error;
 use crate::event::Position;
 use crate::replication::client::{TailClientConfig, catch_up_to, run_tail_session};
-use crate::replication::proto as replication_proto;
-use crate::replication::proto::segment_replication_client::SegmentReplicationClient;
+use crate::wire;
+use kronosdb_protocol as p;
 
 use super::cluster::{ClusterManager, PeerConfig};
 use super::types::{NodeId, RaftRequest, RaftResponse};
@@ -402,7 +402,7 @@ impl ClusterManager {
                     epoch,
                     voters: voters.clone(),
                     recovery_claim: None,
-                    transport: self.cluster_config.peer_transport.clone(),
+                    peers: Arc::clone(&self.peers),
                 };
                 let control = Arc::clone(&self.control);
                 Some(tokio::spawn(async move {
@@ -665,6 +665,7 @@ impl ClusterManager {
                 context,
                 CursorSnapshot {
                     position: engine.local_tail().0,
+                    log_epoch: engine.log_epoch(),
                 },
             );
         }
@@ -681,21 +682,24 @@ impl ClusterManager {
             .filter(|peer| peer.id != self.cluster_config.node_id)
             .map(|peer| async move {
                 let result = async {
-                    let channel = self.cached_channel(&peer.addr).await?;
-                    let mut client = SegmentReplicationClient::new(channel)
-                        .max_decoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES);
-                    let request = self
-                        .cluster_config
-                        .peer_transport
-                        .request(replication_proto::GetCursorsRequest {})?;
-                    let response = client
-                        .get_cursors(request)
+                    let reply = self
+                        .peers
+                        .request(&peer.addr, &p::Frame::GetCursors(p::GetCursors {}))
                         .await
-                        .map_err(|error| Error::Unavailable {
-                            message: format!("query native cursors from node {}: {error}", peer.id),
-                        })?
-                        .into_inner();
+                        .map_err(|error| {
+                            wire::with_context(
+                                error,
+                                format!("query native cursors from node {}", peer.id),
+                            )
+                        })?;
+                    let Ok(p::Frame::Cursors(response)) = reply.decode() else {
+                        return Err(Error::Internal {
+                            message: format!(
+                                "node {} answered a cursor query with something else",
+                                peer.id
+                            ),
+                        });
+                    };
                     if response.node_id != peer.id {
                         return Err(Error::Unavailable {
                             message: format!(
@@ -709,12 +713,13 @@ impl ClusterManager {
                         control_epoch: response.control_epoch,
                         contexts: response
                             .contexts
-                            .into_iter()
+                            .iter()
                             .map(|cursor| {
                                 (
-                                    cursor.context,
+                                    cursor.context.to_string(),
                                     CursorSnapshot {
                                         position: cursor.durable_position,
+                                        log_epoch: cursor.log_epoch,
                                     },
                                 )
                             })
@@ -768,46 +773,34 @@ impl ClusterManager {
         }
 
         // Any live voter quorum intersects the quorum that made every prior
-        // client acknowledgement durable. Therefore at least one response has
-        // every committed byte. Pull the longest same-epoch prefix, then, after
-        // claiming, re-replicate it to a fresh quorum before opening writes.
-        let safe_tail = snapshots
+        // client acknowledgement durable, so some responder holds every
+        // committed byte. Which one is the one whose log is newest the way
+        // Raft ranks logs: by the epoch its last EpochChange names, then by
+        // length. Tails of different epochs are not comparable: a deposed
+        // leader's unacknowledged suffix is longer than the acknowledged
+        // events that replaced it. The claimant keeps its own log when it is
+        // the best, and otherwise takes the best voter's (cutting back its own
+        // suffix to where its epoch ends there, never below its watermark),
+        // then re-replicates it to a fresh quorum before opening writes.
+        let candidate = |node_id: NodeId, cursor: Option<&CursorSnapshot>| ClaimCandidate {
+            node_id,
+            log_epoch: cursor.map(|cursor| cursor.log_epoch).unwrap_or(0),
+            tail: cursor.map(|cursor| cursor.position).unwrap_or(0),
+        };
+        let local = ClaimCandidate {
+            node_id: self.cluster_config.node_id,
+            log_epoch: engine.log_epoch(),
+            tail: engine.local_tail().0,
+        };
+        let peers: Vec<_> = snapshots
             .iter()
-            .map(|snapshot| {
-                snapshot
-                    .contexts
-                    .get(context)
-                    .map(|cursor| cursor.position)
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
-        let local_tail = engine.local_tail().0;
-        if local_tail == safe_tail || safe_tail == 0 {
-            return Ok(safe_tail);
-        }
-        if local_tail > safe_tail {
-            return Err(Error::Corrupted {
-                message: format!(
-                    "local context {context} tail {local_tail} exceeds the longest voter tail {safe_tail} in epoch {prior_epoch}"
-                ),
-            });
-        }
-
-        let source = snapshots
-            .iter()
-            .find(|snapshot| {
-                snapshot.node_id != self.cluster_config.node_id
-                    && snapshot
-                        .contexts
-                        .get(context)
-                        .map(|cursor| cursor.position)
-                        .unwrap_or(0)
-                        >= safe_tail
-            })
-            .ok_or_else(|| Error::Unavailable {
-                message: format!("no voter can source context {context} through {safe_tail}"),
-            })?;
+            .filter(|snapshot| snapshot.node_id != self.cluster_config.node_id)
+            .map(|snapshot| candidate(snapshot.node_id, snapshot.contexts.get(context)))
+            .collect();
+        let source = match choose_claim_source(local, &peers) {
+            ClaimSource::Local => return Ok(local.tail),
+            ClaimSource::Peer(source) => source,
+        };
         let peer = active_voters
             .iter()
             .find(|peer| peer.id == source.node_id)
@@ -817,6 +810,15 @@ impl ClusterManager {
                     source.node_id
                 ),
             })?;
+        tracing::info!(
+            context,
+            source = source.node_id,
+            source_epoch = source.log_epoch,
+            source_tail = source.tail,
+            local_epoch = local.log_epoch,
+            local_tail = local.tail,
+            "claimant is not the newest log; taking the best voter's before claiming"
+        );
         catch_up_to(
             Arc::clone(&engine),
             TailClientConfig {
@@ -827,12 +829,47 @@ impl ClusterManager {
                 epoch: prior_epoch,
                 voters: active_voters.iter().map(|peer| peer.id).collect(),
                 recovery_claim: Some((claim_epoch, self.cluster_config.node_id)),
-                transport: self.cluster_config.peer_transport.clone(),
+                peers: Arc::clone(&self.peers),
             },
-            Position(safe_tail),
+            Position(source.tail),
         )
         .await?;
-        Ok(safe_tail)
+        Ok(source.tail)
+    }
+}
+
+/// One voter's log for a context, as far as ranking it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimCandidate {
+    node_id: NodeId,
+    /// The epoch of the newest `EpochChange` in its log.
+    log_epoch: u64,
+    /// Its next event position.
+    tail: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimSource {
+    /// The claimant's own log is the newest (or tied): it keeps it.
+    Local,
+    /// Another voter's log is newer: take it.
+    Peer(ClaimCandidate),
+}
+
+/// Picks the log a claimant builds on: the greatest `(log_epoch, tail)`,
+/// which is Raft's "last term, then index" rule with epochs for terms. A
+/// voter in a later epoch wins over one with a longer tail, because that
+/// tail is a suffix its epoch's successor has already replaced. Ties keep the
+/// claimant's own log, then the lowest node id, so the choice is stable.
+fn choose_claim_source(local: ClaimCandidate, peers: &[ClaimCandidate]) -> ClaimSource {
+    let rank = |candidate: &ClaimCandidate| (candidate.log_epoch, candidate.tail);
+    let best = peers
+        .iter()
+        .copied()
+        .min_by_key(|peer| (std::cmp::Reverse(rank(peer)), peer.node_id));
+    match best {
+        Some(best) if rank(&best) > rank(&local) => ClaimSource::Peer(best),
+        _ => ClaimSource::Local,
     }
 }
 
@@ -854,4 +891,82 @@ struct VoterCursors {
 
 struct CursorSnapshot {
     position: u64,
+    log_epoch: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn voter(node_id: NodeId, log_epoch: u64, tail: u64) -> ClaimCandidate {
+        ClaimCandidate {
+            node_id,
+            log_epoch,
+            tail,
+        }
+    }
+
+    #[test]
+    fn the_claimant_keeps_its_log_when_nobody_is_ahead() {
+        let local = voter(1, 4, 10);
+        assert_eq!(
+            choose_claim_source(local, &[voter(2, 4, 8), voter(3, 3, 12)]),
+            ClaimSource::Local,
+            "a longer tail in an older epoch is a suffix that was replaced"
+        );
+        assert_eq!(choose_claim_source(local, &[]), ClaimSource::Local);
+    }
+
+    #[test]
+    fn a_voter_with_a_longer_tail_in_the_same_epoch_is_ahead() {
+        let local = voter(1, 4, 10);
+        assert_eq!(
+            choose_claim_source(local, &[voter(2, 4, 12), voter(3, 4, 11)]),
+            ClaimSource::Peer(voter(2, 4, 12))
+        );
+    }
+
+    #[test]
+    fn a_voter_in_a_later_epoch_wins_over_a_longer_tail() {
+        // The deposed leader holds events 5 and 6 nobody acknowledged; the
+        // survivor holds one event the next leader acknowledged.
+        let deposed = voter(1, 1, 7);
+        let survivor = voter(2, 4, 6);
+        assert_eq!(
+            choose_claim_source(deposed, &[survivor]),
+            ClaimSource::Peer(survivor)
+        );
+    }
+
+    #[test]
+    fn a_longer_tail_does_not_beat_a_later_epoch_among_peers_either() {
+        let local = voter(1, 2, 5);
+        assert_eq!(
+            choose_claim_source(local, &[voter(2, 3, 5), voter(3, 2, 50)]),
+            ClaimSource::Peer(voter(2, 3, 5))
+        );
+    }
+
+    #[test]
+    fn ties_keep_the_claimants_log_and_then_the_lowest_node() {
+        let local = voter(2, 4, 10);
+        assert_eq!(
+            choose_claim_source(local, &[voter(1, 4, 10), voter(3, 4, 10)]),
+            ClaimSource::Local
+        );
+        let local = voter(1, 3, 1);
+        assert_eq!(
+            choose_claim_source(local, &[voter(3, 4, 10), voter(2, 4, 10)]),
+            ClaimSource::Peer(voter(2, 4, 10))
+        );
+    }
+
+    #[test]
+    fn a_voter_without_the_context_ranks_last() {
+        let local = voter(1, 0, 0);
+        assert_eq!(
+            choose_claim_source(local, &[voter(2, 0, 0)]),
+            ClaimSource::Local
+        );
+    }
 }

@@ -1,0 +1,13 @@
+{
+  "frame": "TopologyChange",
+  "stream": 55,
+  "flags": 0,
+  "body": {
+    "change_type": "added",
+    "message_type": "com.acme.PlaceOrder",
+    "handler_kind": "command",
+    "client_id": "billing-1@host-b",
+    "component_name": "billing"
+  },
+  "description": ""
+}

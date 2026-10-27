@@ -1,22 +1,20 @@
 //! Cluster-aware routing facade for the native event data plane.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use kronosdb_protocol as p;
 use parking_lot::RwLock;
-use tonic::transport::Channel;
 
 use crate::api::EventStore;
-use crate::append::{AppendRequest, AppendResponse};
+use crate::append::{AppendCondition, AppendRequest, AppendResponse, RecordAppend, RecordBatch};
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{Position, SequencedEvent, Tag};
 use crate::replication::control::ReplicationControl;
-use crate::replication::peer::PeerTransportConfig;
-use crate::replication::proto as replication_proto;
-use crate::replication::proto::segment_replication_client::SegmentReplicationClient;
+use crate::replication::peer::PeerPool;
 use crate::store::EventStoreEngine;
 use crate::stream::EventStream;
+use crate::wire;
 
 use super::cluster::PeerConfig;
 
@@ -28,8 +26,7 @@ pub struct NativeEngine {
     context_name: String,
     control: Arc<ReplicationControl>,
     peers: Arc<RwLock<Vec<PeerConfig>>>,
-    transport: PeerTransportConfig,
-    channels: Arc<tokio::sync::RwLock<HashMap<String, Channel>>>,
+    pool: Arc<PeerPool>,
 }
 
 impl NativeEngine {
@@ -38,34 +35,21 @@ impl NativeEngine {
         context_name: String,
         control: Arc<ReplicationControl>,
         peers: Arc<RwLock<Vec<PeerConfig>>>,
-        transport: PeerTransportConfig,
-        channels: Arc<tokio::sync::RwLock<HashMap<String, Channel>>>,
+        pool: Arc<PeerPool>,
     ) -> Self {
         Self {
             local_engine,
             context_name,
             control,
             peers,
-            transport,
-            channels,
+            pool,
         }
-    }
-
-    async fn channel(&self, address: &str) -> Result<Channel, Error> {
-        if let Some(channel) = self.channels.read().await.get(address).cloned() {
-            return Ok(channel);
-        }
-        let channel = self.transport.connect(address).await?;
-        self.channels
-            .write()
-            .await
-            .insert(address.to_string(), channel.clone());
-        Ok(channel)
     }
 
     async fn forward_append(
         &self,
-        request: AppendRequest,
+        condition: Option<&AppendCondition>,
+        batch: &RecordBatch,
         epoch: u64,
         leader_id: u64,
         system: bool,
@@ -79,129 +63,69 @@ impl NativeEngine {
             .ok_or_else(|| Error::Unavailable {
                 message: format!("claimed leader {leader_id} is absent from voter config"),
             })?;
-        let channel = self.channel(&leader.addr).await?;
-        let mut client = SegmentReplicationClient::new(channel)
-            .max_decoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::replication::PEER_MAX_MESSAGE_BYTES);
-        let request = self.transport.request(encode_forward_append(
-            &self.context_name,
+        // The records go to the leader as they are.
+        let records = wire::batch_records(batch)?;
+        let forward = p::Frame::ForwardAppend(p::ForwardAppend {
+            context: &self.context_name,
             epoch,
             leader_id,
-            request,
             system,
-        ))?;
-        let response = client
-            .forward_append(request)
+            condition: condition.map(wire::wire_condition),
+            events: records,
+        });
+        let reply = self
+            .pool
+            .request(&leader.addr, &forward)
             .await
-            .map_err(|error| Error::Unavailable {
-                message: format!("forward native append to node {leader_id}: {error}"),
-            })?
-            .into_inner();
+            .map_err(|error| {
+                wire::with_context(error, format!("forward native append to node {leader_id}"))
+            })?;
 
-        match response.result {
-            Some(replication_proto::forward_append_response::Result::Success(success)) => {
-                if success.epoch != epoch {
+        match reply.decode() {
+            Ok(p::Frame::ForwardAppended(appended)) => {
+                if appended.epoch != epoch {
                     return Err(Error::Unavailable {
                         message: format!(
                             "claimed leader changed epoch during append: sent {epoch}, received {}",
-                            success.epoch
+                            appended.epoch
                         ),
                     });
                 }
                 Ok(AppendResponse {
-                    first_position: Position(success.first_position),
-                    count: success.count,
-                    consistency_marker: Position(success.consistency_marker),
+                    first_position: Position(appended.first_position),
+                    count: appended.count,
+                    consistency_marker: Position(appended.marker),
                 })
             }
-            Some(replication_proto::forward_append_response::Result::Rejected(rejected)) => {
+            Ok(p::Frame::ForwardAppendConflict(conflict)) => {
                 Err(Error::ConsistencyConditionViolated {
-                    conflicting_position: Position(rejected.conflicting_position),
+                    conflicting_position: Position(conflict.conflicting_position),
                 })
             }
-            Some(replication_proto::forward_append_response::Result::Retry(retry)) => {
-                Err(Error::Unavailable {
-                    message: format!("native append must be retried: {}", retry.reason),
-                })
-            }
-            None => Err(Error::Internal {
-                message: "claimed leader returned an empty append response".into(),
+            Ok(p::Frame::ForwardAppendRetry(retry)) => Err(Error::Unavailable {
+                message: format!("native append must be retried: {}", retry.reason),
+            }),
+            _ => Err(Error::Internal {
+                message: "claimed leader answered a forwarded append with something else".into(),
             }),
         }
     }
 }
 
-fn encode_forward_append(
-    context: &str,
-    epoch: u64,
-    leader_id: u64,
-    request: AppendRequest,
-    system: bool,
-) -> replication_proto::ForwardAppendRequest {
-    let events = request
-        .events
-        .into_iter()
-        .map(|event| replication_proto::ForwardEvent {
-            identifier: event.identifier,
-            name: event.name,
-            version: event.version,
-            timestamp: event.timestamp,
-            payload: event.payload,
-            metadata: event
-                .metadata
-                .into_iter()
-                .map(|(key, value)| replication_proto::ForwardMetadata { key, value })
-                .collect(),
-            tags: event
-                .tags
-                .into_iter()
-                .map(|tag| replication_proto::ForwardTag {
-                    key: tag.key,
-                    value: tag.value,
-                })
-                .collect(),
-        })
-        .collect();
-    let condition = request
-        .condition
-        .map(|condition| replication_proto::ForwardCondition {
-            consistency_marker: condition.consistency_marker.0,
-            criteria: condition
-                .criteria
-                .criteria
-                .into_iter()
-                .map(|criterion| replication_proto::ForwardCriterion {
-                    names: criterion.names,
-                    tags: criterion
-                        .tags
-                        .into_iter()
-                        .map(|tag| replication_proto::ForwardTag {
-                            key: tag.key,
-                            value: tag.value,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        });
-    replication_proto::ForwardAppendRequest {
-        context: context.to_string(),
-        epoch,
-        leader_id,
-        events,
-        condition,
-        system,
-    }
+/// An append on its way to the leader.
+enum Routed {
+    /// A client's events as records.
+    Records(RecordAppend),
+    /// Events, and whether the server itself wrote them.
+    Events(AppendRequest, bool),
 }
 
 impl NativeEngine {
     /// The shared append route: leader-local staged write or forward to the
-    /// claimed leader. `system` selects the server-authored staging path
-    /// (snapshot records) over the client-checked one.
-    async fn route_append(
-        &self,
-        request: AppendRequest,
-        system: bool,
-    ) -> Result<AppendResponse, Error> {
+    /// claimed leader. Events that are `Events` with `system` set take the
+    /// server-authored staging path (snapshot records); everything else is a
+    /// client append, checked.
+    async fn route_append(&self, append: Routed) -> Result<AppendResponse, Error> {
         let claim = self.control.claim().ok_or_else(|| Error::Unavailable {
             message: "no leader has claimed the write path yet — the node is starting or \
                       an election is in progress; retry shortly"
@@ -218,24 +142,14 @@ impl NativeEngine {
                         .into(),
                 });
             }
-            // The writer-lock section runs on the blocking pool (it holds a
-            // lock for microseconds); the durability wait is awaited here so
-            // no thread is pinned for the fsync duration.
-            let engine = Arc::clone(&self.local_engine);
-            let staged = tokio::task::spawn_blocking(move || {
-                if system {
-                    engine.append_system_stage(request)
-                } else {
-                    engine.append_stage(request)
+            // The writer-lock section is staged where `StageMode` says; the
+            // durability wait is awaited, so no thread is pinned for the
+            // fsync duration.
+            let result = match append {
+                Routed::Records(request) => self.local_engine.append_records_async(request).await,
+                Routed::Events(request, system) => {
+                    self.local_engine.append_async(request, system).await
                 }
-            })
-            .await
-            .map_err(|error| Error::Internal {
-                message: format!("native append worker panicked: {error}"),
-            })?;
-            let result = match staged {
-                Ok(staged) => self.local_engine.append_finish_async(staged).await,
-                Err(error) => Err(error),
             };
             if !self.control.is_local_writable(claim.epoch, claim.leader_id) {
                 return Err(Error::Unavailable {
@@ -247,8 +161,22 @@ impl NativeEngine {
             }
             result
         } else {
-            self.forward_append(request, claim.epoch, claim.leader_id, system)
-                .await
+            let (condition, batch, system) = match append {
+                Routed::Records(request) => (request.condition, request.events, false),
+                Routed::Events(request, system) => (
+                    request.condition,
+                    RecordBatch::from_events(&request.events),
+                    system,
+                ),
+            };
+            self.forward_append(
+                condition.as_ref(),
+                &batch,
+                claim.epoch,
+                claim.leader_id,
+                system,
+            )
+            .await
         }
     }
 }
@@ -256,16 +184,24 @@ impl NativeEngine {
 #[async_trait::async_trait]
 impl EventStore for NativeEngine {
     async fn append(&self, request: AppendRequest) -> Result<AppendResponse, Error> {
+        self.append_records(RecordAppend {
+            condition: request.condition,
+            events: RecordBatch::from_events(&request.events),
+        })
+        .await
+    }
+
+    async fn append_records(&self, request: RecordAppend) -> Result<AppendResponse, Error> {
         // Checked here as well as in the leader's `append_stage` so a
         // follower rejects a reserved-namespace append before forwarding it.
         // Leader-side, the same error maps to the forward protocol's Retry
         // arm — the client would spin on a request that can never succeed.
-        crate::system::validate_client_append(&request.events)?;
+        request.events.check_client()?;
         if let Some(condition) = &request.condition {
             crate::system::validate_client_condition(&condition.criteria)?;
         }
 
-        self.route_append(request, false).await
+        self.route_append(Routed::Records(request)).await
     }
 
     fn source(
@@ -287,8 +223,23 @@ impl EventStore for NativeEngine {
             .source_page(from_position, condition, up_to, limit)
     }
 
-    fn subscribe(&self, from_position: Position, condition: SourcingCondition) -> EventStream {
-        self.local_engine.subscribe(from_position, condition)
+    fn read_records(
+        &self,
+        condition: &SourcingCondition,
+        page: &crate::store::PageBounds<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<crate::store::RecordPage, Error> {
+        self.local_engine.read_records(condition, page, out)
+    }
+
+    fn subscribe(
+        &self,
+        from_position: Position,
+        condition: SourcingCondition,
+        exclude_names: &[String],
+    ) -> EventStream {
+        self.local_engine
+            .subscribe(from_position, condition, exclude_names)
     }
 
     fn head(&self) -> Position {
@@ -330,7 +281,7 @@ impl EventStore for NativeEngine {
         // are data inside it, never a client-authored `$` event. Forwarded
         // as a system append so the leader stages it through the same seam.
         let request = crate::snapshot::append_request(&key, state, fold_position);
-        let response = self.route_append(request, true).await?;
+        let response = self.route_append(Routed::Events(request, true)).await?;
         Ok(response.first_position)
     }
 

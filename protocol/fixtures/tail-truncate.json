@@ -1,0 +1,13 @@
+{
+  "frame": "TailTruncate",
+  "stream": 69,
+  "flags": 0,
+  "body": {
+    "epoch": "8",
+    "position": "1048570",
+    "has_boundary": true,
+    "prev_record_crc": 305419896,
+    "prev_at_segment_start": false
+  },
+  "description": ""
+}
