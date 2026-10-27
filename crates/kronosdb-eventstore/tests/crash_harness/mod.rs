@@ -144,13 +144,24 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Allocates a free localhost port by binding 127.0.0.1:0 and dropping the listener.
-/// Small TOCTOU window — acceptable in a test harness.
+/// A free localhost port: bound on 127.0.0.1:0 and dropped. Another process
+/// can still take it before the server binds; that window is accepted here.
 pub fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
+    // The kernel can hand a port it just released straight back, so ports this
+    // process already gave out are skipped: two nodes must never share one.
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut given = GIVEN.lock().unwrap();
+    loop {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
 pub struct SpawnConfig {
