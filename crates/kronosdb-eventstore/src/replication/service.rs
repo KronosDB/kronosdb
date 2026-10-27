@@ -1211,10 +1211,17 @@ mod tests {
         engine.shutdown();
     }
 
+    /// Copies a node's files. A rotated segment's `.idx`/`.bloom` are written
+    /// in the background as `*.tmp` and renamed, which `shutdown` does not
+    /// wait for: those are skipped, and a copy without them rebuilds them
+    /// at open.
     fn copy_log(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
+            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
             std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
         }
     }
