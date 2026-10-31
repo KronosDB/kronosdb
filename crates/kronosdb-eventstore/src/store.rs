@@ -1274,9 +1274,10 @@ fn prepare_system_append(mut request: AppendRequest) -> Result<Prepared, Error> 
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
     pub max_segment_size: u64,
-    /// Sealed segment mmaps kept open. A wide historical scan over more
-    /// segments than this reopens and remaps files as it goes.
-    pub mmap_cache_size: usize,
+    /// Mappings of sealed segments and their indexes this store may keep,
+    /// shared with every other store holding the same budget: by default
+    /// the process's, sized from the kernel's limit (`MappingBudget::shared`).
+    pub mapping_budget: Arc<crate::cache::MappingBudget>,
     /// How sealed segments are read (prototype switch).
     pub read_mode: crate::segment::blocks::ReadMode,
     /// Memory budget of the verified block cache for sealed segments.
@@ -1309,7 +1310,7 @@ impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
-            mmap_cache_size: crate::cache::DEFAULT_MMAP_CACHE_SIZE,
+            mapping_budget: crate::cache::MappingBudget::shared(),
             read_mode: crate::segment::blocks::ReadMode::default(),
             block_cache_bytes: crate::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES,
             block_size: crate::segment::blocks::DEFAULT_BLOCK_SIZE,
@@ -1344,15 +1345,9 @@ impl StoreOptions {
     /// The block cache gets a quarter. Segment indexes take no heap budget:
     /// they are mapped, and the rest of the budget is left to the page cache
     /// that serves both them and the mapped segments.
-    pub fn auto_scaled_with_budget(sealed_segment_count: usize, budget_bytes: usize) -> Self {
-        let segments = sealed_segment_count.max(1);
-        let block_cache_bytes = budget_bytes / 4;
-
+    pub fn auto_scaled_with_budget(_sealed_segment_count: usize, budget_bytes: usize) -> Self {
         Self {
-            block_cache_bytes,
-            // Mmaps cost address space, not memory: keep every sealed
-            // segment mapped, like their indexes.
-            mmap_cache_size: segments.max(crate::cache::DEFAULT_MMAP_CACHE_SIZE),
+            block_cache_bytes: budget_bytes / 4,
             ..Self::default()
         }
     }
@@ -1577,12 +1572,12 @@ impl EventStoreEngine {
         };
         let watermark = Arc::new(WatermarkState::new(INITIAL_EPOCH, voters, 0));
         let cache = Arc::new(IndexCache::with_blocks(
-            opts.mmap_cache_size,
             crate::segment::blocks::BlockCache::new(
                 opts.block_cache_bytes,
                 opts.block_size,
                 opts.readahead_blocks,
             ),
+            Arc::clone(&opts.mapping_budget),
         ));
         writer.lock().attach_index_cache(Arc::clone(&cache));
         std::fs::create_dir_all(dir.join(merge::INDEX_DIR))?;
@@ -1728,12 +1723,12 @@ impl EventStoreEngine {
             recovered_watermark,
         ));
         let cache = Arc::new(IndexCache::with_blocks(
-            opts.mmap_cache_size,
             crate::segment::blocks::BlockCache::new(
                 opts.block_cache_bytes,
                 opts.block_size,
                 opts.readahead_blocks,
             ),
+            Arc::clone(&opts.mapping_budget),
         ));
         for (base, index) in sealed {
             cache.adopt(base, index);
@@ -4644,6 +4639,65 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// A read over more sealed segments than the old fixed cache of 100 held
+    /// maps each one once and keeps it: the next read maps nothing. With a
+    /// budget too small for them all, reads stay correct and remap instead.
+    #[test]
+    fn sealed_segments_stay_mapped_within_the_budget() {
+        for (limit, keeps_all) in [(10_000, true), (40, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let budget = crate::cache::MappingBudget::new(limit);
+            let store = EventStoreEngine::create_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 4 * 1024,
+                    mapping_budget: Arc::clone(&budget),
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            for batch in 0..500u64 {
+                let events = (0..20)
+                    .map(|i| {
+                        make_event(
+                            "OrderPlaced",
+                            vec![tag("orderId", &format!("o-{batch}-{i}"))],
+                        )
+                    })
+                    .collect();
+                store
+                    .append(AppendRequest {
+                        condition: None,
+                        events,
+                    })
+                    .unwrap();
+            }
+            let sealed = store.segments.read().sealed_count;
+            assert!(sealed > 150, "only {sealed} sealed segments");
+            let misses = || {
+                store
+                    .cache
+                    .mmap_misses
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            assert_eq!(
+                store.source(Position(0), &cond_match_all()).unwrap().len(),
+                10_000
+            );
+            let after_first = misses();
+            assert_eq!(
+                store.source(Position(0), &cond_match_all()).unwrap().len(),
+                10_000
+            );
+            if keeps_all {
+                assert_eq!(misses(), after_first, "a second read mapped segments again");
+            } else {
+                assert!(misses() > after_first);
+                assert!(budget.live() <= limit + 1, "{} mapped", budget.live());
+            }
+        }
     }
 
     #[test]

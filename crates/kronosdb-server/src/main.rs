@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the context manager and ensure a default context exists.
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
-        mmap_cache_size: kronosdb_eventstore::cache::DEFAULT_MMAP_CACHE_SIZE,
+        mapping_budget: kronosdb_eventstore::cache::MappingBudget::shared(),
         read_mode: config.read_mode,
         block_cache_bytes: config.block_cache_bytes,
         block_size: config.block_size,
