@@ -51,6 +51,11 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_READAHEAD_BLOCKS")]
     readahead_blocks: Option<usize>,
 
+    /// Bytes per second a background index merge may write (default
+    /// 64 MiB; 0 = unlimited).
+    #[arg(long, env = "KRONOSDB_INDEX_MERGE_RATE")]
+    index_merge_rate: Option<u64>,
+
     /// Maximum snapshot state size in bytes (default 4MB). Snapshot records
     /// share the log with events; oversized blobs are rejected at the RPC.
     #[arg(long, env = "KRONOSDB_MAX_SNAPSHOT_SIZE")]
@@ -272,6 +277,8 @@ struct StorageConfig {
     block_size: Option<usize>,
     #[serde(rename = "readahead-blocks")]
     readahead_blocks: Option<usize>,
+    #[serde(rename = "index-merge-rate")]
+    index_merge_rate: Option<u64>,
     #[serde(rename = "ack-mode")]
     ack_mode: Option<String>,
     #[serde(rename = "max-snapshot-size")]
@@ -440,6 +447,8 @@ pub struct ServerConfig {
     pub block_cache_bytes: usize,
     pub block_size: usize,
     pub readahead_blocks: usize,
+    /// Bytes per second a background index merge may write; 0 = unlimited.
+    pub index_merge_rate: u64,
     /// Maximum snapshot state size in bytes; larger appends are rejected.
     pub max_snapshot_size: u64,
     pub group_commit_ms: u64,
@@ -623,6 +632,10 @@ impl ServerConfig {
                 .readahead_blocks
                 .or(file_config.storage.readahead_blocks)
                 .unwrap_or(DEFAULT_READAHEAD_BLOCKS),
+            index_merge_rate: cli
+                .index_merge_rate
+                .or(file_config.storage.index_merge_rate)
+                .unwrap_or(kronosdb_eventstore::store::DEFAULT_INDEX_MERGE_RATE),
             max_snapshot_size: cli
                 .max_snapshot_size
                 .or(file_config.storage.max_snapshot_size)

@@ -89,6 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         group_commit_interval_ms: config.group_commit_ms,
         node_id,
         voters: voter_ids,
+        index_merge_rate: config.index_merge_rate,
+        background_index_merge: true,
     };
     let contexts = Arc::new(ContextManager::with_options(
         &config.data_dir,

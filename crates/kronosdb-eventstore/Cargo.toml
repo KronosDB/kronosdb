@@ -18,9 +18,6 @@ libc = "0.2"
 roaring = "0.10"
 parking_lot = "0.12"
 dashmap = "6"
-# Sealed segments' key filters. Pinned: the filter is persisted in `.idx`
-# files, so its construction and hashing are part of the file format.
-xorf = { version = "=0.13.0", default-features = false, features = ["binary-fuse"] }
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync", "rt", "fs", "io-util"] }

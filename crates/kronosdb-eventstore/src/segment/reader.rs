@@ -133,6 +133,15 @@ impl SegmentReader {
     }
 }
 
+impl SegmentReader {
+    /// The length of the record at `byte_offset`, header included, from its
+    /// header alone.
+    pub fn record_len_at(&self, byte_offset: u64) -> Result<u32, Error> {
+        let (_, _, _, body_end) = frame_at(&self.mmap, byte_offset as usize)?;
+        Ok((body_end - byte_offset as usize) as u32)
+    }
+}
+
 /// Parses the header of the record at `byte_offset`: its flags, stored CRC,
 /// and the range of its body. Nothing past the header is read.
 fn frame_at(data: &[u8], byte_offset: usize) -> Result<(u8, u32, usize, usize), Error> {

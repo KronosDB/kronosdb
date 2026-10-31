@@ -11,6 +11,7 @@ pub mod hardware;
 pub mod cache;
 pub mod context;
 pub(crate) mod inline_breaker;
+pub mod log_index;
 pub mod metrics;
 pub mod raft;
 pub mod replication;

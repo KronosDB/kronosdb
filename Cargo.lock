@@ -1984,7 +1984,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
- "xorf",
 ]
 
 [[package]]
@@ -5062,15 +5061,6 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.18",
  "time",
-]
-
-[[package]]
-name = "xorf"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f13846c9009c0e550697ddde851e934b5dfafbce757a5ef5edfdb27ea20803e"
-dependencies = [
- "libm",
 ]
 
 [[package]]
