@@ -64,7 +64,7 @@ fn batch_size_throughput(c: &mut Criterion) {
 
 /// Tests sustained throughput with segment rotation.
 /// Small segments force rotation every ~600 events, measuring the overhead
-/// of sealing a segment + building .idx/.bloom files.
+/// of sealing a segment + writing its .idx file.
 fn sustained_with_rotation(c: &mut Criterion) {
     let mut group = c.benchmark_group("append_sustained");
     group.sample_size(10);

@@ -316,13 +316,10 @@ fn print_overhead(path: &Path) -> Result<(), String> {
         stats.watermark_checkpoints, stats.watermark_checkpoint_bytes
     );
 
-    for (label, extension) in [("index", "idx"), ("bloom", "bloom")] {
-        let companion = path.with_extension(extension);
-        let bytes = std::fs::metadata(&companion)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        println!("  {label}_companion:     {bytes} bytes");
-    }
+    let index_bytes = std::fs::metadata(path.with_extension("idx"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    println!("  index_companion:     {index_bytes} bytes");
 
     Ok(())
 }

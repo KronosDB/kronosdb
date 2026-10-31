@@ -1,8 +1,12 @@
 pub mod blocks;
 pub mod crc;
+pub mod filter;
 pub mod format;
+pub mod key_table;
+pub mod query;
 pub mod reader;
 pub mod record;
+pub mod sealed_index;
 pub mod segment_index;
 pub mod writer;
 

@@ -448,8 +448,12 @@ impl SegmentWriter {
         self.serialize_buf.clear();
         let flags_byte = format::serialize_control(control, &mut self.serialize_buf);
         let payload = std::mem::take(&mut self.serialize_buf);
-        self.write_record(flags_byte, &payload)?;
+        let written = self.write_record(flags_byte, &payload);
         self.serialize_buf = payload;
+        written?;
+        // After the write, which may have rotated: the record sits in the
+        // segment that is active now, and its sealed index will carry it.
+        self.active_index.write().insert_control(*control);
         Ok(())
     }
 
@@ -492,6 +496,9 @@ impl SegmentWriter {
         let mut cursor = 0usize;
         let mut expected = first_position;
         let mut events: Vec<(usize, EventIndexFields)> = Vec::new();
+        // Control records, each with how many of the frame's events precede
+        // it, so the index records them where they sit.
+        let mut controls: Vec<(usize, format::ControlRecord)> = Vec::new();
         let mut epoch_changes = Vec::new();
         while cursor < bytes.len() {
             if bytes.len() - cursor < RECORD_HEADER_SIZE {
@@ -546,17 +553,20 @@ impl SegmentWriter {
                 }
                 expected = expected.next();
                 events.push((record_start, fields));
-            } else if flags_byte == flags::CONTROL_EPOCH_CHANGE
-                && let format::ControlRecord::EpochChange {
+            } else if flags::is_control(flags_byte) {
+                let control = format::deserialize_control(flags_byte, payload)?;
+                if let format::ControlRecord::EpochChange {
                     epoch,
                     start_position,
                     ..
-                } = format::deserialize_control(flags_byte, payload)?
-            {
-                epoch_changes.push(EpochStart {
-                    epoch,
-                    start_position,
-                });
+                } = control
+                {
+                    epoch_changes.push(EpochStart {
+                        epoch,
+                        start_position,
+                    });
+                }
+                controls.push((events.len(), control));
             }
             cursor = record_end;
         }
@@ -569,13 +579,20 @@ impl SegmentWriter {
         // a concurrent reader can never seek to an incomplete record.
         {
             let mut index = self.active_index.write();
-            for (relative_offset, fields) in &events {
+            let mut controls = controls.iter().peekable();
+            for (i, (relative_offset, fields)) in events.iter().enumerate() {
+                while let Some((_, control)) = controls.next_if(|(before, _)| *before == i) {
+                    index.insert_control(*control);
+                }
                 index.insert_event(
                     fields.position.0,
                     byte_start + *relative_offset as u64,
                     &fields.name,
                     &fields.tags,
                 );
+            }
+            for (_, control) in controls {
+                index.insert_control(*control);
             }
         }
         self.next_position = expected;

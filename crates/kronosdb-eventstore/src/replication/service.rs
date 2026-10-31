@@ -1211,7 +1211,7 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Copies a node's files. A rotated segment's `.idx`/`.bloom` are written
+    /// Copies a node's files. A rotated segment's `.idx` is written
     /// in the background as `*.tmp` and renamed, which `shutdown` does not
     /// wait for: those are skipped, and a copy without them rebuilds them
     /// at open.
@@ -1342,6 +1342,38 @@ mod tests {
             log_bytes(leader),
             "the follower is not byte-identical to the leader"
         );
+        assert_indexes_identical(leader, follower);
+    }
+
+    /// The sealed segments' indexes are byte-identical too: the follower
+    /// built its live index from replicated frames, the leader from its own
+    /// appends, and both wrote the same `.idx` at the seal. Seals land in
+    /// the background, so this waits for them.
+    fn assert_indexes_identical(leader: &Path, follower: &Path) {
+        let mut bases = segment::list_segment_files(leader).unwrap();
+        bases.pop(); // the active segment
+        let read = |dir: &Path, base: u64| {
+            std::fs::read(segment::segment_path(dir, base).with_extension("idx")).ok()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for base in bases {
+            let (ours, theirs) = loop {
+                match (read(leader, base), read(follower, base)) {
+                    (Some(ours), Some(theirs)) => break (ours, theirs),
+                    _ if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => panic!(
+                        "segment {base} sealed without an index: {:?}",
+                        (other.0.is_some(), other.1.is_some())
+                    ),
+                }
+            };
+            assert!(
+                ours == theirs,
+                "segment {base}: follower's index differs from the leader's"
+            );
+        }
     }
 
     /// The reported bug: the returning node holds two events the new leader

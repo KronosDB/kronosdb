@@ -1,7 +1,8 @@
-//! Measures bloom filter effectiveness.
+//! Measures key filter effectiveness.
 //!
-//! The bloom filter is the first line of defense against unnecessary index loads.
-//! A bloom rejection means: no .idx file loaded, no bitmap ops, no segment scan.
+//! Each sealed segment's key filter (inside its mapped .idx) is the first line
+//! of defense: a rejection means no key directory lookup, no bitmap ops, no
+//! segment read.
 //! This benchmark quantifies that savings.
 
 use criterion::{Criterion, criterion_group, criterion_main};

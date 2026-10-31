@@ -46,12 +46,8 @@ pub async fn page(State(state): State<AdminState>) -> Html<String> {
     let storage_rows = [
         setting("Segment Size", &format_bytes(config.segment_size)),
         setting(
-            "Index Cache",
-            &format!("{} entries", config.index_cache_size),
-        ),
-        setting(
-            "Bloom Cache",
-            &format!("{} entries", config.bloom_cache_size),
+            "Block Cache",
+            &format_bytes(config.block_cache_bytes as u64),
         ),
         setting("Group Commit", &format!("{}ms", config.group_commit_ms)),
     ]
