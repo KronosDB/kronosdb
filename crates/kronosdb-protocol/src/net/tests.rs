@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use super::client::{self, ConnectOptions, Credential};
+use super::rules::{DEFAULT_WINDOW, MIN_WINDOW};
 use super::server::{self, Accepted, BoxFuture, PeerInfo, ServerConfig, ServerStream, Service};
 use super::{Failure, NetError, OwnedFrame, encode};
 use crate::codec::{FLAG_END, PREFACE, Records, RecordsBuf};
@@ -59,7 +60,7 @@ impl Service for Toy {
         })
     }
 
-    fn request(&self, session: &Arc<ToySession>, mut stream: ServerStream) -> BoxFuture<()> {
+    fn request(&self, session: &Arc<ToySession>, stream: ServerStream) -> BoxFuture<()> {
         let session = Arc::clone(session);
         let self_flood = Arc::clone(&self.flood);
         Box::pin(async move {
@@ -123,28 +124,18 @@ impl Service for Toy {
                         }))
                         .await;
                 }
-                // Never sends more than it was granted; ends when cancelled.
+                // Progress after progress, as fast as the window lets it;
+                // ends when cancelled.
                 Frame::Subscribe(s) => {
                     let mut position = s.from;
-                    let mut credits = s.credits;
                     loop {
-                        while credits > 0 {
-                            position += 1;
-                            credits -= 1;
-                            if out
-                                .send(&Frame::Progress(Progress { position }))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        match stream.inbound.next().await {
-                            Some(frame) => match frame.decode() {
-                                Ok(Frame::Credit(c)) => credits += c.credits,
-                                _ => return,
-                            },
-                            None => return,
+                        position += 1;
+                        if out
+                            .send(&Frame::Progress(Progress { position }))
+                            .await
+                            .is_err()
+                        {
+                            return;
                         }
                     }
                 }
@@ -185,13 +176,13 @@ struct Harness {
 }
 
 async fn start(credential: &str, heartbeat: Duration) -> Result<Harness, NetError> {
-    start_with(credential, heartbeat, client::DEFAULT_STREAM_BUDGET).await
+    start_with(credential, heartbeat, DEFAULT_WINDOW).await
 }
 
 async fn start_with(
     credential: &str,
     heartbeat: Duration,
-    stream_budget: usize,
+    window: u32,
 ) -> Result<Harness, NetError> {
     let flood = Arc::new(Flood::default());
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -218,7 +209,7 @@ async fn start_with(
         client_name: "test".into(),
         client_id: "test-1".into(),
         credential: Credential::Token(credential.into()),
-        stream_budget,
+        window,
         ..ConnectOptions::default()
     };
     let conn = client::handshake(client_io, &options).await?;
@@ -309,48 +300,31 @@ async fn server_streams_end_with_their_last_frame() {
     assert_eq!(markers, vec![None, None, None, Some(99)]);
 }
 
+fn subscribe(from: u64) -> Frame<'static> {
+    Frame::Subscribe(Subscribe {
+        context: 0,
+        from,
+        criteria: vec![],
+        exclude_names: vec![],
+        batch_size: 0,
+        progress_interval: 0,
+    })
+}
+
 #[tokio::test]
-async fn subscriptions_honour_credit_and_cancel() {
-    let h = start("ci", Duration::from_secs(10)).await.unwrap();
-    let mut stream = h
-        .conn
-        .open(
-            &Frame::Subscribe(Subscribe {
-                context: 0,
-                from: 100,
-                criteria: vec![],
-                exclude_names: vec![],
-                credits: 2,
-                batch_size: 0,
-                progress_interval: 0,
-            }),
-            false,
-        )
+async fn subscriptions_follow_their_window_and_end_on_cancel() {
+    let h = start_with("ci", Duration::from_secs(10), MIN_WINDOW)
         .await
         .unwrap();
-    let mut seen = Vec::new();
-    for _ in 0..2 {
+    let mut stream = h.conn.open(&subscribe(100), true).await.unwrap();
+    // Far more than one window's worth arrives, in order, as it is read.
+    for expected in 101..=20_100 {
         let frame = stream.next().await.unwrap().unwrap();
         let Frame::Progress(p) = frame.decode().unwrap() else {
             panic!()
         };
-        seen.push(p.position);
+        assert_eq!(p.position, expected);
     }
-    // Out of credit: nothing more arrives until the client grants it.
-    let quiet = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
-    assert!(quiet.is_err(), "the server sent past its credit");
-    stream
-        .send(&Frame::Credit(Credit { credits: 3 }))
-        .await
-        .unwrap();
-    for _ in 0..3 {
-        let frame = stream.next().await.unwrap().unwrap();
-        let Frame::Progress(p) = frame.decode().unwrap() else {
-            panic!()
-        };
-        seen.push(p.position);
-    }
-    assert_eq!(seen, vec![101, 102, 103, 104, 105]);
 
     // Cancel is confirmed with RequestFailed(cancelled), and the connection lives on.
     stream.send_end(&Frame::Cancel(Cancel {})).await.unwrap();
@@ -508,23 +482,7 @@ async fn a_protocol_violation_closes_the_connection() {
         Arc::new(ServerConfig::default()),
         shutdown_rx,
     ));
-    let mut bytes = PREFACE.to_vec();
-    bytes.extend_from_slice(
-        &encode(
-            0,
-            0,
-            &Frame::Hello(Hello {
-                version: PROTOCOL_VERSION,
-                features: 0,
-                record_format: server::RECORD_FORMAT,
-                client_name: "",
-                client_id: "",
-                credential_kind: CredentialKind::TOKEN,
-                credential: "ci",
-            }),
-        )
-        .unwrap(),
-    );
+    let mut bytes = hello_bytes();
     // A server frame from the client.
     bytes.extend_from_slice(&encode(5, FLAG_END, &Frame::Head(Head { position: 1 })).unwrap());
     client_io.write_all(&bytes).await.unwrap();
@@ -576,32 +534,30 @@ async fn others_still_complete(conn: &client::Connection) {
     .expect("unrelated requests were held up by a stream nobody reads");
 }
 
+/// Waits until the toy's flood has stopped sending for a while; returns how
+/// many frames it sent.
+async fn settled(flood: &Flood) -> usize {
+    let mut last = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let sent = flood.sent.load(Ordering::Relaxed);
+        if sent == last {
+            return sent;
+        }
+        last = sent;
+    }
+}
+
 #[tokio::test]
-async fn an_unread_subscription_with_a_huge_window_holds_nothing_up() {
+async fn an_unread_stream_holds_nothing_up() {
     let h = start("ci", Duration::from_secs(10)).await.unwrap();
-    let credits = 100_000;
-    let mut stream = h
-        .conn
-        .open(
-            &Frame::Subscribe(Subscribe {
-                context: 0,
-                from: 0,
-                criteria: vec![],
-                exclude_names: vec![],
-                credits,
-                batch_size: 0,
-                progress_interval: 0,
-            }),
-            false,
-        )
-        .await
-        .unwrap();
-    // The server sends the whole window while nobody reads it.
+    let mut stream = h.conn.open(&subscribe(0), true).await.unwrap();
+    // The server sends a whole window while nobody reads it.
     others_still_complete(&h.conn).await;
     others_still_complete(&h.conn).await;
 
-    // Every frame of the window is there, in order, once the consumer reads.
-    for expected in 1..=credits as u64 {
+    // Every frame is there, in order, once the consumer reads.
+    for expected in 1..=100_000 {
         let frame = stream.next().await.unwrap().unwrap();
         let Frame::Progress(p) = frame.decode().unwrap() else {
             panic!()
@@ -612,55 +568,20 @@ async fn an_unread_subscription_with_a_huge_window_holds_nothing_up() {
 }
 
 #[tokio::test]
-async fn a_source_nobody_reads_is_cut_off_and_the_connection_goes_on() {
-    // Room for three frames of 30 kB, not four.
+async fn a_stream_nobody_reads_waits_at_its_window_and_is_read_whole_however_late() {
+    // Room for three frames of 30 kB and a fourth that overdraws the window.
     let h = start_with("ci", Duration::from_secs(10), 100_000)
         .await
         .unwrap();
-    let mut stream = h
-        .conn
-        .open(&flood_source(100_000, 30_000), true)
-        .await
-        .unwrap();
+    let mut stream = h.conn.open(&flood_source(200, 30_000), true).await.unwrap();
     others_still_complete(&h.conn).await;
+    assert_eq!(
+        settled(&h.flood).await,
+        4,
+        "the server sent past the window"
+    );
 
-    // The consumer comes back: what fit is there, then why the rest is not.
-    let mut read = 0;
-    let error = loop {
-        match stream.next().await {
-            Ok(Some(_)) => read += 1,
-            Ok(None) => panic!("the source cannot finish: nobody read it"),
-            Err(e) => break e,
-        }
-    };
-    assert_eq!(read, 3);
-    let failure = error.failure().unwrap();
-    assert_eq!(failure.code, ErrorCode::RESOURCE_EXHAUSTED);
-    assert!(failure.message.contains("100000-byte budget"), "{failure}");
-    // Finished: nothing more, and no second cancel.
-    assert!(stream.next().await.unwrap().is_none());
-
-    // The server was told to stop, and the connection is none the worse.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while h.flood.ended.load(Ordering::Relaxed) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the server went on sending to a stream the client cancelled");
-    assert!(h.flood.sent.load(Ordering::Relaxed) < 100_000);
-    others_still_complete(&h.conn).await;
-    assert!(!h.conn.is_closed());
-}
-
-#[tokio::test]
-async fn a_source_within_its_budget_is_read_whole_however_late() {
-    let h = start_with("ci", Duration::from_secs(10), 1 << 20)
-        .await
-        .unwrap();
-    let mut stream = h.conn.open(&flood_source(50, 10_000), true).await.unwrap();
-    others_still_complete(&h.conn).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The consumer comes back late: nothing was lost, and nothing failed.
     let mut markers = Vec::new();
     while let Some(frame) = stream.next().await.unwrap() {
         let Frame::Events(e) = frame.decode().unwrap() else {
@@ -668,40 +589,155 @@ async fn a_source_within_its_budget_is_read_whole_however_late() {
         };
         markers.push(e.marker);
     }
-    assert_eq!(markers.len(), 50);
+    assert_eq!(markers.len(), 200);
     assert_eq!(markers.last().unwrap(), &Some(99));
+    others_still_complete(&h.conn).await;
 }
 
 #[tokio::test]
-async fn a_frame_bigger_than_the_budget_still_arrives() {
-    let h = start_with("ci", Duration::from_secs(10), 1_000)
+async fn a_frame_bigger_than_the_window_still_arrives() {
+    let h = start_with("ci", Duration::from_secs(10), MIN_WINDOW)
         .await
         .unwrap();
-    let mut stream = h.conn.open(&flood_source(1, 100_000), true).await.unwrap();
-    let frame = stream.next().await.unwrap().unwrap();
-    assert!(frame.is_end());
-    assert!(stream.next().await.unwrap().is_none());
+    let mut stream = h.conn.open(&flood_source(3, 100_000), true).await.unwrap();
+    let mut frames = 0;
+    while stream.next().await.unwrap().is_some() {
+        frames += 1;
+    }
+    assert_eq!(frames, 3);
+}
+
+#[tokio::test]
+async fn a_cancelled_stream_stops_at_once() {
+    let h = start("ci", Duration::from_secs(10)).await.unwrap();
+    let stream = h
+        .conn
+        .open(&flood_source(100_000, 30_000), true)
+        .await
+        .unwrap();
+    let sent = settled(&h.flood).await;
+    assert!(
+        sent < 1_000,
+        "the server sent {sent} frames past the window"
+    );
+    stream.cancel().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.flood.ended.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the server went on with a stream the client cancelled");
+    assert_eq!(h.flood.sent.load(Ordering::Relaxed), sent);
+    others_still_complete(&h.conn).await;
+}
+
+#[tokio::test]
+async fn a_cancel_is_read_while_the_server_is_behind_on_writing() {
+    // The client opens a stream and never reads: the server fills the pipe
+    // and the stream's window and is behind. A Cancel still gets through.
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let flood = Arc::new(Flood::default());
+    let server = tokio::spawn(server::run(
+        server_io,
+        Arc::new(PeerInfo {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            certificates: vec![],
+        }),
+        Arc::new(Toy {
+            flood: Arc::clone(&flood),
+        }),
+        Arc::new(ServerConfig::default()),
+        shutdown_rx,
+    ));
+    let mut bytes = hello_bytes();
+    bytes.extend_from_slice(&encode(1, FLAG_END, &flood_source(100_000, 30_000)).unwrap());
+    let (_read_half, mut write_half) = tokio::io::split(client_io);
+    write_half.write_all(&bytes).await.unwrap();
+    settled(&flood).await;
+    assert_eq!(flood.ended.load(Ordering::Relaxed), 0);
+    let cancel = encode(1, FLAG_END, &Frame::Cancel(Cancel {})).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), write_half.write_all(&cancel))
+        .await
+        .expect("the server stopped reading")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while flood.ended.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Cancel waited behind the replies it was meant to stop");
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_older_client_is_told_to_upgrade() {
+    let error = handshake_raw(PROTOCOL_VERSION - 1, DEFAULT_WINDOW).await;
+    assert_eq!(error.code, ErrorCode::REJECTED);
+    assert!(error.message.contains("upgrade the client"), "{error}");
+}
+
+#[tokio::test]
+async fn a_window_below_the_minimum_is_refused() {
+    let error = handshake_raw(PROTOCOL_VERSION, MIN_WINDOW - 1).await;
+    assert_eq!(error.code, ErrorCode::INVALID_ARGUMENT);
+}
+
+/// A handshake the server refuses: what it said.
+async fn handshake_raw(version: u16, window: u32) -> Failure {
+    let (mut client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(server::run(
+        server_io,
+        Arc::new(PeerInfo {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            certificates: vec![],
+        }),
+        Arc::new(Toy {
+            flood: Arc::default(),
+        }),
+        Arc::new(ServerConfig::default()),
+        shutdown_rx,
+    ));
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&encode(0, 0, &hello(version, window)).unwrap());
+    client_io.write_all(&bytes).await.unwrap();
+    let mut received = Vec::new();
+    client_io.read_to_end(&mut received).await.unwrap();
+    assert!(server.await.unwrap().is_err());
+    let first = crate::codec::split_frame(&received).unwrap().unwrap();
+    let Some(Frame::RequestFailed(f)) = Frame::decode(first.header.kind, first.body).unwrap()
+    else {
+        panic!("expected RequestFailed");
+    };
+    Failure::new(f.code, f.message)
+}
+
+fn hello(version: u16, window: u32) -> Frame<'static> {
+    Frame::Hello(Hello {
+        version,
+        features: 0,
+        record_format: server::RECORD_FORMAT,
+        client_name: "",
+        client_id: "",
+        credential_kind: CredentialKind::TOKEN,
+        credential: "ci",
+        window,
+    })
+}
+
+/// The preface and a Hello, as a raw client sends them.
+fn hello_bytes() -> Vec<u8> {
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&encode(0, 0, &hello(PROTOCOL_VERSION, DEFAULT_WINDOW)).unwrap());
+    bytes
 }
 
 /// Hello and a run of GetHead requests, as one burst of bytes.
 fn raw_requests(count: u32) -> Vec<u8> {
-    let mut bytes = PREFACE.to_vec();
-    bytes.extend_from_slice(
-        &encode(
-            0,
-            0,
-            &Frame::Hello(Hello {
-                version: PROTOCOL_VERSION,
-                features: 0,
-                record_format: server::RECORD_FORMAT,
-                client_name: "",
-                client_id: "",
-                credential_kind: CredentialKind::TOKEN,
-                credential: "ci",
-            }),
-        )
-        .unwrap(),
-    );
+    let mut bytes = hello_bytes();
     for id in 1..=count {
         bytes.extend_from_slice(
             &encode(id, FLAG_END, &Frame::GetHead(GetHead { context: 0 })).unwrap(),
@@ -983,6 +1019,57 @@ mod sockets {
             }
         });
         (addr, shutdown)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_request_right_behind_a_cancel_is_answered_at_once() {
+        // A reader takes part of a stream, drops it and asks its next
+        // question at once, as a reader that wants the first N events does.
+        // The Cancel lets the server catch up; the request that came with it
+        // must not wait for the peer to send anything more.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let (tcp, peer) = listener.accept().await.unwrap();
+            let _ = tcp.set_nodelay(true);
+            server::connection(
+                tcp,
+                peer,
+                Arc::new(Toy {
+                    flood: Arc::default(),
+                }),
+                Arc::new(ServerConfig::default()),
+                shutdown_rx,
+            )
+            .await;
+        });
+        let options = ConnectOptions {
+            credential: Credential::Token("ci".into()),
+            ..ConnectOptions::default()
+        };
+        let conn = client::connect(&addr.to_string(), &options).await.unwrap();
+        for _ in 0..50 {
+            let mut stream = conn
+                .open(&flood_source(100_000, 30_000), true)
+                .await
+                .unwrap();
+            for _ in 0..300 {
+                stream.next().await.unwrap().unwrap();
+            }
+            drop(stream);
+            let started = std::time::Instant::now();
+            let answer = conn
+                .request(&Frame::GetHead(GetHead { context: 1 }))
+                .await
+                .unwrap();
+            assert_eq!(head(&answer), 1007);
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "answered after {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     async fn who(conn: &client::Connection) {

@@ -127,9 +127,9 @@ impl Peers for NativePeers {
                 .await
                 .map_err(net_fault)?;
             let (events_tx, events) = mpsc::channel(64);
-            let (credits, credits_rx) = mpsc::unbounded_channel();
-            tokio::spawn(pump_relay(stream, events_tx, credits_rx));
-            Ok(RemoteFeed { events, credits })
+            let (permits, permits_rx) = mpsc::unbounded_channel();
+            tokio::spawn(pump_relay(stream, events_tx, permits_rx));
+            Ok(RemoteFeed { events, permits })
         })
     }
 }
@@ -180,23 +180,23 @@ impl NativePeers {
 }
 
 /// Moves a relayed subscription's events from the owning node to the feed,
-/// and the subscriber's credits the other way. Ends with the first of: the
+/// and the subscriber's permits the other way. Ends with the first of: the
 /// terminal event, the feed being dropped, the connection failing.
 async fn pump_relay(
     mut stream: ClientStream,
     events: mpsc::Sender<Result<crate::hub::SubscriptionEvent, Fault>>,
-    mut credits: mpsc::UnboundedReceiver<u64>,
+    mut permits: mpsc::UnboundedReceiver<u64>,
 ) {
     loop {
         tokio::select! {
             _ = events.closed() => return,
-            grant = credits.recv() => {
+            grant = permits.recv() => {
                 let Some(mut grant) = grant else { return };
                 while grant > 0 {
                     let chunk = grant.min(u32::MAX as u64);
                     grant -= chunk;
-                    let credit = p::Frame::Credit(p::Credit { credits: chunk as u32 });
-                    if stream.send(&credit).await.is_err() {
+                    let permits = p::Frame::Permits(p::Permits { count: chunk as u32 });
+                    if stream.send(&permits).await.is_err() {
                         return;
                     }
                 }

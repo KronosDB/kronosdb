@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::codec::{
-    DecodeError, EncodeError, FRAME_HEADER_LEN, FrameHeader, encode_frame, split_frame,
+    DecodeError, EncodeError, FLAG_END, FRAME_HEADER_LEN, FrameHeader, encode_frame, split_frame,
 };
 use crate::generated::{ErrorCode, Frame, RequestFailed};
 
@@ -248,6 +248,20 @@ impl Out {
             Out::Shared { body, .. } => FRAME_HEADER_LEN + body.len(),
         }
     }
+
+    fn header(&self) -> &[u8] {
+        match self {
+            Out::Frame(b) => &b[..FRAME_HEADER_LEN],
+            Out::Shared { header, .. } => header,
+        }
+    }
+
+    /// Whether this is one of `stream`'s frames that a Cancel makes pointless:
+    /// any but the one that ends the stream, which the client still waits for.
+    fn cancelled_with(&self, stream: u32) -> bool {
+        let h = self.header();
+        u32::from_le_bytes(h[7..11].try_into().unwrap()) == stream && h[6] & FLAG_END == 0
+    }
 }
 
 pub(crate) fn shared_header(
@@ -339,6 +353,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub(crate) fn has_frame(&self) -> bool {
         self.buf.len() >= 4
             && self.buf.len() >= u32::from_le_bytes(self.buf[0..4].try_into().unwrap()) as usize + 4
+    }
+
+    /// The kind of the next frame, once all of it is buffered.
+    pub(crate) fn peek_kind(&self) -> Option<u16> {
+        (self.buf.len() >= 6 && self.has_frame())
+            .then(|| u16::from_le_bytes(self.buf[4..6].try_into().unwrap()))
     }
 
     /// The next complete frame already buffered, if any.

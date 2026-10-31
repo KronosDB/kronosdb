@@ -87,7 +87,7 @@ pub enum ToQueryHandler {
     CancelQuery { request_id: String },
     /// A subscription query to answer with an initial result and updates.
     Subscription(Arc<SubscriptionQuery>),
-    /// The subscriber granted more update credits.
+    /// The subscriber granted more update permits.
     SubscriptionPermits {
         subscription_id: String,
         permits: u64,

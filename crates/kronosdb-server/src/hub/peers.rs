@@ -21,8 +21,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct RemoteFeed {
     /// What the handler produced, in order. Closes when the relay ends.
     pub events: mpsc::Receiver<Result<SubscriptionEvent, Fault>>,
-    /// Update credits the subscriber granted, to pass on to the owner.
-    pub credits: mpsc::UnboundedSender<u64>,
+    /// Update permits the subscriber granted, to pass on to the owner.
+    pub permits: mpsc::UnboundedSender<u64>,
 }
 
 /// One node's share of a query.

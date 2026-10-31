@@ -8,7 +8,7 @@ import java.util.List;
 /**
  * A subscription query for a handler connected to this node, from another
  * node. Answered with SubscriptionQueryEvent frames; the opening node
- * grants credits with Credit and ends it with Cancel.
+ * grants update Permits and ends it with Cancel.
  *
  * @param bus the bus
  * @param targetClientId the target client id

@@ -163,7 +163,7 @@ class ConformanceTest {
 
     @Test
     void enumsKeepValuesThisVersionDoesNotKnow() {
-        Hello hello = new Hello(1, 0, 3, "c", "id", CredentialKind.of(9), "");
+        Hello hello = new Hello(2, 0, 3, "c", "id", CredentialKind.of(9), "", 65536);
         byte[] bin = encoded(hello);
         Hello back = (Hello) decoded(bin);
         assertEquals(9, back.credentialKind().value());
@@ -192,8 +192,8 @@ class ConformanceTest {
     void valuesOutsideTheirFieldAreRefused() {
         Writer w = new Writer();
         assertThrows(ProtocolException.class, () -> new ContextBound(70_000).encode(w));
-        assertThrows(ProtocolException.class, () -> new Credit(-1).encode(w));
-        assertThrows(ProtocolException.class, () -> new Credit(1L << 32).encode(w));
+        assertThrows(ProtocolException.class, () -> new Window(-1).encode(w));
+        assertThrows(ProtocolException.class, () -> new Window(1L << 32).encode(w));
         assertEquals(0, w.position());
     }
 

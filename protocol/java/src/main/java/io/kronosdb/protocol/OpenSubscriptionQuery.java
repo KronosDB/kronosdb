@@ -7,8 +7,8 @@ import java.util.List;
 
 /**
  * Opens a subscription query: an initial result, then updates as the
- * handler sends them, then a completion. The client grants update credits
- * with Credit and ends the subscription with Cancel.
+ * handler sends them, then a completion. The client grants more updates
+ * with Permits and ends the subscription with Cancel.
  *
  * @param bus the bus
  * @param subscription the subscription

@@ -189,6 +189,7 @@ export function HelloToJson(v: P.Hello): J {
     client_id: v.clientId,
     credential_kind: (CredentialKindNames[v.credentialKind] ?? v.credentialKind),
     credential: v.credential,
+    window: v.window,
   };
 }
 
@@ -201,6 +202,7 @@ export function HelloFromJson(j: J): P.Hello {
     clientId: String(j.client_id),
     credentialKind: enumFromJson(P.CredentialKind, j.credential_kind),
     credential: String(j.credential),
+    window: Number(j.window),
   };
 }
 
@@ -354,6 +356,30 @@ export function CancelFromJson(j: J): P.Cancel {
   };
 }
 
+export function WindowToJson(v: P.Window): J {
+  return {
+    bytes: v.bytes,
+  };
+}
+
+export function WindowFromJson(j: J): P.Window {
+  return {
+    bytes: Number(j.bytes),
+  };
+}
+
+export function PermitsToJson(v: P.Permits): J {
+  return {
+    count: v.count,
+  };
+}
+
+export function PermitsFromJson(j: J): P.Permits {
+  return {
+    count: Number(j.count),
+  };
+}
+
 export function RequestFailedToJson(v: P.RequestFailed): J {
   return {
     code: (ErrorCodeNames[v.code] ?? v.code),
@@ -450,7 +476,6 @@ export function SubscribeToJson(v: P.Subscribe): J {
     from: v.from.toString(),
     criteria: v.criteria.map((x) => CriterionToJson(x)),
     exclude_names: v.excludeNames.map((x) => x),
-    credits: v.credits,
     batch_size: v.batchSize,
     progress_interval: v.progressInterval,
   };
@@ -462,21 +487,8 @@ export function SubscribeFromJson(j: J): P.Subscribe {
     from: BigInt(j.from),
     criteria: (j.criteria as unknown[]).map((x) => CriterionFromJson(x)),
     excludeNames: (j.exclude_names as unknown[]).map((x) => String(x)),
-    credits: Number(j.credits),
     batchSize: Number(j.batch_size),
     progressInterval: Number(j.progress_interval),
-  };
-}
-
-export function CreditToJson(v: P.Credit): J {
-  return {
-    credits: v.credits,
-  };
-}
-
-export function CreditFromJson(j: J): P.Credit {
-  return {
-    credits: Number(j.credits),
   };
 }
 
@@ -2080,6 +2092,8 @@ export function frameBodyToJson(frame: Frame): J {
     case "ContextBound": return ContextBoundToJson(frame.body);
     case "GoAway": return GoAwayToJson(frame.body);
     case "Cancel": return CancelToJson(frame.body);
+    case "Window": return WindowToJson(frame.body);
+    case "Permits": return PermitsToJson(frame.body);
     case "RequestFailed": return RequestFailedToJson(frame.body);
     case "Append": return AppendToJson(frame.body);
     case "Appended": return AppendedToJson(frame.body);
@@ -2087,7 +2101,6 @@ export function frameBodyToJson(frame: Frame): J {
     case "Source": return SourceToJson(frame.body);
     case "Events": return EventsToJson(frame.body);
     case "Subscribe": return SubscribeToJson(frame.body);
-    case "Credit": return CreditToJson(frame.body);
     case "Progress": return ProgressToJson(frame.body);
     case "GetHead": return GetHeadToJson(frame.body);
     case "Head": return HeadToJson(frame.body);
@@ -2191,6 +2204,8 @@ export function frameFromJson(name: string, body: J): Frame {
     case "ContextBound": return { name: "ContextBound", body: ContextBoundFromJson(body) };
     case "GoAway": return { name: "GoAway", body: GoAwayFromJson(body) };
     case "Cancel": return { name: "Cancel", body: CancelFromJson(body) };
+    case "Window": return { name: "Window", body: WindowFromJson(body) };
+    case "Permits": return { name: "Permits", body: PermitsFromJson(body) };
     case "RequestFailed": return { name: "RequestFailed", body: RequestFailedFromJson(body) };
     case "Append": return { name: "Append", body: AppendFromJson(body) };
     case "Appended": return { name: "Appended", body: AppendedFromJson(body) };
@@ -2198,7 +2213,6 @@ export function frameFromJson(name: string, body: J): Frame {
     case "Source": return { name: "Source", body: SourceFromJson(body) };
     case "Events": return { name: "Events", body: EventsFromJson(body) };
     case "Subscribe": return { name: "Subscribe", body: SubscribeFromJson(body) };
-    case "Credit": return { name: "Credit", body: CreditFromJson(body) };
     case "Progress": return { name: "Progress", body: ProgressFromJson(body) };
     case "GetHead": return { name: "GetHead", body: GetHeadFromJson(body) };
     case "Head": return { name: "Head", body: HeadFromJson(body) };

@@ -6,9 +6,9 @@
 use crate::codec::*;
 
 /// The protocol version this code speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// CRC32C of the schema source, for checking generated code is in sync.
-pub const SCHEMA_HASH: &str = "a65e0eff";
+pub const SCHEMA_HASH: &str = "56aaeb68";
 
 /// Why a request failed. Unknown codes must be treated as `internal`.
 ///
@@ -676,9 +676,9 @@ impl<'a> Schedule<'a> {
 pub struct Hello<'a> {
     /// Highest protocol version the client speaks.
     pub version: u16,
-    /// Feature bits the client would like to use. None are defined in version 1.
+    /// Feature bits the client would like to use. None are defined in version 2.
     pub features: u64,
-    /// Stored record layout the client decodes. Version 1 knows layout 3.
+    /// Stored record layout the client decodes. Version 2 knows layout 3.
     pub record_format: u8,
     /// Application name, shown in the admin console.
     pub client_name: &'a str,
@@ -686,6 +686,9 @@ pub struct Hello<'a> {
     pub client_id: &'a str,
     pub credential_kind: CredentialKind,
     pub credential: &'a str,
+    /// Each stream's window: the bytes of frames the server may send on a
+    /// stream before the client grants more with Window. At least 64 KiB.
+    pub window: u32,
 }
 
 impl<'a> Hello<'a> {
@@ -700,6 +703,7 @@ impl<'a> Hello<'a> {
             client_id: r.str16()?,
             credential_kind: CredentialKind(r.u8()?),
             credential: r.str32()?,
+            window: r.u32()?,
         })
     }
 
@@ -718,6 +722,8 @@ impl<'a> Hello<'a> {
         put_u8(w, credential_kind.0);
         let credential = &self.credential;
         put_str32(w, credential, "Hello.credential")?;
+        let window = &self.window;
+        put_u32(w, *window);
         Ok(())
     }
 
@@ -739,6 +745,8 @@ impl<'a> Hello<'a> {
         m.insert("credential_kind".into(), credential_kind.to_json());
         let credential = &self.credential;
         m.insert("credential".into(), serde_json::json!(*credential));
+        let window = &self.window;
+        m.insert("window".into(), serde_json::json!(*window));
         serde_json::Value::Object(m)
     }
 }
@@ -1104,8 +1112,9 @@ impl<'a> GoAway<'a> {
     }
 }
 
-/// Ends a stream the client opened. The server answers with RequestFailed
-/// with code `cancelled` unless the stream already ended.
+/// Ends a stream the client opened. The server sends nothing more on it but
+/// a RequestFailed with code `cancelled`, unless the stream already ended.
+/// May follow the client's END.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cancel {}
 
@@ -1124,6 +1133,67 @@ impl Cancel {
     pub fn to_json(&self) -> serde_json::Value {
         #[allow(unused_mut)]
         let mut m = serde_json::Map::new();
+        serde_json::Value::Object(m)
+    }
+}
+
+/// Grants the server `bytes` more of the stream's window: the client has
+/// consumed that much of what the server sent. May follow the client's END.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    pub bytes: u32,
+}
+
+impl Window {
+    pub const KIND: u16 = 0x0009;
+
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self { bytes: r.u32()? })
+    }
+
+    pub fn encode(&self, w: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = &self.bytes;
+        put_u32(w, *bytes);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn to_json(&self) -> serde_json::Value {
+        #[allow(unused_mut)]
+        let mut m = serde_json::Map::new();
+        let bytes = &self.bytes;
+        m.insert("bytes".into(), serde_json::json!(*bytes));
+        serde_json::Value::Object(m)
+    }
+}
+
+/// Grants `count` more messages on a stream whose messages are counted: the
+/// commands or queries a handler stream takes, or the updates a subscription
+/// query accepts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Permits {
+    pub count: u32,
+}
+
+impl Permits {
+    pub const KIND: u16 = 0x000a;
+
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self { count: r.u32()? })
+    }
+
+    pub fn encode(&self, w: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let count = &self.count;
+        put_u32(w, *count);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn to_json(&self) -> serde_json::Value {
+        #[allow(unused_mut)]
+        let mut m = serde_json::Map::new();
+        let count = &self.count;
+        m.insert("count".into(), serde_json::json!(*count));
         serde_json::Value::Object(m)
     }
 }
@@ -1422,8 +1492,7 @@ impl<'a> Events<'a> {
 }
 
 /// Opens a live subscription from `from`. The server sends Events frames as
-/// matching events become durable, never more events than the client has
-/// granted credits for.
+/// matching events become durable, as far as the stream's window allows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Subscribe<'a> {
     pub context: u16,
@@ -1432,8 +1501,7 @@ pub struct Subscribe<'a> {
     pub criteria: Vec<Criterion<'a>>,
     /// Events of these types are skipped even when the criteria match.
     pub exclude_names: Vec<&'a str>,
-    /// Events the server may send before the first Credit frame.
-    pub credits: u32,
+    /// Most events per frame; 0 lets the server choose.
     pub batch_size: u32,
     /// Send a Progress frame at most this often while nothing matches; 0
     /// disables them.
@@ -1463,7 +1531,6 @@ impl<'a> Subscribe<'a> {
                 }
                 v0
             },
-            credits: r.u32()?,
             batch_size: r.u32()?,
             progress_interval: r.u32()?,
         })
@@ -1484,8 +1551,6 @@ impl<'a> Subscribe<'a> {
         for item0 in exclude_names.iter() {
             put_str16(w, item0, "Subscribe.exclude_names")?;
         }
-        let credits = &self.credits;
-        put_u32(w, *credits);
         let batch_size = &self.batch_size;
         put_u32(w, *batch_size);
         let progress_interval = &self.progress_interval;
@@ -1516,8 +1581,6 @@ impl<'a> Subscribe<'a> {
                     .collect(),
             ),
         );
-        let credits = &self.credits;
-        m.insert("credits".into(), serde_json::json!(*credits));
         let batch_size = &self.batch_size;
         m.insert("batch_size".into(), serde_json::json!(*batch_size));
         let progress_interval = &self.progress_interval;
@@ -1525,36 +1588,6 @@ impl<'a> Subscribe<'a> {
             "progress_interval".into(),
             serde_json::json!(*progress_interval),
         );
-        serde_json::Value::Object(m)
-    }
-}
-
-/// Grants the server this many more events on a subscription, updates on a
-/// subscription query, or messages on a handler stream.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Credit {
-    pub credits: u32,
-}
-
-impl Credit {
-    pub const KIND: u16 = 0x0103;
-
-    pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Ok(Self { credits: r.u32()? })
-    }
-
-    pub fn encode(&self, w: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let credits = &self.credits;
-        put_u32(w, *credits);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn to_json(&self) -> serde_json::Value {
-        #[allow(unused_mut)]
-        let mut m = serde_json::Map::new();
-        let credits = &self.credits;
-        m.insert("credits".into(), serde_json::json!(*credits));
         serde_json::Value::Object(m)
     }
 }
@@ -2955,10 +2988,10 @@ impl<'a> CommandResponse<'a> {
 }
 
 /// Opens a command handler stream. The client then subscribes to command
-/// types and grants the server credits; the server sends commands, at most
-/// one per credit, and the client answers each with CommandHandled. Credits
-/// belong to the stream, not to a command type: one credit is one command of
-/// any type the stream handles, and credits granted before the first
+/// types and grants the server Permits; the server sends commands, at most
+/// one per permit, and the client answers each with CommandHandled. Permits
+/// belong to the stream, not to a command type: one permit is one command of
+/// any type the stream handles, and permits granted before the first
 /// subscription count. Closing the stream unsubscribes everything it
 /// subscribed.
 #[derive(Debug, Clone, PartialEq)]
@@ -3754,7 +3787,7 @@ impl<'a> QueryPermits<'a> {
 pub struct SubscriptionQuery<'a> {
     pub subscription_id: &'a str,
     pub query: Query<'a>,
-    /// Updates the handler may send before the first credit.
+    /// Updates the handler may send before the subscriber grants more.
     pub permits: u64,
 }
 
@@ -3795,8 +3828,8 @@ impl<'a> SubscriptionQuery<'a> {
 }
 
 /// Opens a subscription query: an initial result, then updates as the
-/// handler sends them, then a completion. The client grants update credits
-/// with Credit and ends the subscription with Cancel.
+/// handler sends them, then a completion. The client grants more updates
+/// with Permits and ends the subscription with Cancel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenSubscriptionQuery<'a> {
     pub bus: u16,
@@ -3864,7 +3897,7 @@ impl<'a> HandleSubscriptionQuery<'a> {
     }
 }
 
-/// The subscriber granted more update credits.
+/// The subscriber granted more updates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubscriptionQueryPermits<'a> {
     pub subscription_id: &'a str,
@@ -6272,7 +6305,7 @@ impl<'a> ForwardQuery<'a> {
 
 /// A subscription query for a handler connected to this node, from another
 /// node. Answered with SubscriptionQueryEvent frames; the opening node
-/// grants credits with Credit and ends it with Cancel.
+/// grants update Permits and ends it with Cancel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelaySubscription<'a> {
     pub bus: &'a str,
@@ -6333,6 +6366,8 @@ pub enum Frame<'a> {
     ContextBound(ContextBound),
     GoAway(GoAway<'a>),
     Cancel(Cancel),
+    Window(Window),
+    Permits(Permits),
     RequestFailed(RequestFailed<'a>),
     Append(Append<'a>),
     Appended(Appended),
@@ -6340,7 +6375,6 @@ pub enum Frame<'a> {
     Source(Source<'a>),
     Events(Events<'a>),
     Subscribe(Subscribe<'a>),
-    Credit(Credit),
     Progress(Progress),
     GetHead(GetHead),
     Head(Head),
@@ -6444,6 +6478,8 @@ impl<'a> Frame<'a> {
             Frame::ContextBound(_) => ContextBound::KIND,
             Frame::GoAway(_) => GoAway::KIND,
             Frame::Cancel(_) => Cancel::KIND,
+            Frame::Window(_) => Window::KIND,
+            Frame::Permits(_) => Permits::KIND,
             Frame::RequestFailed(_) => RequestFailed::KIND,
             Frame::Append(_) => Append::KIND,
             Frame::Appended(_) => Appended::KIND,
@@ -6451,7 +6487,6 @@ impl<'a> Frame<'a> {
             Frame::Source(_) => Source::KIND,
             Frame::Events(_) => Events::KIND,
             Frame::Subscribe(_) => Subscribe::KIND,
-            Frame::Credit(_) => Credit::KIND,
             Frame::Progress(_) => Progress::KIND,
             Frame::GetHead(_) => GetHead::KIND,
             Frame::Head(_) => Head::KIND,
@@ -6555,6 +6590,8 @@ impl<'a> Frame<'a> {
             Frame::ContextBound(_) => "ContextBound",
             Frame::GoAway(_) => "GoAway",
             Frame::Cancel(_) => "Cancel",
+            Frame::Window(_) => "Window",
+            Frame::Permits(_) => "Permits",
             Frame::RequestFailed(_) => "RequestFailed",
             Frame::Append(_) => "Append",
             Frame::Appended(_) => "Appended",
@@ -6562,7 +6599,6 @@ impl<'a> Frame<'a> {
             Frame::Source(_) => "Source",
             Frame::Events(_) => "Events",
             Frame::Subscribe(_) => "Subscribe",
-            Frame::Credit(_) => "Credit",
             Frame::Progress(_) => "Progress",
             Frame::GetHead(_) => "GetHead",
             Frame::Head(_) => "Head",
@@ -6670,6 +6706,8 @@ impl<'a> Frame<'a> {
             ContextBound::KIND => Frame::ContextBound(ContextBound::decode(r)?),
             GoAway::KIND => Frame::GoAway(GoAway::decode(r)?),
             Cancel::KIND => Frame::Cancel(Cancel::decode(r)?),
+            Window::KIND => Frame::Window(Window::decode(r)?),
+            Permits::KIND => Frame::Permits(Permits::decode(r)?),
             RequestFailed::KIND => Frame::RequestFailed(RequestFailed::decode(r)?),
             Append::KIND => Frame::Append(Append::decode(r)?),
             Appended::KIND => Frame::Appended(Appended::decode(r)?),
@@ -6677,7 +6715,6 @@ impl<'a> Frame<'a> {
             Source::KIND => Frame::Source(Source::decode(r)?),
             Events::KIND => Frame::Events(Events::decode(r)?),
             Subscribe::KIND => Frame::Subscribe(Subscribe::decode(r)?),
-            Credit::KIND => Frame::Credit(Credit::decode(r)?),
             Progress::KIND => Frame::Progress(Progress::decode(r)?),
             GetHead::KIND => Frame::GetHead(GetHead::decode(r)?),
             Head::KIND => Frame::Head(Head::decode(r)?),
@@ -6806,6 +6843,8 @@ impl<'a> Frame<'a> {
             Frame::ContextBound(f) => f.encode(w),
             Frame::GoAway(f) => f.encode(w),
             Frame::Cancel(f) => f.encode(w),
+            Frame::Window(f) => f.encode(w),
+            Frame::Permits(f) => f.encode(w),
             Frame::RequestFailed(f) => f.encode(w),
             Frame::Append(f) => f.encode(w),
             Frame::Appended(f) => f.encode(w),
@@ -6813,7 +6852,6 @@ impl<'a> Frame<'a> {
             Frame::Source(f) => f.encode(w),
             Frame::Events(f) => f.encode(w),
             Frame::Subscribe(f) => f.encode(w),
-            Frame::Credit(f) => f.encode(w),
             Frame::Progress(f) => f.encode(w),
             Frame::GetHead(f) => f.encode(w),
             Frame::Head(f) => f.encode(w),
@@ -6918,6 +6956,8 @@ impl<'a> Frame<'a> {
             Frame::ContextBound(f) => f.to_json(),
             Frame::GoAway(f) => f.to_json(),
             Frame::Cancel(f) => f.to_json(),
+            Frame::Window(f) => f.to_json(),
+            Frame::Permits(f) => f.to_json(),
             Frame::RequestFailed(f) => f.to_json(),
             Frame::Append(f) => f.to_json(),
             Frame::Appended(f) => f.to_json(),
@@ -6925,7 +6965,6 @@ impl<'a> Frame<'a> {
             Frame::Source(f) => f.to_json(),
             Frame::Events(f) => f.to_json(),
             Frame::Subscribe(f) => f.to_json(),
-            Frame::Credit(f) => f.to_json(),
             Frame::Progress(f) => f.to_json(),
             Frame::GetHead(f) => f.to_json(),
             Frame::Head(f) => f.to_json(),

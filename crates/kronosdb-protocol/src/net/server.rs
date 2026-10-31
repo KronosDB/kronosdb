@@ -12,14 +12,14 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
@@ -31,7 +31,7 @@ use super::{
 };
 use crate::codec::{FLAG_END, PREFACE};
 use crate::generated::{
-    ErrorCode, Frame, GoAway, Hello, PROTOCOL_VERSION, Pong, ServerPing, Welcome,
+    ErrorCode, Frame, GoAway, Hello, PROTOCOL_VERSION, Pong, ServerPing, Welcome, Window,
 };
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -98,12 +98,61 @@ impl Default for ServerConfig {
     }
 }
 
+/// A stream's window, and whether the client cancelled the stream: granted
+/// and cancelled by the connection, spent by the stream's senders.
+struct Flow {
+    /// Bytes the stream may still send; below zero once a frame overdrew it.
+    window: AtomicI64,
+    cancelled: AtomicBool,
+    changed: Notify,
+}
+
+impl Flow {
+    fn new(window: u32) -> Self {
+        Self {
+            window: AtomicI64::new(window as i64),
+            cancelled: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    fn grant(&self, bytes: u32) {
+        self.window.fetch_add(bytes as i64, Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    /// Spends `len` bytes, waiting while nothing is left. A frame may
+    /// overdraw what is left, so one bigger than the whole window still goes.
+    /// Fails once the client cancelled: nothing more is sent on the stream.
+    async fn spend(&self, len: usize) -> Result<(), NetError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(NetError::Closed);
+            }
+            if self.window.load(Ordering::Acquire) > 0 {
+                self.window.fetch_sub(len as i64, Ordering::AcqRel);
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+}
+
 /// Answers one request. Cloneable, so a request can answer from several tasks.
 #[derive(Clone)]
 pub struct StreamSender {
     id: u32,
     tx: OutTx,
     ended: Arc<AtomicBool>,
+    flow: Arc<Flow>,
 }
 
 impl StreamSender {
@@ -111,13 +160,19 @@ impl StreamSender {
         self.id
     }
 
+    /// Queues a frame once the stream's window allows it. The frame that ends
+    /// the stream never waits for the window, so a stream can always be ended;
+    /// any other fails once the stream ended or the client cancelled it.
     async fn push(&self, out: Out, end: bool) -> Result<(), NetError> {
         if end {
             if self.ended.swap(true, Ordering::AcqRel) {
                 return Err(NetError::Closed);
             }
-        } else if self.ended.load(Ordering::Acquire) {
-            return Err(NetError::Closed);
+        } else {
+            if self.ended.load(Ordering::Acquire) {
+                return Err(NetError::Closed);
+            }
+            self.flow.spend(out.len()).await?;
         }
         self.tx.push(out).await
     }
@@ -156,6 +211,11 @@ impl StreamSender {
 
     pub fn has_finished(&self) -> bool {
         self.ended.load(Ordering::Acquire)
+    }
+
+    /// Whether the client cancelled the stream.
+    pub fn is_cancelled(&self) -> bool {
+        self.flow.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -219,6 +279,7 @@ struct Entry {
     inbound: Option<mpsc::Sender<OwnedFrame>>,
     cancel: watch::Sender<bool>,
     flags: Arc<Flags>,
+    flow: Arc<Flow>,
 }
 
 /// A frame for a stream whose inbound queue was full: reading waits for room.
@@ -273,7 +334,8 @@ const FRAMES_PER_TURN: usize = 128;
 const TURN_BUDGET: Duration = Duration::from_micros(500);
 /// More queued replies are moved into the write buffer only below this.
 const WRITE_TARGET: usize = 256 * 1024;
-/// Reading pauses while this much is waiting to be written, so a peer that
+/// Past this much waiting to be written the connection is behind: it reads
+/// only the frames [`rules::read_while_behind`] lets through, so a peer that
 /// does not read cannot make the server buffer without bound.
 const READ_PAUSE: usize = 1024 * 1024;
 /// How long a closing connection may take to flush its last replies.
@@ -433,8 +495,8 @@ where
     let mut reader = FrameReader::new(r, config.max_frame);
 
     let handshake = handshake(&mut reader, &outbox, &service, peer, &config);
-    let session = match tokio::time::timeout(config.handshake_timeout, handshake).await {
-        Ok(Ok(accepted)) => accepted.session,
+    let (session, window) = match tokio::time::timeout(config.handshake_timeout, handshake).await {
+        Ok(Ok((accepted, window))) => (accepted.session, window),
         Ok(Err(e)) => {
             // The refusal is queued: let it out before closing.
             let farewell = farewell(&outbox, &mut wbuf, &mut taken, &mut w);
@@ -470,7 +532,11 @@ where
             break Err(e.into());
         }
         // Everything already buffered first: one read often holds many frames.
+        // Behind on writing, only the frames that cut work (a Cancel, a
+        // Window) are taken; the first other one waits until the replies
+        // queued ahead of it are out.
         let mut over_budget = false;
+        let behind = !taken.is_empty() || wbuf.pending() >= READ_PAUSE;
         if stalled.is_none() {
             let mut budget = FRAMES_PER_TURN;
             let mut traffic = false;
@@ -478,6 +544,9 @@ where
             loop {
                 if budget == 0 || spent > TURN_BUDGET {
                     over_budget = reader.has_frame();
+                    break;
+                }
+                if behind && !reader.peek_kind().is_some_and(rules::read_while_behind) {
                     break;
                 }
                 let frame = match reader.buffered() {
@@ -512,7 +581,27 @@ where
                     ServerRoute::Cancel => {
                         if let Some(entry) = streams.get_mut(&id) {
                             entry.inbound = None;
+                            entry.flow.cancel();
                             let _ = entry.cancel.send(true);
+                            // What it queued is not sent: the client stopped
+                            // reading it, and it would hold up every other
+                            // stream on the way out.
+                            outbox.discard(id);
+                            taken.retain(|out| !out.cancelled_with(id));
+                        }
+                    }
+                    ServerRoute::Window => {
+                        let bytes = match frame.decode() {
+                            Ok(Frame::Window(Window { bytes })) => bytes,
+                            _ => {
+                                break 'conn Err(NetError::Unexpected {
+                                    kind: frame.kind(),
+                                    context: "as a Window",
+                                });
+                            }
+                        };
+                        if let Some(entry) = streams.get(&id) {
+                            entry.flow.grant(bytes);
                         }
                     }
                     ServerRoute::Deliver => {
@@ -561,10 +650,12 @@ where
                         let (cancel_tx, cancel_rx) = watch::channel(false);
                         let mut cancelled = cancel_tx.subscribe();
                         let flags = Arc::new(Flags::default());
+                        let flow = Arc::new(Flow::new(window));
                         let out = StreamSender {
                             id,
                             tx: outbox.sender(),
                             ended: Arc::new(AtomicBool::new(false)),
+                            flow: Arc::clone(&flow),
                         };
                         let stream = ServerStream {
                             request: frame,
@@ -612,6 +703,7 @@ where
                                     inbound: inbound_tx,
                                     cancel: cancel_tx,
                                     flags,
+                                    flow,
                                 },
                             );
                         }
@@ -671,7 +763,15 @@ where
             continue;
         }
 
-        let can_read = stalled.is_none() && taken.is_empty() && wbuf.pending() < READ_PAUSE;
+        let behind = !taken.is_empty() || wbuf.pending() >= READ_PAUSE;
+        if !behind && stalled.is_none() && reader.has_frame() {
+            // Caught up, with a frame that waited for it already here (the
+            // request that came in behind a Cancel): take it now, not once
+            // the peer sends more.
+            continue;
+        }
+        // Behind, reading goes on until a frame that has to wait is whole.
+        let can_read = stalled.is_none() && !(behind && reader.has_frame());
         // Not `biased`. Replies are already flushed above, so the write arm
         // is ready only while the socket is full. With it listed first, a
         // stream whose handler keeps the queue full and a peer that keeps
@@ -775,7 +875,7 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
     service: &Arc<S>,
     peer: Arc<PeerInfo>,
     config: &ServerConfig,
-) -> Result<Accepted<S::Session>, NetError> {
+) -> Result<(Accepted<S::Session>, u32), NetError> {
     let preface = reader.read_exact(PREFACE.len()).await?;
     if preface.as_ref() != PREFACE {
         return Err(NetError::Unexpected {
@@ -800,10 +900,6 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
             context: "before Hello",
         });
     }
-    let (version, record_format) = match hello.decode()? {
-        Frame::Hello(h) => (h.version, h.record_format),
-        _ => unreachable!("checked the kind"),
-    };
     let refuse = |failure: Failure| {
         control(
             outbox,
@@ -811,13 +907,33 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
             FLAG_END,
             &Frame::RequestFailed(failure.to_frame()),
         );
-        Err::<Accepted<S::Session>, NetError>(NetError::Failed(failure))
+        Err::<(Accepted<S::Session>, u32), NetError>(NetError::Failed(failure))
+    };
+    // The version first, from its own two bytes: an older Hello may not
+    // decode as this version's, and its client deserves to be told why.
+    let version = match hello.body() {
+        [a, b, ..] => u16::from_le_bytes([*a, *b]),
+        _ => 0,
     };
     if version < PROTOCOL_VERSION {
         return refuse(Failure::new(
             ErrorCode::REJECTED,
             format!(
-                "protocol version {version} is not supported; this server speaks {PROTOCOL_VERSION}"
+                "protocol version {version} is not supported; this server speaks \
+                 {PROTOCOL_VERSION}: upgrade the client"
+            ),
+        ));
+    }
+    let (record_format, window) = match hello.decode()? {
+        Frame::Hello(h) => (h.record_format, h.window),
+        _ => unreachable!("checked the kind"),
+    };
+    if window < rules::MIN_WINDOW {
+        return refuse(Failure::new(
+            ErrorCode::INVALID_ARGUMENT,
+            format!(
+                "a stream window of {window} bytes is too small; grant at least {}",
+                rules::MIN_WINDOW
             ),
         ));
     }
@@ -845,7 +961,7 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
         heartbeat: u32::try_from(config.heartbeat.as_millis()).unwrap_or(u32::MAX),
     });
     outbox.push_now(Out::Frame(encode(0, 0, &welcome)?));
-    Ok(accepted)
+    Ok((accepted, window))
 }
 
 /// The stored record layout this build reads and writes.

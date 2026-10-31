@@ -10,7 +10,7 @@ import java.util.List;
  *
  * @param subscriptionId the subscription id
  * @param query the query
- * @param permits Updates the handler may send before the first credit.
+ * @param permits Updates the handler may send before the subscriber grants more.
  */
 public record SubscriptionQuery(String subscriptionId, Query query, long permits) {
 

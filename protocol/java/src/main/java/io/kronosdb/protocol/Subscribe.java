@@ -7,18 +7,16 @@ import java.util.List;
 
 /**
  * Opens a live subscription from {@code from}. The server sends Events frames as
- * matching events become durable, never more events than the client has
- * granted credits for.
+ * matching events become durable, as far as the stream's window allows.
  *
  * @param context the context
  * @param from the from
  * @param criteria Empty matches every event.
  * @param excludeNames Events of these types are skipped even when the criteria match.
- * @param credits Events the server may send before the first Credit frame.
- * @param batchSize the batch size
+ * @param batchSize Most events per frame; 0 lets the server choose.
  * @param progressInterval Send a Progress frame at most this often while nothing matches; 0 disables them.
  */
-public record Subscribe(int context, long from, List<Criterion> criteria, List<String> excludeNames, long credits, long batchSize, long progressInterval) implements Frame {
+public record Subscribe(int context, long from, List<Criterion> criteria, List<String> excludeNames, long batchSize, long progressInterval) implements Frame {
 
     /** The frame kind on the wire. */
     public static final int KIND = 0x0102;
@@ -35,7 +33,6 @@ public record Subscribe(int context, long from, List<Criterion> criteria, List<S
                 r.readList16(r1 -> Criterion.decode(r1)),
                 r.readList16(r1 -> r1.readStr16()),
                 r.readU32(),
-                r.readU32(),
                 r.readU32());
     }
 
@@ -51,7 +48,6 @@ public record Subscribe(int context, long from, List<Criterion> criteria, List<S
         for (String e0 : excludeNames) {
             w.writeStr16(e0, "Subscribe.exclude_names");
         }
-        w.writeU32(credits);
         w.writeU32(batchSize);
         w.writeU32(progressInterval);
     }

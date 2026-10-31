@@ -1,7 +1,8 @@
 # The KronosDB native protocol
 
-Version 1. One long-lived TCP connection per client, with optional TLS,
-carrying multiplexed request streams of little-endian, fixed-layout frames.
+Version 2. One long-lived TCP connection per client, with optional TLS,
+carrying multiplexed request streams of little-endian, fixed-layout frames,
+each stream paced by its own window.
 
 Every byte on the wire is declared in [`kronosdb.schema`](kronosdb.schema).
 The codecs, the message reference at the end of this document, and the golden
@@ -107,17 +108,23 @@ always ends the stream. The client may reuse an id after its stream finished.
 Requests take one of three shapes:
 
 - **Unary** (Append, GetHead, …): the request carries `END`; the server
-  answers with exactly one frame carrying `END`.
-- **Server stream** (Source, SnapshottedSource): the request carries `END`;
-  the server answers with frames until one carries `END`.
-- **Subscription** (Subscribe): the request does not carry `END`. The client
-  sends [Credit](#credit) frames on the stream; the server sends events and
-  progress. The client ends it with [Cancel](#cancel).
+  answers with exactly one frame, which carries `END`.
+- **Server stream** (Source, SnapshottedSource, Subscribe, DispatchQuery):
+  the request carries `END`; the server answers with frames until one carries
+  `END`. A subscription has no last frame of its own: it runs until the
+  client cancels it.
+- **Two-way stream** (the handler streams, OpenPlatform,
+  OpenSubscriptionQuery, TailOpen): the request does not carry `END`, and the
+  client goes on sending in the stream — answers, permits, acknowledgements.
 
-[Cancel](#cancel) ends any stream the client opened. It is the client's last
-frame on the stream and carries `END`; the server answers with RequestFailed
-with code `cancelled`, unless the stream already finished, in which case the
-Cancel is ignored.
+A client's `END` says it has nothing more to send *in* the stream.
+[Window](#window) and [Cancel](#cancel) are *about* the stream, and may follow
+it until the server ends the stream; arriving after that, they are ignored.
+
+[Cancel](#cancel) ends a stream early. It carries `END`. The server stops
+working on the stream, sends nothing more of what it had queued for it, and
+answers with RequestFailed with code `cancelled` — unless the stream already
+ended, in which case the Cancel is ignored.
 
 ### Contexts
 
@@ -131,20 +138,37 @@ id fails with `invalid_argument`. Messaging buses are bound the same way with
 
 ### Flow control
 
-TCP carries backpressure for requests and replies. Subscriptions additionally
-use credits counted in events: Subscribe grants the initial credits and each
-[Credit](#credit) adds more. The server never sends more events than the
-client has granted, and never waits to fill a batch.
+Every stream has a **window**: how many bytes of frames the server may send on
+it ahead of the client. Hello's `window` sets it for every stream of the
+connection, at least 64 KiB. The server counts each frame it sends on a
+stream, header included, against the stream's window, and sends while the
+window is positive: one frame may take it below zero, and the next waits. The
+frame that ends a stream counts for nothing and never waits, so a stream can
+always be ended. As the client's consumer reads a stream's frames, the client
+grants their bytes back with [Window](#window). Granting once half the window
+has been read keeps the server sending without a pause.
 
-Streams without credits (Source, SnapshottedSource, the results of a query)
-are sent as fast as TCP takes them, and one connection carries many streams.
-A client therefore reads every frame as it arrives, whoever is waiting for
-it, and keeps a stream's frames for its consumer: as many as the credits it
-granted, or for a stream without credits up to a budget of its own. A
-consumer that falls further behind than that loses the stream, not the
-connection: the client sends [Cancel](#cancel) and fails the stream locally
-with `resource_exhausted`. A reader that stops reading would stall every
-other request on the connection, replies included.
+A consumer that falls behind therefore holds back its own stream and nothing
+else: the server stays at most a window ahead of it, and waits. No stream is
+failed for being read slowly, and the connection's other streams go on. The
+client reads every frame as it arrives and keeps it for its stream's
+consumer; what it keeps for one stream is bounded by the window. A window
+should be at least twice what the link carries in a round trip: the reference
+clients grant 8 MiB, and nodes grant each other more, since replication paces
+itself with its own acknowledgements.
+
+What a client sends needs no window. Requests are answered one by one, a
+handler's answers are bounded by the permits it granted, and a server that is
+behind on writing a connection stops reading it, except for the frames that
+relieve it: Window, Cancel and ClientPong.
+
+Messages an application counts take **permits**, not bytes:
+[Permits](#permits) grants a handler stream more commands or queries, and a
+subscription query more updates. Permits say how much work a consumer takes
+on; the window says how much it buffers. A stream can have both.
+
+Events frames carry at most a request's `batch_size` events, and never more
+than 1 MiB of them.
 
 A subscriber whose criteria rarely match still advances: with a non-zero
 `progress_interval`, the server sends [Progress](#progress) while nothing
@@ -171,21 +195,21 @@ the stream tells the handlers still working on the query
 ([CancelQuery](#cancelquery)). [OpenSubscriptionQuery](#opensubscriptionquery)
 streams [SubscriptionQueryEvent](#subscriptionqueryevent) frames: the initial
 result first, then updates, then a completion with END; the subscriber grants
-update credits with Credit and ends it with Cancel. An update beyond the
-subscriber's credits is dropped, so a handler that must not lose any holds
+more updates with Permits and ends it with Cancel. An update beyond the
+subscriber's permits is dropped, so a handler that must not lose any holds
 them until it is told of more.
 
 **Handlers.** [OpenCommandHandlers](#opencommandhandlers) and
 [OpenQueryHandlers](#openqueryhandlers) open a stream that lives as long as
 the handler. The client subscribes to names (the server answers with
 [ServerAck](#serverack) when the instruction id is not empty) and grants
-permits with [Credit](#credit); the server sends one command or query per
-permit. Permits belong to the stream, not to a name: a Credit of 100 means
+[Permits](#permits); the server sends one command or query per
+permit. Permits belong to the stream, not to a name: Permits of 100 means
 100 more commands (or queries) of whatever names the stream handles, so a
 handler grants its capacity once, typically right after opening the stream,
 and tops it up as it answers. Subscribing or unsubscribing a name leaves the
 stream's permits as they are. The server also tells a query handler when a subscriber grants
-update credits ([SubscriptionQueryPermits](#subscriptionquerypermits)) or
+update permits ([SubscriptionQueryPermits](#subscriptionquerypermits)) or
 leaves ([CancelSubscriptionQuery](#cancelsubscriptionquery)). A handler
 answers a subscription query with [SubscriptionQueryHandled](#subscriptionqueryhandled)
 frames: an `initial_result`, `update`s, and `complete` or
@@ -214,7 +238,7 @@ the client to move when the server is shutting down.
 [ForwardCommand](#forwardcommand), [ForwardQuery](#forwardquery) and
 [RelaySubscription](#relaysubscription), which only a principal with the
 `peer` role may send. They are answered exactly like the client requests they
-stand for; a relayed subscription takes its update credits and its cancel from
+stand for; a relayed subscription takes its update permits and its cancel from
 the opening node.
 
 ## Errors
@@ -263,7 +287,8 @@ format. Welcome's `record_format` says which layout the connection carries.
 
 Hello carries the highest version the client speaks; Welcome answers with the
 version both will use. A server supports the current version and the one
-before it.
+before it — except version 1, which KronosDB 0.11 spoke: its streams had no
+windows, and a server refuses it with `rejected`.
 
 Within a version, a frame may gain fields at its end. A decoder therefore
 ignores bytes after the fields it knows in a frame body — and only there:
@@ -299,6 +324,8 @@ The rest of this document is generated from `kronosdb.schema`.
 | `0x8005` | [ContextBound](#contextbound) | server |
 | `0x8006` | [GoAway](#goaway) | server |
 | `0x0006` | [Cancel](#cancel) | client |
+| `0x0009` | [Window](#window) | client |
+| `0x000a` | [Permits](#permits) | client |
 | `0x8007` | [RequestFailed](#requestfailed) | server |
 | `0x0100` | [Append](#append) | client |
 | `0x8100` | [Appended](#appended) | server |
@@ -306,7 +333,6 @@ The rest of this document is generated from `kronosdb.schema`.
 | `0x0101` | [Source](#source) | client |
 | `0x8102` | [Events](#events) | server |
 | `0x0102` | [Subscribe](#subscribe) | client |
-| `0x0103` | [Credit](#credit) | client |
 | `0x8103` | [Progress](#progress) | server |
 | `0x0104` | [GetHead](#gethead) | client |
 | `0x8104` | [Head](#head) | server |
@@ -403,12 +429,13 @@ First frame of every connection, after the 8-byte preface `KRONOSDB`.
 | Field | Type | |
 |---|---|---|
 | `version` | u16 | Highest protocol version the client speaks. |
-| `features` | u64 | Feature bits the client would like to use. None are defined in version 1. |
-| `record_format` | u8 | Stored record layout the client decodes. Version 1 knows layout 3. |
+| `features` | u64 | Feature bits the client would like to use. None are defined in version 2. |
+| `record_format` | u8 | Stored record layout the client decodes. Version 2 knows layout 3. |
 | `client_name` | str16 | Application name, shown in the admin console. |
 | `client_id` | str16 | This instance, unique per process. |
 | `credential_kind` | [CredentialKind](#credentialkind) |  |
 | `credential` | str32 |  |
+| `window` | u32 | Each stream's window: the bytes of frames the server may send on a stream before the client grants more with Window. At least 64 KiB. |
 
 #### Welcome
 
@@ -520,10 +547,34 @@ accepted, open ones are finished, then the connection closes.
 
 Kind `0x0006`, sent by the client.
 
-Ends a stream the client opened. The server answers with RequestFailed
-with code `cancelled` unless the stream already ended.
+Ends a stream the client opened. The server sends nothing more on it but
+a RequestFailed with code `cancelled`, unless the stream already ended.
+May follow the client's END.
 
 No fields.
+
+#### Window
+
+Kind `0x0009`, sent by the client.
+
+Grants the server `bytes` more of the stream's window: the client has
+consumed that much of what the server sent. May follow the client's END.
+
+| Field | Type | |
+|---|---|---|
+| `bytes` | u32 |  |
+
+#### Permits
+
+Kind `0x000a`, sent by the client.
+
+Grants `count` more messages on a stream whose messages are counted: the
+commands or queries a handler stream takes, or the updates a subscription
+query accepts.
+
+| Field | Type | |
+|---|---|---|
+| `count` | u32 |  |
 
 #### RequestFailed
 
@@ -603,8 +654,7 @@ frame of a Source.
 Kind `0x0102`, sent by the client.
 
 Opens a live subscription from `from`. The server sends Events frames as
-matching events become durable, never more events than the client has
-granted credits for.
+matching events become durable, as far as the stream's window allows.
 
 | Field | Type | |
 |---|---|---|
@@ -612,20 +662,8 @@ granted credits for.
 | `from` | u64 |  |
 | `criteria` | list16<[Criterion](#criterion)> | Empty matches every event. |
 | `exclude_names` | list16<str16> | Events of these types are skipped even when the criteria match. |
-| `credits` | u32 | Events the server may send before the first Credit frame. |
-| `batch_size` | u32 |  |
+| `batch_size` | u32 | Most events per frame; 0 lets the server choose. |
 | `progress_interval` | u32 | Send a Progress frame at most this often while nothing matches; 0 disables them. |
-
-#### Credit
-
-Kind `0x0103`, sent by the client.
-
-Grants the server this many more events on a subscription, updates on a
-subscription query, or messages on a handler stream.
-
-| Field | Type | |
-|---|---|---|
-| `credits` | u32 |  |
 
 #### Progress
 
@@ -877,10 +915,10 @@ The handler's answer to DispatchCommand or ForwardCommand.
 Kind `0x0201`, sent by the client.
 
 Opens a command handler stream. The client then subscribes to command
-types and grants the server credits; the server sends commands, at most
-one per credit, and the client answers each with CommandHandled. Credits
-belong to the stream, not to a command type: one credit is one command of
-any type the stream handles, and credits granted before the first
+types and grants the server Permits; the server sends commands, at most
+one per permit, and the client answers each with CommandHandled. Permits
+belong to the stream, not to a command type: one permit is one command of
+any type the stream handles, and permits granted before the first
 subscription count. Closing the stream unsubscribes everything it
 subscribed.
 
@@ -1047,8 +1085,8 @@ The handler may send `permits` more results for a streaming query.
 Kind `0x0306`, sent by the client.
 
 Opens a subscription query: an initial result, then updates as the
-handler sends them, then a completion. The client grants update credits
-with Credit and ends the subscription with Cancel.
+handler sends them, then a completion. The client grants more updates
+with Permits and ends the subscription with Cancel.
 
 | Field | Type | |
 |---|---|---|
@@ -1069,7 +1107,7 @@ Asks this handler for a subscription's initial result and updates.
 
 Kind `0x8306`, sent by the server.
 
-The subscriber granted more update credits.
+The subscriber granted more updates.
 
 | Field | Type | |
 |---|---|---|
@@ -1511,7 +1549,7 @@ Kind `0x1202`, sent by the client.
 
 A subscription query for a handler connected to this node, from another
 node. Answered with SubscriptionQueryEvent frames; the opening node
-grants credits with Credit and ends it with Cancel.
+grants update Permits and ends it with Cancel.
 
 | Field | Type | |
 |---|---|---|
@@ -1711,7 +1749,7 @@ A query whose result is kept up to date.
 |---|---|---|
 | `subscription_id` | str16 |  |
 | `query` | [Query](#query) |  |
-| `permits` | u64 | Updates the handler may send before the first credit. |
+| `permits` | u64 | Updates the handler may send before the subscriber grants more. |
 
 #### QueryUpdate
 

@@ -2,9 +2,9 @@
 // change the schema and run `just protocol`.
 
 /** The protocol version this code speaks. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 /** CRC32C of the schema source, for checking generated code is in sync. */
-export const SCHEMA_HASH = "a65e0eff";
+export const SCHEMA_HASH = "56aaeb68";
 
 /** The peer sent bytes that violate the protocol. */
 export class ProtocolError extends Error {}
@@ -714,11 +714,11 @@ export type Hello = {
    */
   version: number;
   /**
-   * Feature bits the client would like to use. None are defined in version 1.
+   * Feature bits the client would like to use. None are defined in version 2.
    */
   features: bigint;
   /**
-   * Stored record layout the client decodes. Version 1 knows layout 3.
+   * Stored record layout the client decodes. Version 2 knows layout 3.
    */
   recordFormat: number;
   /**
@@ -731,6 +731,11 @@ export type Hello = {
   clientId: string;
   credentialKind: number;
   credential: string;
+  /**
+   * Each stream's window: the bytes of frames the server may send on a
+   * stream before the client grants more with Window. At least 64 KiB.
+   */
+  window: number;
 };
 
 export function decodeHello(r: Reader): Hello {
@@ -742,6 +747,7 @@ export function decodeHello(r: Reader): Hello {
     clientId: readStr16(r),
     credentialKind: readU8(r),
     credential: readStr32(r),
+    window: readU32(r),
   };
 }
 
@@ -753,6 +759,7 @@ export function encodeHello(w: Writer, v: Hello): void {
   writeStr16(w, v.clientId, "Hello.client_id");
   writeU8(w, v.credentialKind);
   writeStr32(w, v.credential, "Hello.credential");
+  writeU32(w, v.window);
 }
 
 /**
@@ -962,8 +969,9 @@ export function encodeGoAway(w: Writer, v: GoAway): void {
 }
 
 /**
- * Ends a stream the client opened. The server answers with RequestFailed
- * with code `cancelled` unless the stream already ended.
+ * Ends a stream the client opened. The server sends nothing more on it but
+ * a RequestFailed with code `cancelled`, unless the stream already ended.
+ * May follow the client's END.
  */
 export type Cancel = Record<string, never>;
 
@@ -972,6 +980,43 @@ export function decodeCancel(_r: Reader): Cancel {
 }
 
 export function encodeCancel(_w: Writer, _v: Cancel): void {
+}
+
+/**
+ * Grants the server `bytes` more of the stream's window: the client has
+ * consumed that much of what the server sent. May follow the client's END.
+ */
+export type Window = {
+  bytes: number;
+};
+
+export function decodeWindow(r: Reader): Window {
+  return {
+    bytes: readU32(r),
+  };
+}
+
+export function encodeWindow(w: Writer, v: Window): void {
+  writeU32(w, v.bytes);
+}
+
+/**
+ * Grants `count` more messages on a stream whose messages are counted: the
+ * commands or queries a handler stream takes, or the updates a subscription
+ * query accepts.
+ */
+export type Permits = {
+  count: number;
+};
+
+export function decodePermits(r: Reader): Permits {
+  return {
+    count: readU32(r),
+  };
+}
+
+export function encodePermits(w: Writer, v: Permits): void {
+  writeU32(w, v.count);
 }
 
 /**
@@ -1118,8 +1163,7 @@ export function encodeEvents(w: Writer, v: Events): void {
 
 /**
  * Opens a live subscription from `from`. The server sends Events frames as
- * matching events become durable, never more events than the client has
- * granted credits for.
+ * matching events become durable, as far as the stream's window allows.
  */
 export type Subscribe = {
   context: number;
@@ -1133,9 +1177,8 @@ export type Subscribe = {
    */
   excludeNames: string[];
   /**
-   * Events the server may send before the first Credit frame.
+   * Most events per frame; 0 lets the server choose.
    */
-  credits: number;
   batchSize: number;
   /**
    * Send a Progress frame at most this often while nothing matches; 0
@@ -1150,7 +1193,6 @@ export function decodeSubscribe(r: Reader): Subscribe {
     from: readU64(r),
     criteria: readList16(r, (r) => decodeCriterion(r)),
     excludeNames: readList16(r, (r) => readStr16(r)),
-    credits: readU32(r),
     batchSize: readU32(r),
     progressInterval: readU32(r),
   };
@@ -1167,27 +1209,8 @@ export function encodeSubscribe(w: Writer, v: Subscribe): void {
   for (const item0 of v.excludeNames) {
     writeStr16(w, item0, "Subscribe.exclude_names");
   }
-  writeU32(w, v.credits);
   writeU32(w, v.batchSize);
   writeU32(w, v.progressInterval);
-}
-
-/**
- * Grants the server this many more events on a subscription, updates on a
- * subscription query, or messages on a handler stream.
- */
-export type Credit = {
-  credits: number;
-};
-
-export function decodeCredit(r: Reader): Credit {
-  return {
-    credits: readU32(r),
-  };
-}
-
-export function encodeCredit(w: Writer, v: Credit): void {
-  writeU32(w, v.credits);
 }
 
 /**
@@ -1838,10 +1861,10 @@ export function encodeCommandResponse(w: Writer, v: CommandResponse): void {
 
 /**
  * Opens a command handler stream. The client then subscribes to command
- * types and grants the server credits; the server sends commands, at most
- * one per credit, and the client answers each with CommandHandled. Credits
- * belong to the stream, not to a command type: one credit is one command of
- * any type the stream handles, and credits granted before the first
+ * types and grants the server Permits; the server sends commands, at most
+ * one per permit, and the client answers each with CommandHandled. Permits
+ * belong to the stream, not to a command type: one permit is one command of
+ * any type the stream handles, and permits granted before the first
  * subscription count. Closing the stream unsubscribes everything it
  * subscribed.
  */
@@ -2230,7 +2253,7 @@ export type SubscriptionQuery = {
   subscriptionId: string;
   query: Query;
   /**
-   * Updates the handler may send before the first credit.
+   * Updates the handler may send before the subscriber grants more.
    */
   permits: bigint;
 };
@@ -2251,8 +2274,8 @@ export function encodeSubscriptionQuery(w: Writer, v: SubscriptionQuery): void {
 
 /**
  * Opens a subscription query: an initial result, then updates as the
- * handler sends them, then a completion. The client grants update credits
- * with Credit and ends the subscription with Cancel.
+ * handler sends them, then a completion. The client grants more updates
+ * with Permits and ends the subscription with Cancel.
  */
 export type OpenSubscriptionQuery = {
   bus: number;
@@ -2289,7 +2312,7 @@ export function encodeHandleSubscriptionQuery(w: Writer, v: HandleSubscriptionQu
 }
 
 /**
- * The subscriber granted more update credits.
+ * The subscriber granted more updates.
  */
 export type SubscriptionQueryPermits = {
   subscriptionId: string;
@@ -3361,7 +3384,7 @@ export function encodeForwardQuery(w: Writer, v: ForwardQuery): void {
 /**
  * A subscription query for a handler connected to this node, from another
  * node. Answered with SubscriptionQueryEvent frames; the opening node
- * grants credits with Credit and ends it with Cancel.
+ * grants update Permits and ends it with Cancel.
  */
 export type RelaySubscription = {
   bus: string;
@@ -3440,6 +3463,8 @@ export const FrameKind = {
   ContextBound: 0x8005,
   GoAway: 0x8006,
   Cancel: 0x0006,
+  Window: 0x0009,
+  Permits: 0x000a,
   RequestFailed: 0x8007,
   Append: 0x0100,
   Appended: 0x8100,
@@ -3447,7 +3472,6 @@ export const FrameKind = {
   Source: 0x0101,
   Events: 0x8102,
   Subscribe: 0x0102,
-  Credit: 0x0103,
   Progress: 0x8103,
   GetHead: 0x0104,
   Head: 0x8104,
@@ -3550,6 +3574,8 @@ export type Frame =
   | { name: "ContextBound"; body: ContextBound }
   | { name: "GoAway"; body: GoAway }
   | { name: "Cancel"; body: Cancel }
+  | { name: "Window"; body: Window }
+  | { name: "Permits"; body: Permits }
   | { name: "RequestFailed"; body: RequestFailed }
   | { name: "Append"; body: Append }
   | { name: "Appended"; body: Appended }
@@ -3557,7 +3583,6 @@ export type Frame =
   | { name: "Source"; body: Source }
   | { name: "Events"; body: Events }
   | { name: "Subscribe"; body: Subscribe }
-  | { name: "Credit"; body: Credit }
   | { name: "Progress"; body: Progress }
   | { name: "GetHead"; body: GetHead }
   | { name: "Head"; body: Head }
@@ -3665,6 +3690,8 @@ export function decodeFrameBody(kind: number, r: Reader): Frame | undefined {
     case 0x8005: return { name: "ContextBound", body: decodeContextBound(r) };
     case 0x8006: return { name: "GoAway", body: decodeGoAway(r) };
     case 0x0006: return { name: "Cancel", body: decodeCancel(r) };
+    case 0x0009: return { name: "Window", body: decodeWindow(r) };
+    case 0x000a: return { name: "Permits", body: decodePermits(r) };
     case 0x8007: return { name: "RequestFailed", body: decodeRequestFailed(r) };
     case 0x0100: return { name: "Append", body: decodeAppend(r) };
     case 0x8100: return { name: "Appended", body: decodeAppended(r) };
@@ -3672,7 +3699,6 @@ export function decodeFrameBody(kind: number, r: Reader): Frame | undefined {
     case 0x0101: return { name: "Source", body: decodeSource(r) };
     case 0x8102: return { name: "Events", body: decodeEvents(r) };
     case 0x0102: return { name: "Subscribe", body: decodeSubscribe(r) };
-    case 0x0103: return { name: "Credit", body: decodeCredit(r) };
     case 0x8103: return { name: "Progress", body: decodeProgress(r) };
     case 0x0104: return { name: "GetHead", body: decodeGetHead(r) };
     case 0x8104: return { name: "Head", body: decodeHead(r) };
@@ -3783,6 +3809,8 @@ export function encodeFrame(w: Writer, stream: number, flags: number, frame: Fra
     case "ContextBound": encodeContextBound(w, frame.body); break;
     case "GoAway": encodeGoAway(w, frame.body); break;
     case "Cancel": encodeCancel(w, frame.body); break;
+    case "Window": encodeWindow(w, frame.body); break;
+    case "Permits": encodePermits(w, frame.body); break;
     case "RequestFailed": encodeRequestFailed(w, frame.body); break;
     case "Append": encodeAppend(w, frame.body); break;
     case "Appended": encodeAppended(w, frame.body); break;
@@ -3790,7 +3818,6 @@ export function encodeFrame(w: Writer, stream: number, flags: number, frame: Fra
     case "Source": encodeSource(w, frame.body); break;
     case "Events": encodeEvents(w, frame.body); break;
     case "Subscribe": encodeSubscribe(w, frame.body); break;
-    case "Credit": encodeCredit(w, frame.body); break;
     case "Progress": encodeProgress(w, frame.body); break;
     case "GetHead": encodeGetHead(w, frame.body); break;
     case "Head": encodeHead(w, frame.body); break;

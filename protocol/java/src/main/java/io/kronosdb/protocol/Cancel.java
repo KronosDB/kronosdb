@@ -6,8 +6,9 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 /**
- * Ends a stream the client opened. The server answers with RequestFailed
- * with code {@code cancelled} unless the stream already ended.
+ * Ends a stream the client opened. The server sends nothing more on it but
+ * a RequestFailed with code {@code cancelled}, unless the stream already ended.
+ * May follow the client's END.
  */
 public record Cancel() implements Frame {
 
