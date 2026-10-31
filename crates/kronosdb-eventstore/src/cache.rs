@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use lru::LruCache;
 use memmap2::Mmap;
@@ -16,36 +16,98 @@ use crate::segment::segment_index::SegmentIndex;
 
 const ORD: Ordering = Ordering::Relaxed;
 
-/// Default number of sealed segment mmaps to cache.
-pub const DEFAULT_MMAP_CACHE_SIZE: usize = 100;
+/// Open sealed segment files the block read path (`read-path = "blocks"`)
+/// keeps at once; past this many the least recently used is closed.
+const OPEN_SEALED_FILES: usize = 100;
 
-/// Most sealed segment indexes kept mapped at once. A mapping costs address
-/// space and one entry in the process's map table, not heap; past this many
-/// (a log of tens of thousands of segments) a pseudo-random one is unmapped,
-/// and mapped again when next asked for, which costs an open and a few
-/// hundred bytes of checks.
-pub const MAX_MAPPED_INDEXES: usize = 16_384;
+/// Mappings of sealed segments and of their indexes this process may keep at
+/// once, shared by every context. A mapping costs address space and one entry
+/// in the kernel's per-process map table, not memory: the page cache decides
+/// what is resident, mapped or not. So everything stays mapped until the
+/// table runs short, and only then is one let go. Mapping a segment again
+/// costs an open, a map, the unmap of another and fresh page faults on data
+/// that is often already in memory, which is most of a read's time when it
+/// happens on every read.
+#[derive(Debug)]
+pub struct MappingBudget {
+    live: AtomicUsize,
+    limit: usize,
+    warned: AtomicBool,
+}
+
+impl MappingBudget {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            limit: limit.max(1),
+            warned: AtomicBool::new(false),
+        })
+    }
+
+    /// The process's budget: three quarters of the kernel's limit
+    /// (`vm.max_map_count`, 65530 by default; the default where there is no
+    /// such file), the rest left to the allocator, libraries and stacks.
+    pub fn shared() -> Arc<Self> {
+        static SHARED: OnceLock<Arc<MappingBudget>> = OnceLock::new();
+        let limit = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .unwrap_or(65_530);
+        Arc::clone(SHARED.get_or_init(|| Self::new(limit / 4 * 3)))
+    }
+
+    /// Mappings held now.
+    pub fn live(&self) -> usize {
+        self.live.load(ORD)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn took(&self) {
+        self.live.fetch_add(1, ORD);
+    }
+
+    fn gave(&self, n: usize) {
+        self.live.fetch_sub(n, ORD);
+    }
+
+    /// Whether more is mapped than the budget allows. Says so in the log the
+    /// first time, because from then on reads pay for remapping.
+    fn over(&self) -> bool {
+        let over = self.live.load(ORD) > self.limit;
+        if over && !self.warned.swap(true, ORD) {
+            tracing::warn!(
+                limit = self.limit,
+                "the mapping budget is full: sealed segments past it are mapped again on \
+                 each read, which is slower; raise vm.max_map_count to keep them all mapped"
+            );
+        }
+        over
+    }
+}
 
 const SHARDS: usize = 16;
 
 type Shard = RwLock<HashMap<u64, Arc<SealedIndex>>>;
 
 /// Mapped `.idx` files of sealed segments, by base position. Every read of
-/// every sealed segment asks here first (for its key filter), so the lookup
-/// takes a sharded read lock and nothing else.
+/// every sealed segment asks here first, so the lookup takes a sharded read
+/// lock and nothing else. Over the budget, a pseudo-random one is unmapped.
 struct MappedIndexes {
     shards: Vec<Shard>,
     entries: AtomicUsize,
-    max_entries: usize,
+    budget: Arc<MappingBudget>,
     victim: AtomicUsize,
 }
 
 impl MappedIndexes {
-    fn new(max_entries: usize) -> Self {
+    fn new(budget: Arc<MappingBudget>) -> Self {
         Self {
             shards: (0..SHARDS).map(|_| RwLock::new(HashMap::new())).collect(),
             entries: AtomicUsize::new(0),
-            max_entries: max_entries.max(1),
+            budget,
             victim: AtomicUsize::new(0),
         }
     }
@@ -62,8 +124,9 @@ impl MappedIndexes {
     fn put(&self, base: u64, index: Arc<SealedIndex>) {
         if self.shard(base).write().insert(base, index).is_none() {
             self.entries.fetch_add(1, ORD);
+            self.budget.took();
         }
-        while self.entries.load(ORD) > self.max_entries {
+        while self.budget.over() {
             if !self.evict_one(base) {
                 break;
             }
@@ -77,6 +140,7 @@ impl MappedIndexes {
             if let Some(key) = shard.keys().copied().find(|&key| key != keep) {
                 shard.remove(&key);
                 self.entries.fetch_sub(1, ORD);
+                self.budget.gave(1);
                 return true;
             }
         }
@@ -86,11 +150,65 @@ impl MappedIndexes {
     fn pop(&self, base: u64) {
         if self.shard(base).write().remove(&base).is_some() {
             self.entries.fetch_sub(1, ORD);
+            self.budget.gave(1);
         }
     }
 
     fn len(&self) -> usize {
         self.entries.load(ORD)
+    }
+}
+
+impl Drop for MappedIndexes {
+    fn drop(&mut self) {
+        self.budget.gave(self.entries.load(ORD));
+    }
+}
+
+/// Mapped sealed segment files, by base position. Over the budget, the least
+/// recently used is unmapped.
+struct MappedSegments {
+    lru: Mutex<LruCache<u64, Arc<Mmap>>>,
+    budget: Arc<MappingBudget>,
+}
+
+impl MappedSegments {
+    fn new(budget: Arc<MappingBudget>) -> Self {
+        Self {
+            lru: Mutex::new(LruCache::unbounded()),
+            budget,
+        }
+    }
+
+    fn get(&self, base: u64) -> Option<Arc<Mmap>> {
+        self.lru.lock().get(&base).map(Arc::clone)
+    }
+
+    fn put(&self, base: u64, mmap: Arc<Mmap>) {
+        let mut lru = self.lru.lock();
+        if lru.put(base, mmap).is_none() {
+            self.budget.took();
+        }
+        while lru.len() > 1 && self.budget.over() {
+            lru.pop_lru();
+            self.budget.gave(1);
+        }
+    }
+
+    fn pop(&self, base: u64) {
+        if self.lru.lock().pop(&base).is_some() {
+            self.budget.gave(1);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lru.lock().len()
+    }
+}
+
+impl Drop for MappedSegments {
+    fn drop(&mut self) {
+        self.budget.gave(self.lru.get_mut().len());
     }
 }
 
@@ -102,8 +220,8 @@ impl MappedIndexes {
 /// served from its pinned in-memory index until it is.
 pub struct IndexCache {
     mapped: MappedIndexes,
-    /// LRU cache of mmap handles for sealed segments, keyed by base position.
-    mmaps: Mutex<LruCache<u64, Arc<Mmap>>>,
+    /// Mapped sealed segment files, kept while the mapping budget allows.
+    mmaps: MappedSegments,
     /// Open sealed segment files for block reads, keyed by base position.
     sealed_files: Mutex<LruCache<u64, Arc<SealedFile>>>,
     /// Verified blocks of sealed segments.
@@ -123,29 +241,24 @@ pub struct IndexCache {
 }
 
 impl IndexCache {
-    /// A cache keeping up to `mmap_capacity` segment mappings, with the
-    /// default block cache.
-    pub fn new(mmap_capacity: usize) -> Self {
+    /// A cache with the default block cache, mapping within `budget`.
+    pub fn new(budget: Arc<MappingBudget>) -> Self {
         Self::with_blocks(
-            mmap_capacity,
             BlockCache::new(
                 crate::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES,
                 crate::segment::blocks::DEFAULT_BLOCK_SIZE,
                 crate::segment::blocks::DEFAULT_READAHEAD_BLOCKS,
             ),
+            budget,
         )
     }
 
     /// Like `new`, with an explicitly configured block cache.
-    pub fn with_blocks(mmap_capacity: usize, blocks: BlockCache) -> Self {
+    pub fn with_blocks(blocks: BlockCache, budget: Arc<MappingBudget>) -> Self {
         Self {
-            mapped: MappedIndexes::new(MAX_MAPPED_INDEXES),
-            mmaps: Mutex::new(LruCache::new(
-                NonZeroUsize::new(mmap_capacity.max(1)).unwrap(),
-            )),
-            sealed_files: Mutex::new(LruCache::new(
-                NonZeroUsize::new(mmap_capacity.max(1)).unwrap(),
-            )),
+            mapped: MappedIndexes::new(Arc::clone(&budget)),
+            mmaps: MappedSegments::new(budget),
+            sealed_files: Mutex::new(LruCache::new(NonZeroUsize::new(OPEN_SEALED_FILES).unwrap())),
             blocks: Arc::new(blocks),
             pinned: Mutex::new(HashMap::new()),
             index_hits: AtomicU64::new(0),
@@ -192,17 +305,22 @@ impl IndexCache {
         self.mapped.len()
     }
 
+    /// How many sealed segment files are mapped.
+    pub fn mapped_segments(&self) -> usize {
+        self.mmaps.len()
+    }
+
     /// Gets a cached mmap handle for a sealed segment, opening it if not cached.
     /// Sealed segments are immutable, so the mmap can be safely shared.
     pub fn get_mmap(&self, segment_path: &Path, base_position: u64) -> Result<Arc<Mmap>, Error> {
-        if let Some(mmap) = self.mmaps.lock().get(&base_position) {
+        if let Some(mmap) = self.mmaps.get(base_position) {
             self.mmap_hits.fetch_add(1, ORD);
-            return Ok(Arc::clone(mmap));
+            return Ok(mmap);
         }
         self.mmap_misses.fetch_add(1, ORD);
         let file = std::fs::File::open(segment_path)?;
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-        self.mmaps.lock().put(base_position, Arc::clone(&mmap));
+        self.mmaps.put(base_position, Arc::clone(&mmap));
         Ok(mmap)
     }
 
@@ -239,7 +357,7 @@ impl IndexCache {
         self.sealed_files.lock().pop(&base_position);
         self.blocks.invalidate(base_position);
         self.mapped.pop(base_position);
-        self.mmaps.lock().pop(&base_position);
+        self.mmaps.pop(base_position);
         self.pinned.lock().remove(&base_position);
     }
 
@@ -328,7 +446,7 @@ mod tests {
     fn maps_once_and_answers_from_the_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let (path, base) = setup_sealed_segment(dir.path());
-        let cache = IndexCache::new(10);
+        let cache = IndexCache::new(MappingBudget::new(10));
         let index = cache.get_index(&path, base).unwrap();
         assert_eq!(index.position_range(), 1..3);
         assert!(index.offset_of(1).unwrap().is_some());
@@ -342,7 +460,7 @@ mod tests {
     fn invalidate_unmaps() {
         let dir = tempfile::tempdir().unwrap();
         let (path, base) = setup_sealed_segment(dir.path());
-        let cache = IndexCache::new(10);
+        let cache = IndexCache::new(MappingBudget::new(10));
         let first = cache.get_index(&path, base).unwrap();
         cache.invalidate(base);
         assert!(cache.index_cached(base).is_none());
@@ -354,7 +472,7 @@ mod tests {
     fn pinned_until_unpinned_then_mapped() {
         let dir = tempfile::tempdir().unwrap();
         let (path, base) = setup_sealed_segment(dir.path());
-        let cache = IndexCache::new(10);
+        let cache = IndexCache::new(MappingBudget::new(10));
         let pinned = Arc::new(SegmentIndex::build_from_segment(&path).unwrap());
         cache.pin_sealed(base, Arc::clone(&pinned));
         assert!(cache.is_pinned(base));
@@ -370,7 +488,8 @@ mod tests {
 
     #[test]
     fn the_mapping_count_is_capped_and_keeps_the_newest() {
-        let mapped = MappedIndexes::new(3);
+        let budget = MappingBudget::new(3);
+        let mapped = MappedIndexes::new(Arc::clone(&budget));
         let dir = tempfile::tempdir().unwrap();
         let (path, base) = setup_sealed_segment(dir.path());
         let index = Arc::new(SealedIndex::open(&path.with_extension("idx"), base).unwrap());
@@ -381,5 +500,35 @@ mod tests {
         }
         mapped.pop(49);
         assert_eq!(mapped.len(), 2);
+        assert_eq!(budget.live(), 2);
+        drop(mapped);
+        assert_eq!(budget.live(), 0);
+    }
+
+    /// Segments and indexes share one budget, and every context's cache
+    /// counts against it: what one cache maps, another has less room for.
+    #[test]
+    fn segment_and_index_mappings_share_one_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, base) = setup_sealed_segment(dir.path());
+        let budget = MappingBudget::new(4);
+        let first = IndexCache::new(Arc::clone(&budget));
+        let second = IndexCache::new(Arc::clone(&budget));
+        first.get_index(&path, base).unwrap();
+        first.get_mmap(&path, base).unwrap();
+        assert_eq!(budget.live(), 2);
+        // Under the budget nothing is let go; past it, the least recently
+        // used segment of the cache that maps one more goes.
+        for key in 100..103u64 {
+            second.get_mmap(&path, key).unwrap();
+        }
+        assert_eq!(budget.live(), 4);
+        assert_eq!(second.mapped_segments(), 2);
+        assert!(second.mmaps.get(102).is_some() && second.mmaps.get(101).is_some());
+        assert_eq!(first.mapped_segments(), 1);
+        drop(second);
+        assert_eq!(budget.live(), 2);
+        first.invalidate(base);
+        assert_eq!(budget.live(), 0);
     }
 }
