@@ -3,7 +3,7 @@
 //! This is the most important benchmark for capacity planning. It answers:
 //! - How does read latency degrade as you go from 100K to 10M events?
 //! - At what point do cache misses start to dominate?
-//! - Does the bloom filter keep non-existent entity queries constant-time?
+//! - Do the key tables keep non-existent entity queries constant-time?
 //!
 //! Models a realistic e-commerce workload where the store grows over time
 //! but individual queries are always "source events for order X" (8 events).
@@ -18,7 +18,7 @@ use tempfile::tempdir;
 ///
 /// Each data point: N orders × 8 events, source one specific order.
 /// The query always returns 8 events — what changes is how much data
-/// the store has to skip past (sealed segments, bloom checks, etc.).
+/// the store has to skip past (sealed segments, key table lookups, etc.).
 fn read_latency_vs_volume(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_latency_vs_volume");
     group.sample_size(20);
@@ -76,10 +76,10 @@ fn read_latency_vs_volume(c: &mut Criterion) {
     group.finish();
 }
 
-/// Bloom filter rejection at scale: query for non-existent entity.
-/// Should stay ~constant regardless of store size (just N bloom checks).
-fn bloom_rejection_vs_volume(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bloom_rejection_vs_volume");
+/// Key table rejection at scale: query for non-existent entity.
+/// Should stay ~constant regardless of store size (a few table lookups).
+fn key_table_rejection_vs_volume(c: &mut Criterion) {
+    let mut group = c.benchmark_group("key_table_rejection_vs_volume");
     group.sample_size(30);
 
     let events_per_segment = 5_000;
@@ -105,7 +105,7 @@ fn bloom_rejection_vs_volume(c: &mut Criterion) {
                     events_per_segment,
                 );
 
-                // Warm blooms.
+                // Warm the key tables.
                 let _ = store.source(Position(1), &condition).unwrap();
 
                 b.iter(|| {
@@ -234,6 +234,6 @@ fn append_at_scale(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().significance_level(0.05);
-    targets = read_latency_vs_volume, bloom_rejection_vs_volume, cache_pressure_at_scale, append_at_scale
+    targets = read_latency_vs_volume, key_table_rejection_vs_volume, cache_pressure_at_scale, append_at_scale
 }
 criterion_main!(benches);

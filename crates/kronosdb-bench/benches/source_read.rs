@@ -3,7 +3,7 @@
 //! In DCB event sourcing, the dominant read pattern is:
 //! "Source all events for entity X" — highly selective (5-50 events from millions).
 //!
-//! This tests the full read path: segment list lookup → bloom filter check →
+//! This tests the full read path: segment list lookup → key table lookup →
 //! index load → bitmap intersection → mmap scan → event deserialization.
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -96,8 +96,8 @@ fn source_decision_model(c: &mut Criterion) {
     group.finish();
 }
 
-/// Bloom filter effectiveness: query for non-existent entity.
-/// Should be near-instant — all segments rejected by bloom.
+/// Key table rejection: query for non-existent entity.
+/// Should be near-instant — every key table rules it out.
 fn source_nonexistent(c: &mut Criterion) {
     let mut group = c.benchmark_group("source_nonexistent");
     group.sample_size(100);
@@ -111,7 +111,7 @@ fn source_nonexistent(c: &mut Criterion) {
         let store = create_multi_segment_store(dir.path(), num_orders, 1_000, events_per_seg);
 
         let condition = nonexistent_order_condition();
-        // Warm blooms.
+        // Warm the key tables.
         let events = store.source(Position(1), &condition).unwrap();
         assert!(events.is_empty());
 

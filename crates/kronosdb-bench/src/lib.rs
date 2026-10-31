@@ -148,7 +148,7 @@ pub fn order_payment_condition(order_id: usize) -> SourcingCondition {
     }
 }
 
-/// "Source events for entity that doesn't exist" — bloom filter best case.
+/// "Source events for entity that doesn't exist" — every key table rules it out.
 pub fn nonexistent_order_condition() -> SourcingCondition {
     SourcingCondition {
         criteria: vec![Criterion {

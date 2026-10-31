@@ -47,10 +47,10 @@ pub struct StoreMetrics {
     pub index_cache_hits: AtomicU64,
     pub index_cache_misses: AtomicU64,
 
-    // ── Key filters of sealed segments ──
-    pub bloom_checks: AtomicU64,
-    /// Segments skipped because their key filter said "definitely not".
-    pub bloom_rejections: AtomicU64,
+    // ── Key tables consulted by reads ──
+    pub key_table_checks: AtomicU64,
+    /// Key tables that ruled a read out: none of its keys is in them.
+    pub key_table_skips: AtomicU64,
 
     // ── Mmap cache ──
     pub mmap_cache_hits: AtomicU64,
@@ -87,8 +87,8 @@ impl StoreMetrics {
             source_duration_us: AtomicU64::new(0),
             index_cache_hits: AtomicU64::new(0),
             index_cache_misses: AtomicU64::new(0),
-            bloom_checks: AtomicU64::new(0),
-            bloom_rejections: AtomicU64::new(0),
+            key_table_checks: AtomicU64::new(0),
+            key_table_skips: AtomicU64::new(0),
             mmap_cache_hits: AtomicU64::new(0),
             mmap_cache_misses: AtomicU64::new(0),
             segment_rotations: AtomicU64::new(0),
@@ -112,8 +112,8 @@ impl StoreMetrics {
             source_duration_us: self.source_duration_us.load(ORD),
             index_cache_hits: self.index_cache_hits.load(ORD),
             index_cache_misses: self.index_cache_misses.load(ORD),
-            bloom_checks: self.bloom_checks.load(ORD),
-            bloom_rejections: self.bloom_rejections.load(ORD),
+            key_table_checks: self.key_table_checks.load(ORD),
+            key_table_skips: self.key_table_skips.load(ORD),
             mmap_cache_hits: self.mmap_cache_hits.load(ORD),
             mmap_cache_misses: self.mmap_cache_misses.load(ORD),
             segment_rotations: self.segment_rotations.load(ORD),
@@ -154,10 +154,10 @@ impl StoreMetrics {
     }
 
     #[inline]
-    pub fn record_bloom_check(&self, rejected: bool) {
-        self.bloom_checks.fetch_add(1, ORD);
-        if rejected {
-            self.bloom_rejections.fetch_add(1, ORD);
+    pub fn record_key_table_check(&self, ruled_out: bool) {
+        self.key_table_checks.fetch_add(1, ORD);
+        if ruled_out {
+            self.key_table_skips.fetch_add(1, ORD);
         }
     }
 
@@ -192,8 +192,8 @@ pub struct MetricsSnapshot {
     pub source_duration_us: u64,
     pub index_cache_hits: u64,
     pub index_cache_misses: u64,
-    pub bloom_checks: u64,
-    pub bloom_rejections: u64,
+    pub key_table_checks: u64,
+    pub key_table_skips: u64,
     pub mmap_cache_hits: u64,
     pub mmap_cache_misses: u64,
     pub segment_rotations: u64,

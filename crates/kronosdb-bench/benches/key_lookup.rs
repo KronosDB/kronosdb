@@ -12,15 +12,15 @@ use kronosdb_eventstore::event::Position;
 use std::hint::black_box;
 use tempfile::tempdir;
 
-fn bloom_filter_effectiveness(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bloom_filter");
+fn key_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("key_lookup");
     group.sample_size(50);
 
     // 5K orders × 8 events = 40K events, ~20 sealed segments.
     let dir = tempdir().unwrap();
     let store = create_multi_segment_store(dir.path(), 5_000, 500, 2_000);
 
-    // Query for an order that exists — bloom passes on segments containing it.
+    // Query for an order that exists: found in the tables that hold it.
     let hit_condition = order_condition(42);
     let _ = store.source(Position(1), &hit_condition).unwrap();
 
@@ -34,7 +34,7 @@ fn bloom_filter_effectiveness(c: &mut Criterion) {
         });
     });
 
-    // Query for an order that does NOT exist — bloom rejects ALL segments.
+    // Query for an order that does NOT exist: every key table rules it out.
     let miss_condition = nonexistent_order_condition();
     let _ = store.source(Position(1), &miss_condition).unwrap();
 
@@ -48,7 +48,7 @@ fn bloom_filter_effectiveness(c: &mut Criterion) {
         });
     });
 
-    // Query by event type only — bloom passes on ALL segments (low selectivity).
+    // Query by event type only: found in every table (low selectivity).
     let broad_condition = SourcingCondition {
         criteria: vec![QueryCriterion {
             names: vec!["OrderPlaced".into()],
@@ -70,5 +70,5 @@ fn bloom_filter_effectiveness(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bloom_filter_effectiveness);
+criterion_group!(benches, key_lookup);
 criterion_main!(benches);
