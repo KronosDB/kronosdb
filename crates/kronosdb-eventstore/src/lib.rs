@@ -10,6 +10,7 @@ pub mod hardware;
 
 pub mod cache;
 pub mod context;
+pub mod fetch;
 pub(crate) mod inline_breaker;
 pub mod log_index;
 pub mod metrics;

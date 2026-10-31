@@ -1278,6 +1278,9 @@ pub struct StoreOptions {
     /// shared with every other store holding the same budget: by default
     /// the process's, sized from the kernel's limit (`MappingBudget::shared`).
     pub mapping_budget: Arc<crate::cache::MappingBudget>,
+    /// Open sealed segment files the stores keep, shared by every store in
+    /// the process, sized from its open-file limit (`FileBudget::shared`).
+    pub file_budget: Arc<crate::cache::FileBudget>,
     /// How sealed segments are read (prototype switch).
     pub read_mode: crate::segment::blocks::ReadMode,
     /// Memory budget of the verified block cache for sealed segments.
@@ -1311,6 +1314,7 @@ impl Default for StoreOptions {
         Self {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
             mapping_budget: crate::cache::MappingBudget::shared(),
+            file_budget: crate::cache::FileBudget::shared(),
             read_mode: crate::segment::blocks::ReadMode::default(),
             block_cache_bytes: crate::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES,
             block_size: crate::segment::blocks::DEFAULT_BLOCK_SIZE,
@@ -1578,6 +1582,7 @@ impl EventStoreEngine {
                 opts.readahead_blocks,
             ),
             Arc::clone(&opts.mapping_budget),
+            Arc::clone(&opts.file_budget),
         ));
         writer.lock().attach_index_cache(Arc::clone(&cache));
         std::fs::create_dir_all(dir.join(merge::INDEX_DIR))?;
@@ -1729,6 +1734,7 @@ impl EventStoreEngine {
                 opts.readahead_blocks,
             ),
             Arc::clone(&opts.mapping_budget),
+            Arc::clone(&opts.file_budget),
         ));
         for (base, index) in sealed {
             cache.adopt(base, index);
@@ -3142,9 +3148,15 @@ impl EventStoreEngine {
                     base,
                     Arc::clone(sealed),
                 )?)),
-                ReadMode::Mapped => Ok(RecordReader::Mapped(SegmentReader::from_shared_mmap(
-                    self.cache.get_mmap(seg_path, base)?,
-                )?)),
+                // Past the mapping budget, mapping this segment would unmap
+                // another: read the records it is asked for instead.
+                ReadMode::Mapped => match self.cache.mapped_within_budget(seg_path, base)? {
+                    Some(mmap) => Ok(RecordReader::Mapped(SegmentReader::from_shared_mmap(mmap)?)),
+                    None => Ok(RecordReader::Fetched(crate::fetch::FetchedRecords::new(
+                        self.cache.segment_file(seg_path, base)?,
+                        Arc::clone(sealed),
+                    ))),
+                },
             },
         }
     }
@@ -3791,6 +3803,7 @@ impl<'a> Locate<'a> {
                 }
             }
             let reader = &mut self.reader.as_mut().unwrap().1;
+            reader.prepare(&self.offsets)?;
             for &(position, offset) in &self.offsets {
                 if let Walk::Stop = visit(position, reader.record_at(position, offset)?)? {
                     return Ok(Walk::Stop);
@@ -4658,63 +4671,194 @@ mod tests {
         .unwrap()
     }
 
+    /// A store of tiny segments: 500 batches of 20 events, each with its
+    /// own order id, sealing a few hundred segments.
+    fn many_segments_store(
+        dir: &Path,
+        budget: &Arc<crate::cache::MappingBudget>,
+        files: &Arc<crate::cache::FileBudget>,
+    ) -> EventStoreEngine {
+        let store = EventStoreEngine::create_with_store_options(
+            dir,
+            &StoreOptions {
+                max_segment_size: 4 * 1024,
+                mapping_budget: Arc::clone(budget),
+                file_budget: Arc::clone(files),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        for batch in 0..500u64 {
+            let events = (0..20)
+                .map(|i| {
+                    make_event(
+                        "OrderPlaced",
+                        vec![tag("orderId", &format!("o-{batch}-{i}"))],
+                    )
+                })
+                .collect();
+            store
+                .append(AppendRequest {
+                    condition: None,
+                    events,
+                })
+                .unwrap();
+        }
+        let sealed = store.segments.read().sealed_count;
+        assert!(sealed > 150, "only {sealed} sealed segments");
+        store
+    }
+
     /// A read over more sealed segments than the old fixed cache of 100 held
-    /// maps each one once and keeps it: the next read maps nothing. With a
-    /// budget too small for them all, reads stay correct and remap instead.
+    /// maps each one once and keeps it: the next read maps nothing. Past a
+    /// budget too small for them all, segments are not mapped at all: their
+    /// records are read from open files, and the next read maps nothing
+    /// either.
     #[test]
     fn sealed_segments_stay_mapped_within_the_budget() {
         for (limit, keeps_all) in [(10_000, true), (40, false)] {
             let dir = tempfile::tempdir().unwrap();
             let budget = crate::cache::MappingBudget::new(limit);
-            let store = EventStoreEngine::create_with_store_options(
-                dir.path(),
-                &StoreOptions {
-                    max_segment_size: 4 * 1024,
-                    mapping_budget: Arc::clone(&budget),
-                    ..StoreOptions::default()
-                },
-            )
-            .unwrap();
-            for batch in 0..500u64 {
-                let events = (0..20)
-                    .map(|i| {
-                        make_event(
-                            "OrderPlaced",
-                            vec![tag("orderId", &format!("o-{batch}-{i}"))],
-                        )
-                    })
-                    .collect();
-                store
-                    .append(AppendRequest {
-                        condition: None,
-                        events,
-                    })
-                    .unwrap();
-            }
-            let sealed = store.segments.read().sealed_count;
-            assert!(sealed > 150, "only {sealed} sealed segments");
-            let misses = || {
-                store
-                    .cache
-                    .mmap_misses
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            };
+            let files = crate::cache::FileBudget::new(10_000);
+            let store = many_segments_store(dir.path(), &budget, &files);
+            let ord = std::sync::atomic::Ordering::Relaxed;
+            let misses = || store.cache.mmap_misses.load(ord);
+            let file_reads = || store.cache.file_hits.load(ord) + store.cache.file_misses.load(ord);
             assert_eq!(
                 store.source(Position(0), &cond_match_all()).unwrap().len(),
                 10_000
             );
             let after_first = misses();
+            let opened = store.cache.file_misses.load(ord);
             assert_eq!(
                 store.source(Position(0), &cond_match_all()).unwrap().len(),
                 10_000
             );
+            assert_eq!(misses(), after_first, "a second read mapped segments again");
+            assert!(budget.live() <= limit, "{} mapped", budget.live());
             if keeps_all {
-                assert_eq!(misses(), after_first, "a second read mapped segments again");
+                assert_eq!(file_reads(), 0);
             } else {
-                assert!(misses() > after_first);
-                assert!(budget.live() <= limit + 1, "{} mapped", budget.live());
+                assert!(file_reads() > 0, "no segment was read past the budget");
+                assert_eq!(
+                    store.cache.file_misses.load(ord),
+                    opened,
+                    "a second read opened files again"
+                );
             }
         }
+    }
+
+    /// Reads past the mapping budget return exactly what mapped reads
+    /// return, for sparse and dense reads, also when the file budget is too
+    /// small to keep every file open.
+    #[test]
+    fn reads_past_the_mapping_budget_match_mapped_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let roomy = crate::cache::MappingBudget::new(10_000);
+        let mapped =
+            many_segments_store(dir.path(), &roomy, &crate::cache::FileBudget::new(10_000));
+        let conditions = [
+            cond_match_all(),
+            tag_cond("o-7-3"),
+            tag_cond("o-480-0"),
+            SourcingCondition {
+                criteria: (0..500)
+                    .step_by(37)
+                    .map(|batch| Criterion {
+                        names: vec![],
+                        tags: vec![tag("orderId", &format!("o-{batch}-5"))],
+                    })
+                    .collect(),
+            },
+        ];
+        let expected: Vec<Vec<SequencedEvent>> = conditions
+            .iter()
+            .map(|condition| mapped.source(Position(0), condition).unwrap())
+            .collect();
+        mapped.shutdown();
+        drop(mapped);
+
+        for files in [10_000, 3] {
+            let tight = crate::cache::MappingBudget::new(1);
+            let store = EventStoreEngine::open_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 4 * 1024,
+                    mapping_budget: Arc::clone(&tight),
+                    file_budget: crate::cache::FileBudget::new(files),
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            for (condition, expected) in conditions.iter().zip(&expected) {
+                let got = store.source(Position(0), condition).unwrap();
+                assert_eq!(got.len(), expected.len());
+                for (got, expected) in got.iter().zip(expected) {
+                    assert_eq!(got.position, expected.position);
+                    assert_eq!(got.identifier, expected.identifier);
+                    assert_eq!(got.payload, expected.payload);
+                }
+            }
+            let ord = std::sync::atomic::Ordering::Relaxed;
+            assert!(store.cache.file_misses.load(ord) > 0);
+            assert!(store.cache.mapped_segments() <= 1);
+        }
+    }
+
+    /// A damaged record, or a segment file shorter than its index says, is
+    /// caught on the path past the mapping budget too.
+    #[test]
+    fn reads_past_the_mapping_budget_check_what_they_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let roomy = crate::cache::MappingBudget::new(10_000);
+        let store = many_segments_store(dir.path(), &roomy, &crate::cache::FileBudget::new(10_000));
+        let first = store.segments.read().bases[1];
+        store.seals.wait_idle();
+        store.shutdown();
+        drop(store);
+
+        let open = || {
+            EventStoreEngine::open_with_store_options(
+                dir.path(),
+                &StoreOptions {
+                    max_segment_size: 4 * 1024,
+                    mapping_budget: crate::cache::MappingBudget::new(1),
+                    file_budget: crate::cache::FileBudget::new(10_000),
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let path = segment::segment_path(dir.path(), first);
+        let original = std::fs::read(&path).unwrap();
+        // The payload of the segment's last event.
+        let mut flipped = original.clone();
+        let at = flipped.len() - 2;
+        flipped[at] ^= 0xFF;
+        std::fs::write(&path, &flipped).unwrap();
+        let store = open();
+        let read = store.source(Position(0), &cond_match_all());
+        assert!(
+            matches!(read, Err(Error::Corrupted { .. })),
+            "flipped byte served: {:?}",
+            read.map(|events| events.len())
+        );
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        assert!(
+            store.cache.file_misses.load(ord) > 0,
+            "read through a mapping"
+        );
+        drop(store);
+
+        std::fs::write(&path, &original[..original.len() - 10]).unwrap();
+        let store = open();
+        let read = store.source(Position(0), &cond_match_all());
+        assert!(
+            matches!(read, Err(Error::Corrupted { .. })),
+            "short segment served: {:?}",
+            read.map(|events| events.len())
+        );
     }
 
     #[test]
