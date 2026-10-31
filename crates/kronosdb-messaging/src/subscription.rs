@@ -117,9 +117,9 @@ struct ActiveSubscription {
     opened_at: Instant,
     /// Channel to send updates to the subscriber.
     update_tx: mpsc::Sender<SubscriptionUpdate>,
-    /// Update credit: how many more updates the subscriber has asked for.
+    /// Update permits: how many more updates the subscriber has asked for.
     /// Seeded from `initial_permits`, replenished by FlowControl. Terminal
-    /// messages (complete / error) bypass the credit check — the subscriber
+    /// messages (complete / error) bypass the permit check — the subscriber
     /// must always learn the subscription ended.
     permits: AtomicI64,
 }
@@ -262,8 +262,8 @@ impl SubscriptionRegistry {
     ) -> (PendingQuery, mpsc::Receiver<SubscriptionUpdate>) {
         // Create the update channel. The subscriber's requested permit count
         // sizes the buffer (bounded to keep a hostile value from pinning
-        // memory) and seeds the update credit. One extra slot is reserved so
-        // a terminal message still fits when the credit budget's worth of
+        // memory) and seeds the update permits. One extra slot is reserved so
+        // a terminal message still fits when the permits' worth of
         // updates is sitting unconsumed in the buffer.
         let initial_permits = query.initial_permits.clamp(1, 1024);
         let (update_tx, update_rx) = mpsc::channel(initial_permits as usize + 1);
@@ -304,11 +304,11 @@ impl SubscriptionRegistry {
 
     /// Sends an update from a handler to a subscription query subscriber.
     ///
-    /// Credit-based flow control: each non-terminal update consumes one permit
+    /// Permit-based flow control: each non-terminal update consumes one permit
     /// (seeded from `initial_permits`, replenished via [`grant_permits`]).
-    /// Out-of-credit updates are dropped with a warning — the subscriber
+    /// Updates past the permits are dropped with a warning — the subscriber
     /// stopped refilling, so it is either gone or not keeping up. Terminal
-    /// updates (complete / error) bypass the credit check.
+    /// updates (complete / error) bypass the permit check.
     pub fn send_update(&self, subscription_id: &str, update: SubscriptionUpdate) {
         let active = self.active.read();
         let Some(sub) = active.get(subscription_id) else {
@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn updates_stop_when_credit_exhausted_and_resume_on_grant() {
+    fn updates_stop_when_permits_run_out_and_resume_on_grant() {
         let registry = SubscriptionRegistry::new();
         registry.subscribe_handler(
             "GetOrderCount".into(),
@@ -617,7 +617,7 @@ mod tests {
 
         registry.send_update("sub-1", update("sub-1"));
         registry.send_update("sub-1", update("sub-1"));
-        registry.send_update("sub-1", update("sub-1")); // out of credit — dropped
+        registry.send_update("sub-1", update("sub-1")); // out of permits — dropped
 
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_update_bypasses_credit() {
+    fn terminal_update_bypasses_permits() {
         let registry = SubscriptionRegistry::new();
         registry.subscribe_handler(
             "GetOrderCount".into(),
@@ -645,7 +645,7 @@ mod tests {
         sub.initial_permits = 1;
         let (_pending, mut rx) = registry.open(sub).unwrap();
 
-        registry.send_update("sub-1", update("sub-1")); // consumes the only credit
+        registry.send_update("sub-1", update("sub-1")); // consumes the only permit
         let mut terminal = update("sub-1");
         terminal.complete = true;
         registry.send_update("sub-1", terminal);

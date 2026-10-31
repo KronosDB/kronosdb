@@ -5,10 +5,16 @@
 use std::time::{Duration, Instant};
 
 use crate::generated::{
-    Cancel, ClientPong, ErrorCode, GoAway, Hello, OpenCommandHandlers, OpenPlatform,
-    OpenQueryHandlers, OpenSubscriptionQuery, Ping, Pong, RelaySubscription, RequestFailed,
-    ServerPing, Subscribe, TailOpen, Welcome,
+    Cancel, ClientPong, ErrorCode, GoAway, Hello, Permits, Ping, Pong, RequestFailed, ServerPing,
+    Welcome, Window,
 };
+
+/// Each stream's window when the client does not choose one: enough for a
+/// stream to fill a fast link a millisecond or two away, refilled at half.
+pub const DEFAULT_WINDOW: u32 = 8 * 1024 * 1024;
+/// The smallest window a client may grant; anything less would make every
+/// stream crawl.
+pub const MIN_WINDOW: u32 = 64 * 1024;
 
 /// Whether a frame kind is one the server sends.
 pub fn sent_by_server(kind: u16) -> bool {
@@ -28,6 +34,8 @@ pub enum ServerRoute {
     Deliver,
     /// The client gave up on a stream.
     Cancel,
+    /// The client grants a stream more of its window.
+    Window,
     /// Nothing to do: input for a stream that has already finished.
     Drop,
     /// The client broke the protocol; the connection closes.
@@ -49,10 +57,23 @@ pub fn route_from_client(kind: u16, stream: u32, open: bool) -> ServerRoute {
     }
     match (kind, open) {
         (Cancel::KIND, true) => ServerRoute::Cancel,
-        (Cancel::KIND, false) => ServerRoute::Drop,
+        (Window::KIND, true) => ServerRoute::Window,
+        // About a stream, never the start of one: what arrives after the
+        // stream ended is late, not a request.
+        (Cancel::KIND | Window::KIND | Permits::KIND, false) => ServerRoute::Drop,
         (_, true) => ServerRoute::Deliver,
         (_, false) => ServerRoute::Open,
     }
+}
+
+/// Whether the server acts on a frame of `kind` while it is behind on
+/// writing. Reading otherwise pauses then, so a client that does not read
+/// cannot make the server buffer without bound; these produce no more than
+/// one short answer per open stream, and two of them are how a client gets
+/// the server out of being behind: a Cancel drops what a stream queued, and
+/// a Window lets a stream that waited on it go on.
+pub fn read_while_behind(kind: u16) -> bool {
+    matches!(kind, Cancel::KIND | Window::KIND | ClientPong::KIND)
 }
 
 /// What the client does with one frame from the server.
@@ -111,41 +132,11 @@ pub fn reply_kind(kind: u16, end: bool) -> Reply {
     }
 }
 
-/// How much of a stream's replies the server may have in flight towards a
-/// consumer that has not read them yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplyFlow {
-    /// The server sends no more than the client granted (credits, a byte
-    /// window), so what is queued is bounded by the client's own grant and
-    /// the client keeps all of it. A platform stream belongs here too: its
-    /// frames are heartbeats and instructions at the server's own pace.
-    Granted,
-    /// The server sends as fast as the connection takes it. The client keeps
-    /// a byte budget per stream and fails the stream that outruns its
-    /// consumer, so one slow reader cannot hold up the connection.
-    Budgeted,
-}
-
-/// Which kind of replies the stream opened by a request of `kind` gets. A
-/// request this does not know is treated as `Budgeted`, the safe side.
-pub fn reply_flow(kind: u16) -> ReplyFlow {
-    match kind {
-        Subscribe::KIND
-        | OpenSubscriptionQuery::KIND
-        | RelaySubscription::KIND
-        | OpenCommandHandlers::KIND
-        | OpenQueryHandlers::KIND
-        | OpenPlatform::KIND
-        | TailOpen::KIND => ReplyFlow::Granted,
-        _ => ReplyFlow::Budgeted,
-    }
-}
-
-/// Whether a stream that already queues `queued` bytes takes another frame
-/// of `len` bytes within `budget`. A stream with nothing queued always takes
-/// one, so a frame bigger than the budget still gets through.
-pub fn admits(queued: usize, len: usize, budget: usize) -> bool {
-    queued == 0 || queued.saturating_add(len) <= budget
+/// Whether a client that consumed `consumed` bytes of a stream since it last
+/// granted any grants them back now: once it is half the window, so the
+/// server keeps sending while the grant travels.
+pub fn grant_due(consumed: u32, window: u32) -> bool {
+    consumed >= window / 2
 }
 
 /// Liveness of a quiet connection: after `interval` without traffic send a
@@ -222,7 +213,7 @@ pub fn unanswered_code(cancelled: bool) -> (ErrorCode, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::{Append, Appended, Credit, Events, GetHead, Head};
+    use crate::generated::{Append, Appended, Events, GetHead, Head};
 
     #[test]
     fn server_routes_by_stream_and_state() {
@@ -237,8 +228,17 @@ mod tests {
         ));
         assert_eq!(route_from_client(Append::KIND, 7, false), ServerRoute::Open);
         assert_eq!(
-            route_from_client(Credit::KIND, 7, true),
+            route_from_client(Permits::KIND, 7, true),
             ServerRoute::Deliver
+        );
+        assert_eq!(
+            route_from_client(Window::KIND, 7, true),
+            ServerRoute::Window
+        );
+        assert_eq!(route_from_client(Window::KIND, 7, false), ServerRoute::Drop);
+        assert_eq!(
+            route_from_client(Permits::KIND, 7, false),
+            ServerRoute::Drop
         );
         assert_eq!(
             route_from_client(Cancel::KIND, 7, true),
@@ -284,23 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn only_granted_streams_are_unbudgeted() {
-        use crate::generated::{DispatchQuery, SnapshottedSource, Source};
-        assert_eq!(reply_flow(Subscribe::KIND), ReplyFlow::Granted);
-        assert_eq!(reply_flow(OpenCommandHandlers::KIND), ReplyFlow::Granted);
-        assert_eq!(reply_flow(TailOpen::KIND), ReplyFlow::Granted);
-        assert_eq!(reply_flow(Source::KIND), ReplyFlow::Budgeted);
-        assert_eq!(reply_flow(SnapshottedSource::KIND), ReplyFlow::Budgeted);
-        assert_eq!(reply_flow(DispatchQuery::KIND), ReplyFlow::Budgeted);
-        assert_eq!(reply_flow(0x7fff), ReplyFlow::Budgeted);
+    fn only_frames_that_cut_work_are_read_while_behind() {
+        assert!(read_while_behind(Cancel::KIND));
+        assert!(read_while_behind(Window::KIND));
+        assert!(read_while_behind(ClientPong::KIND));
+        // A ping wants an answer queued behind everything else.
+        assert!(!read_while_behind(Ping::KIND));
+        assert!(!read_while_behind(Permits::KIND));
+        assert!(!read_while_behind(Append::KIND));
     }
 
     #[test]
-    fn a_budget_admits_up_to_its_size_and_one_oversized_frame() {
-        assert!(admits(0, 100, 10));
-        assert!(admits(40, 60, 100));
-        assert!(!admits(41, 60, 100));
-        assert!(!admits(1, usize::MAX, 100));
+    fn grants_go_back_at_half_the_window() {
+        assert!(!grant_due(0, 1000));
+        assert!(!grant_due(499, 1000));
+        assert!(grant_due(500, 1000));
     }
 
     #[test]

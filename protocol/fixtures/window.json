@@ -1,0 +1,9 @@
+{
+  "frame": "Window",
+  "stream": 13,
+  "flags": 0,
+  "body": {
+    "bytes": 4194304
+  },
+  "description": "The client consumed 4 MiB of a stream and grants it back."
+}

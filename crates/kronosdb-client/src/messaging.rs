@@ -470,7 +470,7 @@ impl Bus {
     }
 
     /// Opens a subscription query: an initial result, then updates, until
-    /// the handler completes it or the stream is cancelled. Update credits
+    /// the handler completes it or the stream is cancelled. Update permits
     /// are granted back as updates are taken.
     pub async fn subscription_query(
         &self,
@@ -494,7 +494,7 @@ impl Bus {
             .await?;
         Ok(SubscriptionQueryStream {
             stream,
-            window: Window::new(permits),
+            permits: PermitPool::new(permits),
             outstanding: permits as u64,
         })
     }
@@ -517,13 +517,13 @@ impl Bus {
                 false,
             )
             .await?;
-        // One window for the whole stream, whatever it subscribes to.
+        // One pool of permits for the whole stream, whatever it subscribes to.
         stream
-            .send(&p::Frame::Credit(p::Credit { credits: permits }))
+            .send(&p::Frame::Permits(p::Permits { count: permits }))
             .await?;
         Ok(CommandHandlers {
             stream,
-            window: Window::new(permits),
+            permits: PermitPool::new(permits),
             backlog: Vec::new(),
             instructions: 0,
         })
@@ -547,13 +547,13 @@ impl Bus {
                 false,
             )
             .await?;
-        // One window for the whole stream, whatever it subscribes to.
+        // One pool of permits for the whole stream, whatever it subscribes to.
         stream
-            .send(&p::Frame::Credit(p::Credit { credits: permits }))
+            .send(&p::Frame::Permits(p::Permits { count: permits }))
             .await?;
         Ok(QueryHandlers {
             stream,
-            window: Window::new(permits),
+            permits: PermitPool::new(permits),
             backlog: Vec::new(),
             instructions: 0,
         })
@@ -562,14 +562,14 @@ impl Bus {
 
 // ── Permits ────────────────────────────────────────────────────────────
 
-/// The permits a handler grants the server: a window that is topped up once
+/// The permits a handler grants the server: a pool that is topped up once
 /// half of it has been answered.
-struct Window {
+struct PermitPool {
     size: u32,
     answered: AtomicU32,
 }
 
-impl Window {
+impl PermitPool {
     fn new(size: u32) -> Arc<Self> {
         Arc::new(Self {
             size,
@@ -628,7 +628,7 @@ async fn await_ack(
 /// take commands and answer each.
 pub struct CommandHandlers {
     stream: ClientStream,
-    window: Arc<Window>,
+    permits: Arc<PermitPool>,
     backlog: Vec<OwnedFrame>,
     instructions: u64,
 }
@@ -637,7 +637,7 @@ pub struct CommandHandlers {
 pub struct IncomingCommand {
     pub command: Command,
     writer: StreamWriter,
-    window: Arc<Window>,
+    permits: Arc<PermitPool>,
 }
 
 impl IncomingCommand {
@@ -653,9 +653,9 @@ impl IncomingCommand {
                 result: result.wire_command(),
             }))
             .await?;
-        if let Some(granted) = self.window.answered() {
+        if let Some(granted) = self.permits.answered() {
             self.writer
-                .send(&p::Frame::Credit(p::Credit { credits: granted }))
+                .send(&p::Frame::Permits(p::Permits { count: granted }))
                 .await?;
         }
         Ok(())
@@ -664,7 +664,7 @@ impl IncomingCommand {
 
 impl CommandHandlers {
     /// Serves `command` from now on, once the server acknowledges it. It
-    /// shares the stream's window of permits with every other command.
+    /// shares the stream's permits with every other command.
     pub async fn subscribe(&mut self, command: &str, load_factor: u32) -> Result<()> {
         let id = instruction_id(&mut self.instructions);
         self.stream
@@ -709,7 +709,7 @@ impl CommandHandlers {
                 return Ok(Some(IncomingCommand {
                     command: Message::from_command(&frame, &h.command),
                     writer: self.stream.writer(),
-                    window: Arc::clone(&self.window),
+                    permits: Arc::clone(&self.permits),
                 }));
             }
         }
@@ -758,7 +758,7 @@ impl QueryResults {
 /// A query handler stream.
 pub struct QueryHandlers {
     stream: ClientStream,
-    window: Arc<Window>,
+    permits: Arc<PermitPool>,
     backlog: Vec<OwnedFrame>,
     instructions: u64,
 }
@@ -767,7 +767,7 @@ pub struct QueryHandlers {
 pub struct IncomingQuery {
     pub query: Query,
     writer: StreamWriter,
-    window: Arc<Window>,
+    permits: Arc<PermitPool>,
 }
 
 impl IncomingQuery {
@@ -792,9 +792,9 @@ impl IncomingQuery {
                 request_id: &self.query.message_id,
             }))
             .await?;
-        if let Some(granted) = self.window.answered() {
+        if let Some(granted) = self.permits.answered() {
             self.writer
-                .send(&p::Frame::Credit(p::Credit { credits: granted }))
+                .send(&p::Frame::Permits(p::Permits { count: granted }))
                 .await?;
         }
         Ok(())
@@ -884,7 +884,7 @@ pub enum QueryHandlerEvent {
     CancelQuery(String),
     /// The subscriber went away.
     CancelSubscription(String),
-    /// The subscriber granted more update credits.
+    /// The subscriber granted more update permits.
     SubscriptionPermits {
         subscription_id: String,
         permits: u64,
@@ -944,7 +944,7 @@ impl QueryHandlers {
                 p::Frame::HandleQuery(h) => QueryHandlerEvent::Query(IncomingQuery {
                     query: Message::from_query(&frame, &h.query),
                     writer: writer(),
-                    window: Arc::clone(&self.window),
+                    permits: Arc::clone(&self.permits),
                 }),
                 p::Frame::HandleSubscriptionQuery(h) => {
                     QueryHandlerEvent::Subscription(IncomingSubscription {
@@ -1006,11 +1006,11 @@ pub enum SubscriptionEvent {
     },
 }
 
-/// A live subscription query. Update credits are granted back as updates are
-/// taken, so the handler stays within the window it was given.
+/// A live subscription query. Update permits are granted back as updates are
+/// taken, so the handler stays within the permits it was given.
 pub struct SubscriptionQueryStream {
     stream: ClientStream,
-    window: Arc<Window>,
+    permits: Arc<PermitPool>,
     outstanding: u64,
 }
 
@@ -1030,11 +1030,11 @@ impl SubscriptionQueryStream {
                 }
                 p::SubscriptionEvent::Update(u) => {
                     self.outstanding = self.outstanding.saturating_sub(1);
-                    if self.outstanding <= (self.window.size / 2) as u64 {
-                        let top_up = self.window.size as u64 - self.outstanding;
+                    if self.outstanding <= (self.permits.size / 2) as u64 {
+                        let top_up = self.permits.size as u64 - self.outstanding;
                         self.stream
-                            .send(&p::Frame::Credit(p::Credit {
-                                credits: top_up as u32,
+                            .send(&p::Frame::Permits(p::Permits {
+                                count: top_up as u32,
                             }))
                             .await?;
                         self.outstanding += top_up;
@@ -1304,9 +1304,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_window_grants_back_once_half_is_answered() {
-        let window = Window::new(10);
-        let grants: Vec<Option<u32>> = (0..10).map(|_| window.answered()).collect();
+    fn a_pool_grants_back_once_half_is_answered() {
+        let pool = PermitPool::new(10);
+        let grants: Vec<Option<u32>> = (0..10).map(|_| pool.answered()).collect();
         assert_eq!(
             grants,
             vec![
@@ -1322,8 +1322,8 @@ mod tests {
                 Some(5)
             ]
         );
-        // A window of one grants after every answer.
-        let one = Window::new(1);
+        // A pool of one grants after every answer.
+        let one = PermitPool::new(1);
         assert_eq!(one.answered(), Some(1));
         assert_eq!(one.answered(), Some(1));
     }

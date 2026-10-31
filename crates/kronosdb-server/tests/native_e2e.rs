@@ -6,8 +6,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use kronosdb_client::{
-    Appended, Client, Condition, ConnectOptions, Criterion, Delivery, ErrorCode, NewEvent,
-    SubscribeOptions,
+    Appended, Client, Condition, ConnectOptions, Criterion, DEFAULT_WINDOW, Delivery, ErrorCode,
+    MIN_WINDOW, NewEvent, SubscribeOptions,
 };
 
 struct Node {
@@ -199,7 +199,7 @@ async fn event_store_over_the_native_protocol() {
             0,
             SubscribeOptions {
                 criteria: vec![Criterion::tag("orderId", "o-2")],
-                credits: 2,
+                batch_size: 2,
                 ..SubscribeOptions::default()
             },
         )
@@ -213,7 +213,7 @@ async fn event_store_over_the_native_protocol() {
             .unwrap()
         {
             Some(Delivery::Events(batch)) => {
-                assert!(batch.len() <= 2, "the server sent past its credit");
+                assert!(batch.len() <= 2, "the server sent past the batch size");
                 seen.extend(batch.iter().map(|e| e.identifier.to_string()));
             }
             Some(Delivery::Progress(_)) => {}
@@ -359,8 +359,8 @@ struct Ask {
     from: u64,
     criteria: Vec<Criterion>,
     exclude: Vec<&'static str>,
-    /// Events the server may send ahead of the consumer.
-    credits: u32,
+    /// The stream's window: how far the server may run ahead of the consumer.
+    window: u32,
 }
 
 /// Events of `ctx` a subscription from `from` with these criteria and
@@ -395,9 +395,11 @@ impl Collector {
         // Its own connection: a client connection is read by one task, so a
         // subscription nobody reads would stall every request sharing it
         // once its stream queue is full.
-        let client = Client::connect(&node.native, &ConnectOptions::default())
-            .await
-            .unwrap();
+        let options = ConnectOptions {
+            window: ask.window,
+            ..ConnectOptions::default()
+        };
+        let client = Client::connect(&node.native, &options).await.unwrap();
         let mut sub = client
             .default_context()
             .subscribe(
@@ -405,7 +407,6 @@ impl Collector {
                 SubscribeOptions {
                     criteria: ask.criteria.clone(),
                     exclude_names: ask.exclude.iter().map(|n| n.to_string()).collect(),
-                    credits: ask.credits,
                     progress_interval_ms: 25,
                     ..SubscribeOptions::default()
                 },
@@ -461,6 +462,60 @@ async fn within<F: std::future::Future>(secs: u64, label: &str, body: F) -> F::O
         .unwrap_or_else(|_| panic!("{label}: no result within {secs}s"))
 }
 
+/// A read far bigger than the stream's window, by a consumer that comes late
+/// and reads slowly, arrives whole: the server waits for the consumer instead
+/// of failing it. A read dropped early stops the server at once, and the
+/// connection carries on.
+#[tokio::test]
+async fn a_slow_reader_is_paced_by_its_window_and_a_dropped_read_stops() {
+    within(120, "a slow reader", async {
+        let dir = work_dir("slow-reader");
+        let node = spawn(&dir);
+        let client = connect(&node).await;
+        let ctx = client.default_context();
+        // 4 MB: sixty-odd windows of the smallest size.
+        let payload = vec![b'x'; 4096];
+        for round in 0..10u32 {
+            let events: Vec<_> = (0..100)
+                .map(|i| NewEvent {
+                    payload: payload.clone().into(),
+                    ..event("Big", "o-1", round * 100 + i)
+                })
+                .collect();
+            append_ok(&ctx, &events, None).await;
+        }
+
+        let options = ConnectOptions {
+            window: MIN_WINDOW,
+            ..ConnectOptions::default()
+        };
+        let reader = Client::connect(&node.native, &options).await.unwrap();
+        let reading = reader.default_context();
+        let mut source = reading.source(0, &[], 100).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut events = 0;
+        let mut batches = 0u32;
+        while let Some(batch) = source.next().await.unwrap() {
+            events += batch.len();
+            batches += 1;
+            if batches.is_multiple_of(10) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(events, 1_000);
+
+        // Dropped after one batch: the next request on the connection is
+        // not held up behind the rest of the read.
+        let mut source = reading.source(0, &[], 100).await.unwrap();
+        assert!(source.next().await.unwrap().is_some());
+        drop(source);
+        let started = std::time::Instant::now();
+        reading.head().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    })
+    .await;
+}
+
 /// Subscriptions that start far behind the head, at it, and in the middle of
 /// the writes all receive exactly the events they asked for, in order and
 /// once, while eight writers append and the log rotates.
@@ -498,21 +553,21 @@ async fn subscriptions_under_heavy_appends() {
             from: 0,
             criteria: vec![],
             exclude: vec![],
-            credits: 64,
+            window: MIN_WINDOW,
         },
         Ask {
             label: "everything but Noise",
             from: 0,
             criteria: vec![],
             exclude: vec!["Noise"],
-            credits: 64,
+            window: MIN_WINDOW,
         },
         Ask {
             label: "one order from the start",
             from: 0,
             criteria: vec![Criterion::tag("orderId", "o-3")],
             exclude: vec![],
-            credits: 64,
+            window: MIN_WINDOW,
         },
         Ask {
             label: "two orders and a type, from the middle of the backlog",
@@ -525,7 +580,7 @@ async fn subscriptions_under_heavy_appends() {
                 },
             ],
             exclude: vec![],
-            credits: 64,
+            window: MIN_WINDOW,
         },
         Ask {
             label: "types only, live",
@@ -535,28 +590,28 @@ async fn subscriptions_under_heavy_appends() {
                 tags: vec![],
             }],
             exclude: vec![],
-            credits: 64,
+            window: MIN_WINDOW,
         },
         Ask {
-            label: "everything from the start, credit for whole shared batches",
+            label: "everything from the start, a window for whole shared batches",
             from: 0,
             criteria: vec![],
             exclude: vec![],
-            credits: 100_000,
+            window: DEFAULT_WINDOW,
         },
         Ask {
-            label: "everything, live, credit for whole shared batches",
+            label: "everything, live, a window for whole shared batches",
             from: start,
             criteria: vec![],
             exclude: vec![],
-            credits: 100_000,
+            window: DEFAULT_WINDOW,
         },
         Ask {
             label: "an order nobody writes",
             from: 0,
             criteria: vec![Criterion::tag("orderId", "nobody")],
             exclude: vec![],
-            credits: 64,
+            window: MIN_WINDOW,
         },
     ];
     let mut collectors = Vec::new();
@@ -582,7 +637,7 @@ async fn subscriptions_under_heavy_appends() {
         from: late_from,
         criteria: vec![Criterion::tag("orderId", "o-1")],
         exclude: vec![],
-        credits: 16,
+        window: MIN_WINDOW,
     };
     let late = Collector::start(&node, &late_ask).await;
     for writer in writers {
@@ -731,14 +786,14 @@ async fn a_quiet_filtered_subscription_still_reports_progress() {
 }
 
 /// A stream that wants every event shares the dispatcher's batches, but a
-/// batch is only sent whole when its client has the credit for all of it.
+/// batch is only sent whole when it is within the stream's batch size.
 #[tokio::test]
-async fn a_live_stream_that_wants_everything_never_outruns_its_credit() {
+async fn a_live_stream_that_wants_everything_keeps_to_its_batch_size() {
     within(
         60,
-        "a_live_stream_that_wants_everything_never_outruns_its_credit",
+        "a_live_stream_that_wants_everything_keeps_to_its_batch_size",
         async {
-            let dir = work_dir("shared-credit");
+            let dir = work_dir("shared-batch");
             let node = spawn(&dir);
             let client = connect(&node).await;
             let ctx = client.default_context();
@@ -749,14 +804,14 @@ async fn a_live_stream_that_wants_everything_never_outruns_its_credit() {
                 .subscribe(
                     from,
                     SubscribeOptions {
-                        credits: 2,
+                        batch_size: 2,
                         ..SubscribeOptions::default()
                     },
                 )
                 .await
                 .unwrap();
             // One commit of ten events: a shared batch of ten, for a client that
-            // granted two.
+            // takes two at a time.
             let events: Vec<_> = (1..=10).map(|n| event("ItemAdded", "o-1", n)).collect();
             append_ok(&ctx, &events, None).await;
             append_ok(&ctx, &[event("ItemAdded", "o-2", 11)], None).await;
@@ -769,7 +824,11 @@ async fn a_live_stream_that_wants_everything_never_outruns_its_credit() {
                     .unwrap()
                 {
                     Some(Delivery::Events(batch)) => {
-                        assert!(batch.len() <= 2, "{} events for a credit of 2", batch.len());
+                        assert!(
+                            batch.len() <= 2,
+                            "{} events for a batch size of 2",
+                            batch.len()
+                        );
                         seen.extend(batch.iter().map(|e| e.identifier.to_string()));
                     }
                     Some(Delivery::Progress(_)) => {}
@@ -789,7 +848,7 @@ async fn a_live_stream_that_wants_everything_never_outruns_its_credit() {
 
 /// Filtering subscriptions at the live tail take their events from the
 /// dispatcher's chunks. Whether they start behind the head, at it or in the
-/// middle of the writes, run slowly on a small credit window, or share the
+/// middle of the writes, run slowly on the smallest window, or share the
 /// server with subscriptions that come and go, each gets exactly its events,
 /// in order and once, while eight writers append and the log rotates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -833,7 +892,7 @@ async fn filtered_subscriptions_scenario() {
                 from: start,
                 criteria: by_order(o),
                 exclude: vec![],
-                credits: 64,
+                window: MIN_WINDOW,
             },
             Duration::ZERO,
         ));
@@ -845,17 +904,17 @@ async fn filtered_subscriptions_scenario() {
                 from: 0,
                 criteria: by_order(7),
                 exclude: vec![],
-                credits: 64,
+                window: MIN_WINDOW,
             },
             Duration::ZERO,
         ),
         (
             Ask {
-                label: "a slow consumer on a credit of two",
+                label: "a slow consumer on the smallest window",
                 from: start,
                 criteria: by_order(3),
                 exclude: vec![],
-                credits: 2,
+                window: MIN_WINDOW,
             },
             Duration::from_millis(15),
         ),
@@ -865,7 +924,7 @@ async fn filtered_subscriptions_scenario() {
                 from: start / 2,
                 criteria: by_order(11),
                 exclude: vec![],
-                credits: 4,
+                window: MIN_WINDOW,
             },
             Duration::from_millis(8),
         ),
@@ -881,7 +940,7 @@ async fn filtered_subscriptions_scenario() {
                     },
                 ],
                 exclude: vec!["Noise"],
-                credits: 64,
+                window: MIN_WINDOW,
             },
             Duration::ZERO,
         ),
@@ -894,7 +953,7 @@ async fn filtered_subscriptions_scenario() {
                     tags: vec![],
                 }],
                 exclude: vec!["OrderPlaced"],
-                credits: 256,
+                window: 1 << 20,
             },
             Duration::ZERO,
         ),
@@ -904,7 +963,7 @@ async fn filtered_subscriptions_scenario() {
                 from: start,
                 criteria: vec![],
                 exclude: vec!["Noise"],
-                credits: 256,
+                window: 1 << 20,
             },
             Duration::ZERO,
         ),
@@ -914,7 +973,7 @@ async fn filtered_subscriptions_scenario() {
                 from: start,
                 criteria: by_order(99),
                 exclude: vec![],
-                credits: 64,
+                window: MIN_WINDOW,
             },
             Duration::ZERO,
         ),
@@ -948,7 +1007,6 @@ async fn filtered_subscriptions_scenario() {
                         0,
                         SubscribeOptions {
                             criteria: vec![Criterion::tag("orderId", format!("o-{}", i % 40))],
-                            credits: 8,
                             ..SubscribeOptions::default()
                         },
                     )
@@ -966,7 +1024,7 @@ async fn filtered_subscriptions_scenario() {
         from: ctx.head().await.unwrap().saturating_sub(200),
         criteria: by_order(1),
         exclude: vec![],
-        credits: 16,
+        window: MIN_WINDOW,
     };
     let late = Collector::start(&node, &late_ask).await;
     for writer in writers {
@@ -996,15 +1054,15 @@ async fn filtered_subscriptions_scenario() {
     assert!(delivered > 1_000, "the scenario delivered only {delivered}");
 }
 
-/// A filtering stream sends a chunk's matches only as far as its client's
-/// credit goes, then carries on from the same chunk.
+/// A filtering stream sends a chunk's matches only as far as its batch size
+/// goes, then carries on from the same chunk.
 #[tokio::test]
-async fn a_filtered_live_stream_never_outruns_its_credit() {
+async fn a_filtered_live_stream_keeps_to_its_batch_size() {
     within(
         60,
-        "a_filtered_live_stream_never_outruns_its_credit",
+        "a_filtered_live_stream_keeps_to_its_batch_size",
         async {
-            let dir = work_dir("filtered-credit");
+            let dir = work_dir("filtered-batch");
             let node = spawn(&dir);
             let client = connect(&node).await;
             let ctx = client.default_context();
@@ -1016,7 +1074,7 @@ async fn a_filtered_live_stream_never_outruns_its_credit() {
                     from,
                     SubscribeOptions {
                         criteria: vec![Criterion::tag("orderId", "o-1")],
-                        credits: 2,
+                        batch_size: 2,
                         ..SubscribeOptions::default()
                     },
                 )
@@ -1037,7 +1095,11 @@ async fn a_filtered_live_stream_never_outruns_its_credit() {
                     .unwrap()
                 {
                     Some(Delivery::Events(batch)) => {
-                        assert!(batch.len() <= 2, "{} events for a credit of 2", batch.len());
+                        assert!(
+                            batch.len() <= 2,
+                            "{} events for a batch size of 2",
+                            batch.len()
+                        );
                         seen.extend(batch.iter().map(|e| e.identifier.to_string()));
                     }
                     Some(Delivery::Progress(_)) => {}

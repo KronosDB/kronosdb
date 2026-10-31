@@ -17,7 +17,8 @@ use kronosdb_protocol::net::{NetError, OwnedFrame};
 use tokio::sync::Mutex;
 
 pub use kronosdb_protocol::net::Failure;
-pub use kronosdb_protocol::net::client::{ConnectOptions, Credential};
+pub use kronosdb_protocol::net::client::{ConnectOptions, Credential, DEFAULT_WINDOW};
+pub use kronosdb_protocol::net::rules::MIN_WINDOW;
 pub use kronosdb_protocol::{ErrorCode, EventRecord};
 pub use messaging::*;
 
@@ -439,19 +440,13 @@ impl Context {
                     from,
                     criteria: wire_criteria(&options.criteria),
                     exclude_names: options.exclude_names.iter().map(String::as_str).collect(),
-                    credits: options.credits,
                     batch_size: options.batch_size,
                     progress_interval: options.progress_interval_ms,
                 }),
-                false,
+                true,
             )
             .await?;
-        Ok(Subscription {
-            stream,
-            refill_at: options.credits / 2,
-            granted: options.credits,
-            outstanding: options.credits as u64,
-        })
+        Ok(Subscription { stream })
     }
 
     /// Stores `state` under `key` as a snapshot of the log up to `position`,
@@ -590,27 +585,14 @@ impl SnapshottedSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SubscribeOptions {
     pub criteria: Vec<Criterion>,
     pub exclude_names: Vec<String>,
-    /// Events the server may send ahead of the consumer.
-    pub credits: u32,
+    /// Most events per batch; 0 lets the server choose.
     pub batch_size: u32,
     /// Report progress through quiet stretches this often; 0 never.
     pub progress_interval_ms: u32,
-}
-
-impl Default for SubscribeOptions {
-    fn default() -> Self {
-        Self {
-            criteria: vec![],
-            exclude_names: vec![],
-            credits: 4096,
-            batch_size: 0,
-            progress_interval_ms: 0,
-        }
-    }
 }
 
 /// What a subscription delivers.
@@ -621,13 +603,10 @@ pub enum Delivery {
     Progress(u64),
 }
 
-/// A live subscription. Credits are granted back automatically as batches
-/// are taken, so the server stays at most `credits` events ahead.
+/// A live subscription. The server stays at most the connection's window
+/// ahead of what is taken from it.
 pub struct Subscription {
     stream: ClientStream,
-    granted: u32,
-    refill_at: u32,
-    outstanding: u64,
 }
 
 impl Subscription {
@@ -636,20 +615,7 @@ impl Subscription {
             return Ok(None);
         };
         match frame.decode()? {
-            p::Frame::Events(e) => {
-                let n = e.events.len() as u64;
-                self.outstanding = self.outstanding.saturating_sub(n);
-                if self.outstanding <= self.refill_at as u64 {
-                    let top_up = self.granted as u64 - self.outstanding;
-                    self.stream
-                        .send(&p::Frame::Credit(p::Credit {
-                            credits: top_up as u32,
-                        }))
-                        .await?;
-                    self.outstanding += top_up;
-                }
-                Ok(Some(Delivery::Events(EventBatch { frame })))
-            }
+            p::Frame::Events(_) => Ok(Some(Delivery::Events(EventBatch { frame }))),
             p::Frame::Progress(pr) => Ok(Some(Delivery::Progress(pr.position))),
             _ => Err(unexpected(&frame, "on a subscription")),
         }

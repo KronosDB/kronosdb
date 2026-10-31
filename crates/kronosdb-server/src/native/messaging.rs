@@ -120,7 +120,7 @@ pub async fn open_command_handlers(ctx: Ctx, stream: ServerStream) -> Result<(),
                         handlers.unsubscribe(u.command);
                         ack(&out, u.instruction_id).await;
                     }
-                    Ok(p::Frame::Credit(c)) => handlers.grant(c.credits as i64),
+                    Ok(p::Frame::Permits(p)) => handlers.grant(p.count as i64),
                     Ok(p::Frame::CommandHandled(h)) => {
                         handlers.complete(wire::command_result(Source(frame.bytes()), &h.result));
                     }
@@ -128,7 +128,7 @@ pub async fn open_command_handlers(ctx: Ctx, stream: ServerStream) -> Result<(),
                     _ => {
                         return Err(invalid(
                             "a command handler stream accepts SubscribeCommand, \
-                             UnsubscribeCommand, Credit, CommandHandled and ClientAck",
+                             UnsubscribeCommand, Permits, CommandHandled and ClientAck",
                         ));
                     }
                 }
@@ -265,7 +265,7 @@ pub async fn open_query_handlers(ctx: Ctx, stream: ServerStream) -> Result<(), F
                         handlers.unsubscribe(u.query);
                         ack(&out, u.instruction_id).await;
                     }
-                    Ok(p::Frame::Credit(c)) => handlers.grant(c.credits as i64),
+                    Ok(p::Frame::Permits(p)) => handlers.grant(p.count as i64),
                     Ok(p::Frame::QueryHandled(h)) => {
                         handlers.handled(wire::query_result(Source(frame.bytes()), &h.result));
                     }
@@ -282,7 +282,7 @@ pub async fn open_query_handlers(ctx: Ctx, stream: ServerStream) -> Result<(), F
                     _ => {
                         return Err(invalid(
                             "a query handler stream accepts SubscribeQuery, UnsubscribeQuery, \
-                             Credit, QueryHandled, QueryDone, SubscriptionQueryHandled and ClientAck",
+                             Permits, QueryHandled, QueryDone, SubscriptionQueryHandled and ClientAck",
                         ));
                     }
                 }
@@ -318,7 +318,7 @@ pub async fn open_subscription_query(ctx: Ctx, stream: ServerStream) -> Result<(
 }
 
 /// Streams a subscription's events to its subscriber, and passes the update
-/// credits it grants on to the feed. Ends after the terminal event, or when
+/// permits it grants on to the feed. Ends after the terminal event, or when
 /// the subscriber cancels (which drops the feed and so cancels the
 /// subscription).
 pub async fn send_events(
@@ -360,8 +360,8 @@ pub async fn send_events(
             frame = inbound.next() => {
                 let Some(frame) = frame else { return Ok(()) };
                 match frame.decode() {
-                    Ok(p::Frame::Credit(c)) => feed.grant(c.credits as u64),
-                    _ => return Err(invalid("a subscription query accepts only Credit and Cancel")),
+                    Ok(p::Frame::Permits(p)) => feed.grant(p.count as u64),
+                    _ => return Err(invalid("a subscription query accepts only Permits and Cancel")),
                 }
             }
         }

@@ -1,0 +1,9 @@
+{
+  "description": "A handler grants the server 500 more commands.",
+  "frame": "Permits",
+  "stream": 13,
+  "flags": 0,
+  "body": {
+    "count": 500
+  }
+}

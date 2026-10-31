@@ -15,7 +15,7 @@ use super::bus::Bus;
 use super::peers::RemoteFeed;
 use super::types::{Fault, FaultKind, SubscriptionEvent, ToQueryHandler};
 
-/// A handler's event, as the update the bus accounts credits for and
+/// A handler's event, as the update the bus accounts permits for and
 /// delivers. The initial result travels apart from the updates.
 pub(super) fn update_of(
     subscription_id: &str,
@@ -139,7 +139,7 @@ impl SubscriptionFeed {
                 );
             }
             Source::Remote(feed) => {
-                let _ = feed.credits.send(permits);
+                let _ = feed.permits.send(permits);
             }
         }
     }

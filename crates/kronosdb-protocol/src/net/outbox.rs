@@ -91,6 +91,19 @@ impl Outbox {
         }
     }
 
+    /// Drops what a cancelled stream queued and has not been taken, except
+    /// the frame that ends it.
+    pub(crate) fn discard(&self, stream: u32) {
+        let mut s = self.lock();
+        let was_full = s.queue.len() >= OUTBOUND_CAPACITY;
+        s.queue.retain(|out| !out.cancelled_with(stream));
+        if was_full && s.queue.len() < OUTBOUND_CAPACITY {
+            for w in s.tx_wakers.drain(..) {
+                w.wake();
+            }
+        }
+    }
+
     /// Ready when [`take`](Self::take) has something; otherwise registers the
     /// task to be woken. With `closing`, also ready once no sender remains.
     pub(crate) fn poll_ready(&self, cx: &mut Context<'_>, closing: bool) -> Poll<()> {
@@ -418,6 +431,43 @@ mod tests {
         blocked.await.unwrap().unwrap();
         outbox.close();
         assert!(matches!(tx.push(frame(1, 2)).await, Err(NetError::Closed)));
+    }
+
+    #[test]
+    fn a_cancel_discards_its_streams_frames_but_the_last() {
+        use crate::codec::FLAG_END;
+        use crate::generated::{Frame, Progress, RequestFailed};
+        let progress = |stream, flags| {
+            Out::Frame(
+                super::super::encode(stream, flags, &Frame::Progress(Progress { position: 1 }))
+                    .unwrap(),
+            )
+        };
+        let outbox = Outbox::new();
+        outbox.push_now(progress(1, 0));
+        outbox.push_now(progress(2, 0));
+        outbox.push_now(progress(1, 0));
+        let failed = RequestFailed {
+            code: crate::generated::ErrorCode::CANCELLED,
+            message: "",
+        };
+        outbox.push_now(Out::Frame(
+            super::super::encode(1, FLAG_END, &Frame::RequestFailed(failed)).unwrap(),
+        ));
+        outbox.discard(1);
+        let (mut queue, mut finished) = (VecDeque::new(), Vec::new());
+        outbox.take(&mut queue, &mut finished);
+        let left: Vec<(u32, bool)> = queue
+            .iter()
+            .map(|out| {
+                let h = out.header();
+                (
+                    u32::from_le_bytes(h[7..11].try_into().unwrap()),
+                    h[6] & FLAG_END != 0,
+                )
+            })
+            .collect();
+        assert_eq!(left, vec![(2, false), (1, true)]);
     }
 
     #[tokio::test]

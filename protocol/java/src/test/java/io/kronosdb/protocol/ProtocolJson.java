@@ -184,6 +184,7 @@ final class ProtocolJson {
         m.put("client_id", v.clientId());
         m.put("credential_kind", Json.enumName(v.credentialKind().variantName(), v.credentialKind().value()));
         m.put("credential", v.credential());
+        m.put("window", Long.valueOf(v.window()));
         return m;
     }
 
@@ -196,7 +197,8 @@ final class ProtocolJson {
                 Json.str(m.get("client_name")),
                 Json.str(m.get("client_id")),
                 CredentialKind.of(Json.enumValue(m.get("credential_kind"), CredentialKind::valueOfName)),
-                Json.str(m.get("credential")));
+                Json.str(m.get("credential")),
+                Json.longValue(m.get("window")));
     }
 
     static Object toJson(Welcome v) {
@@ -346,6 +348,30 @@ final class ProtocolJson {
         return new Cancel();
     }
 
+    static Object toJson(Window v) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("bytes", Long.valueOf(v.bytes()));
+        return m;
+    }
+
+    static Window windowFromJson(Object j) {
+        Map<String, Object> m = Json.object(j);
+        return new Window(
+                Json.longValue(m.get("bytes")));
+    }
+
+    static Object toJson(Permits v) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("count", Long.valueOf(v.count()));
+        return m;
+    }
+
+    static Permits permitsFromJson(Object j) {
+        Map<String, Object> m = Json.object(j);
+        return new Permits(
+                Json.longValue(m.get("count")));
+    }
+
     static Object toJson(RequestFailed v) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("code", Json.enumName(v.code().variantName(), v.code().value()));
@@ -442,7 +468,6 @@ final class ProtocolJson {
         m.put("from", Long.toUnsignedString(v.from()));
         m.put("criteria", Json.list(v.criteria(), e1 -> toJson(e1)));
         m.put("exclude_names", Json.list(v.excludeNames(), e1 -> e1));
-        m.put("credits", Long.valueOf(v.credits()));
         m.put("batch_size", Long.valueOf(v.batchSize()));
         m.put("progress_interval", Long.valueOf(v.progressInterval()));
         return m;
@@ -455,21 +480,8 @@ final class ProtocolJson {
                 Json.u64(m.get("from")),
                 Json.map(m.get("criteria"), j1 -> criterionFromJson(j1)),
                 Json.map(m.get("exclude_names"), j1 -> Json.str(j1)),
-                Json.longValue(m.get("credits")),
                 Json.longValue(m.get("batch_size")),
                 Json.longValue(m.get("progress_interval")));
-    }
-
-    static Object toJson(Credit v) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("credits", Long.valueOf(v.credits()));
-        return m;
-    }
-
-    static Credit creditFromJson(Object j) {
-        Map<String, Object> m = Json.object(j);
-        return new Credit(
-                Json.longValue(m.get("credits")));
     }
 
     static Object toJson(Progress v) {
@@ -2055,6 +2067,8 @@ final class ProtocolJson {
             case ContextBound v -> toJson(v);
             case GoAway v -> toJson(v);
             case Cancel v -> toJson(v);
+            case Window v -> toJson(v);
+            case Permits v -> toJson(v);
             case RequestFailed v -> toJson(v);
             case Append v -> toJson(v);
             case Appended v -> toJson(v);
@@ -2062,7 +2076,6 @@ final class ProtocolJson {
             case Source v -> toJson(v);
             case Events v -> toJson(v);
             case Subscribe v -> toJson(v);
-            case Credit v -> toJson(v);
             case Progress v -> toJson(v);
             case GetHead v -> toJson(v);
             case Head v -> toJson(v);
@@ -2170,6 +2183,8 @@ final class ProtocolJson {
             case "ContextBound" -> contextBoundFromJson(body);
             case "GoAway" -> goAwayFromJson(body);
             case "Cancel" -> cancelFromJson(body);
+            case "Window" -> windowFromJson(body);
+            case "Permits" -> permitsFromJson(body);
             case "RequestFailed" -> requestFailedFromJson(body);
             case "Append" -> appendFromJson(body);
             case "Appended" -> appendedFromJson(body);
@@ -2177,7 +2192,6 @@ final class ProtocolJson {
             case "Source" -> sourceFromJson(body);
             case "Events" -> eventsFromJson(body);
             case "Subscribe" -> subscribeFromJson(body);
-            case "Credit" -> creditFromJson(body);
             case "Progress" -> progressFromJson(body);
             case "GetHead" -> getHeadFromJson(body);
             case "Head" -> headFromJson(body);

@@ -9,14 +9,15 @@ import java.util.List;
  * First frame of every connection, after the 8-byte preface {@code KRONOSDB}.
  *
  * @param version Highest protocol version the client speaks.
- * @param features Feature bits the client would like to use. None are defined in version 1.
- * @param recordFormat Stored record layout the client decodes. Version 1 knows layout 3.
+ * @param features Feature bits the client would like to use. None are defined in version 2.
+ * @param recordFormat Stored record layout the client decodes. Version 2 knows layout 3.
  * @param clientName Application name, shown in the admin console.
  * @param clientId This instance, unique per process.
  * @param credentialKind the credential kind
  * @param credential the credential
+ * @param window Each stream's window: the bytes of frames the server may send on a stream before the client grants more with Window. At least 64 KiB.
  */
-public record Hello(int version, long features, int recordFormat, String clientName, String clientId, CredentialKind credentialKind, String credential) implements Frame {
+public record Hello(int version, long features, int recordFormat, String clientName, String clientId, CredentialKind credentialKind, String credential, long window) implements Frame {
 
     /** The frame kind on the wire. */
     public static final int KIND = 0x0001;
@@ -34,7 +35,8 @@ public record Hello(int version, long features, int recordFormat, String clientN
                 r.readStr16(),
                 r.readStr16(),
                 CredentialKind.of(r.readU8()),
-                r.readStr32());
+                r.readStr32(),
+                r.readU32());
     }
 
     @Override
@@ -46,5 +48,6 @@ public record Hello(int version, long features, int recordFormat, String clientN
         w.writeStr16(clientId, "Hello.client_id");
         w.writeU8(credentialKind.value());
         w.writeStr32(credential, "Hello.credential");
+        w.writeU32(window);
     }
 }

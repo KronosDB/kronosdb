@@ -6,7 +6,7 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 /**
- * The subscriber granted more update credits.
+ * The subscriber granted more updates.
  *
  * @param subscriptionId the subscription id
  * @param permits the permits

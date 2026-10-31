@@ -2,7 +2,7 @@
   "description": "A processor subscription: two event types, progress every 5 s.",
   "frame": "Subscribe",
   "stream": 13,
-  "flags": 0,
+  "flags": 1,
   "body": {
     "context": 0,
     "from": "1048578",
@@ -18,7 +18,6 @@
     "exclude_names": [
       "LegacyAudit"
     ],
-    "credits": 1000,
     "batch_size": 256,
     "progress_interval": 5000
   }

@@ -129,6 +129,7 @@ impl PeerPool {
             credential: self.transport.credential(),
             tls,
             connect_timeout: CONNECT_TIMEOUT,
+            window: super::PEER_WINDOW,
             ..ConnectOptions::default()
         };
         client::connect(native, &options)

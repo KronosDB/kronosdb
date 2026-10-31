@@ -7,10 +7,10 @@ import java.util.List;
 
 /**
  * Opens a command handler stream. The client then subscribes to command
- * types and grants the server credits; the server sends commands, at most
- * one per credit, and the client answers each with CommandHandled. Credits
- * belong to the stream, not to a command type: one credit is one command of
- * any type the stream handles, and credits granted before the first
+ * types and grants the server Permits; the server sends commands, at most
+ * one per permit, and the client answers each with CommandHandled. Permits
+ * belong to the stream, not to a command type: one permit is one command of
+ * any type the stream handles, and permits granted before the first
  * subscription count. Closing the stream unsubscribes everything it
  * subscribed.
  *

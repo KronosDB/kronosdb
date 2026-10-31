@@ -184,21 +184,17 @@ pub async fn snapshotted_source(ctx: Ctx, stream: ServerStream) -> Result<(), Fa
 }
 
 /// A live subscription: catches up from `from`, then follows the log as
-/// events become durable. Never sends more events than the client granted,
+/// events become durable. Paced by the stream's window like every stream;
 /// never waits to fill a batch.
 pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure> {
     let frame = stream.request.clone();
     let Ok(p::Frame::Subscribe(req)) = frame.decode() else {
         return Err(invalid("malformed Subscribe"));
     };
-    if req.credits == 0 {
-        return Err(invalid("a subscription needs initial credits"));
-    }
     let store = ctx.store(req.context, Access::Read)?;
     let condition = convert::read_condition(&req.criteria);
     let exclude: Vec<String> = req.exclude_names.iter().map(|n| n.to_string()).collect();
     let batch = batch_size(req.batch_size);
-    let mut credits = req.credits as u64;
     // Checked here: a stream is woken only by events that match it, so a
     // condition that can never match would otherwise fail on no read at all.
     kronosdb_eventstore::system::validate_client_condition(&condition).map_err(convert::failure)?;
@@ -215,15 +211,9 @@ pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure
     loop {
         tokio::select! {
             biased;
-            frame = stream.inbound.next() => match frame {
-                Some(frame) => match frame.decode() {
-                    Ok(p::Frame::Credit(c)) => credits += c.credits as u64,
-                    _ => return Err(invalid("a subscription only accepts Credit and Cancel")),
-                },
-                // Cancelled, or the client went away: the runtime answers.
-                None => return Ok(()),
-            },
-            bound = events.wait_for_new_events(), if credits > 0 => {
+            // Cancelled, or the client went away: the runtime answers.
+            _ = stream.inbound.cancelled() => return Ok(()),
+            bound = events.wait_for_new_events() => {
                 let bound = Position(bound);
                 if bound <= events.cursor {
                     // Only a closed engine returns without progress.
@@ -231,13 +221,11 @@ pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure
                         message: "the context is shutting down; resubscribe".into(),
                     }));
                 }
-                let limit = (credits as usize).min(batch);
                 // A stream that wants every event at the live tail sends the
                 // batch the dispatcher encoded for all of them: no read, no
                 // copy, no CRC check here.
-                if let Some(chunk) = events.live_batch(limit) {
+                if let Some(chunk) = events.live_batch(batch) {
                     if chunk.count > 0 {
-                        credits -= chunk.count as u64;
                         if out.send_shared(p::Events::KIND, false, chunk.body.clone()).await.is_err() {
                             return Ok(());
                         }
@@ -250,10 +238,9 @@ pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure
                 // A filtering stream at the live tail takes what the
                 // dispatcher matched for it out of the same chunk: the
                 // records are already read, checked and copied.
-                if let Some(pick) = events.live_picks(limit) {
+                if let Some(pick) = events.live_picks(batch) {
                     events.advance_cursor(Position(pick.next));
                     if let Some(body) = pick.body {
-                        credits -= pick.count as u64;
                         if out.send_shared(p::Events::KIND, false, body).await.is_err() {
                             return Ok(());
                         }
@@ -272,7 +259,7 @@ pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure
                     .read_records(
                         &condition,
                         &PageBounds {
-                            limit,
+                            limit: batch,
                             max_bytes: MAX_BATCH_BYTES,
                             exclude_names: &exclude,
                             ..PageBounds::new(events.cursor, bound)
@@ -281,7 +268,6 @@ pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure
                     )
                     .map_err(convert::failure)?;
                 if page.count > 0 {
-                    credits -= page.count as u64;
                     let body = finish_events_body(body, page.count, None);
                     if out.send_shared(p::Events::KIND, false, body).await.is_err() {
                         return Ok(());

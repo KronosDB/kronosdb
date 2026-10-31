@@ -2,7 +2,7 @@
 //! concurrent requests on it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -13,19 +13,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use super::rules::{self, ClientRoute, LivenessCheck, Reply, ReplyFlow};
+use super::rules::{self, ClientRoute, LivenessCheck, Reply};
 use super::server::RECORD_FORMAT;
 use super::{
     DEFAULT_MAX_FRAME, Failure, FrameReader, NetError, Out, OwnedFrame, encode, write_loop,
 };
 use crate::codec::{FLAG_END, PREFACE};
 use crate::generated::{
-    Cancel, ClientPong, CredentialKind, ErrorCode, Frame, Hello, PROTOCOL_VERSION, Welcome,
+    Cancel, ClientPong, CredentialKind, Frame, Hello, PROTOCOL_VERSION, Welcome, Window,
 };
 
-/// What a stream without credits may have queued for a consumer that is
-/// not reading, by default.
-pub const DEFAULT_STREAM_BUDGET: usize = 32 * 1024 * 1024;
+pub use super::rules::DEFAULT_WINDOW;
 
 /// How a client proves who it is.
 #[derive(Debug, Clone)]
@@ -43,11 +41,11 @@ pub struct ConnectOptions {
     pub credential: Credential,
     pub tls: Option<(TlsConnector, ServerName<'static>)>,
     pub connect_timeout: Duration,
-    /// Bytes of replies one stream without credits (a Source, a query's
-    /// results) may have waiting for its consumer. A stream that falls
-    /// further behind is cancelled and fails with `resource_exhausted`; the
-    /// rest of the connection never waits for it.
-    pub stream_budget: usize,
+    /// Bytes of frames the server may send on each stream ahead of its
+    /// consumer. A consumer that falls behind holds its own stream at most
+    /// this far ahead, and no other. Bigger fills a link that is further
+    /// away; the server never sends more than this on a stream nobody reads.
+    pub window: u32,
 }
 
 impl Default for ConnectOptions {
@@ -58,7 +56,7 @@ impl Default for ConnectOptions {
             credential: Credential::None,
             tls: None,
             connect_timeout: Duration::from_secs(10),
-            stream_budget: DEFAULT_STREAM_BUDGET,
+            window: DEFAULT_WINDOW,
         }
     }
 }
@@ -79,23 +77,10 @@ enum Slot {
     Stream(Sink),
 }
 
-/// What the reader puts in a stream's queue.
-enum Delivery {
-    Frame(OwnedFrame),
-    /// The consumer fell behind its budget; the stream is cancelled and
-    /// nothing more will come.
-    Overflowed {
-        budget: usize,
-    },
-}
-
-/// The reader's end of a stream's queue. The queue is unbounded so that
-/// handing a frame over never waits; a stream without a grant is held to
-/// `budget` bytes instead, counted in `queued`.
+/// The reader's end of a stream's queue. Unbounded, so handing a frame over
+/// never waits: the stream's window bounds what the server sends into it.
 struct Sink {
-    tx: mpsc::UnboundedSender<Delivery>,
-    queued: Arc<AtomicUsize>,
-    budget: Option<usize>,
+    tx: mpsc::UnboundedSender<OwnedFrame>,
 }
 
 struct Shared {
@@ -104,7 +89,7 @@ struct Shared {
     last_id: AtomicU32,
     closed: watch::Receiver<bool>,
     draining: AtomicBool,
-    stream_budget: usize,
+    window: u32,
     welcome: Welcomed,
 }
 
@@ -191,6 +176,7 @@ where
             client_id: &options.client_id,
             credential_kind: kind,
             credential,
+            window: options.window,
         }),
     )?);
     tx.send(Out::Frame(Bytes::from(first)))
@@ -220,7 +206,7 @@ where
         last_id: AtomicU32::new(0),
         closed: closed_rx,
         draining: AtomicBool::new(false),
-        stream_budget: options.stream_budget,
+        window: options.window,
         welcome,
     });
     // The reader holds the connection weakly: once every `Connection` and
@@ -343,35 +329,10 @@ fn deliver(shared: &Shared, id: u32, frame: OwnedFrame) {
             let _ = tx.send(result);
         }
         Some(Slot::Stream(sink)) => {
-            let len = frame.bytes().len();
-            let queued = sink.queued.load(Ordering::Relaxed);
-            let fits = sink
-                .budget
-                .is_none_or(|budget| rules::admits(queued, len, budget));
-            if fits {
-                sink.queued.fetch_add(len, Ordering::Relaxed);
-                // A consumer that stopped reading has dropped its receiver.
-                let _ = sink.tx.send(Delivery::Frame(frame));
-                if last {
-                    slots.remove(&id);
-                }
-            } else {
-                let budget = sink.budget.unwrap_or(usize::MAX);
-                let _ = sink.tx.send(Delivery::Overflowed { budget });
+            // A consumer that stopped reading has dropped its receiver.
+            let _ = sink.tx.send(frame);
+            if last {
                 slots.remove(&id);
-                drop(slots);
-                // Tell the server to stop; from here the stream's frames are
-                // dropped as those of a finished request. The writer's queue
-                // may be full, and the reader must not wait for it.
-                if let Ok(cancel) = encode(id, FLAG_END, &Frame::Cancel(Cancel {}))
-                    && let Err(mpsc::error::TrySendError::Full(cancel)) =
-                        shared.out.try_send(Out::Frame(cancel))
-                {
-                    let out = shared.out.clone();
-                    tokio::spawn(async move {
-                        let _ = out.send(cancel).await;
-                    });
-                }
             }
         }
         None => {}
@@ -417,22 +378,14 @@ impl Connection {
         rx.await.unwrap_or(Err(NetError::Closed))
     }
 
-    /// Opens a stream with its first frame. With `end` the client sends
-    /// nothing more and only reads (a Source); without it the client may keep
-    /// sending (a subscription's credits, a handler's answers).
+    /// Opens a stream with its first frame. With `end` the client says
+    /// nothing more in it and only reads (a Source, a subscription); without
+    /// it the client keeps sending (a handler's answers, a subscription
+    /// query's permits). Either way the stream's window is granted back as
+    /// its frames are read, and dropping it cancels it.
     pub async fn open(&self, frame: &Frame<'_>, end: bool) -> Result<ClientStream, NetError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let queued = Arc::new(AtomicUsize::new(0));
-        let budget = match rules::reply_flow(frame.kind()) {
-            ReplyFlow::Granted => None,
-            ReplyFlow::Budgeted => Some(self.shared.stream_budget),
-        };
-        let sink = Sink {
-            tx,
-            queued: Arc::clone(&queued),
-            budget,
-        };
-        let id = self.shared.allocate(Slot::Stream(sink))?;
+        let id = self.shared.allocate(Slot::Stream(Sink { tx }))?;
         if let Err(e) = self.shared.send(id, end, frame).await {
             self.shared.release(id);
             return Err(e);
@@ -443,7 +396,7 @@ impl Connection {
                 shared: Arc::clone(&self.shared),
             },
             rx,
-            queued,
+            consumed: 0,
             finished: false,
         })
     }
@@ -471,8 +424,9 @@ impl StreamWriter {
 /// Dropping it before the server finished cancels the request.
 pub struct ClientStream {
     sender: StreamWriter,
-    rx: mpsc::UnboundedReceiver<Delivery>,
-    queued: Arc<AtomicUsize>,
+    rx: mpsc::UnboundedReceiver<OwnedFrame>,
+    /// Bytes read since the window was last granted back.
+    consumed: u32,
     finished: bool,
 }
 
@@ -487,34 +441,41 @@ impl ClientStream {
         if self.finished {
             return Ok(None);
         }
-        let frame = match self.rx.recv().await {
-            Some(Delivery::Frame(frame)) => {
-                self.queued
-                    .fetch_sub(frame.bytes().len(), Ordering::Relaxed);
-                frame
-            }
-            Some(Delivery::Overflowed { budget }) => {
-                self.finished = true;
-                return Err(NetError::Failed(Failure::new(
-                    ErrorCode::RESOURCE_EXHAUSTED,
-                    format!(
-                        "the stream was cancelled because replies piled up faster than they \
-                         were read, past its {budget}-byte budget; read the stream promptly, \
-                         ask for smaller batches, or resume the read from the last event received"
-                    ),
-                )));
-            }
-            None => {
-                self.finished = true;
-                return Err(NetError::Closed);
-            }
+        let Some(frame) = self.rx.recv().await else {
+            self.finished = true;
+            return Err(NetError::Closed);
         };
         if rules::reply_kind(frame.kind(), frame.is_end()) == Reply::Last {
             self.finished = true;
+        } else {
+            // The frame that ends a stream spends no window; the others are
+            // granted back once half the window has been read.
+            self.consumed = self.consumed.saturating_add(frame.bytes().len() as u32);
+            if rules::grant_due(self.consumed, self.sender.shared.window) {
+                self.grant();
+            }
         }
         match frame.failure() {
             Some(failure) => Err(NetError::Failed(failure)),
             None => Ok(Some(frame)),
+        }
+    }
+
+    /// Hands the server back the window this stream's consumer used. Never
+    /// waits, so `next` stays safe to cancel: a full writer queue sends it
+    /// from a task of its own.
+    fn grant(&mut self) {
+        let bytes = std::mem::take(&mut self.consumed);
+        let Ok(window) = encode(self.sender.id, 0, &Frame::Window(Window { bytes })) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(window)) =
+            self.sender.shared.out.try_send(Out::Frame(window))
+        {
+            let out = self.sender.shared.out.clone();
+            tokio::spawn(async move {
+                let _ = out.send(window).await;
+            });
         }
     }
 

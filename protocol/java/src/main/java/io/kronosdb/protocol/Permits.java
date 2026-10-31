@@ -6,28 +6,29 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 /**
- * Grants the server this many more events on a subscription, updates on a
- * subscription query, or messages on a handler stream.
+ * Grants {@code count} more messages on a stream whose messages are counted: the
+ * commands or queries a handler stream takes, or the updates a subscription
+ * query accepts.
  *
- * @param credits the credits
+ * @param count the count
  */
-public record Credit(long credits) implements Frame {
+public record Permits(long count) implements Frame {
 
     /** The frame kind on the wire. */
-    public static final int KIND = 0x0103;
+    public static final int KIND = 0x000a;
 
     @Override
     public int kind() {
         return KIND;
     }
 
-    public static Credit decode(Reader r) {
-        return new Credit(
+    public static Permits decode(Reader r) {
+        return new Permits(
                 r.readU32());
     }
 
     @Override
     public void encode(Writer w) {
-        w.writeU32(credits);
+        w.writeU32(count);
     }
 }
