@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::error::Error;
+use crate::segment::sealed_index::SealedIndex;
 use crate::store::{ArchivableSegment, EventStoreEngine};
 
 /// Upload chunk size for segment multipart uploads.
@@ -121,7 +122,12 @@ impl Archiver {
                 report.already_archived += 1;
                 continue;
             }
-            let entry = self.upload_segment(context, &segment).await?;
+            // Segments go up in log order, so the manifest stays a prefix
+            // of the log: one whose seal has not reached the disk yet holds
+            // back the ones after it until the next pass.
+            let Some(entry) = self.upload_segment(context, &segment).await? else {
+                break;
+            };
             manifest.segments.push(entry);
             report.uploaded += 1;
         }
@@ -144,14 +150,15 @@ impl Archiver {
         Ok(report)
     }
 
-    /// Streams one sealed segment (plus its `.idx`)
-    /// into the object store, hashing while uploading, and verifies the
-    /// stored object's size before the caller commits the manifest.
+    /// Streams one final segment's data bytes (plus its `.idx`) into the
+    /// object store, hashing while uploading, and verifies the stored
+    /// object's size before the caller commits the manifest. `None` when the
+    /// segment's `.idx` is not on disk yet: its seal is still in flight.
     async fn upload_segment(
         &self,
         context: &str,
         segment: &ArchivableSegment,
-    ) -> Result<ManifestSegment, Error> {
+    ) -> Result<Option<ManifestSegment>, Error> {
         let file_name = segment
             .path
             .file_name()
@@ -159,16 +166,37 @@ impl Archiver {
             .ok_or_else(|| Error::Internal {
                 message: format!("segment path has no name: {}", segment.path.display()),
             })?;
-        let object = self.context_path(context, &["segments", file_name]);
+        let idx_path = segment.path.with_extension("idx");
+        let idx_bytes = match tokio::fs::read(&idx_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        // The segment's data ends where its locator says. The file may run
+        // on past that (preallocated space a crash kept from being trimmed),
+        // and those bytes are not part of the log.
+        let data_len = SealedIndex::open(&idx_path, segment.base)?.data_len();
 
-        let mut file = tokio::fs::File::open(&segment.path).await?;
+        let object = self.context_path(context, &["segments", file_name]);
+        let file = tokio::fs::File::open(&segment.path).await?;
+        let file_len = file.metadata().await?.len();
+        if file_len < data_len {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "segment {} is {file_len} bytes, but its index says its data runs to \
+                     {data_len}",
+                    segment.path.display()
+                ),
+            });
+        }
+        let mut data = file.take(data_len);
         let upload = self.store.put_multipart(&object).await.map_err(tier_err)?;
         let mut writer = WriteMultipart::new(upload);
         let mut hasher = blake3::Hasher::new();
         let mut total: u64 = 0;
         let mut chunk = vec![0u8; UPLOAD_CHUNK];
         loop {
-            let read = file.read(&mut chunk).await?;
+            let read = data.read(&mut chunk).await?;
             if read == 0 {
                 break;
             }
@@ -177,6 +205,15 @@ impl Archiver {
             total += read as u64;
         }
         writer.finish().await.map_err(tier_err)?;
+        if total != data_len {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "segment {} ended at {total} bytes while uploading its {data_len}",
+                    segment.path.display()
+                ),
+            )));
+        }
 
         // Verify what the store now holds before the manifest may reference it.
         let head = self.store.head(&object).await.map_err(tier_err)?;
@@ -190,34 +227,22 @@ impl Archiver {
             });
         }
 
-        let mut companions = Vec::new();
-        let ext = "idx";
-        match tokio::fs::read(segment.path.with_extension(ext)).await {
-            Ok(bytes) => {
-                let name = format!(
-                    "{}.{ext}",
-                    file_name.trim_end_matches(".seg").trim_end_matches('.')
-                );
-                self.store
-                    .put(
-                        &self.context_path(context, &["segments", &name]),
-                        PutPayload::from(bytes),
-                    )
-                    .await
-                    .map_err(tier_err)?;
-                companions.push(ext.to_string());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        let idx_name = format!("{}.idx", file_name.trim_end_matches(".seg"));
+        self.store
+            .put(
+                &self.context_path(context, &["segments", &idx_name]),
+                PutPayload::from(idx_bytes),
+            )
+            .await
+            .map_err(tier_err)?;
 
-        Ok(ManifestSegment {
+        Ok(Some(ManifestSegment {
             base: segment.base,
             end: segment.end,
             size: total,
             blake3: hasher.finalize().to_hex().to_string(),
-            companions,
-        })
+            companions: vec!["idx".to_string()],
+        }))
     }
 }
 
@@ -263,6 +288,7 @@ mod tests {
                 .expect("append");
             assert!(index < 100_000, "segments never sealed");
         }
+        engine.wait_for_seals();
     }
 
     async fn archiver_for(dir: &std::path::Path) -> Archiver {
@@ -317,6 +343,84 @@ mod tests {
             local_segments.iter().max().unwrap() > &active_base,
             "active segment must stay local-only"
         );
+    }
+
+    #[test]
+    fn a_segment_ending_at_the_watermark_is_not_final() {
+        let data = tempfile::tempdir().expect("data dir");
+        let engine =
+            EventStoreEngine::create_with_options(data.path(), SEGMENT_SIZE).expect("engine");
+        engine
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event(0)],
+            })
+            .expect("append");
+        // Checkpoints alone until one no longer fits: the segment seals
+        // with control records after its last event, and the new active
+        // segment holds no event, so the watermark sits at the sealed
+        // segment's end.
+        let segments = || crate::segment::list_segment_files(data.path()).expect("list");
+        while segments().len() < 2 {
+            engine.persist_watermark_checkpoint().expect("checkpoint");
+        }
+        let sealed_end = segments()[1];
+        assert_eq!(engine.head().0, sealed_end);
+        assert!(
+            engine.archivable_segments().is_empty(),
+            "a segment ending at the watermark can still be reopened"
+        );
+
+        engine
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event(1)],
+            })
+            .expect("append");
+        let archivable = engine.archivable_segments();
+        assert_eq!(archivable.len(), 1);
+        assert_eq!(archivable[0].end, sealed_end);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_the_data_bytes_of_an_untrimmed_segment_are_archived() {
+        let data = tempfile::tempdir().expect("data dir");
+        let tier = tempfile::tempdir().expect("tier dir");
+        let engine = Arc::new(
+            EventStoreEngine::create_with_options(data.path(), SEGMENT_SIZE).expect("engine"),
+        );
+        {
+            let engine = Arc::clone(&engine);
+            tokio::task::spawn_blocking(move || seal_segments(&engine, 1))
+                .await
+                .expect("seal");
+        }
+        // What a crash between rotation and the seal's sync leaves: the
+        // sealed file still at its preallocated length.
+        let segment = engine.archivable_segments().remove(0);
+        let data_bytes = std::fs::read(&segment.path).expect("read segment");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment.path)
+            .and_then(|file| file.set_len(SEGMENT_SIZE * 2))
+            .expect("pad segment");
+
+        let archiver = archiver_for(tier.path()).await;
+        archiver
+            .run_backup_pass("default", &engine)
+            .await
+            .expect("backup pass");
+        let manifest = archiver.load_manifest("default").await.expect("manifest");
+        let entry = &manifest.segments[0];
+        assert_eq!(entry.base, segment.base);
+        assert_eq!(entry.size, data_bytes.len() as u64);
+        assert_eq!(entry.blake3, blake3::hash(&data_bytes).to_hex().to_string());
+        let object = tier
+            .path()
+            .join("default")
+            .join("segments")
+            .join(format!("{:020}.seg", entry.base));
+        assert_eq!(std::fs::read(&object).expect("read object"), data_bytes);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

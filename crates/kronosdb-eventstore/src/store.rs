@@ -2318,10 +2318,17 @@ impl EventStoreEngine {
         Ok(locate_event_anchor(&self.dir, &bases, pos)?.map(|anchor| anchor.crc))
     }
 
-    /// Sealed segments fully covered by the quorum watermark — the archival
-    /// units for tiered storage (ADR-0002). Such segments are immutable:
-    /// failover truncation never reaches below the watermark, so their bytes
-    /// are final on every node.
+    /// Sealed segments whose bytes are final on every node: the archival
+    /// units for tiered storage (ADR-0002).
+    ///
+    /// A segment is final once its end lies strictly below the watermark,
+    /// the rule index merging uses too (ADR-0010). At the watermark is not
+    /// enough: a segment can end with control records (a watermark
+    /// checkpoint written just before a lazy rotation) that followers have
+    /// not received, because they acknowledge positions, not bytes, and a
+    /// failover truncation at that boundary reopens the segment and replaces
+    /// them. Once an event past the segment's end is committed, a quorum
+    /// holds every byte before it, and no truncation reaches it again.
     pub fn archivable_segments(&self) -> Vec<ArchivableSegment> {
         let watermark = self.watermark.get();
         let seg_list = self.segments.read();
@@ -2330,7 +2337,7 @@ impl EventStoreEngine {
         // The last base is the active segment; every earlier one is sealed.
         for window in bases.windows(2) {
             let (base, end) = (window[0], window[1]);
-            if end <= watermark {
+            if end < watermark {
                 out.push(ArchivableSegment {
                     base,
                     end,
@@ -2339,6 +2346,12 @@ impl EventStoreEngine {
             }
         }
         out
+    }
+
+    /// Waits until every segment sealed so far has its companions on disk.
+    #[cfg(test)]
+    pub(crate) fn wait_for_seals(&self) {
+        self.seals.wait_idle();
     }
 
     /// Installs a claimed epoch and exact voter set, aborting all prior-epoch
@@ -4160,9 +4173,13 @@ fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error
 pub struct ArchivableSegment {
     /// First position in the segment (also its filename base).
     pub base: u64,
-    /// End position (exclusive) — the next segment's base.
+    /// End position (exclusive) — the next segment's base. Strictly below
+    /// the watermark.
     pub end: u64,
-    /// Local path of the `.seg` file.
+    /// Local path of the `.seg` file. Its archived bytes are the first
+    /// `data_len` (from the segment's `.idx`), not the file: a crash between
+    /// rotation and the seal's sync can leave a sealed file at its
+    /// preallocated length.
     pub path: PathBuf,
 }
 
