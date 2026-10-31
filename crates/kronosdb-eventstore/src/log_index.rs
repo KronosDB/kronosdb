@@ -145,8 +145,7 @@ pub(crate) fn open(dir: &Path, bases: &[u64], active_base: u64) -> Result<Opened
     let mut rebuilt = 0;
     for &base in &sealed {
         let seg_path = segment::segment_path(dir, base);
-        // Leftovers of earlier formats and of interrupted writes.
-        remove_if_exists(&seg_path.with_extension("bloom"))?;
+        // Leftovers of interrupted writes.
         remove_if_exists(&seg_path.with_extension("idx.tmp"))?;
         remove_if_exists(&seg_path.with_extension("keys.tmp"))?;
         let mut built: Option<SegmentIndex> = None;

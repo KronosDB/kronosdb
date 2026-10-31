@@ -32,7 +32,7 @@ name = "source_cached_vs_cold"
 harness = false
 
 [[bench]]
-name = "bloom_filter"
+name = "key_lookup"
 harness = false
 
 [[bench]]

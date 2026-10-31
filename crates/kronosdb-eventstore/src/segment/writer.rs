@@ -73,7 +73,7 @@ pub struct SegmentWriter {
     /// Rotation itself only swaps files and indexes under the writer lock;
     /// everything that touches the disk for the sealed segment — its final
     /// fdatasync, the directory sync that makes the new file's name durable,
-    /// and the `.idx`/`.bloom` companions — is the sync thread's, off the lock.
+    /// and the `.idx`/`.keys` companions — is the sync thread's, off the lock.
     pending_seals: Vec<PendingSeal>,
     /// Where a rotated-away segment's index is published for readers until
     /// its companions are on disk. Set by the engine; a standalone writer
@@ -741,7 +741,7 @@ impl SegmentWriter {
     /// the new file, trim the old one to its data length, swap in a fresh
     /// index. Every appender waits on this lock, so nothing here may wait on
     /// the disk. The sealed segment's fdatasync, the directory sync for the
-    /// new file's name, and its `.idx`/`.bloom` companions are left as a
+    /// new file's name, and its `.idx`/`.keys` companions are left as a
     /// `PendingSeal` for the group-commit thread, which does them off the
     /// lock in the wave that carries the rotation.
     fn rotate_segment(&mut self) -> Result<(), Error> {

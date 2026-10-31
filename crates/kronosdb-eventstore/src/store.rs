@@ -2451,8 +2451,8 @@ impl EventStoreEngine {
         self.sync_state.is_failed()
     }
 
-    /// Bytes on disk under this context's data directory (segments, indices,
-    /// bloom filters, raft log). Walked per call — the metrics scrape
+    /// Bytes on disk under this context's data directory (segments, index
+    /// files, raft log). Walked per call — the metrics scrape
     /// interval, not the hot path.
     pub fn data_dir_bytes(&self) -> u64 {
         fn walk(dir: &Path) -> u64 {
@@ -3618,7 +3618,7 @@ impl EventStoreEngine {
             &probe,
             from.0,
             head,
-            |ruled_out| self.metrics.record_bloom_check(ruled_out),
+            |ruled_out| self.metrics.record_key_table_check(ruled_out),
             |set| {
                 self.metrics.record_direct_seek();
                 locate.each_record(set.iter(), &mut visit)
@@ -6601,12 +6601,10 @@ mod tests {
         }
     }
 
-    /// Indexes from before version 3 (a whole-loaded `.idx` and a separate
-    /// `.bloom`) are not read: open rebuilds them as v3 and removes the
-    /// filters. A damaged v3 index is rebuilt the same way, and so is a
-    /// missing one.
+    /// An index open cannot read (another format, or damaged) is rebuilt
+    /// from its segment, and so is a missing one.
     #[test]
-    fn open_rebuilds_old_damaged_and_missing_indexes() {
+    fn open_rebuilds_unreadable_and_missing_indexes() {
         let dir = tempfile::tempdir().unwrap();
         log_with_controls(dir.path());
         let expected = index_bytes(dir.path());
@@ -6616,11 +6614,10 @@ mod tests {
             let idx = path.with_extension("idx");
             match i % 3 {
                 0 => {
-                    // A version 2 file, checksum trailer and all.
-                    let mut old = b"KIDX\x02".to_vec();
-                    old.extend_from_slice(&[0x5A; 300]);
-                    std::fs::write(&idx, old).unwrap();
-                    std::fs::write(path.with_extension("bloom"), b"KBLM\x02junk").unwrap();
+                    // Another format version.
+                    let mut other = b"KIDX\x02".to_vec();
+                    other.extend_from_slice(&[0x5A; 300]);
+                    std::fs::write(&idx, other).unwrap();
                 }
                 1 => {
                     let mut damaged = std::fs::read(&idx).unwrap();
@@ -6633,10 +6630,6 @@ mod tests {
 
         let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
         assert_eq!(index_bytes(dir.path()), expected);
-        for &base in &bases {
-            let path = segment::segment_path(dir.path(), base);
-            assert!(!path.with_extension("bloom").exists());
-        }
         let head = store.head().0;
         assert_eq!(
             store.source(Position(0), &cond_match_all()).unwrap().len() as u64,
