@@ -117,20 +117,54 @@ impl SegmentReader {
     /// The record at `byte_offset`, its CRC verified, borrowed from the
     /// mapping: what a read copies onto the wire without decoding it.
     pub fn record_at(&self, byte_offset: usize) -> Result<StoredRecord<'_>, Error> {
-        let data = &*self.mmap;
-        let (flags, stored_crc, body_start, body_end) = frame_at(data, byte_offset)?;
-        let body = &data[body_start..body_end];
-        if crate::segment::crc::record_crc(flags, body) != stored_crc {
-            return Err(Error::Corrupted {
-                message: format!("CRC mismatch at offset {byte_offset}"),
-            });
-        }
-        Ok(StoredRecord {
-            flags,
-            body,
-            framed: &data[byte_offset + 4..body_end],
-        })
+        record_in(&self.mmap, byte_offset)
     }
+}
+
+/// The record at `byte_offset` of `data`, its CRC verified.
+pub(crate) fn record_in(data: &[u8], byte_offset: usize) -> Result<StoredRecord<'_>, Error> {
+    let (flags, stored_crc, body_start, body_end) = frame_at(data, byte_offset)?;
+    let body = &data[body_start..body_end];
+    if crate::segment::crc::record_crc(flags, body) != stored_crc {
+        return Err(Error::Corrupted {
+            message: format!("CRC mismatch at offset {byte_offset}"),
+        });
+    }
+    Ok(StoredRecord {
+        flags,
+        body,
+        framed: &data[byte_offset + 4..body_end],
+    })
+}
+
+/// Checks that `file` starts with the header of the segment at `base`.
+pub(crate) fn check_segment_header(file: &std::fs::File, base: u64) -> Result<(), Error> {
+    let header =
+        crate::segment::blocks::read_exact_at(file, 0, SEGMENT_HEADER_SIZE).map_err(|error| {
+            match error.kind() {
+                std::io::ErrorKind::UnexpectedEof => Error::Corrupted {
+                    message: "segment file too small for header".into(),
+                },
+                _ => error.into(),
+            }
+        })?;
+    if header[0..4] != SEGMENT_MAGIC {
+        return Err(Error::Corrupted {
+            message: "invalid segment magic bytes".into(),
+        });
+    }
+    if header[4] != SEGMENT_VERSION {
+        return Err(Error::Corrupted {
+            message: format!("unsupported segment version: {}", header[4]),
+        });
+    }
+    let header_base = u64::from_le_bytes(header[5..13].try_into().unwrap());
+    if header_base != base {
+        return Err(Error::Corrupted {
+            message: format!("segment header base_position {header_base} doesn't match {base}"),
+        });
+    }
+    Ok(())
 }
 
 impl SegmentReader {
@@ -175,15 +209,28 @@ fn frame_at(data: &[u8], byte_offset: usize) -> Result<(u8, u32, usize, usize), 
 pub enum RecordReader {
     Mapped(SegmentReader),
     Sealed(crate::segment::blocks::SealedReader),
+    /// A sealed segment past the mapping budget: the records a read needs,
+    /// fetched by byte range.
+    Fetched(crate::fetch::FetchedRecords),
 }
 
 impl RecordReader {
+    /// Tells the reader which records are about to be asked for, in
+    /// order, so it can fetch them together. Only `Fetched` uses it.
+    pub fn prepare(&mut self, records: &[(u64, u64)]) -> Result<(), Error> {
+        match self {
+            RecordReader::Fetched(reader) => reader.load(records),
+            RecordReader::Mapped(_) | RecordReader::Sealed(_) => Ok(()),
+        }
+    }
+
     /// The record for `position`, which the segment's offset table places at
     /// `offset`, CRC-verified at some point since it left the disk.
     pub fn record_at(&mut self, position: u64, offset: u64) -> Result<StoredRecord<'_>, Error> {
         match self {
             RecordReader::Mapped(reader) => reader.record_at(offset as usize),
             RecordReader::Sealed(reader) => reader.record_at(position, offset),
+            RecordReader::Fetched(reader) => reader.record_at(position, offset),
         }
     }
 

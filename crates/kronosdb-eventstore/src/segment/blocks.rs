@@ -796,7 +796,7 @@ fn verify_block(
 
 /// `pread` into a fresh buffer without zeroing it first.
 #[cfg(unix)]
-fn read_exact_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_exact_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     use std::os::unix::io::AsRawFd;
 
     let mut buf: Vec<u8> = Vec::with_capacity(len);
@@ -831,7 +831,7 @@ fn read_exact_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_exact_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     use std::os::windows::fs::FileExt;
 
     let mut buf = vec![0u8; len];

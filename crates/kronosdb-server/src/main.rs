@@ -79,9 +79,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create the context manager and ensure a default context exists.
+    // Sealed segments past the mapping budget are read through open files,
+    // one per segment, and the file budget is sized from this limit: raise
+    // it before the first store opens.
+    let open_files = kronosdb_eventstore::cache::raise_open_file_limit();
+    tracing::debug!(open_files, "open-file limit");
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
         mapping_budget: kronosdb_eventstore::cache::MappingBudget::shared(),
+        file_budget: kronosdb_eventstore::cache::FileBudget::shared(),
         read_mode: config.read_mode,
         block_cache_bytes: config.block_cache_bytes,
         block_size: config.block_size,

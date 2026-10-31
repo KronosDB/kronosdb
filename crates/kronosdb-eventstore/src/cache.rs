@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -16,9 +16,159 @@ use crate::segment::segment_index::SegmentIndex;
 
 const ORD: Ordering = Ordering::Relaxed;
 
-/// Open sealed segment files the block read path (`read-path = "blocks"`)
-/// keeps at once; past this many the least recently used is closed.
-const OPEN_SEALED_FILES: usize = 100;
+/// Open sealed segment files this process may keep at once, shared by every
+/// context: the files reads past the mapping budget `pread` from, and the
+/// block read path's (`read-path = "blocks"`). Sized from the descriptor
+/// limit, so a log of thousands of segments is not reopened file by file on
+/// every read; past it the least recently used file is closed.
+#[derive(Debug)]
+pub struct FileBudget {
+    live: AtomicUsize,
+    limit: usize,
+    warned: AtomicBool,
+}
+
+impl FileBudget {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            limit: limit.max(1),
+            warned: AtomicBool::new(false),
+        })
+    }
+
+    /// The process's budget: half of its open-file limit (`RLIMIT_NOFILE`,
+    /// the soft limit as it stands when first asked), the other half left
+    /// to sockets, active segments and index files being opened.
+    pub fn shared() -> Arc<Self> {
+        static SHARED: OnceLock<Arc<FileBudget>> = OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Self::new(open_file_limit() / 2)))
+    }
+
+    /// Files held now.
+    pub fn live(&self) -> usize {
+        self.live.load(ORD)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn took(&self) {
+        self.live.fetch_add(1, ORD);
+    }
+
+    fn gave(&self, n: usize) {
+        self.live.fetch_sub(n, ORD);
+    }
+
+    fn over(&self) -> bool {
+        let over = self.live.load(ORD) > self.limit;
+        if over && !self.warned.swap(true, ORD) {
+            tracing::warn!(
+                limit = self.limit,
+                "the open-file budget is full: sealed segments past it are opened again on \
+                 each read, which is slower; raise the open-file limit (ulimit -n)"
+            );
+        }
+        over
+    }
+}
+
+/// The soft open-file limit; 1024 where it cannot be read.
+fn open_file_limit() -> usize {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the struct it is given and nothing else.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            return usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX);
+        }
+    }
+    1024
+}
+
+/// Raises this process's soft open-file limit as far as the hard limit
+/// allows, as servers do at startup; a read past the mapping budget keeps a
+/// file open per segment. Returns the soft limit in force afterwards. Call
+/// it before the first engine opens: `FileBudget::shared` reads the limit
+/// once.
+pub fn raise_open_file_limit() -> usize {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: as in `open_file_limit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return open_file_limit();
+        }
+        // macOS reports an unlimited hard limit but refuses a soft limit
+        // past the per-process maximum, so try that as a fallback.
+        let wanted = limit.rlim_max.min(1 << 20);
+        for candidate in [wanted, wanted.min(10_240)] {
+            if candidate <= limit.rlim_cur {
+                break;
+            }
+            let raised = libc::rlimit {
+                rlim_cur: candidate,
+                rlim_max: limit.rlim_max,
+            };
+            // SAFETY: setrlimit reads the struct it is given.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                break;
+            }
+        }
+    }
+    open_file_limit()
+}
+
+/// Open files by segment base, closed least recently used first when the
+/// file budget is over.
+struct OpenFiles<V> {
+    lru: Mutex<LruCache<u64, Arc<V>>>,
+    budget: Arc<FileBudget>,
+}
+
+impl<V> OpenFiles<V> {
+    fn new(budget: Arc<FileBudget>) -> Self {
+        Self {
+            lru: Mutex::new(LruCache::unbounded()),
+            budget,
+        }
+    }
+
+    fn get(&self, base: u64) -> Option<Arc<V>> {
+        self.lru.lock().get(&base).map(Arc::clone)
+    }
+
+    fn put(&self, base: u64, file: Arc<V>) {
+        let mut lru = self.lru.lock();
+        if lru.put(base, file).is_none() {
+            self.budget.took();
+        }
+        while lru.len() > 1 && self.budget.over() {
+            lru.pop_lru();
+            self.budget.gave(1);
+        }
+    }
+
+    fn pop(&self, base: u64) {
+        if self.lru.lock().pop(&base).is_some() {
+            self.budget.gave(1);
+        }
+    }
+}
+
+impl<V> Drop for OpenFiles<V> {
+    fn drop(&mut self) {
+        self.budget.gave(self.lru.get_mut().len());
+    }
+}
 
 /// Mappings of sealed segments and of their indexes this process may keep at
 /// once, shared by every context. A mapping costs address space and one entry
@@ -71,6 +221,11 @@ impl MappingBudget {
 
     fn gave(&self, n: usize) {
         self.live.fetch_sub(n, ORD);
+    }
+
+    /// Whether one more mapping fits.
+    fn has_room(&self) -> bool {
+        self.live.load(ORD) < self.limit
     }
 
     /// Whether more is mapped than the budget allows. Says so in the log the
@@ -223,7 +378,10 @@ pub struct IndexCache {
     /// Mapped sealed segment files, kept while the mapping budget allows.
     mmaps: MappedSegments,
     /// Open sealed segment files for block reads, keyed by base position.
-    sealed_files: Mutex<LruCache<u64, Arc<SealedFile>>>,
+    sealed_files: OpenFiles<SealedFile>,
+    /// Open sealed segment files that reads past the mapping budget
+    /// `pread` from, keyed by base position.
+    files: OpenFiles<File>,
     /// Verified blocks of sealed segments.
     blocks: Arc<BlockCache>,
     /// Indexes of segments sealed in memory but not yet on disk. Never
@@ -238,10 +396,15 @@ pub struct IndexCache {
     pub index_misses: AtomicU64,
     pub mmap_hits: AtomicU64,
     pub mmap_misses: AtomicU64,
+    /// Read past the mapping budget from a file already open.
+    pub file_hits: AtomicU64,
+    /// Read past the mapping budget from a file opened for it.
+    pub file_misses: AtomicU64,
 }
 
 impl IndexCache {
-    /// A cache with the default block cache, mapping within `budget`.
+    /// A cache with the default block cache, mapping within `budget` and
+    /// keeping files open within the process's file budget.
     pub fn new(budget: Arc<MappingBudget>) -> Self {
         Self::with_blocks(
             BlockCache::new(
@@ -250,21 +413,29 @@ impl IndexCache {
                 crate::segment::blocks::DEFAULT_READAHEAD_BLOCKS,
             ),
             budget,
+            FileBudget::shared(),
         )
     }
 
-    /// Like `new`, with an explicitly configured block cache.
-    pub fn with_blocks(blocks: BlockCache, budget: Arc<MappingBudget>) -> Self {
+    /// Like `new`, with an explicitly configured block cache and file budget.
+    pub fn with_blocks(
+        blocks: BlockCache,
+        budget: Arc<MappingBudget>,
+        files: Arc<FileBudget>,
+    ) -> Self {
         Self {
             mapped: MappedIndexes::new(Arc::clone(&budget)),
             mmaps: MappedSegments::new(budget),
-            sealed_files: Mutex::new(LruCache::new(NonZeroUsize::new(OPEN_SEALED_FILES).unwrap())),
+            sealed_files: OpenFiles::new(Arc::clone(&files)),
+            files: OpenFiles::new(files),
             blocks: Arc::new(blocks),
             pinned: Mutex::new(HashMap::new()),
             index_hits: AtomicU64::new(0),
             index_misses: AtomicU64::new(0),
             mmap_hits: AtomicU64::new(0),
             mmap_misses: AtomicU64::new(0),
+            file_hits: AtomicU64::new(0),
+            file_misses: AtomicU64::new(0),
         }
     }
 
@@ -324,6 +495,44 @@ impl IndexCache {
         Ok(mmap)
     }
 
+    /// The mapping of a sealed segment if it is mapped already or one more
+    /// mapping fits the budget; `None` past the budget, where mapping it
+    /// would unmap another (and that one's next read map it again), so the
+    /// caller reads the records it needs with `pread` instead.
+    pub fn mapped_within_budget(
+        &self,
+        segment_path: &Path,
+        base_position: u64,
+    ) -> Result<Option<Arc<Mmap>>, Error> {
+        if let Some(mmap) = self.mmaps.get(base_position) {
+            self.mmap_hits.fetch_add(1, ORD);
+            return Ok(Some(mmap));
+        }
+        if !self.mmaps.budget.has_room() {
+            return Ok(None);
+        }
+        self.get_mmap(segment_path, base_position).map(Some)
+    }
+
+    /// An open sealed segment file to `pread` records from, its header
+    /// checked when it was opened.
+    pub fn segment_file(
+        &self,
+        segment_path: &Path,
+        base_position: u64,
+    ) -> Result<Arc<File>, Error> {
+        if let Some(file) = self.files.get(base_position) {
+            self.file_hits.fetch_add(1, ORD);
+            return Ok(file);
+        }
+        self.file_misses.fetch_add(1, ORD);
+        let file = File::open(segment_path)?;
+        crate::segment::reader::check_segment_header(&file, base_position)?;
+        let file = Arc::new(file);
+        self.files.put(base_position, Arc::clone(&file));
+        Ok(file)
+    }
+
     /// A reader over a sealed segment that serves records from the block
     /// cache. `index` must be the segment's own index.
     pub fn sealed_reader(
@@ -332,14 +541,11 @@ impl IndexCache {
         base_position: u64,
         index: Arc<dyn Locator>,
     ) -> Result<SealedReader, Error> {
-        let cached = self.sealed_files.lock().get(&base_position).map(Arc::clone);
-        let file = match cached {
+        let file = match self.sealed_files.get(base_position) {
             Some(file) => file,
             None => {
                 let file = self.blocks.open(segment_path, base_position)?;
-                self.sealed_files
-                    .lock()
-                    .put(base_position, Arc::clone(&file));
+                self.sealed_files.put(base_position, Arc::clone(&file));
                 file
             }
         };
@@ -354,7 +560,8 @@ impl IndexCache {
     /// Invalidates all cache entries for a segment (e.g., after truncation
     /// deletes or reopens it).
     pub fn invalidate(&self, base_position: u64) {
-        self.sealed_files.lock().pop(&base_position);
+        self.sealed_files.pop(base_position);
+        self.files.pop(base_position);
         self.blocks.invalidate(base_position);
         self.mapped.pop(base_position);
         self.mmaps.pop(base_position);
@@ -369,7 +576,8 @@ impl IndexCache {
         // file handles cached under this base belong to an earlier
         // incarnation (a truncated and re-extended suffix, for one) that a
         // slow reader may have loaded after the truncation invalidated them.
-        self.sealed_files.lock().pop(&base_position);
+        self.sealed_files.pop(base_position);
+        self.files.pop(base_position);
         self.blocks.retire(base_position);
         self.mapped.pop(base_position);
         self.pinned.lock().entry(base_position).or_insert(index);
