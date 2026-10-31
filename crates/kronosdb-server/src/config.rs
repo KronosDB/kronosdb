@@ -30,16 +30,6 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_SEGMENT_SIZE")]
     segment_size: Option<u64>,
 
-    /// Most segment indexes to cache (default 0: only --index-cache-bytes
-    /// limits it).
-    #[arg(long, env = "KRONOSDB_INDEX_CACHE_SIZE")]
-    index_cache_size: Option<usize>,
-
-    /// Most bloom filters to cache (default 0: only --bloom-cache-bytes
-    /// limits it).
-    #[arg(long, env = "KRONOSDB_BLOOM_CACHE_SIZE")]
-    bloom_cache_size: Option<usize>,
-
     /// How sealed segments are read: "mapped" (default) through a memory
     /// mapping that re-checks every record's CRC on every read, or "blocks"
     /// through the cache of verified record blocks.
@@ -60,16 +50,6 @@ struct Cli {
     /// Blocks read ahead of a sequential reader (default 16).
     #[arg(long, env = "KRONOSDB_READAHEAD_BLOCKS")]
     readahead_blocks: Option<usize>,
-
-    /// Heap budget in bytes for cached segment indexes, in addition to
-    /// --index-cache-size (default 1 GiB).
-    #[arg(long, env = "KRONOSDB_INDEX_CACHE_BYTES")]
-    index_cache_bytes: Option<usize>,
-
-    /// Heap budget in bytes for cached bloom filters, in addition to
-    /// --bloom-cache-size (default 128 MiB).
-    #[arg(long, env = "KRONOSDB_BLOOM_CACHE_BYTES")]
-    bloom_cache_bytes: Option<usize>,
 
     /// Maximum snapshot state size in bytes (default 4MB). Snapshot records
     /// share the log with events; oversized blobs are rejected at the RPC.
@@ -284,10 +264,6 @@ struct ConfigFile {
 struct StorageConfig {
     #[serde(rename = "segment-size")]
     segment_size: Option<u64>,
-    #[serde(rename = "index-cache-size")]
-    index_cache_size: Option<usize>,
-    #[serde(rename = "bloom-cache-size")]
-    bloom_cache_size: Option<usize>,
     #[serde(rename = "read-path")]
     read_path: Option<String>,
     #[serde(rename = "block-cache-bytes")]
@@ -296,10 +272,6 @@ struct StorageConfig {
     block_size: Option<usize>,
     #[serde(rename = "readahead-blocks")]
     readahead_blocks: Option<usize>,
-    #[serde(rename = "index-cache-bytes")]
-    index_cache_bytes: Option<usize>,
-    #[serde(rename = "bloom-cache-bytes")]
-    bloom_cache_bytes: Option<usize>,
     #[serde(rename = "ack-mode")]
     ack_mode: Option<String>,
     #[serde(rename = "max-snapshot-size")]
@@ -458,21 +430,16 @@ pub struct ServerConfig {
     pub node_name: String,
     pub admin_listen_addr: SocketAddr,
     pub segment_size: u64,
-    pub index_cache_size: usize,
     /// "auto" (default), "written", or "durable"; see the CLI flag docs.
     pub ack_mode: String,
     /// Dev mode: hardware findings are logged at info, not warn/error.
     pub dev: bool,
-    pub bloom_cache_size: usize,
     /// How sealed segments are read.
     pub read_mode: kronosdb_eventstore::segment::blocks::ReadMode,
     /// Memory budget of the verified block cache for sealed segments.
     pub block_cache_bytes: usize,
     pub block_size: usize,
     pub readahead_blocks: usize,
-    /// Heap budgets for cached segment indexes and bloom filters.
-    pub index_cache_bytes: usize,
-    pub bloom_cache_bytes: usize,
     /// Maximum snapshot state size in bytes; larger appends are rejected.
     pub max_snapshot_size: u64,
     pub group_commit_ms: u64,
@@ -538,17 +505,11 @@ impl ServerConfig {
 
         // Defaults.
         const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
-        const DEFAULT_INDEX_CACHE_SIZE: usize = 0;
-        const DEFAULT_BLOOM_CACHE_SIZE: usize = 0;
         const DEFAULT_BLOCK_CACHE_BYTES: usize =
             kronosdb_eventstore::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES;
         const DEFAULT_BLOCK_SIZE: usize = kronosdb_eventstore::segment::blocks::DEFAULT_BLOCK_SIZE;
         const DEFAULT_READAHEAD_BLOCKS: usize =
             kronosdb_eventstore::segment::blocks::DEFAULT_READAHEAD_BLOCKS;
-        const DEFAULT_INDEX_CACHE_BYTES: usize =
-            kronosdb_eventstore::cache::DEFAULT_INDEX_CACHE_BYTES;
-        const DEFAULT_BLOOM_CACHE_BYTES: usize =
-            kronosdb_eventstore::cache::DEFAULT_BLOOM_CACHE_BYTES;
         const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 30;
         const DEFAULT_COMMAND_TIMEOUT: u64 = 30;
         const DEFAULT_QUERY_TIMEOUT: u64 = 30;
@@ -644,14 +605,6 @@ impl ServerConfig {
                 .segment_size
                 .or(file_config.storage.segment_size)
                 .unwrap_or(DEFAULT_SEGMENT_SIZE),
-            index_cache_size: cli
-                .index_cache_size
-                .or(file_config.storage.index_cache_size)
-                .unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            bloom_cache_size: cli
-                .bloom_cache_size
-                .or(file_config.storage.bloom_cache_size)
-                .unwrap_or(DEFAULT_BLOOM_CACHE_SIZE),
             read_mode: cli
                 .read_path
                 .or(file_config.storage.read_path)
@@ -670,14 +623,6 @@ impl ServerConfig {
                 .readahead_blocks
                 .or(file_config.storage.readahead_blocks)
                 .unwrap_or(DEFAULT_READAHEAD_BLOCKS),
-            index_cache_bytes: cli
-                .index_cache_bytes
-                .or(file_config.storage.index_cache_bytes)
-                .unwrap_or(DEFAULT_INDEX_CACHE_BYTES),
-            bloom_cache_bytes: cli
-                .bloom_cache_bytes
-                .or(file_config.storage.bloom_cache_bytes)
-                .unwrap_or(DEFAULT_BLOOM_CACHE_BYTES),
             max_snapshot_size: cli
                 .max_snapshot_size
                 .or(file_config.storage.max_snapshot_size)
@@ -904,8 +849,7 @@ listen = "0.0.0.0:50051"
 
 [storage]
 segment-size = 134217728
-index-cache-size = 100
-bloom-cache-size = 500
+block-cache-bytes = 1048576
 
 [timeouts]
 command = 60
@@ -918,8 +862,7 @@ listen = "0.0.0.0:9090"
 "#;
         let config: ConfigFile = toml::from_str(toml).unwrap();
         assert_eq!(config.storage.segment_size, Some(134217728));
-        assert_eq!(config.storage.index_cache_size, Some(100));
-        assert_eq!(config.storage.bloom_cache_size, Some(500));
+        assert_eq!(config.storage.block_cache_bytes, Some(1048576));
         assert_eq!(config.timeouts.command_timeout, Some(60));
         assert_eq!(config.timeouts.query_timeout, Some(45));
         assert_eq!(config.timeouts.heartbeat_interval, Some(3));

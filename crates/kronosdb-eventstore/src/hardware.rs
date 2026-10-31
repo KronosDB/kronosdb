@@ -716,7 +716,7 @@ pub struct Facts {
     pub filesystem: Filesystem,
     pub memory: MemoryInfo,
     pub cpu: CpuInfo,
-    /// Index plus bloom cache budgets: the heap the caches may grow to.
+    /// The block cache budget: the heap the caches may grow to.
     pub cache_budget_bytes: u64,
 }
 
@@ -796,9 +796,9 @@ pub fn evaluate(facts: &Facts) -> Vec<Finding> {
         add(
             Check::LowMemory,
             format!(
-                "{} of memory{} for index and bloom cache budgets of {} (more than half): \
-                 the caches can crowd out the page cache that serves reads. Add memory, or \
-                 lower index-cache-bytes and bloom-cache-bytes.",
+                "{} of memory{} for a block cache budget of {} (more than half): \
+                 the cache can crowd out the page cache that serves reads and holds the \
+                 mapped segment indexes. Add memory, or lower block-cache-bytes.",
                 fmt_bytes(total),
                 if limited { " (cgroup limit)" } else { "" },
                 fmt_bytes(facts.cache_budget_bytes),
@@ -868,8 +868,8 @@ pub fn log_level(severity: Severity, dev: bool) -> tracing::Level {
 
 pub struct CheckInput<'a> {
     pub data_dir: &'a Path,
-    pub index_cache_bytes: usize,
-    pub bloom_cache_bytes: usize,
+    /// Heap the caches may grow to (the block cache).
+    pub cache_budget_bytes: usize,
     pub ack_mode: AckMode,
     pub dev: bool,
 }
@@ -893,8 +893,7 @@ pub fn check(input: &CheckInput) -> HardwareReport {
         filesystem: detect_filesystem(input.data_dir),
         memory: detect_memory(),
         cpu: detect_cpu(),
-        cache_budget_bytes: (input.index_cache_bytes as u64)
-            .saturating_add(input.bloom_cache_bytes as u64),
+        cache_budget_bytes: input.cache_budget_bytes as u64,
     };
     HardwareReport::new(facts, input.ack_mode, input.dev)
 }
@@ -1525,8 +1524,7 @@ garbage line
         let dir = tempfile::tempdir().unwrap();
         let report = check(&CheckInput {
             data_dir: dir.path(),
-            index_cache_bytes: 1 << 30,
-            bloom_cache_bytes: 128 << 20,
+            cache_budget_bytes: (1 << 30) + (128 << 20),
             ack_mode: AckMode::Auto,
             dev: true,
         });

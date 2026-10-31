@@ -47,9 +47,9 @@ pub struct StoreMetrics {
     pub index_cache_hits: AtomicU64,
     pub index_cache_misses: AtomicU64,
 
-    // ── Bloom filter ──
+    // ── Key filters of sealed segments ──
     pub bloom_checks: AtomicU64,
-    /// Segments skipped because bloom said "definitely not".
+    /// Segments skipped because their key filter said "definitely not".
     pub bloom_rejections: AtomicU64,
 
     // ── Mmap cache ──

@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 
 use crate::api::EventStore;
 use crate::append::{AppendCondition, AppendRequest, AppendResponse, RecordAppend, RecordBatch};
-use crate::cache::{BloomProbe, IndexCache};
+use crate::cache::IndexCache;
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{Position, SequencedEvent, StoredEvent, Tag};
@@ -21,31 +21,26 @@ use crate::metrics::{StoreMetrics, Timer};
 use crate::replication::dispatcher::{WaveDescriptor, WavePublisher, WaveSlice};
 use crate::replication::watermark::WatermarkState;
 use crate::segment::blocks::ReadMode;
+use crate::segment::query::{PositionSet, Probe, SegmentKeys};
 use crate::segment::reader::{RecordReader, SegmentReader};
+use crate::segment::sealed_index::{LoggedControl, SealedIndex};
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::writer::{PendingSeal, SegmentWriter, sync_dir, sync_file};
 use crate::segment::{self, DEFAULT_SEGMENT_SIZE, format};
-
-/// Default cap on the number of segment indices cached: none, the byte
-/// budget decides (`StoreOptions::index_cache_bytes`).
-pub const DEFAULT_INDEX_CACHE_SIZE: usize = 0;
-
-/// Default cap on the number of bloom filters cached: none, the byte budget
-/// decides (`StoreOptions::bloom_cache_bytes`).
-pub const DEFAULT_BLOOM_CACHE_SIZE: usize = 0;
 
 /// The active segment's cached mapping, keyed by its base position.
 type ActiveMmap = Arc<parking_lot::Mutex<Option<(u64, Arc<memmap2::Mmap>)>>>;
 
 /// Cached list of segment bases, avoiding readdir and stat syscalls on every query.
 ///
-/// All segments before `sealed_count` are known to have companion `.idx`/`.bloom`
-/// files. The last segment is the active (writable) segment.
+/// Segments before `sealed_count` are sealed: served from their `.idx`, or
+/// from a pinned in-memory index while it is being written. The last
+/// segment is the active (writable) segment.
 #[derive(Clone)]
 struct SegmentList {
     /// Segment base positions in ascending order.
     bases: Vec<u64>,
-    /// Number of segments known to be sealed (have .idx/.bloom companions).
+    /// Number of sealed segments.
     /// Invariant: sealed_count < bases.len() (the active segment is never sealed).
     sealed_count: usize,
 }
@@ -111,7 +106,7 @@ impl LogView {
 
     /// The index that answers for segment `base`: the active segment's live
     /// index when it is still active, otherwise the sealed index from the
-    /// cache (pinned if the seal is in flight, loaded from `.idx` if not).
+    /// cache (pinned if the seal is in flight, its mapped `.idx` if not).
     /// A segment-list snapshot may say "active" about a segment that has
     /// just been rotated away from; this resolves it correctly either way.
     fn index_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
@@ -121,19 +116,6 @@ impl LogView {
         }
         drop(active);
         Ok(IndexRef::Sealed(self.cache.get_index(seg_path, base)?))
-    }
-
-    /// `index_for` for a read that needs only where positions live, or takes
-    /// every event of the segment: a sealed segment answers from its
-    /// position→offset table alone, without loading its tag bitmaps. The
-    /// result must not be asked about tags or event types.
-    fn offsets_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
-        let active = self.active_index.read();
-        if active.base_position() == base {
-            return Ok(IndexRef::Active(active));
-        }
-        drop(active);
-        Ok(IndexRef::Sealed(self.cache.get_offsets(seg_path, base)?))
     }
 
     /// The reader matching `index_for`'s answer.
@@ -185,9 +167,9 @@ impl LogView {
             };
             let path = segment::segment_path(&self.dir, base);
             let (offset, reader) = {
-                let index = self.offsets_for(base, &path)?;
+                let index = self.index_for(base, &path)?;
                 let offset = index
-                    .get_offset(next)
+                    .offset_of(next)?
                     .ok_or(Error::PositionNotFound { position: next })?;
                 (offset, self.reader_for(&index, base, &path)?)
             };
@@ -392,7 +374,7 @@ impl SyncState {
 
 /// Seals whose companion files are being written on a background thread.
 ///
-/// A rotation leaves the sealed segment's `.idx`/`.bloom` to be written off
+/// A rotation leaves the sealed segment's `.idx` to be written off
 /// the writer lock, after the wave that carries the rotation has made the
 /// segment's bytes durable. Until then the segment answers reads from its
 /// pinned in-memory index. Truncation (failover repair) may delete or reopen
@@ -435,13 +417,12 @@ impl SealQueue {
                     let mut in_flight = queue.in_flight.lock().unwrap();
                     let cancelled = in_flight.remove(&seal.base).unwrap_or(true);
                     match written {
-                        Ok(()) if !cancelled => cache.unpin_sealed(seal.base),
+                        Ok(()) if !cancelled => cache.unpin_sealed(seal.base, &path),
                         Ok(()) => {
                             // Truncated away or reopened meanwhile: the
-                            // companions describe a file that no longer
+                            // index describes a file that no longer
                             // exists in this shape.
                             let _ = std::fs::remove_file(path.with_extension("idx"));
-                            let _ = std::fs::remove_file(path.with_extension("bloom"));
                         }
                         Err(error) => {
                             // The segment stays readable through its pinned
@@ -970,17 +951,9 @@ fn prepare_system_append(mut request: AppendRequest) -> Result<Prepared, Error> 
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
     pub max_segment_size: u64,
-    /// Most segment indexes cached; 0 = no cap but `index_cache_bytes`.
-    pub index_cache_size: usize,
-    /// Most bloom filters cached; 0 = no cap but `bloom_cache_bytes`.
-    pub bloom_cache_size: usize,
     /// Sealed segment mmaps kept open. A wide historical scan over more
     /// segments than this reopens and remaps files as it goes.
     pub mmap_cache_size: usize,
-    /// Heap budget for cached segment indexes, on top of `index_cache_size`.
-    pub index_cache_bytes: usize,
-    /// Heap budget for cached bloom filters, on top of `bloom_cache_size`.
-    pub bloom_cache_bytes: usize,
     /// How sealed segments are read (prototype switch).
     pub read_mode: crate::segment::blocks::ReadMode,
     /// Memory budget of the verified block cache for sealed segments.
@@ -1004,11 +977,7 @@ impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            bloom_cache_size: DEFAULT_BLOOM_CACHE_SIZE,
             mmap_cache_size: crate::cache::DEFAULT_MMAP_CACHE_SIZE,
-            index_cache_bytes: crate::cache::DEFAULT_INDEX_CACHE_BYTES,
-            bloom_cache_bytes: crate::cache::DEFAULT_BLOOM_CACHE_BYTES,
             read_mode: crate::segment::blocks::ReadMode::default(),
             block_cache_bytes: crate::segment::blocks::DEFAULT_BLOCK_CACHE_BYTES,
             block_size: crate::segment::blocks::DEFAULT_BLOCK_SIZE,
@@ -1038,22 +1007,17 @@ impl StoreOptions {
 
     /// Auto-scales cache sizes to fit within a specific per-context byte budget.
     ///
-    /// Bloom filters are small and consulted on every read of every segment,
-    /// so they get a sixteenth; the block cache a quarter; the segment
-    /// indexes (the large objects: tens of megabytes per 256 MB segment) the
-    /// rest. Nothing is capped by entry count.
+    /// The block cache gets a quarter. Segment indexes take no heap budget:
+    /// they are mapped, and the rest of the budget is left to the page cache
+    /// that serves both them and the mapped segments.
     pub fn auto_scaled_with_budget(sealed_segment_count: usize, budget_bytes: usize) -> Self {
         let segments = sealed_segment_count.max(1);
-        let bloom_cache_bytes = budget_bytes / 16;
         let block_cache_bytes = budget_bytes / 4;
-        let index_cache_bytes = budget_bytes - bloom_cache_bytes - block_cache_bytes;
 
         Self {
-            index_cache_bytes,
-            bloom_cache_bytes,
             block_cache_bytes,
             // Mmaps cost address space, not memory: keep every sealed
-            // segment mapped, like the bloom filters.
+            // segment mapped, like their indexes.
             mmap_cache_size: segments.max(crate::cache::DEFAULT_MMAP_CACHE_SIZE),
             ..Self::default()
         }
@@ -1200,7 +1164,7 @@ pub struct EventStoreEngine {
     /// it, without taking the writer lock.
     active_index: Arc<parking_lot::RwLock<SegmentIndex>>,
 
-    /// LRU cache for sealed segment indices, bloom filters, and mmap handles.
+    /// Mapped indexes of sealed segments, and their mmap handles and files.
     /// Also pins the index of every segment sealed in memory but not yet on
     /// disk — see `PendingSeal`.
     cache: Arc<IndexCache>,
@@ -1271,19 +1235,14 @@ impl EventStoreEngine {
             opts.voters.clone()
         };
         let watermark = Arc::new(WatermarkState::new(INITIAL_EPOCH, voters, 0));
-        let cache = Arc::new(
-            IndexCache::with_blocks(
-                opts.index_cache_size,
-                opts.bloom_cache_size,
-                opts.mmap_cache_size,
-                crate::segment::blocks::BlockCache::new(
-                    opts.block_cache_bytes,
-                    opts.block_size,
-                    opts.readahead_blocks,
-                ),
-            )
-            .with_byte_budgets(opts.index_cache_bytes, opts.bloom_cache_bytes),
-        );
+        let cache = Arc::new(IndexCache::with_blocks(
+            opts.mmap_cache_size,
+            crate::segment::blocks::BlockCache::new(
+                opts.block_cache_bytes,
+                opts.block_size,
+                opts.readahead_blocks,
+            ),
+        ));
         writer.lock().attach_index_cache(Arc::clone(&cache));
         let seals = Arc::new(SealQueue::new());
 
@@ -1363,14 +1322,15 @@ impl EventStoreEngine {
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
 
-        // A crash between a rotation and its background seal leaves a sealed
-        // segment without companions; rebuild them so every sealed segment
-        // is served from its own index.
-        heal_sealed_segments(dir, active_base)?;
+        // Every sealed segment is served from its own `.idx`: map each one,
+        // rebuilding any that a crash left unwritten or that is damaged.
+        // Their control summaries are what recovery reads below, so no
+        // sealed segment's records are read at all.
+        let sealed = open_sealed_indexes(dir, active_base)?;
 
         // Build the cached segment list from disk (one-time cost on startup).
         let all_bases = segment::list_segment_files(dir)?;
-        let sealed_count = count_sealed_segments(dir, &all_bases, active_base);
+        let sealed_count = all_bases.iter().filter(|&&base| base < active_base).count();
 
         // Writer's head() already returns the next-exclusive position, which
         // is exactly our head_position semantics — no adjustment.
@@ -1391,7 +1351,13 @@ impl EventStoreEngine {
         } else {
             opts.voters.clone()
         };
-        let recovered = recover_native_control_state(dir, head_pos)?;
+        // The active segment's control records were read once already, by
+        // the writer rebuilding its index.
+        let recovered = recover_native_control_state(
+            sealed.iter().map(|(_, index)| index.controls()),
+            active_index.read().controls(),
+            head_pos,
+        );
         let recovered_watermark = if voters.len() == 1 {
             head_pos
         } else {
@@ -1402,19 +1368,17 @@ impl EventStoreEngine {
             voters,
             recovered_watermark,
         ));
-        let cache = Arc::new(
-            IndexCache::with_blocks(
-                opts.index_cache_size,
-                opts.bloom_cache_size,
-                opts.mmap_cache_size,
-                crate::segment::blocks::BlockCache::new(
-                    opts.block_cache_bytes,
-                    opts.block_size,
-                    opts.readahead_blocks,
-                ),
-            )
-            .with_byte_budgets(opts.index_cache_bytes, opts.bloom_cache_bytes),
-        );
+        let cache = Arc::new(IndexCache::with_blocks(
+            opts.mmap_cache_size,
+            crate::segment::blocks::BlockCache::new(
+                opts.block_cache_bytes,
+                opts.block_size,
+                opts.readahead_blocks,
+            ),
+        ));
+        for (base, index) in sealed {
+            cache.adopt(base, index);
+        }
         writer.lock().attach_index_cache(Arc::clone(&cache));
         let seals = Arc::new(SealQueue::new());
 
@@ -1933,13 +1897,11 @@ impl EventStoreEngine {
             let path = segment::segment_path(&self.dir, base);
             remove_if_exists(&path)?;
             remove_if_exists(&path.with_extension("idx"))?;
-            remove_if_exists(&path.with_extension("bloom"))?;
             self.cache.invalidate(base);
         }
-        // The containing segment becomes active; its sealed companions no
-        // longer describe the truncated file.
+        // The containing segment becomes active; its sealed index no longer
+        // describes the truncated file.
         remove_if_exists(&target_path.with_extension("idx"))?;
-        remove_if_exists(&target_path.with_extension("bloom"))?;
         self.cache.invalidate(target_base);
 
         writer.reopen_truncated(target_base, truncate_offset, pos)?;
@@ -2237,7 +2199,7 @@ impl EventStoreEngine {
     }
 
     /// `stage_pre` for a caller that must not wait on the disk: `None` when
-    /// the check needs an index or bloom filter that is not in memory.
+    /// the check needs a sealed index that is not mapped yet.
     fn stage_pre_cached(&self, request: &Prepared) -> Option<Result<Pre, Error>> {
         let Some(condition) = &request.condition else {
             return Some(Ok(Pre::Checked(0)));
@@ -2621,9 +2583,9 @@ impl EventStoreEngine {
     /// since, under the lock, from its pinned index.
     ///
     /// Sealed segments `[from_sealed, sealed_count)` that can hold an event at
-    /// or after the marker are scanned: bloom → index → first match at or
-    /// after the marker. With `disk` false, an index or bloom filter that is
-    /// not in memory ends the scan with `NeedsDisk` instead of being read.
+    /// or after the marker are scanned: key filter → key directory → first
+    /// match at or after the marker. With `disk` false, an index that is not
+    /// mapped yet ends the scan with `NeedsDisk` instead of being opened.
     fn scan_sealed(
         &self,
         condition: &AppendCondition,
@@ -2632,23 +2594,11 @@ impl EventStoreEngine {
     ) -> Result<(SealedScan, usize), Error> {
         let marker = condition.consistency_marker.0;
         let (window, sealed_count) = self.sealed_window(from_sealed, marker);
-        let probe = BloomProbe::new(&condition.criteria);
+        if window.is_empty() {
+            return Ok((SealedScan::Clear, sealed_count));
+        }
+        let probe = Probe::new(&condition.criteria);
         for base in window {
-            // Bloom filter: skip segment if tag definitely not present.
-            let bloom = if disk {
-                self.cache.bloom_check_probe(
-                    || segment::segment_path(&self.dir, base),
-                    base,
-                    &probe,
-                )
-            } else {
-                self.cache.bloom_check_cached(base, &probe)
-            };
-            if let Some(false) = bloom {
-                continue;
-            }
-
-            // Load index and check for any match after the marker.
             let seg_index = if disk {
                 self.cache
                     .get_index(&segment::segment_path(&self.dir, base), base)?
@@ -2658,7 +2608,11 @@ impl EventStoreEngine {
                     None => return Ok((SealedScan::NeedsDisk, sealed_count)),
                 }
             };
-            if let Some(conflicting_pos) = seg_index.has_match_after(&condition.criteria, marker) {
+            // The filter rules most segments out without a lookup.
+            if !seg_index.might_match(&probe)? {
+                continue;
+            }
+            if let Some(conflicting_pos) = seg_index.first_match_after(&probe, marker)? {
                 self.metrics.record_dcb_violation();
                 return Ok((SealedScan::Conflict(conflicting_pos), sealed_count));
             }
@@ -2780,28 +2734,6 @@ impl EventStoreEngine {
         self.view.index_for(base, seg_path)
     }
 
-    /// The index for a read that needs only positions or takes every event;
-    /// see [`LogView::offsets_for`].
-    fn offsets_for(&self, base: u64, seg_path: &Path) -> Result<IndexRef<'_>, Error> {
-        self.view.offsets_for(base, seg_path)
-    }
-
-    /// The index for a read of `condition`'s events: positions alone if some
-    /// criterion matches everything (the other criteria add nothing then),
-    /// the full tag index otherwise.
-    fn index_for_condition(
-        &self,
-        base: u64,
-        seg_path: &Path,
-        condition: &SourcingCondition,
-    ) -> Result<IndexRef<'_>, Error> {
-        if matches_everything(condition) {
-            self.offsets_for(base, seg_path)
-        } else {
-            self.index_for(base, seg_path)
-        }
-    }
-
     /// The reader matching `index_for`'s answer: the active segment is read
     /// through its mapping with a CRC check per read; a sealed segment through
     /// the block cache, whose blocks were verified when they were loaded (or
@@ -2829,41 +2761,33 @@ impl EventStoreEngine {
         }
     }
 
-    /// Positions in segment `base` matching `condition`, at or after `from`.
+    /// Positions in a segment matching `probe`, at or after `from`.
     fn matching_in_segment(
         &self,
-        index: &SegmentIndex,
-        condition: &SourcingCondition,
+        index: &dyn SegmentKeys,
+        probe: &Probe,
         from: u64,
-    ) -> Option<roaring::RoaringTreemap> {
-        // Rank check first: the usual reason a live subscriber reads is a
-        // commit that holds nothing for it, and that is decided here without
-        // touching a bitmap.
-        if !index.any_match_in(condition, from, u64::MAX) {
-            return None;
-        }
+    ) -> Result<Option<PositionSet>, Error> {
         // A match-everything criterion means every position from `from` on:
-        // positions are dense within a segment, so that is a range, not a
-        // clone of the segment's whole position bitmap per page read.
-        if matches_everything(condition) {
+        // positions are dense within a segment, so that is a range.
+        if probe.takes_everything() {
             let range = index.position_range();
             let start = range.start.max(from);
-            if start >= range.end {
-                return None;
-            }
-            let mut bitmap = roaring::RoaringTreemap::new();
-            bitmap.insert_range(start..range.end);
-            return Some(bitmap);
+            return Ok(
+                (start < range.end).then(|| PositionSet::range(range.start, start, range.end))
+            );
         }
-        let mut bitmap = index.matching(condition)?;
-        if from > index.base_position() {
-            bitmap.remove_range(0..from);
+        // Rank check first: the usual reason a live subscriber reads is a
+        // commit that holds nothing for it, and that is decided here without
+        // combining sets.
+        if !index.any_match_in(probe, from, u64::MAX)? {
+            return Ok(None);
         }
-        if bitmap.is_empty() {
-            None
-        } else {
-            Some(bitmap)
-        }
+        let Some(mut positions) = index.matching(probe)? else {
+            return Ok(None);
+        };
+        positions.remove_below(from);
+        Ok((!positions.is_empty()).then_some(positions))
     }
 
     /// Whether any event in `[from, to)` could match `condition` — a rank
@@ -2881,7 +2805,7 @@ impl EventStoreEngine {
             return false;
         }
         let seg_list = self.segments.read().clone();
-        let probe = BloomProbe::new(condition);
+        let probe = Probe::new(condition);
         for (i, &base) in seg_list.bases.iter().enumerate() {
             if base >= to {
                 break;
@@ -2890,24 +2814,14 @@ impl EventStoreEngine {
             if seg_end <= from.0 {
                 continue;
             }
-            if seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check_probe(
-                    || segment::segment_path(&self.dir, base),
-                    base,
-                    &probe,
-                )
-            {
-                continue;
-            }
             let seg_path = segment::segment_path(&self.dir, base);
-            match self.index_for(base, &seg_path) {
-                Ok(index) => {
-                    if index.any_match_in(condition, from.0, to) {
-                        return true;
-                    }
-                }
-                // Cannot tell: let the read decide.
-                Err(_) => return true,
+            let possible = self.index_for(base, &seg_path).and_then(|index| {
+                Ok(index.might_match(&probe)? && index.any_match_in(&probe, from.0, to)?)
+            });
+            match possible {
+                Ok(false) => {}
+                // A match, or cannot tell: let the read decide.
+                Ok(true) | Err(_) => return true,
             }
         }
         false
@@ -2938,8 +2852,8 @@ impl EventStoreEngine {
         let base = seg_list.bases[seg_idx];
         let seg_path = segment::segment_path(&self.dir, base);
 
-        let index = self.offsets_for(base, &seg_path)?;
-        let Some(offset) = index.get_offset(position.0) else {
+        let index = self.index_for(base, &seg_path)?;
+        let Some(offset) = index.offset_of(position.0)? else {
             return Err(Error::Corrupted {
                 message: format!("event at position {} not found in segment", position.0),
             });
@@ -3057,7 +2971,7 @@ impl EventStoreEngine {
         }
 
         let seg_list = self.segments.read().clone();
-        let condition = crate::system::marker_condition();
+        let probe = Probe::new(&crate::system::marker_condition());
         let mut pos = head - 1;
 
         for &base in seg_list.bases.iter().rev() {
@@ -3065,8 +2979,11 @@ impl EventStoreEngine {
                 continue;
             }
             let seg_path = segment::segment_path(&self.dir, base);
-            let system = match self.index_for(base, &seg_path) {
-                Ok(index) => index.matching(&condition),
+            let system = match self
+                .index_for(base, &seg_path)
+                .and_then(|index| index.matching(&probe))
+            {
+                Ok(system) => system,
                 // Unreadable index: fall back to the true head rather
                 // than under-reporting and stranding a client's cursor.
                 Err(_) => return Position(head),
@@ -3094,7 +3011,7 @@ impl EventStoreEngine {
 
     /// Highest position strictly below `below` matching `condition`, or
     /// `None` if nothing matches. The mirror image of the DCB primitive
-    /// (`find_matching_after`), resolved newest-first with bloom-filter
+    /// (`find_matching_after`), resolved newest-first with key-filter
     /// skips: the expected caller — the snapshot lookup — almost always
     /// finds its answer in the newest segment or two, so the walk usually
     /// probes once and stops.
@@ -3109,28 +3026,22 @@ impl EventStoreEngine {
         }
 
         let seg_list = self.segments.read().clone();
-        let probe = BloomProbe::new(condition);
-        for (i, &base) in seg_list.bases.iter().enumerate().rev() {
+        let probe = Probe::new(condition);
+        for &base in seg_list.bases.iter().rev() {
             if base >= bound {
                 continue;
             }
-            if seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check_probe(
-                    || segment::segment_path(&self.dir, base),
-                    base,
-                    &probe,
-                )
-            {
+            let seg_path = segment::segment_path(&self.dir, base);
+            let index = self.index_for(base, &seg_path)?;
+            if !index.might_match(&probe)? {
                 continue;
             }
-            let seg_path = segment::segment_path(&self.dir, base);
-            let bitmap = self.index_for(base, &seg_path)?.matching(condition);
-            if let Some(mut bitmap) = bitmap {
+            if let Some(mut positions) = index.matching(&probe)? {
                 // The index is written before the watermark advances, so
                 // positions at or past the bound may be present — they are
                 // not committed reads and must not be returned.
-                bitmap.remove_range(bound..);
-                if let Some(max) = bitmap.max() {
+                positions.remove_from(bound);
+                if let Some(max) = positions.max() {
                     return Ok(Some(Position(max)));
                 }
             }
@@ -3164,8 +3075,8 @@ impl EventStoreEngine {
         let base = seg_list.bases[seg_idx];
         let seg_path = segment::segment_path(&self.dir, base);
 
-        let index = self.offsets_for(base, &seg_path)?;
-        let Some(offset) = index.get_offset(position.0) else {
+        let index = self.index_for(base, &seg_path)?;
+        let Some(offset) = index.offset_of(position.0)? else {
             return Err(Error::Corrupted {
                 message: format!("event at position {} not found in segment", position.0),
             });
@@ -3187,7 +3098,7 @@ impl EventStoreEngine {
     /// Reads events matching a query from `from_position` up to the current head.
     /// This is the "Source" operation — a finite read.
     ///
-    /// For sealed segments: uses cached bloom filters, indices, and mmap handles.
+    /// For sealed segments: uses their mapped indexes (key filter first).
     /// For the active segment: uses the in-memory tag index.
     ///
     /// No readdir or stat syscalls — segment list and sealed status are cached.
@@ -3208,8 +3119,8 @@ impl EventStoreEngine {
 
         let mut events = Vec::new();
 
-        let probe = BloomProbe::new(condition);
-        let everything = matches_everything(condition);
+        let probe = Probe::new(condition);
+        let everything = probe.takes_everything();
 
         for (i, &base) in seg_list.bases.iter().enumerate() {
             let is_last = i + 1 == seg_list.bases.len();
@@ -3227,28 +3138,20 @@ impl EventStoreEngine {
                 continue;
             }
 
-            // Sealed segments: bloom filter first, so a segment that cannot
-            // hold a match is skipped without loading its index.
-            // (A condition that takes everything has nothing to rule out.)
-            if !everything
-                && seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check_probe(
-                    || segment::segment_path(&self.dir, base),
-                    base,
-                    &probe,
-                )
-            {
-                self.metrics.record_bloom_check(true);
-                continue;
-            }
-            if seg_list.is_sealed(i) {
-                self.metrics.record_bloom_check(false);
-            }
-
             let seg_path = segment::segment_path(&self.dir, base);
-            let index = self.index_for_condition(base, &seg_path, condition)?;
+            let index = self.index_for(base, &seg_path)?;
+            // Sealed segments: key filter first, so a segment that cannot
+            // hold a match is skipped without a directory lookup.
+            // (A condition that takes everything has nothing to rule out.)
+            if !everything && seg_list.is_sealed(i) {
+                let ruled_out = !index.might_match(&probe)?;
+                self.metrics.record_bloom_check(ruled_out);
+                if ruled_out {
+                    continue;
+                }
+            }
             let Some(matching_positions) =
-                self.matching_in_segment(&index, condition, from_position.0)
+                self.matching_in_segment(&*index, &probe, from_position.0)?
             else {
                 continue; // No matches in this segment.
             };
@@ -3260,7 +3163,7 @@ impl EventStoreEngine {
                 if pos >= head {
                     break;
                 }
-                if let Some(offset) = index.get_offset(pos) {
+                if let Some(offset) = index.offset_of(pos)? {
                     let stored = reader.read_event_at(pos, offset)?;
                     if crate::system::is_system_name(&stored.name) {
                         continue;
@@ -3440,8 +3343,8 @@ impl EventStoreEngine {
         if seg_list.bases.is_empty() || head == 0 {
             return Ok(());
         }
-        let probe = BloomProbe::new(condition);
-        let everything = matches_everything(condition);
+        let probe = Probe::new(condition);
+        let everything = probe.takes_everything();
         let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(CHUNK);
         for (i, &base) in seg_list.bases.iter().enumerate() {
             if base >= head {
@@ -3454,22 +3357,15 @@ impl EventStoreEngine {
             if seg_end < from.0 {
                 continue;
             }
-            if !everything
-                && seg_list.is_sealed(i)
-                && let Some(false) = self.cache.bloom_check_probe(
-                    || segment::segment_path(&self.dir, base),
-                    base,
-                    &probe,
-                )
-            {
-                continue;
-            }
             let seg_path = segment::segment_path(&self.dir, base);
             let (matching, mut reader) = {
-                let index = self.index_for_condition(base, &seg_path, condition)?;
+                let index = self.index_for(base, &seg_path)?;
+                if !everything && seg_list.is_sealed(i) && !index.might_match(&probe)? {
+                    continue;
+                }
                 // Already-consumed positions are dropped up front so a cursor
                 // advancing through the log doesn't re-skip the prefix.
-                let Some(matching) = self.matching_in_segment(&index, condition, from.0) else {
+                let Some(matching) = self.matching_in_segment(&*index, &probe, from.0)? else {
                     continue;
                 };
                 let reader = self.reader_for(&index, base, &seg_path)?;
@@ -3479,9 +3375,9 @@ impl EventStoreEngine {
             while positions.peek().is_some() {
                 offsets.clear();
                 {
-                    let index = self.index_for_condition(base, &seg_path, condition)?;
+                    let index = self.index_for(base, &seg_path)?;
                     for pos in positions.by_ref() {
-                        if let Some(offset) = index.get_offset(pos) {
+                        if let Some(offset) = index.offset_of(pos)? {
                             offsets.push((pos, offset));
                             if offsets.len() == CHUNK {
                                 break;
@@ -3535,15 +3431,6 @@ pub(crate) fn copy_client_record(
 const MAX_PAGE_RESERVE_RECORDS: usize = 1024;
 /// Most bytes it reserves that way.
 const MAX_PAGE_RESERVE_BYTES: usize = 1024 * 1024;
-
-/// Whether some criterion of `condition` matches every event, which makes
-/// every other criterion redundant.
-fn matches_everything(condition: &SourcingCondition) -> bool {
-    condition
-        .criteria
-        .iter()
-        .any(|c| c.tags.is_empty() && c.names.is_empty())
-}
 
 /// What a read's visitor wants next.
 enum Walk {
@@ -3694,24 +3581,6 @@ fn remove_if_exists(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Counts how many segments are sealed (have companion .idx/.bloom files).
-/// Called once during open to populate the cached segment list.
-fn count_sealed_segments(dir: &Path, bases: &[u64], active_base: u64) -> usize {
-    let mut count = 0;
-    for &base in bases {
-        if base == active_base {
-            break; // Active segment — not sealed.
-        }
-        let seg_path = segment::segment_path(dir, base);
-        if SegmentIndex::has_companion_files(&seg_path) {
-            count += 1;
-        } else {
-            break; // Gap in sealed segments — stop counting.
-        }
-    }
-    count
-}
-
 /// What a log's control records say, read once at open.
 struct RecoveredControl {
     /// The highest epoch any control record names.
@@ -3722,67 +3591,39 @@ struct RecoveredControl {
     epochs: crate::replication::epochs::EpochIndex,
 }
 
-fn recover_native_control_state(dir: &Path, local_tail: u64) -> Result<RecoveredControl, Error> {
-    use std::io::Read;
-
-    let mut recovered_epoch = INITIAL_EPOCH;
-    let mut checkpoint = 0u64;
-    let mut epochs = crate::replication::epochs::EpochIndex::default();
-    for base in segment::list_segment_files(dir)? {
-        let path = segment::segment_path(dir, base);
-        let mut file = std::fs::File::open(&path)?;
-        let mut segment_header = [0u8; segment::SEGMENT_HEADER_SIZE];
-        file.read_exact(&mut segment_header)?;
-        loop {
-            let mut header = [0u8; segment::RECORD_HEADER_SIZE];
-            match file.read_exact(&mut header) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.into()),
+/// Folds the log's control records, segment by segment in log order: the
+/// sealed segments' from their indexes' control summaries, the active
+/// segment's from its live index. Nothing is read from the segments.
+fn recover_native_control_state<'a>(
+    sealed: impl Iterator<Item = &'a [LoggedControl]>,
+    active: &'a [LoggedControl],
+    local_tail: u64,
+) -> RecoveredControl {
+    let mut recovered = RecoveredControl {
+        epoch: INITIAL_EPOCH,
+        checkpoint: 0,
+        epochs: crate::replication::epochs::EpochIndex::default(),
+    };
+    for control in sealed.chain(std::iter::once(active)).flatten() {
+        match control.record {
+            crate::segment::format::ControlRecord::EpochChange {
+                epoch,
+                start_position,
+                ..
+            } => {
+                recovered.epoch = recovered.epoch.max(epoch);
+                recovered.epochs.record(epoch, start_position);
             }
-            let header = match crate::segment::record::parse_header(&header)? {
-                Some(header) => header,
-                None => break,
-            };
-            let mut payload = vec![0u8; header.payload_len];
-            if let Err(error) = file.read_exact(&mut payload) {
-                if error.kind() == io::ErrorKind::UnexpectedEof {
-                    break;
-                }
-                return Err(error.into());
+            crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position }
+                if position <= local_tail =>
+            {
+                recovered.checkpoint = recovered.checkpoint.max(position);
+                recovered.epoch = recovered.epoch.max(epoch);
             }
-            if !crate::segment::record::validate_crc(header, &payload) {
-                break;
-            }
-            let crate::segment::record::NativeRecord::Control(control) =
-                crate::segment::record::decode_native(header, &payload)?
-            else {
-                continue;
-            };
-            match control {
-                crate::segment::format::ControlRecord::EpochChange {
-                    epoch,
-                    start_position,
-                    ..
-                } => {
-                    recovered_epoch = recovered_epoch.max(epoch);
-                    epochs.record(epoch, start_position);
-                }
-                crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position }
-                    if position <= local_tail =>
-                {
-                    checkpoint = checkpoint.max(position);
-                    recovered_epoch = recovered_epoch.max(epoch);
-                }
-                crate::segment::format::ControlRecord::WatermarkCheckpoint { .. } => {}
-            }
+            crate::segment::format::ControlRecord::WatermarkCheckpoint { .. } => {}
         }
     }
-    Ok(RecoveredControl {
-        epoch: recovered_epoch,
-        checkpoint,
-        epochs,
-    })
+    recovered
 }
 
 /// The stored CRC of the record that ends at `byte_end` in this node's own
@@ -3953,42 +3794,64 @@ fn scan_replication_boundary(path: &Path, from: Position) -> Result<Vec<Boundary
 }
 
 /// The index answering for one segment: a read guard on the active
-/// segment's live index, or a shared handle to a sealed one.
+/// segment's live index, or a shared handle to a sealed one (pinned in
+/// memory while its `.idx` is written, mapped after).
 enum IndexRef<'a> {
     Active(parking_lot::RwLockReadGuard<'a, SegmentIndex>),
-    Sealed(Arc<SegmentIndex>),
+    Sealed(Arc<dyn SegmentKeys>),
 }
 
 impl std::ops::Deref for IndexRef<'_> {
-    type Target = SegmentIndex;
-    fn deref(&self) -> &SegmentIndex {
+    type Target = dyn SegmentKeys + 'static;
+    fn deref(&self) -> &Self::Target {
         match self {
-            IndexRef::Active(guard) => guard,
-            IndexRef::Sealed(index) => index,
+            IndexRef::Active(guard) => &**guard,
+            IndexRef::Sealed(index) => &**index,
         }
     }
 }
 
-/// Writes companions for every sealed segment that lacks them. A crash
-/// between a rotation and its background seal is the one way a sealed
-/// segment ends up without `.idx`/`.bloom`; rebuilding them here is what
-/// lets every read path assume a sealed segment has an index.
-fn heal_sealed_segments(dir: &Path, active_base: u64) -> Result<(), Error> {
+/// Maps the `.idx` of every sealed segment (every segment but the active
+/// one), in log order. A sealed segment whose index is missing (a crash
+/// between a rotation and its background seal), from an older format, or
+/// damaged gets it rebuilt from the segment first, so every read path can
+/// assume a sealed segment has a valid index. Opening one reads its header
+/// and control summary, a few hundred bytes; the segment is read only when
+/// its index has to be rebuilt.
+fn open_sealed_indexes(
+    dir: &Path,
+    active_base: u64,
+) -> Result<Vec<(u64, Arc<SealedIndex>)>, Error> {
+    let mut sealed = Vec::new();
     for base in segment::list_segment_files(dir)? {
-        if base == active_base {
+        if base >= active_base {
             continue;
         }
         let seg_path = segment::segment_path(dir, base);
-        if SegmentIndex::has_companion_files(&seg_path) {
-            continue;
-        }
-        tracing::info!(
-            base,
-            "sealed segment has no companion files; rebuilding its index"
-        );
-        SegmentIndex::build_from_segment(&seg_path)?.write_to_disk(&seg_path)?;
+        let idx_path = seg_path.with_extension("idx");
+        // Filters of the format before version 3 lived beside the index.
+        remove_if_exists(&seg_path.with_extension("bloom"))?;
+        let index = match SealedIndex::open(&idx_path, base) {
+            Ok(index) => index,
+            Err(error) => {
+                match &error {
+                    Error::Io(io) if io.kind() == io::ErrorKind::NotFound => {
+                        tracing::info!(base, "sealed segment has no index; rebuilding it")
+                    }
+                    Error::Corrupted { message } => tracing::warn!(
+                        base,
+                        reason = %message,
+                        "sealed segment index is unusable; rebuilding it from the segment"
+                    ),
+                    _ => return Err(error),
+                }
+                SegmentIndex::build_from_segment(&seg_path)?.write_to_disk(&seg_path)?;
+                SealedIndex::open(&idx_path, base)?
+            }
+        };
+        sealed.push((base, Arc::new(index)));
     }
-    Ok(())
+    Ok(sealed)
 }
 
 #[cfg(test)]
@@ -4363,8 +4226,8 @@ mod tests {
         for &base in &sealed.bases[..sealed.sealed_count] {
             let path = segment::segment_path(dir.path(), base);
             assert!(
-                SegmentIndex::has_companion_files(&path),
-                "segment {base} lacks companions"
+                SealedIndex::open(&path.with_extension("idx"), base).is_ok(),
+                "segment {base} lacks its index"
             );
             assert!(!store.cache.is_pinned(base));
         }
@@ -4646,10 +4509,9 @@ mod tests {
         }
         let victim = segment::segment_path(dir.path(), sealed.bases[0]);
         std::fs::remove_file(victim.with_extension("idx")).unwrap();
-        std::fs::remove_file(victim.with_extension("bloom")).unwrap();
 
         let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
-        assert!(SegmentIndex::has_companion_files(&victim));
+        assert!(SealedIndex::open(&victim.with_extension("idx"), sealed.bases[0]).is_ok());
         let cond = SourcingCondition {
             criteria: vec![Criterion {
                 names: vec![],
@@ -5128,9 +4990,10 @@ mod tests {
         // Event 3 lives in the first, sealed segment. Flip one bit in its
         // body while nothing has the file cached.
         let seg0 = segment::segment_path(dir.path(), 0);
-        let offset = SegmentIndex::read_idx(&seg0.with_extension("idx"))
+        let offset = SealedIndex::open(&seg0.with_extension("idx"), 0)
             .unwrap()
-            .get_offset(3)
+            .offset_of(3)
+            .unwrap()
             .unwrap();
         let mut bytes = std::fs::read(&seg0).unwrap();
         bytes[offset as usize + 40] ^= 0x04;
@@ -5257,14 +5120,13 @@ mod tests {
         }
     }
 
-    /// A replay takes every event, so it has no use for a segment's tag
-    /// index: the position→offset table is enough. With an index budget
-    /// that holds none of them, a whole-log replay must not load one, and a
-    /// second and third pass must find the tables cached. (Replaying through
-    /// full indexes under such a budget reloaded every one of them on every
-    /// pass.)
+    /// Opening a store maps every sealed segment's index once; after that
+    /// no read, whether a replay, a read by tag or a point read, opens or
+    /// loads an index again, however many segments there are. (Before
+    /// indexes were mapped, a replay under a small heap budget reloaded
+    /// every segment's index on every pass.)
     #[test]
-    fn replaying_more_segments_than_the_index_budget_holds_loads_no_tag_index() {
+    fn reads_never_reload_a_sealed_index() {
         let dir = tempfile::tempdir().unwrap();
         let total = 600u64;
         {
@@ -5294,15 +5156,15 @@ mod tests {
                 dir.path(),
                 &StoreOptions {
                     max_segment_size: 16 * 1024,
-                    index_cache_bytes: 1,
                     read_mode,
                     block_size: 4096,
                     ..StoreOptions::default()
                 },
             )
             .unwrap();
-            let sealed = store.segments.read().sealed_count as u64;
+            let sealed = store.segments.read().sealed_count;
             assert!(sealed >= 3, "need several sealed segments, got {sealed}");
+            assert_eq!(store.cache.mapped_indexes(), sealed);
 
             for pass in 0..3 {
                 assert_eq!(
@@ -5311,33 +5173,20 @@ mod tests {
                     "{read_mode:?} pass {pass}"
                 );
             }
-            let misses = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-            assert_eq!(
-                misses(&store.cache.index_misses),
-                0,
-                "{read_mode:?}: a replay loaded a tag index"
-            );
-            assert_eq!(
-                misses(&store.cache.offsets_misses),
-                sealed,
-                "{read_mode:?}: each table loads once and then stays"
-            );
-
-            // A read by tag does need the tag bitmaps, and gets them.
             let wanted = (0..total).filter(|i| i % 13 == 3).count();
             assert_eq!(
                 store.source(Position(0), &tag_cond("ord-3")).unwrap().len(),
                 wanted
             );
-            assert!(misses(&store.cache.index_misses) > 0);
             assert_eq!(replay_all(&store, &tag_cond("ord-3")), wanted);
-
-            // Point reads by position need only the table, too.
-            let before = misses(&store.cache.index_misses);
             for position in [0, 1, total / 2, total - 1] {
                 store.get_tags(Position(position)).unwrap();
             }
-            assert_eq!(misses(&store.cache.index_misses), before);
+            assert_eq!(
+                store.cache.index_misses.load(Ordering::Relaxed),
+                0,
+                "{read_mode:?}: a read opened an index"
+            );
         }
     }
 
@@ -5617,8 +5466,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = StoreOptions {
             max_segment_size: 1024,
-            index_cache_size: 1,
-            bloom_cache_size: 1,
             ..Default::default()
         };
         let engine =
@@ -5632,9 +5479,14 @@ mod tests {
                 .unwrap();
         }
         engine.seals.wait_idle();
-        assert!(engine.segments.read().sealed_count > 2);
+        let list = engine.segments.read().clone();
+        assert!(list.sealed_count > 2);
+        // Unmap every sealed index but the last, as the mapping cap would.
+        for &base in &list.bases[..list.sealed_count - 1] {
+            engine.cache.invalidate(base);
+        }
 
-        // Marker 0 reaches every sealed segment; the cache holds one.
+        // Marker 0 reaches every sealed segment; one is mapped.
         let request = || {
             conditional(
                 0,
@@ -6181,5 +6033,301 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    // ── Sealed index v3: rebuilds, old formats, recovery from summaries ──
+
+    /// A log of several sealed segments with control records spread through
+    /// it: four epochs (each rotating to a fresh segment and opening it with
+    /// an EpochChange), watermark checkpoints between appends, varied types
+    /// and tags. Returns the head.
+    fn log_with_controls(dir: &Path) -> u64 {
+        let store = tiny_segment_store(dir, ReadMode::Mapped);
+        let mut n = 0u64;
+        for epoch in 1..=4u64 {
+            store.begin_replication_epoch(epoch, [0]).unwrap();
+            store.persist_epoch_change(epoch, 0).unwrap();
+            for burst in 0..6 {
+                for _ in 0..7 {
+                    let name = ["OrderPlaced", "ItemAdded", "OrderShipped"][(n % 3) as usize];
+                    store
+                        .append(AppendRequest {
+                            condition: None,
+                            events: vec![make_event(
+                                name,
+                                vec![
+                                    tag("orderId", &format!("o-{}", n / 5)),
+                                    tag("customerId", &format!("c-{}", n % 11)),
+                                ],
+                            )],
+                        })
+                        .unwrap();
+                    n += 1;
+                }
+                if burst % 2 == 1 {
+                    store.persist_watermark_checkpoint().unwrap();
+                }
+            }
+        }
+        store.seals.wait_idle();
+        let sealed = store.segments.read().sealed_count;
+        assert!(sealed >= 6, "need several sealed segments, got {sealed}");
+        let head = store.head().0;
+        store.shutdown();
+        head
+    }
+
+    fn sealed_bases(dir: &Path) -> Vec<u64> {
+        let mut bases = segment::list_segment_files(dir).unwrap();
+        bases.pop(); // the active segment
+        bases
+    }
+
+    fn index_bytes(dir: &Path) -> Vec<(u64, Vec<u8>)> {
+        sealed_bases(dir)
+            .into_iter()
+            .map(|base| {
+                let path = segment::segment_path(dir, base).with_extension("idx");
+                (base, std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// The `.idx` of a segment is a function of the segment: the one the
+    /// seal wrote from the live index, the one a rebuild from the file
+    /// writes, and the one a reopened store writes after losing it are the
+    /// same bytes. (Archived indexes, ADR-0002, rely on this.)
+    #[test]
+    fn a_rebuilt_index_is_byte_identical_to_the_sealed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        log_with_controls(dir.path());
+        let sealed = index_bytes(dir.path());
+        for (base, bytes) in &sealed {
+            let path = segment::segment_path(dir.path(), *base);
+            let rebuilt = SegmentIndex::build_from_segment(&path)
+                .unwrap()
+                .encode_sealed()
+                .unwrap();
+            assert!(&rebuilt == bytes, "segment {base}: rebuild differs");
+            std::fs::remove_file(path.with_extension("idx")).unwrap();
+        }
+
+        let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
+        let reopened = index_bytes(dir.path());
+        assert_eq!(reopened.len(), sealed.len());
+        for ((base, before), (_, after)) in sealed.iter().zip(&reopened) {
+            assert!(
+                before == after,
+                "segment {base}: reopened store wrote different bytes"
+            );
+        }
+        assert_eq!(
+            store
+                .source(Position(0), &tag_cond_key("customerId", "c-3"))
+                .unwrap()
+                .len(),
+            (0..store.head().0).filter(|n| n % 11 == 3).count()
+        );
+    }
+
+    fn tag_cond_key(key: &str, value: &str) -> SourcingCondition {
+        SourcingCondition {
+            criteria: vec![Criterion {
+                names: vec![],
+                tags: vec![tag(key, value)],
+            }],
+        }
+    }
+
+    /// Indexes from before version 3 (a whole-loaded `.idx` and a separate
+    /// `.bloom`) are not read: open rebuilds them as v3 and removes the
+    /// filters. A damaged v3 index is rebuilt the same way, and so is a
+    /// missing one.
+    #[test]
+    fn open_rebuilds_old_damaged_and_missing_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        log_with_controls(dir.path());
+        let expected = index_bytes(dir.path());
+        let bases = sealed_bases(dir.path());
+        for (i, &base) in bases.iter().enumerate() {
+            let path = segment::segment_path(dir.path(), base);
+            let idx = path.with_extension("idx");
+            match i % 3 {
+                0 => {
+                    // A version 2 file, checksum trailer and all.
+                    let mut old = b"KIDX\x02".to_vec();
+                    old.extend_from_slice(&[0x5A; 300]);
+                    std::fs::write(&idx, old).unwrap();
+                    std::fs::write(path.with_extension("bloom"), b"KBLM\x02junk").unwrap();
+                }
+                1 => {
+                    let mut damaged = std::fs::read(&idx).unwrap();
+                    damaged[60] ^= 0x01;
+                    std::fs::write(&idx, damaged).unwrap();
+                }
+                _ => std::fs::remove_file(&idx).unwrap(),
+            }
+        }
+
+        let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
+        assert_eq!(index_bytes(dir.path()), expected);
+        for &base in &bases {
+            let path = segment::segment_path(dir.path(), base);
+            assert!(!path.with_extension("bloom").exists());
+        }
+        let head = store.head().0;
+        assert_eq!(
+            store.source(Position(0), &cond_match_all()).unwrap().len() as u64,
+            head
+        );
+        assert_eq!(
+            store
+                .source(Position(0), &tag_cond_key("orderId", "o-3"))
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    /// The control state recovery computed before indexes carried control
+    /// summaries: a scan of every record of every segment. Kept as the
+    /// reference the summaries are checked against.
+    fn recover_by_full_scan(dir: &Path, local_tail: u64) -> RecoveredControl {
+        use std::io::Read;
+
+        let mut recovered = RecoveredControl {
+            epoch: INITIAL_EPOCH,
+            checkpoint: 0,
+            epochs: crate::replication::epochs::EpochIndex::default(),
+        };
+        for base in segment::list_segment_files(dir).unwrap() {
+            let mut file = std::fs::File::open(segment::segment_path(dir, base)).unwrap();
+            let mut segment_header = [0u8; segment::SEGMENT_HEADER_SIZE];
+            file.read_exact(&mut segment_header).unwrap();
+            loop {
+                let mut header = [0u8; segment::RECORD_HEADER_SIZE];
+                if file.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let Some(header) = crate::segment::record::parse_header(&header).unwrap() else {
+                    break;
+                };
+                let mut payload = vec![0u8; header.payload_len];
+                if file.read_exact(&mut payload).is_err()
+                    || !crate::segment::record::validate_crc(header, &payload)
+                {
+                    break;
+                }
+                let crate::segment::record::NativeRecord::Control(control) =
+                    crate::segment::record::decode_native(header, &payload).unwrap()
+                else {
+                    continue;
+                };
+                match control {
+                    crate::segment::format::ControlRecord::EpochChange {
+                        epoch,
+                        start_position,
+                        ..
+                    } => {
+                        recovered.epoch = recovered.epoch.max(epoch);
+                        recovered.epochs.record(epoch, start_position);
+                    }
+                    crate::segment::format::ControlRecord::WatermarkCheckpoint {
+                        epoch,
+                        position,
+                    } if position <= local_tail => {
+                        recovered.checkpoint = recovered.checkpoint.max(position);
+                        recovered.epoch = recovered.epoch.max(epoch);
+                    }
+                    crate::segment::format::ControlRecord::WatermarkCheckpoint { .. } => {}
+                }
+            }
+        }
+        recovered
+    }
+
+    fn assert_same_recovery(a: &RecoveredControl, b: &RecoveredControl) {
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.checkpoint, b.checkpoint);
+        assert_eq!(a.epochs.last_epoch(), b.epochs.last_epoch());
+        for epoch in 0..8 {
+            assert_eq!(
+                a.epochs.extent(epoch),
+                b.epochs.extent(epoch),
+                "epoch {epoch}"
+            );
+        }
+    }
+
+    /// Recovery from the sealed indexes' control summaries and the active
+    /// segment's live index finds exactly what a scan of every record did.
+    #[test]
+    fn recovery_from_control_summaries_equals_a_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = log_with_controls(dir.path());
+        let scanned = recover_by_full_scan(dir.path(), head);
+        assert_eq!(scanned.epoch, 4);
+        assert!(scanned.checkpoint > 0);
+        assert_eq!(scanned.epochs.last_epoch(), Some(4));
+
+        let writer = SegmentWriter::open(dir.path(), 4 * 1024).unwrap();
+        let sealed = open_sealed_indexes(dir.path(), writer.active_base_position()).unwrap();
+        assert!(sealed.iter().any(|(_, index)| !index.controls().is_empty()));
+        let active = writer.active_index_handle();
+        let summarized = recover_native_control_state(
+            sealed.iter().map(|(_, index)| index.controls()),
+            active.read().controls(),
+            head,
+        );
+        assert_same_recovery(&summarized, &scanned);
+        // A local tail below some checkpoints leaves those out, both ways.
+        let low = scanned.checkpoint - 1;
+        assert_same_recovery(
+            &recover_native_control_state(
+                sealed.iter().map(|(_, index)| index.controls()),
+                active.read().controls(),
+                low,
+            ),
+            &recover_by_full_scan(dir.path(), low),
+        );
+        drop(writer);
+
+        // And the engine opens to the same state.
+        let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
+        assert_eq!(store.log_epoch(), 4);
+        for epoch in 0..8 {
+            assert_eq!(store.epoch_extent(epoch), scanned.epochs.extent(epoch));
+        }
+    }
+
+    /// Opening a log reads no sealed segment's records: with every sealed
+    /// segment's body gone (its file emptied, its index intact), the store
+    /// still opens, to the same control state.
+    #[test]
+    fn open_reads_no_sealed_segment_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = log_with_controls(dir.path());
+        let scanned = recover_by_full_scan(dir.path(), head);
+        for base in sealed_bases(dir.path()) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(segment::segment_path(dir.path(), base))
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+        let store = EventStoreEngine::open_with_options(dir.path(), 4 * 1024).unwrap();
+        assert_eq!(store.head().0, head);
+        assert_eq!(store.log_epoch(), scanned.epoch);
+        for epoch in 0..8 {
+            assert_eq!(store.epoch_extent(epoch), scanned.epochs.extent(epoch));
+        }
+        // Indexes still answer what lives where; only reading the records
+        // themselves needs the bodies.
+        assert!(store.has_matches_between(
+            Position(0),
+            Position(head),
+            &tag_cond_key("orderId", "o-1")
+        ));
     }
 }

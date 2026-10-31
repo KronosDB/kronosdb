@@ -313,7 +313,7 @@ mod tests {
     fn latest_survives_segment_rotation() {
         let dir = tempfile::tempdir().unwrap();
         // Tiny segments force rotation so the lookup exercises the sealed
-        // bloom → index → max path, not just the active tag index.
+        // filter → index → max path, not just the active tag index.
         let engine = EventStoreEngine::create_with_options(dir.path(), 4096).unwrap();
 
         append(&engine, b"k", b"early".to_vec(), Position(0)).unwrap();

@@ -202,25 +202,25 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     engine_family!(
         "kronosdb_index_cache_hits_total",
         "counter",
-        "Segment index cache hits",
+        "Sealed segment index lookups served by an open mapping",
         index_cache_hits
     );
     engine_family!(
         "kronosdb_index_cache_misses_total",
         "counter",
-        "Segment index cache misses",
+        "Sealed segment indexes mapped from disk",
         index_cache_misses
     );
     engine_family!(
         "kronosdb_bloom_checks_total",
         "counter",
-        "Bloom filter checks",
+        "Sealed segment key filter checks",
         bloom_checks
     );
     engine_family!(
         "kronosdb_bloom_rejections_total",
         "counter",
-        "Segments skipped by bloom filter",
+        "Sealed segments skipped by their key filter",
         bloom_rejections
     );
     engine_family!(

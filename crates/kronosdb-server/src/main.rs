@@ -81,14 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the context manager and ensure a default context exists.
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
-        index_cache_size: config.index_cache_size,
-        bloom_cache_size: config.bloom_cache_size,
-        // Every sealed segment stays mapped: address space, not memory.
-        mmap_cache_size: config
-            .index_cache_size
-            .max(kronosdb_eventstore::cache::DEFAULT_MMAP_CACHE_SIZE),
-        index_cache_bytes: config.index_cache_bytes,
-        bloom_cache_bytes: config.bloom_cache_bytes,
+        mmap_cache_size: kronosdb_eventstore::cache::DEFAULT_MMAP_CACHE_SIZE,
         read_mode: config.read_mode,
         block_cache_bytes: config.block_cache_bytes,
         block_size: config.block_size,
@@ -111,8 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let report =
             kronosdb_eventstore::hardware::check(&kronosdb_eventstore::hardware::CheckInput {
                 data_dir: &config.data_dir,
-                index_cache_bytes: config.index_cache_bytes,
-                bloom_cache_bytes: config.bloom_cache_bytes,
+                cache_budget_bytes: config.block_cache_bytes,
                 ack_mode,
                 dev: config.dev,
             });

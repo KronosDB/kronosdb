@@ -124,9 +124,9 @@ fn bloom_rejection_vs_volume(c: &mut Criterion) {
 
 /// Cache thrashing at scale: what happens when the working set exceeds cache size?
 ///
-/// With default cache sizes (50 indices, 200 blooms) and thousands of segments,
-/// random-order queries force evictions. This models a production scenario where
-/// many different entities are queried in rapid succession (e.g., a busy API).
+/// Thousands of segments queried in random order: every segment's mapped index
+/// is probed, none is loaded. This models a production scenario where many
+/// different entities are queried in rapid succession (e.g., a busy API).
 fn cache_pressure_at_scale(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_pressure");
     group.sample_size(15);

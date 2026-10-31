@@ -54,7 +54,7 @@ pub struct ManifestSegment {
     pub size: u64,
     /// blake3 of the `.seg` bytes, computed while uploading.
     pub blake3: String,
-    /// Companion objects uploaded alongside (e.g. "idx", "bloom").
+    /// Companion objects uploaded alongside (the "idx").
     pub companions: Vec<String>,
 }
 
@@ -144,7 +144,7 @@ impl Archiver {
         Ok(report)
     }
 
-    /// Streams one sealed segment (plus small `.idx`/`.bloom` companions)
+    /// Streams one sealed segment (plus its `.idx`)
     /// into the object store, hashing while uploading, and verifies the
     /// stored object's size before the caller commits the manifest.
     async fn upload_segment(
@@ -191,26 +191,24 @@ impl Archiver {
         }
 
         let mut companions = Vec::new();
-        for ext in ["idx", "bloom"] {
-            let companion_path = segment.path.with_extension(ext);
-            match tokio::fs::read(&companion_path).await {
-                Ok(bytes) => {
-                    let name = format!(
-                        "{}.{ext}",
-                        file_name.trim_end_matches(".seg").trim_end_matches('.')
-                    );
-                    self.store
-                        .put(
-                            &self.context_path(context, &["segments", &name]),
-                            PutPayload::from(bytes),
-                        )
-                        .await
-                        .map_err(tier_err)?;
-                    companions.push(ext.to_string());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        let ext = "idx";
+        match tokio::fs::read(segment.path.with_extension(ext)).await {
+            Ok(bytes) => {
+                let name = format!(
+                    "{}.{ext}",
+                    file_name.trim_end_matches(".seg").trim_end_matches('.')
+                );
+                self.store
+                    .put(
+                        &self.context_path(context, &["segments", &name]),
+                        PutPayload::from(bytes),
+                    )
+                    .await
+                    .map_err(tier_err)?;
+                companions.push(ext.to_string());
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
         Ok(ManifestSegment {

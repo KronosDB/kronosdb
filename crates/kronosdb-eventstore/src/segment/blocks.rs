@@ -70,8 +70,8 @@ use crate::error::Error;
 use crate::event::StoredEvent;
 use crate::segment::crc::{self, Span};
 use crate::segment::format;
+use crate::segment::query::SegmentKeys;
 use crate::segment::reader::StoredRecord;
-use crate::segment::segment_index::SegmentIndex;
 use crate::segment::{RECORD_HEADER_SIZE, flags};
 
 /// Default block size. Small enough that a point read does not drag in much
@@ -397,7 +397,7 @@ impl BlockCache {
     pub fn reader(
         self: &Arc<Self>,
         file: Arc<SealedFile>,
-        index: Arc<SegmentIndex>,
+        index: Arc<dyn SegmentKeys>,
     ) -> SealedReader {
         SealedReader {
             cache: Arc::clone(self),
@@ -491,7 +491,7 @@ impl BlockCache {
 pub struct SealedReader {
     cache: Arc<BlockCache>,
     file: Arc<SealedFile>,
-    index: Arc<SegmentIndex>,
+    index: Arc<dyn SegmentKeys>,
     current: Option<Arc<Block>>,
 }
 
@@ -555,14 +555,40 @@ impl SealedReader {
         }
     }
 
+    /// The offset of the `i`th event's record, from the segment's index.
+    fn offset(&self, i: usize) -> Result<u64, Error> {
+        self.index
+            .offset_of(self.index.base_position() + i as u64)?
+            .ok_or_else(|| Error::Corrupted {
+                message: format!("segment {} index has no event {i}", self.file.base),
+            })
+    }
+
+    /// The first event in `[lo, n)` whose record starts at or past `bound`:
+    /// a binary search of the offset table.
+    fn first_at_or_past(&self, bound: u64, mut lo: usize, mut hi: usize) -> Result<usize, Error> {
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.offset(mid)? < bound {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
     /// Where the segment's last event record ends.
-    fn data_end(&self, offsets: &[u64]) -> Result<u64, Error> {
+    fn data_end(&self, events: usize) -> Result<u64, Error> {
         if let Some(&end) = self.file.data_end.get() {
             return Ok(end);
         }
-        let last = *offsets.last().ok_or_else(|| Error::Corrupted {
-            message: format!("segment {} index lists no events", self.file.base),
-        })?;
+        let Some(last) = events.checked_sub(1) else {
+            return Err(Error::Corrupted {
+                message: format!("segment {} index lists no events", self.file.base),
+            });
+        };
+        let last = self.offset(last)?;
         let header =
             read_exact_at(&self.file.file, last, RECORD_HEADER_SIZE).map_err(|e| {
                 match e.kind() {
@@ -594,9 +620,9 @@ impl SealedReader {
     /// they are served.
     fn load(&self, k: u64, whole: bool) -> Result<Block, Error> {
         let block_size = self.cache.block_size as u64;
-        let offsets = self.index.offsets();
-        let lo = offsets.partition_point(|&o| o < k * block_size);
-        if lo >= offsets.len() {
+        let events = self.index.event_count() as usize;
+        let lo = self.first_at_or_past(k * block_size, 0, events)?;
+        if lo >= events {
             return Err(Error::Corrupted {
                 message: format!(
                     "segment {} has no record in block {k}; its index and file disagree",
@@ -604,13 +630,16 @@ impl SealedReader {
                 ),
             });
         }
-        let hi = lo + offsets[lo..].partition_point(|&o| o < (k + 1) * block_size);
-        let last = hi >= offsets.len();
-        let start = offsets[lo];
+        let hi = self.first_at_or_past((k + 1) * block_size, lo, events)?;
+        let offsets = (lo..hi)
+            .map(|i| self.offset(i))
+            .collect::<Result<Vec<u64>, Error>>()?;
+        let last = hi >= events;
+        let start = offsets[0];
         let end = if last {
-            self.data_end(offsets)?
+            self.data_end(events)?
         } else {
-            offsets[hi]
+            self.offset(hi)?
         };
         if end <= start || end > self.file.len || end - start > u64::from(u32::MAX) {
             return Err(Error::Corrupted {
@@ -642,7 +671,7 @@ impl SealedReader {
             if offs.len() != hi - lo
                 || offs
                     .iter()
-                    .zip(&offsets[lo..hi])
+                    .zip(&offsets)
                     .any(|(&rel, &table)| start + u64::from(rel) != table)
             {
                 return Err(Error::Corrupted {
@@ -657,10 +686,7 @@ impl SealedReader {
                 .fetch_add(offs.len() as u64, ORD);
             (offs, Vec::new())
         } else {
-            let offs: Vec<u32> = offsets[lo..hi]
-                .iter()
-                .map(|&o| (o - start) as u32)
-                .collect();
+            let offs: Vec<u32> = offsets.iter().map(|&o| (o - start) as u32).collect();
             let words = offs.len().div_ceil(64);
             (offs, (0..words).map(|_| AtomicU64::new(0)).collect())
         };
@@ -826,6 +852,7 @@ mod tests {
     use crate::event::{AppendEvent, Position, Tag};
     use crate::segment::format::ControlRecord;
     use crate::segment::reader::SegmentReader;
+    use crate::segment::segment_index::SegmentIndex;
     use crate::segment::writer::SegmentWriter;
 
     fn event(i: u64) -> AppendEvent {
@@ -887,7 +914,7 @@ mod tests {
 
     fn reader(cache: &Arc<BlockCache>, f: &Fixture) -> SealedReader {
         let file = cache.open(&f.path, 0).unwrap();
-        cache.reader(file, Arc::clone(&f.index))
+        cache.reader(file, f.index.clone())
     }
 
     fn offset_of(f: &Fixture, pos: u64) -> u64 {
@@ -1073,7 +1100,7 @@ mod tests {
 
         cache.invalidate(0);
         let file = cache.open(&f.path, 0).unwrap();
-        let mut sealed = cache.reader(file, Arc::clone(&new_index));
+        let mut sealed = cache.reader(file, new_index.clone());
         let after = sealed
             .read_event_at(250, new_index.get_offset(250).unwrap())
             .unwrap();
@@ -1131,7 +1158,7 @@ mod tests {
         std::thread::scope(|s| {
             for _ in 0..4 {
                 s.spawn(|| {
-                    let mut sealed = cache.reader(Arc::clone(&file), Arc::clone(&f.index));
+                    let mut sealed = cache.reader(Arc::clone(&file), f.index.clone());
                     for pos in 0..f.events {
                         sealed.read_event_at(pos, offset_of(&f, pos)).unwrap();
                     }
