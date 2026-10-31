@@ -1,8 +1,9 @@
 pub mod blocks;
 pub mod crc;
-pub mod filter;
 pub mod format;
 pub mod key_table;
+pub mod mapped_set;
+pub mod merge;
 pub mod query;
 pub mod reader;
 pub mod record;

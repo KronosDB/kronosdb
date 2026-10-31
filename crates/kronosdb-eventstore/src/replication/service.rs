@@ -1211,15 +1211,19 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Copies a node's files. A rotated segment's `.idx` is written
-    /// in the background as `*.tmp` and renamed, which `shutdown` does not
-    /// wait for: those are skipped, and a copy without them rebuilds them
-    /// at open.
+    /// Copies a node's files, its index directory included. A rotated
+    /// segment's index files are written in the background as `*.tmp` and
+    /// renamed, which `shutdown` does not wait for: those are skipped, and a
+    /// copy without them rebuilds them at open.
     fn copy_log(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
             if entry.path().extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                copy_log(&entry.path(), &to.join(entry.file_name()));
                 continue;
             }
             std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
@@ -1347,7 +1351,7 @@ mod tests {
 
     /// The sealed segments' indexes are byte-identical too: the follower
     /// built its live index from replicated frames, the leader from its own
-    /// appends, and both wrote the same `.idx` at the seal. Seals land in
+    /// appends, and both wrote the same `.idx` and `.keys` at the seal. Seals land in
     /// the background, so this waits for them.
     fn assert_indexes_identical(leader: &Path, follower: &Path) {
         let mut bases = segment::list_segment_files(leader).unwrap();
@@ -1373,6 +1377,16 @@ mod tests {
                 ours == theirs,
                 "segment {base}: follower's index differs from the leader's"
             );
+            // The key table too, unless a merge has already taken it in.
+            let keys = |dir: &Path| {
+                std::fs::read(segment::segment_path(dir, base).with_extension("keys")).ok()
+            };
+            if let (Some(ours), Some(theirs)) = (keys(leader), keys(follower)) {
+                assert!(
+                    ours == theirs,
+                    "segment {base}: follower's key table differs from the leader's"
+                );
+            }
         }
     }
 

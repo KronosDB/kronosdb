@@ -10,7 +10,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::Error;
 use crate::segment::blocks::{BlockCache, SealedFile, SealedReader};
-use crate::segment::query::SegmentKeys;
+use crate::segment::query::Locator;
 use crate::segment::sealed_index::SealedIndex;
 use crate::segment::segment_index::SegmentIndex;
 
@@ -157,7 +157,7 @@ impl IndexCache {
 
     /// The index of sealed segment `base`, without touching the disk:
     /// mapped already, or pinned. `None` otherwise.
-    pub fn index_cached(&self, base: u64) -> Option<Arc<dyn SegmentKeys>> {
+    pub fn index_cached(&self, base: u64) -> Option<Arc<dyn Locator>> {
         if let Some(index) = self.mapped.get(base) {
             self.index_hits.fetch_add(1, ORD);
             return Some(index);
@@ -169,7 +169,7 @@ impl IndexCache {
 
     /// The index of sealed segment `base`, mapping its `.idx` if it is not
     /// mapped yet.
-    pub fn get_index(&self, segment_path: &Path, base: u64) -> Result<Arc<dyn SegmentKeys>, Error> {
+    pub fn get_index(&self, segment_path: &Path, base: u64) -> Result<Arc<dyn Locator>, Error> {
         if let Some(index) = self.index_cached(base) {
             return Ok(index);
         }
@@ -212,7 +212,7 @@ impl IndexCache {
         &self,
         segment_path: &Path,
         base_position: u64,
-        index: Arc<dyn SegmentKeys>,
+        index: Arc<dyn Locator>,
     ) -> Result<SealedReader, Error> {
         let cached = self.sealed_files.lock().get(&base_position).map(Arc::clone);
         let file = match cached {
@@ -271,6 +271,11 @@ impl IndexCache {
         self.pinned.lock().remove(&base_position);
     }
 
+    /// The in-memory index of a segment whose seal is in flight.
+    pub fn pinned(&self, base_position: u64) -> Option<Arc<SegmentIndex>> {
+        self.pinned.lock().get(&base_position).cloned()
+    }
+
     /// Whether the segment's index is still pinned (seal not yet on disk).
     pub fn is_pinned(&self, base_position: u64) -> bool {
         self.pinned.lock().contains_key(&base_position)
@@ -280,10 +285,8 @@ impl IndexCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::criteria::{Criterion, SourcingCondition};
     use crate::event::{AppendEvent, Position, Tag};
     use crate::segment::DEFAULT_SEGMENT_SIZE;
-    use crate::segment::query::Probe;
     use crate::segment::writer::SegmentWriter;
 
     fn make_event(name: &str, tags: Vec<Tag>) -> AppendEvent {
@@ -321,30 +324,14 @@ mod tests {
         (seg_path, 1)
     }
 
-    fn probe_for(value: &str) -> Probe {
-        Probe::new(&SourcingCondition {
-            criteria: vec![Criterion {
-                names: vec![],
-                tags: vec![Tag::from_str("orderId", value)],
-            }],
-        })
-    }
-
     #[test]
     fn maps_once_and_answers_from_the_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let (path, base) = setup_sealed_segment(dir.path());
         let cache = IndexCache::new(10);
         let index = cache.get_index(&path, base).unwrap();
-        assert!(index.might_match(&probe_for("A")).unwrap());
-        assert!(!index.might_match(&probe_for("NONEXISTENT")).unwrap());
-        let positions: Vec<u64> = index
-            .matching(&probe_for("A"))
-            .unwrap()
-            .unwrap()
-            .iter()
-            .collect();
-        assert_eq!(positions, vec![1, 2]);
+        assert_eq!(index.position_range(), 1..3);
+        assert!(index.offset_of(1).unwrap().is_some());
         assert_eq!(cache.index_misses.load(ORD), 1);
         let again = cache.get_index(&path, base).unwrap();
         assert!(Arc::ptr_eq(&index, &again));

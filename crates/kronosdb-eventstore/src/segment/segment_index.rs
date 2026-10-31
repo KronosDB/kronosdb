@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -7,12 +6,13 @@ use roaring::RoaringBitmap;
 use crate::error::Error;
 use crate::event::{Position, Tag};
 use crate::segment::format::{self, ControlRecord};
+use crate::segment::key_table::{self, TableInfo};
 use crate::segment::query::{
-    self, EVENT_TYPE_TAG_KEY, KeyBitmaps, PositionSet, Probe, ProbeKey, SegmentKeys,
+    EVENT_TYPE_TAG_KEY, KeySource, Locator, PositionSet, Positions, Probe, ProbeKey, Resolved,
     write_forward_key,
 };
 use crate::segment::record;
-use crate::segment::sealed_index::{self, LoggedControl, SealedParts};
+use crate::segment::sealed_index::{self, LocatorParts, LoggedControl};
 use crate::segment::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, flags};
 
 /// Forward key to positions, relative to the segment's base. Keys are
@@ -22,9 +22,10 @@ use crate::segment::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, flags};
 type KeyMap = HashMap<Vec<u8>, RoaringBitmap, foldhash::fast::RandomState>;
 
 /// The index of a segment held in memory: the active segment's, maintained
-/// as records are written, and a freshly sealed segment's until its `.idx`
-/// is on disk. Sealed segments are otherwise served from their mapped
-/// `.idx` (`SealedIndex`), which this writes.
+/// as records are written, and a freshly sealed segment's until its files
+/// are on disk. A sealed segment is otherwise served from its mapped `.idx`
+/// (`SealedIndex`, where its events are) and its `.keys` or a merged table
+/// (`KeyTableFile`, which events hold which keys), both of which this writes.
 pub struct SegmentIndex {
     /// Forward key → positions holding it, relative to `base_position`.
     bitmaps: KeyMap,
@@ -35,6 +36,8 @@ pub struct SegmentIndex {
     offsets: Vec<u64>,
     /// The segment's control records, in log order.
     controls: Vec<LoggedControl>,
+    /// Where the segment's data ends, once it is sealed (or was read back).
+    data_len: Option<u64>,
     /// Scratch for building a forward key on insert, so a key that is already
     /// indexed costs no allocation.
     key_scratch: Vec<u8>,
@@ -50,6 +53,7 @@ impl SegmentIndex {
             base_position,
             offsets: Vec::new(),
             controls: Vec::new(),
+            data_len: None,
             key_scratch: Vec::new(),
         }
     }
@@ -178,6 +182,7 @@ impl SegmentIndex {
             }
             offset = end;
         }
+        index.data_len = Some(offset as u64);
         Ok(index)
     }
 
@@ -208,66 +213,94 @@ impl SegmentIndex {
         self.bitmaps.len()
     }
 
-    /// Positions matching `condition`. A convenience over
-    /// [`SegmentKeys::matching`] for callers with no prepared probe.
+    /// Positions matching `condition`. A convenience for callers with no
+    /// prepared probe.
     pub fn matching_condition(
         &self,
         condition: &crate::criteria::SourcingCondition,
     ) -> Option<PositionSet> {
-        query::matching(self, &Probe::new(condition)).expect("an in-memory index cannot fail")
+        Resolved::new(self, &Probe::new(condition))
+            .and_then(|resolved| resolved.matching_in(0, u64::MAX))
+            .expect("an in-memory index cannot fail")
     }
 
     /// The first position at or after `after` matching `condition`: the DCB
-    /// check. A convenience over [`SegmentKeys::first_match_after`].
+    /// check.
     pub fn has_match_after(
         &self,
         condition: &crate::criteria::SourcingCondition,
         after: u64,
     ) -> Option<Position> {
-        query::first_match_after(self, &Probe::new(condition), after)
+        Resolved::new(self, &Probe::new(condition))
+            .and_then(|resolved| resolved.first_at_or_after(after))
             .expect("an in-memory index cannot fail")
+            .map(Position)
     }
 
-    /// The segment's `.idx` (version 3) as bytes. Deterministic: the same
-    /// segment gives the same bytes however its index was built.
-    pub fn encode_sealed(&self) -> Result<Vec<u8>, Error> {
-        sealed_index::encode(self.sealed_parts())
+    /// Records where the segment's data ends: it is sealed.
+    pub fn set_data_len(&mut self, data_len: u64) {
+        self.data_len = Some(data_len);
     }
 
-    /// Writes the segment's `.idx` (version 3) next to it.
-    pub fn write_to_disk(&self, segment_path: &Path) -> Result<(), Error> {
-        sealed_index::write(&segment_path.with_extension("idx"), self.sealed_parts())
-    }
-
-    fn sealed_parts(&self) -> SealedParts<'_> {
-        SealedParts {
+    fn locator_parts(&self) -> Result<LocatorParts<'_>, Error> {
+        Ok(LocatorParts {
             base: self.base_position,
             offsets: &self.offsets,
-            keys: self
-                .bitmaps
-                .iter()
-                .map(|(key, bitmap)| (key.as_slice(), bitmap))
-                .collect(),
             controls: &self.controls,
-        }
+            data_len: self.data_len.ok_or_else(|| Error::Internal {
+                message: format!(
+                    "segment {} is not sealed: its data length is unknown",
+                    self.base_position
+                ),
+            })?,
+        })
+    }
+
+    /// The segment's `.idx` as bytes. Deterministic: the same segment gives
+    /// the same bytes however its index was built.
+    pub fn encode_locator(&self) -> Result<Vec<u8>, Error> {
+        sealed_index::encode(self.locator_parts()?)
+    }
+
+    /// Writes the segment's `.idx` next to it.
+    pub fn write_locator(&self, segment_path: &Path) -> Result<(), Error> {
+        sealed_index::write(&segment_path.with_extension("idx"), self.locator_parts()?)
+    }
+
+    /// Writes the segment's `.keys` next to it: its key table.
+    pub fn write_keys(&self, segment_path: &Path) -> Result<TableInfo, Error> {
+        key_table::write_table(
+            &segment_path.with_extension("keys"),
+            self.base_position,
+            self.offsets.len() as u64,
+            self.bitmaps
+                .iter()
+                .map(|(key, bitmap)| (key.as_slice(), bitmap)),
+        )
+    }
+
+    /// Writes both of the segment's index files: `.keys`, then `.idx`.
+    pub fn write_to_disk(&self, segment_path: &Path) -> Result<(), Error> {
+        self.write_keys(segment_path)?;
+        self.write_locator(segment_path)
     }
 }
 
-impl KeyBitmaps for SegmentIndex {
+impl KeySource for SegmentIndex {
     fn base(&self) -> u64 {
         self.base_position
     }
 
-    fn count(&self) -> u64 {
+    fn span(&self) -> u64 {
         self.offsets.len() as u64
     }
 
-    fn bitmap(&self, key: &ProbeKey) -> Result<Option<Cow<'_, RoaringBitmap>>, Error> {
-        Ok(self.bitmaps.get(&key.bytes).map(Cow::Borrowed))
+    fn positions(&self, key: &ProbeKey) -> Result<Option<Positions<'_>>, Error> {
+        Ok(self.bitmaps.get(&key.bytes).map(Positions::Memory))
     }
 }
 
-impl SegmentKeys for SegmentIndex {
+impl Locator for SegmentIndex {
     fn base_position(&self) -> u64 {
         self.base_position
     }
@@ -280,21 +313,18 @@ impl SegmentKeys for SegmentIndex {
         Ok(self.get_offset(position))
     }
 
-    /// Exact, not probabilistic: the keys are at hand.
-    fn might_match(&self, probe: &Probe) -> Result<bool, Error> {
-        Ok(probe.might_match(|key| self.bitmaps.contains_key(&key.bytes)))
-    }
-
-    fn matching(&self, probe: &Probe) -> Result<Option<PositionSet>, Error> {
-        query::matching(self, probe)
-    }
-
-    fn any_match_in(&self, probe: &Probe, from: u64, to: u64) -> Result<bool, Error> {
-        query::any_match_in(self, probe, from, to)
-    }
-
-    fn first_match_after(&self, probe: &Probe, after: u64) -> Result<Option<Position>, Error> {
-        query::first_match_after(self, probe, after)
+    fn record_len(&self, position: u64) -> Result<Option<u32>, Error> {
+        let Some(offset) = self.get_offset(position) else {
+            return Ok(None);
+        };
+        let next = match self.get_offset(position + 1) {
+            Some(next) => next,
+            None => match self.data_len {
+                Some(end) => end,
+                None => return Ok(None),
+            },
+        };
+        sealed_index::record_len_before(offset, next, &self.controls, position + 1).map(Some)
     }
 }
 
@@ -304,6 +334,7 @@ mod tests {
     use crate::criteria::{Criterion, SourcingCondition};
     use crate::event::AppendEvent;
     use crate::segment::DEFAULT_SEGMENT_SIZE;
+    use crate::segment::key_table::KeyTableFile;
     use crate::segment::reader::SegmentReader;
     use crate::segment::sealed_index::SealedIndex;
     use crate::segment::writer::SegmentWriter;
@@ -383,8 +414,13 @@ mod tests {
         let index = SegmentIndex::build_from_segment(&seg_path).unwrap();
         index.write_to_disk(&seg_path).unwrap();
         let mapped = SealedIndex::open(&seg_path.with_extension("idx"), 1).unwrap();
+        let keys = KeyTableFile::open(&seg_path.with_extension("keys")).unwrap();
         let probe = Probe::new(&by_tags(vec![tag("orderId", "A")]));
-        assert_eq!(positions(mapped.matching(&probe).unwrap()), vec![1, 2]);
+        let resolved = Resolved::new(&keys, &probe).unwrap();
+        assert_eq!(
+            positions(resolved.matching_in(0, u64::MAX).unwrap()),
+            vec![1, 2]
+        );
         let (o1, o2) = (
             mapped.offset_of(1).unwrap().unwrap(),
             mapped.offset_of(2).unwrap().unwrap(),

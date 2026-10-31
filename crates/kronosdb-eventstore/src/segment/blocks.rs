@@ -70,7 +70,7 @@ use crate::error::Error;
 use crate::event::StoredEvent;
 use crate::segment::crc::{self, Span};
 use crate::segment::format;
-use crate::segment::query::SegmentKeys;
+use crate::segment::query::Locator;
 use crate::segment::reader::StoredRecord;
 use crate::segment::{RECORD_HEADER_SIZE, flags};
 
@@ -397,7 +397,7 @@ impl BlockCache {
     pub fn reader(
         self: &Arc<Self>,
         file: Arc<SealedFile>,
-        index: Arc<dyn SegmentKeys>,
+        index: Arc<dyn Locator>,
     ) -> SealedReader {
         SealedReader {
             cache: Arc::clone(self),
@@ -491,7 +491,7 @@ impl BlockCache {
 pub struct SealedReader {
     cache: Arc<BlockCache>,
     file: Arc<SealedFile>,
-    index: Arc<dyn SegmentKeys>,
+    index: Arc<dyn Locator>,
     current: Option<Arc<Block>>,
 }
 

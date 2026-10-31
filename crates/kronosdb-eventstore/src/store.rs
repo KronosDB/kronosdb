@@ -17,13 +17,16 @@ use crate::subscription::CommitFeed;
 use crate::system::Visibility;
 
 use crate::inline_breaker::{InlineBreaker, Verdict};
+use crate::log_index::{MergeContext, MergeTotals};
 use crate::metrics::{StoreMetrics, Timer};
 use crate::replication::dispatcher::{WaveDescriptor, WavePublisher, WaveSlice};
 use crate::replication::watermark::WatermarkState;
 use crate::segment::blocks::ReadMode;
-use crate::segment::query::{PositionSet, Probe, SegmentKeys};
+use crate::segment::key_table::KeyTableFile;
+use crate::segment::merge;
+use crate::segment::query::{Locator, PositionSet, Probe, Resolved};
 use crate::segment::reader::{RecordReader, SegmentReader};
-use crate::segment::sealed_index::{LoggedControl, SealedIndex};
+use crate::segment::sealed_index::LoggedControl;
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::writer::{PendingSeal, SegmentWriter, sync_dir, sync_file};
 use crate::segment::{self, DEFAULT_SEGMENT_SIZE, format};
@@ -31,24 +34,106 @@ use crate::segment::{self, DEFAULT_SEGMENT_SIZE, format};
 /// The active segment's cached mapping, keyed by its base position.
 type ActiveMmap = Arc<parking_lot::Mutex<Option<(u64, Arc<memmap2::Mmap>)>>>;
 
-/// Cached list of segment bases, avoiding readdir and stat syscalls on every query.
+/// The log's layout: its segments and the key tables that index them. One
+/// snapshot behind one lock, so a reader never sees a merged table without
+/// the per-segment tables it replaced, or the reverse (ADR-0010).
 ///
-/// Segments before `sealed_count` are sealed: served from their `.idx`, or
-/// from a pinned in-memory index while it is being written. The last
-/// segment is the active (writable) segment.
+/// Segments before `sealed_count` are sealed: located through their `.idx`
+/// (or a pinned in-memory index while it is being written), their keys in a
+/// merged table or in their own `.keys`. The last segment is the active
+/// (writable) one.
 #[derive(Clone)]
-struct SegmentList {
+pub(crate) struct SegmentList {
     /// Segment base positions in ascending order.
-    bases: Vec<u64>,
+    pub(crate) bases: Arc<Vec<u64>>,
     /// Number of sealed segments.
     /// Invariant: sealed_count < bases.len() (the active segment is never sealed).
-    sealed_count: usize,
+    pub(crate) sealed_count: usize,
+    /// The own key table of every sealed segment no merged table covers.
+    pub(crate) keys: Arc<std::collections::BTreeMap<u64, SegmentKeys>>,
+    /// Merged key tables, by base, disjoint.
+    pub(crate) tables: Arc<Vec<Arc<KeyTableFile>>>,
+}
+
+/// A sealed segment's own key table: in memory while its seal is in flight,
+/// its mapped `.keys` after.
+#[derive(Clone)]
+pub(crate) enum SegmentKeys {
+    Pinned(Arc<SegmentIndex>),
+    Mapped(Arc<KeyTableFile>),
 }
 
 impl SegmentList {
     fn is_sealed(&self, index: usize) -> bool {
         index < self.sealed_count
     }
+
+    /// Where segment `index` ends: the next base, or past everything for
+    /// the active segment.
+    fn end_of(&self, index: usize) -> u64 {
+        self.bases.get(index + 1).copied().unwrap_or(u64::MAX)
+    }
+
+    /// The merged table holding `position`, if any.
+    pub(crate) fn table_at(&self, position: u64) -> Option<&Arc<KeyTableFile>> {
+        let at = self
+            .tables
+            .partition_point(|table| table.base() <= position);
+        at.checked_sub(1)
+            .map(|i| &self.tables[i])
+            .filter(|table| position < table.end())
+    }
+
+    /// The disjoint sources whose keys cover `[from, to)`, in position
+    /// order, each clipped to the range: merged tables where they exist,
+    /// segments elsewhere.
+    fn sources(&self, from: u64, to: u64) -> Vec<Source> {
+        let mut out = Vec::new();
+        if from >= to || self.bases.is_empty() {
+            return out;
+        }
+        let mut at = from.max(self.bases[0]);
+        while at < to {
+            if let Some(table) = self.table_at(at) {
+                let hi = table.end().min(to);
+                out.push(Source::Table(Arc::clone(table), at, hi));
+                at = hi;
+                continue;
+            }
+            let index = self.bases.partition_point(|&b| b <= at) - 1;
+            let next_table = self.tables[self.tables.partition_point(|t| t.base() <= at)..]
+                .first()
+                .map_or(u64::MAX, |table| table.base());
+            let hi = self.end_of(index).min(next_table).min(to);
+            out.push(Source::Segment(index, at, hi));
+            at = hi;
+        }
+        out
+    }
+}
+
+/// One source of keys for a read, clipped to `[lo, hi)`.
+#[derive(Clone)]
+enum Source {
+    Table(Arc<KeyTableFile>, u64, u64),
+    /// A segment, by its index in the list.
+    Segment(usize, u64, u64),
+}
+
+impl Source {
+    fn range(&self) -> (u64, u64) {
+        match self {
+            Source::Table(_, lo, hi) | Source::Segment(_, lo, hi) => (*lo, *hi),
+        }
+    }
+}
+
+/// A source's keys, held for the length of a read.
+enum KeyHandle {
+    Table(Arc<KeyTableFile>),
+    Pinned(Arc<SegmentIndex>),
+    /// The active segment's live index, taken under its lock each time.
+    Active,
 }
 
 /// Read access to the committed log that owns its handles, so a thread that
@@ -133,6 +218,192 @@ impl LogView {
         }
     }
 
+    /// The keys of segment `index` of `list`, a snapshot of the layout:
+    /// its own table or pinned index there, or the live index if it is still
+    /// active. A segment rotated or merged since the snapshot is found in
+    /// the cache's pinned indexes or the current layout, and as a last
+    /// resort its `.keys` is mapped, unless `disk` is false (`None` then).
+    fn segment_keys(
+        &self,
+        list: &SegmentList,
+        index: usize,
+        disk: bool,
+    ) -> Result<Option<KeyHandle>, Error> {
+        let base = list.bases[index];
+        let from_layout = |list: &SegmentList| {
+            list.keys
+                .get(&base)
+                .map(|keys| match keys {
+                    SegmentKeys::Pinned(index) => KeyHandle::Pinned(Arc::clone(index)),
+                    SegmentKeys::Mapped(table) => KeyHandle::Table(Arc::clone(table)),
+                })
+                .or_else(|| list.table_at(base).map(|t| KeyHandle::Table(Arc::clone(t))))
+        };
+        if let Some(handle) = from_layout(list) {
+            return Ok(Some(handle));
+        }
+        if self.active_index.read().base_position() == base {
+            return Ok(Some(KeyHandle::Active));
+        }
+        if let Some(index) = self.cache.pinned(base) {
+            return Ok(Some(KeyHandle::Pinned(index)));
+        }
+        if let Some(handle) = from_layout(&self.segments.read()) {
+            return Ok(Some(handle));
+        }
+        if !disk {
+            return Ok(None);
+        }
+        let path = segment::segment_path(&self.dir, base).with_extension("keys");
+        Ok(Some(KeyHandle::Table(Arc::new(KeyTableFile::open(&path)?))))
+    }
+
+    /// The keys of `source`; see [`segment_keys`](Self::segment_keys).
+    fn source_keys(
+        &self,
+        list: &SegmentList,
+        source: &Source,
+        disk: bool,
+    ) -> Result<Option<KeyHandle>, Error> {
+        match source {
+            Source::Table(table, ..) => Ok(Some(KeyHandle::Table(Arc::clone(table)))),
+            Source::Segment(index, ..) => self.segment_keys(list, *index, disk),
+        }
+    }
+
+    /// Runs `f` on `probe` resolved against `source`'s keys. For the active
+    /// segment that happens under its index's read lock, so `f` must be
+    /// quick. `None` when the keys are not at hand without the disk.
+    fn with_resolved<T>(
+        &self,
+        list: &SegmentList,
+        source: &Source,
+        probe: &Probe,
+        disk: bool,
+        f: impl FnOnce(&Resolved<'_>) -> Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        let Some(handle) = self.source_keys(list, source, disk)? else {
+            return Ok(None);
+        };
+        match handle {
+            KeyHandle::Table(table) => f(&Resolved::new(&*table, probe)?).map(Some),
+            KeyHandle::Pinned(index) => f(&Resolved::new(&*index, probe)?).map(Some),
+            KeyHandle::Active => {
+                let Source::Segment(at, ..) = source else {
+                    unreachable!("only a segment can be active");
+                };
+                let active = self.active_index.read();
+                if active.base_position() == list.bases[*at] {
+                    return f(&Resolved::new(&*active, probe)?).map(Some);
+                }
+                drop(active);
+                // Rotated since: now pinned, or sealed.
+                let Some(handle) = self.segment_keys(list, *at, disk)? else {
+                    return Ok(None);
+                };
+                match handle {
+                    KeyHandle::Table(table) => f(&Resolved::new(&*table, probe)?).map(Some),
+                    KeyHandle::Pinned(index) => f(&Resolved::new(&*index, probe)?).map(Some),
+                    KeyHandle::Active => Err(Error::Internal {
+                        message: format!("segment {} is active and not", list.bases[*at]),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Calls `each` with the positions in `[from, to)` matching `probe`,
+    /// a window of at most [`MATCH_WINDOW`] positions at a time, in position
+    /// order, until it says stop. Each source's keys are looked up once
+    /// (the active segment's once per window, under its lock); a window
+    /// starts at the next match, so empty stretches are skipped whole.
+    /// `ruled_out` hears, per source, whether its keys rule the query out.
+    fn for_each_match(
+        &self,
+        list: &SegmentList,
+        probe: &Probe,
+        from: u64,
+        to: u64,
+        mut ruled_out: impl FnMut(bool),
+        mut each: impl FnMut(&PositionSet) -> Result<Walk, Error>,
+    ) -> Result<Walk, Error> {
+        /// The next window at or after `cursor` below `hi`, and where it ends.
+        fn window(
+            resolved: &Resolved<'_>,
+            cursor: u64,
+            hi: u64,
+        ) -> Result<Option<(PositionSet, u64)>, Error> {
+            let Some(start) = resolved.first_at_or_after(cursor)? else {
+                return Ok(None);
+            };
+            if start >= hi {
+                return Ok(None);
+            }
+            let end = start.saturating_add(MATCH_WINDOW).min(hi);
+            Ok(resolved
+                .matching_in(start, end)?
+                .map(|set| (set, end))
+                .or(Some((PositionSet::range(start, start, start), end))))
+        }
+
+        for source in list.sources(from, to) {
+            let (lo, hi) = source.range();
+            let handle = self
+                .source_keys(list, &source, true)?
+                .ok_or_else(|| Error::Internal {
+                    message: "a read found no keys for a segment".into(),
+                })?;
+            let mut walk = |resolved: &Resolved<'_>| -> Result<Walk, Error> {
+                ruled_out(resolved.is_dead());
+                if resolved.is_dead() {
+                    return Ok(Walk::Next);
+                }
+                let mut cursor = lo;
+                while let Some((set, end)) = window(resolved, cursor, hi)? {
+                    if !set.is_empty()
+                        && let Walk::Stop = each(&set)?
+                    {
+                        return Ok(Walk::Stop);
+                    }
+                    cursor = end;
+                }
+                Ok(Walk::Next)
+            };
+            let walked = match handle {
+                KeyHandle::Table(table) => walk(&Resolved::new(&*table, probe)?)?,
+                KeyHandle::Pinned(index) => walk(&Resolved::new(&*index, probe)?)?,
+                KeyHandle::Active => {
+                    // One window at a time under the lock, so the writer
+                    // is never held up for longer than a window takes.
+                    let mut cursor = lo;
+                    let mut first = true;
+                    loop {
+                        let next = self.with_resolved(list, &source, probe, true, |resolved| {
+                            if first {
+                                ruled_out(resolved.is_dead());
+                            }
+                            window(resolved, cursor, hi)
+                        })?;
+                        first = false;
+                        let Some(Some((set, end))) = next else {
+                            break Walk::Next;
+                        };
+                        if !set.is_empty()
+                            && let Walk::Stop = each(&set)?
+                        {
+                            break Walk::Stop;
+                        }
+                        cursor = end;
+                    }
+                }
+            };
+            if let Walk::Stop = walked {
+                return Ok(Walk::Stop);
+            }
+        }
+        Ok(Walk::Next)
+    }
+
     /// Calls `visit` with the position, event type name, tags and stored
     /// record of every event in `[from, to)`, in log order, reading the log
     /// sequentially: one index lookup per segment to find where `from`
@@ -200,6 +471,11 @@ impl LogView {
         Ok(next)
     }
 }
+
+/// Most positions a read takes from one source in one go: a window starts
+/// at the next match, so this bounds what a dense key costs per step, never
+/// what skipping costs.
+const MATCH_WINDOW: u64 = 1 << 20;
 
 /// Default extra coalescing window before sealing a commit wave (0 = seal as
 /// soon as the sync thread observes pending writes). Batching under load does
@@ -372,33 +648,46 @@ impl SyncState {
     }
 }
 
-/// Seals whose companion files are being written on a background thread.
+/// Seals whose index files are being written on a background thread.
 ///
-/// A rotation leaves the sealed segment's `.idx` to be written off
-/// the writer lock, after the wave that carries the rotation has made the
-/// segment's bytes durable. Until then the segment answers reads from its
-/// pinned in-memory index. Truncation (failover repair) may delete or reopen
-/// such a segment while its companions are in flight; it cancels the seal
-/// and waits, so no companion is ever written for a file it does not
+/// A rotation leaves the sealed segment's `.idx` and `.keys` to be written
+/// off the writer lock, after the wave that carries the rotation has made
+/// the segment's bytes durable. Until then the segment answers reads from
+/// its pinned in-memory index. Truncation (failover repair) may delete or
+/// reopen such a segment while its files are in flight; it cancels the seal
+/// and waits, so no index file is ever written for a file it does not
 /// describe.
 struct SealQueue {
     /// Bases with a finalize in flight, and whether it was cancelled.
     in_flight: StdMutex<std::collections::BTreeMap<u64, bool>>,
     done: Condvar,
+    dir: PathBuf,
+    cache: Arc<IndexCache>,
+    segments: Arc<RwLock<SegmentList>>,
+    merge: Arc<MergeContext>,
 }
 
 impl SealQueue {
-    fn new() -> Self {
+    fn new(
+        dir: &Path,
+        cache: &Arc<IndexCache>,
+        segments: &Arc<RwLock<SegmentList>>,
+        merge: &Arc<MergeContext>,
+    ) -> Self {
         Self {
             in_flight: StdMutex::new(std::collections::BTreeMap::new()),
             done: Condvar::new(),
+            dir: dir.to_path_buf(),
+            cache: Arc::clone(cache),
+            segments: Arc::clone(segments),
+            merge: Arc::clone(merge),
         }
     }
 
-    /// Writes the seals' companion files on a background thread. The
-    /// segments' bytes are already durable (the wave fsync'd them), so the
-    /// companions may land in any order relative to further appends.
-    fn finalize(self: &Arc<Self>, seals: Vec<PendingSeal>, dir: &Path, cache: &Arc<IndexCache>) {
+    /// Writes the seals' index files on a background thread. The segments'
+    /// bytes are already durable (the wave fsync'd them), so the files may
+    /// land in any order relative to further appends.
+    fn finalize(self: &Arc<Self>, seals: Vec<PendingSeal>) {
         {
             let mut in_flight = self.in_flight.lock().unwrap();
             for seal in &seals {
@@ -406,43 +695,78 @@ impl SealQueue {
             }
         }
         let queue = Arc::clone(self);
-        let cache = Arc::clone(cache);
-        let dir = dir.to_path_buf();
         let spawned = std::thread::Builder::new()
             .name("kronosdb-seal".into())
             .spawn(move || {
                 for seal in seals {
-                    let path = segment::segment_path(&dir, seal.base);
-                    let written = seal.index.write_to_disk(&path);
-                    let mut in_flight = queue.in_flight.lock().unwrap();
-                    let cancelled = in_flight.remove(&seal.base).unwrap_or(true);
-                    match written {
-                        Ok(()) if !cancelled => cache.unpin_sealed(seal.base, &path),
-                        Ok(()) => {
-                            // Truncated away or reopened meanwhile: the
-                            // index describes a file that no longer
-                            // exists in this shape.
-                            let _ = std::fs::remove_file(path.with_extension("idx"));
-                        }
-                        Err(error) => {
-                            // The segment stays readable through its pinned
-                            // index; the next open rebuilds the companions.
-                            tracing::error!(
-                                base = seal.base,
-                                %error,
-                                "failed to write sealed segment companions; \
-                                 they will be rebuilt at the next open"
-                            );
-                        }
-                    }
-                    queue.done.notify_all();
+                    queue.finish(seal);
                 }
             });
         if let Err(error) = spawned {
-            tracing::error!(%error, "failed to spawn the seal thread; companions will be rebuilt at the next open");
+            tracing::error!(%error, "failed to spawn the seal thread; index files will be rebuilt at the next open");
             self.in_flight.lock().unwrap().clear();
             self.done.notify_all();
         }
+    }
+
+    fn finish(&self, seal: PendingSeal) {
+        let path = segment::segment_path(&self.dir, seal.base);
+        let written = seal
+            .index
+            .write_to_disk(&path)
+            .and_then(|()| KeyTableFile::open(&path.with_extension("keys")));
+        let cancelled = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .remove(&seal.base)
+            .unwrap_or(true);
+        match written {
+            Ok(keys) if !cancelled => {
+                // Only the incarnation this seal is of: a truncation that
+                // got in since replaced or dropped its pinned entry.
+                let current = {
+                    let mut layout = self.segments.write();
+                    let current = match layout.keys.get(&seal.base) {
+                        Some(SegmentKeys::Pinned(pinned)) => Arc::ptr_eq(pinned, &seal.index),
+                        Some(SegmentKeys::Mapped(_)) => false,
+                        // Not noted while pending: still this incarnation if
+                        // the layout has it sealed and no table covers it.
+                        None => {
+                            let at = layout.bases.binary_search(&seal.base);
+                            at.is_ok_and(|at| layout.is_sealed(at))
+                                && layout.table_at(seal.base).is_none()
+                        }
+                    };
+                    if current {
+                        Arc::make_mut(&mut layout.keys)
+                            .insert(seal.base, SegmentKeys::Mapped(Arc::new(keys)));
+                    }
+                    current
+                };
+                if current {
+                    self.cache.unpin_sealed(seal.base, &path);
+                    self.merge.poke();
+                }
+            }
+            Ok(_) => {
+                // Truncated away or reopened meanwhile: the files describe
+                // a segment that no longer exists in this shape.
+                let _ = std::fs::remove_file(path.with_extension("idx"));
+                let _ = std::fs::remove_file(path.with_extension("keys"));
+            }
+            Err(error) => {
+                // The segment stays readable through its pinned index; the
+                // next open rebuilds the files.
+                tracing::error!(
+                    base = seal.base,
+                    %error,
+                    "failed to write a sealed segment's index files; \
+                     they will be rebuilt at the next open"
+                );
+            }
+        }
+        self.done.notify_all();
     }
 
     /// Cancels every in-flight seal at or past `base` and waits for the
@@ -480,7 +804,6 @@ fn spawn_sync_thread(
     watermark: Arc<WatermarkState>,
     feed: Arc<CommitFeed>,
     coalesce_window: Duration,
-    cache: Arc<IndexCache>,
     seals: Arc<SealQueue>,
 ) {
     std::thread::Builder::new()
@@ -605,7 +928,7 @@ fn spawn_sync_thread(
                             durable_tail.store(durable, Ordering::Release);
                             sync_state.complete_wave(wave);
                             if !taken_seals.is_empty() {
-                                seals.finalize(taken_seals, &dir, &cache);
+                                seals.finalize(taken_seals);
                             }
                             // This node's durable cursor advances. With a
                             // quorum of one this IS the watermark bump that
@@ -971,7 +1294,16 @@ pub struct StoreOptions {
     pub node_id: crate::replication::watermark::NodeId,
     /// Exact voter set used for native segment quorum calculations.
     pub voters: Vec<crate::replication::watermark::NodeId>,
+    /// Bytes per second a background index merge may write (ADR-0010);
+    /// 0 is unlimited.
+    pub index_merge_rate: u64,
+    /// Whether index merges run in the background. Off, they run only when
+    /// [`EventStoreEngine::merge_index`] is called.
+    pub background_index_merge: bool,
 }
+
+/// Default write rate of background index merges.
+pub const DEFAULT_INDEX_MERGE_RATE: u64 = 64 << 20;
 
 impl Default for StoreOptions {
     fn default() -> Self {
@@ -985,6 +1317,8 @@ impl Default for StoreOptions {
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             node_id: DEFAULT_NODE_ID,
             voters: vec![DEFAULT_NODE_ID],
+            index_merge_rate: DEFAULT_INDEX_MERGE_RATE,
+            background_index_merge: true,
         }
     }
 }
@@ -1196,6 +1530,13 @@ pub struct EventStoreEngine {
 
     /// Shuts the inline staging route for a while after one stalls.
     inline_breaker: InlineBreaker,
+
+    /// The log-wide index's merges (ADR-0010), and the thread running them
+    /// in the background when it runs.
+    merge: Arc<MergeContext>,
+    merger: StdMutex<Option<std::thread::JoinHandle<()>>>,
+    /// Index files the last open had to rebuild from their segments.
+    rebuilt_at_open: usize,
 }
 
 impl EventStoreEngine {
@@ -1244,7 +1585,21 @@ impl EventStoreEngine {
             ),
         ));
         writer.lock().attach_index_cache(Arc::clone(&cache));
-        let seals = Arc::new(SealQueue::new());
+        std::fs::create_dir_all(dir.join(merge::INDEX_DIR))?;
+        merge::write_manifest(dir, &[])?;
+        let segments = Arc::new(RwLock::new(SegmentList {
+            bases: Arc::new(vec![active_base]),
+            sealed_count: 0,
+            keys: Arc::default(),
+            tables: Arc::default(),
+        }));
+        let merge = MergeContext::new(
+            dir.to_path_buf(),
+            Arc::clone(&segments),
+            watermark.handle(),
+            opts.index_merge_rate,
+        );
+        let seals = Arc::new(SealQueue::new(dir, &cache, &segments, &merge));
 
         spawn_sync_thread(
             dir.to_path_buf(),
@@ -1257,14 +1612,9 @@ impl EventStoreEngine {
             Arc::clone(&watermark),
             Arc::clone(&feed),
             Duration::from_millis(opts.group_commit_interval_ms),
-            Arc::clone(&cache),
             Arc::clone(&seals),
         );
 
-        let segments = Arc::new(RwLock::new(SegmentList {
-            bases: vec![active_base],
-            sealed_count: 0,
-        }));
         let view = LogView {
             dir: dir.to_path_buf(),
             segments: Arc::clone(&segments),
@@ -1274,6 +1624,9 @@ impl EventStoreEngine {
             max_segment_size: opts.max_segment_size,
             watermark: watermark.handle(),
         };
+        let merger = opts
+            .background_index_merge
+            .then(|| crate::log_index::spawn(Arc::clone(&merge)));
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -1296,6 +1649,9 @@ impl EventStoreEngine {
             metrics: Arc::new(StoreMetrics::new()),
             stage_tx: std::sync::OnceLock::new(),
             inline_breaker: InlineBreaker::new(),
+            merge,
+            merger: StdMutex::new(merger),
+            rebuilt_at_open: 0,
         })
     }
 
@@ -1322,15 +1678,18 @@ impl EventStoreEngine {
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
 
-        // Every sealed segment is served from its own `.idx`: map each one,
-        // rebuilding any that a crash left unwritten or that is damaged.
-        // Their control summaries are what recovery reads below, so no
-        // sealed segment's records are read at all.
-        let sealed = open_sealed_indexes(dir, active_base)?;
-
         // Build the cached segment list from disk (one-time cost on startup).
         let all_bases = segment::list_segment_files(dir)?;
         let sealed_count = all_bases.iter().filter(|&&base| base < active_base).count();
+
+        // Every sealed segment's `.idx` is mapped, and the key tables: the
+        // merged ones the manifest names, and the own `.keys` of segments
+        // none covers. Only a missing or damaged file is rebuilt. The
+        // locators' control summaries are what recovery reads below, so no
+        // sealed segment's records are read at all.
+        let opened = crate::log_index::open(dir, &all_bases, active_base)?;
+        let rebuilt_at_open = opened.rebuilt;
+        let sealed = opened.locators;
 
         // Writer's head() already returns the next-exclusive position, which
         // is exactly our head_position semantics — no adjustment.
@@ -1380,7 +1739,19 @@ impl EventStoreEngine {
             cache.adopt(base, index);
         }
         writer.lock().attach_index_cache(Arc::clone(&cache));
-        let seals = Arc::new(SealQueue::new());
+        let segments = Arc::new(RwLock::new(SegmentList {
+            bases: Arc::new(all_bases),
+            sealed_count,
+            keys: Arc::new(opened.keys),
+            tables: Arc::new(opened.tables),
+        }));
+        let merge = MergeContext::new(
+            dir.to_path_buf(),
+            Arc::clone(&segments),
+            watermark.handle(),
+            opts.index_merge_rate,
+        );
+        let seals = Arc::new(SealQueue::new(dir, &cache, &segments, &merge));
 
         spawn_sync_thread(
             dir.to_path_buf(),
@@ -1393,14 +1764,9 @@ impl EventStoreEngine {
             Arc::clone(&watermark),
             Arc::clone(&feed),
             Duration::from_millis(opts.group_commit_interval_ms),
-            Arc::clone(&cache),
             Arc::clone(&seals),
         );
 
-        let segments = Arc::new(RwLock::new(SegmentList {
-            bases: all_bases,
-            sealed_count,
-        }));
         let view = LogView {
             dir: dir.to_path_buf(),
             segments: Arc::clone(&segments),
@@ -1432,6 +1798,12 @@ impl EventStoreEngine {
             metrics: Arc::new(StoreMetrics::new()),
             stage_tx: std::sync::OnceLock::new(),
             inline_breaker: InlineBreaker::new(),
+            merger: StdMutex::new(
+                opts.background_index_merge
+                    .then(|| crate::log_index::spawn(Arc::clone(&merge))),
+            ),
+            merge,
+            rebuilt_at_open,
         })
     }
 
@@ -1775,13 +2147,22 @@ impl EventStoreEngine {
             return;
         }
         let mut seg_list = self.segments.write();
+        let mut keys = None;
         for seal in writer.pending_seals() {
             if seg_list.bases.last().is_some_and(|last| seal.base > *last) {
-                seg_list.bases.push(seal.base);
+                Arc::make_mut(&mut seg_list.bases).push(seal.base);
+            }
+            // Its keys, until the seal writes its `.keys`.
+            if !seg_list.keys.contains_key(&seal.base) {
+                keys.get_or_insert_with(|| (*seg_list.keys).clone())
+                    .insert(seal.base, SegmentKeys::Pinned(Arc::clone(&seal.index)));
             }
         }
+        if let Some(keys) = keys {
+            seg_list.keys = Arc::new(keys);
+        }
         if seg_list.bases.last().is_some_and(|last| new_base > *last) {
-            seg_list.bases.push(new_base);
+            Arc::make_mut(&mut seg_list.bases).push(new_base);
         }
         seg_list.sealed_count = seg_list.bases.len().saturating_sub(1);
         self.metrics.record_segment_rotation();
@@ -1893,19 +2274,32 @@ impl EventStoreEngine {
         writer.discard_pending_seals_from(target_base);
         self.seals.cancel_from(target_base);
 
+        // Merged tables cover only segments that end below the watermark,
+        // which no truncation reaches.
+        debug_assert!(
+            seg_list
+                .tables
+                .last()
+                .is_none_or(|t| t.end() <= target_base)
+        );
         for &base in &seg_list.bases[target_index + 1..] {
             let path = segment::segment_path(&self.dir, base);
             remove_if_exists(&path)?;
             remove_if_exists(&path.with_extension("idx"))?;
+            remove_if_exists(&path.with_extension("keys"))?;
             self.cache.invalidate(base);
         }
-        // The containing segment becomes active; its sealed index no longer
-        // describes the truncated file.
+        // The containing segment becomes active; its sealed index files no
+        // longer describe the truncated file.
         remove_if_exists(&target_path.with_extension("idx"))?;
+        remove_if_exists(&target_path.with_extension("keys"))?;
         self.cache.invalidate(target_base);
+        let mut keys = (*seg_list.keys).clone();
+        keys.retain(|&base, _| base < target_base);
+        seg_list.keys = Arc::new(keys);
 
         writer.reopen_truncated(target_base, truncate_offset, pos)?;
-        seg_list.bases.truncate(target_index + 1);
+        Arc::make_mut(&mut seg_list.bases).truncate(target_index + 1);
         seg_list.sealed_count = target_index;
         self.local_tail.store(pos.0, Ordering::Release);
         self.durable_tail.store(pos.0, Ordering::Release);
@@ -1982,11 +2376,13 @@ impl EventStoreEngine {
             }
             let wave = self.sync_state.mark_pending();
             let start_position = writer.head().0;
+            let old_base = writer.active_base_position();
             writer.write_control(&crate::segment::format::ControlRecord::EpochChange {
                 epoch,
                 leader_id,
                 start_position,
             })?;
+            self.note_rotation(&writer, old_base);
             self.epochs.lock().record(epoch, start_position);
             wave
         };
@@ -2002,9 +2398,12 @@ impl EventStoreEngine {
         let wave = {
             let mut writer = self.writer.lock();
             let wave = self.sync_state.mark_pending();
+            let old_base = writer.active_base_position();
+            // A record that does not fit rotates the segment, like an event.
             writer.write_control(
                 &crate::segment::format::ControlRecord::WatermarkCheckpoint { epoch, position },
             )?;
+            self.note_rotation(&writer, old_base);
             wave
         };
         self.sync_state.wait_for_sync(wave)
@@ -2577,15 +2976,16 @@ impl EventStoreEngine {
 
     /// The sealed-segment half of a DCB check, run BEFORE the writer lock:
     /// sealed segments are immutable, so their answer cannot change while the
-    /// lock is not held, and this is the half that may touch the disk (an
-    /// index the cache has evicted). Returns the verdict and how many sealed
-    /// segments were covered; `check_dcb_locked` re-checks any segment sealed
-    /// since, under the lock, from its pinned index.
+    /// lock is not held. Returns the verdict and how many sealed segments were
+    /// covered; `check_dcb_locked` re-checks any segment sealed since, under
+    /// the lock, from its pinned index.
     ///
-    /// Sealed segments `[from_sealed, sealed_count)` that can hold an event at
-    /// or after the marker are scanned: key filter → key directory → first
-    /// match at or after the marker. With `disk` false, an index that is not
-    /// mapped yet ends the scan with `NeedsDisk` instead of being opened.
+    /// Only what lies at or after the marker is scanned, from the start of
+    /// sealed segment `from_sealed`: the keys covering that range (usually
+    /// just the newest sealed segment's, or none) are asked for the first
+    /// match at or after the marker. Every sealed segment's keys are mapped
+    /// or pinned, so this reads no file; with `disk` false, keys that would
+    /// have to be opened end the scan with `NeedsDisk` instead.
     fn scan_sealed(
         &self,
         condition: &AppendCondition,
@@ -2593,51 +2993,31 @@ impl EventStoreEngine {
         disk: bool,
     ) -> Result<(SealedScan, usize), Error> {
         let marker = condition.consistency_marker.0;
-        let (window, sealed_count) = self.sealed_window(from_sealed, marker);
-        if window.is_empty() {
+        let list = self.segments.read().clone();
+        let sealed_count = list.sealed_count;
+        let sealed_end = list.bases[sealed_count];
+        let start = marker.max(list.bases[from_sealed.min(sealed_count)]);
+        if start >= sealed_end {
             return Ok((SealedScan::Clear, sealed_count));
         }
         let probe = Probe::new(&condition.criteria);
-        for base in window {
-            let seg_index = if disk {
-                self.cache
-                    .get_index(&segment::segment_path(&self.dir, base), base)?
-            } else {
-                match self.cache.index_cached(base) {
-                    Some(index) => index,
-                    None => return Ok((SealedScan::NeedsDisk, sealed_count)),
+        for source in list.sources(start, sealed_end) {
+            let (lo, hi) = source.range();
+            let found = self
+                .view
+                .with_resolved(&list, &source, &probe, disk, |resolved| {
+                    Ok(resolved.first_at_or_after(lo)?.filter(|&p| p < hi))
+                })?;
+            match found {
+                None => return Ok((SealedScan::NeedsDisk, sealed_count)),
+                Some(Some(position)) => {
+                    self.metrics.record_dcb_violation();
+                    return Ok((SealedScan::Conflict(Position(position)), sealed_count));
                 }
-            };
-            // The filter rules most segments out without a lookup.
-            if !seg_index.might_match(&probe)? {
-                continue;
-            }
-            if let Some(conflicting_pos) = seg_index.first_match_after(&probe, marker)? {
-                self.metrics.record_dcb_violation();
-                return Ok((SealedScan::Conflict(conflicting_pos), sealed_count));
+                Some(None) => {}
             }
         }
         Ok((SealedScan::Clear, sealed_count))
-    }
-
-    /// Bases of the sealed segments `[from_sealed, sealed_count)` that end at
-    /// or after `marker`, and the sealed count they were taken against. A
-    /// segment that ends below the marker was already validated by the caller;
-    /// segments are ordered, so those are found by search, not by walking a
-    /// list that grows with the log.
-    fn sealed_window(&self, from_sealed: usize, marker: u64) -> (Vec<u64>, usize) {
-        let list = self.segments.read();
-        let sealed_count = list.sealed_count;
-        // Segment i ends where segment i+1 begins.
-        let below_marker = list.bases[1..].partition_point(|&next_base| next_base <= marker);
-        let start = below_marker.max(from_sealed);
-        let end = sealed_count.min(list.bases.len().saturating_sub(1));
-        let window = if start < end {
-            list.bases[start..end].to_vec()
-        } else {
-            Vec::new()
-        };
-        (window, sealed_count)
     }
 
     /// The half of a DCB check that must run under the writer lock: any
@@ -2761,39 +3141,10 @@ impl EventStoreEngine {
         }
     }
 
-    /// Positions in a segment matching `probe`, at or after `from`.
-    fn matching_in_segment(
-        &self,
-        index: &dyn SegmentKeys,
-        probe: &Probe,
-        from: u64,
-    ) -> Result<Option<PositionSet>, Error> {
-        // A match-everything criterion means every position from `from` on:
-        // positions are dense within a segment, so that is a range.
-        if probe.takes_everything() {
-            let range = index.position_range();
-            let start = range.start.max(from);
-            return Ok(
-                (start < range.end).then(|| PositionSet::range(range.start, start, range.end))
-            );
-        }
-        // Rank check first: the usual reason a live subscriber reads is a
-        // commit that holds nothing for it, and that is decided here without
-        // combining sets.
-        if !index.any_match_in(probe, from, u64::MAX)? {
-            return Ok(None);
-        }
-        let Some(mut positions) = index.matching(probe)? else {
-            return Ok(None);
-        };
-        positions.remove_below(from);
-        Ok((!positions.is_empty()).then_some(positions))
-    }
-
-    /// Whether any event in `[from, to)` could match `condition` — a rank
-    /// check per segment, no bitmap materialized, no read. A subscriber
-    /// woken by a commit asks this before paging; with tag criteria the
-    /// answer is usually no, and the wakeup costs a few hash lookups.
+    /// Whether any event in `[from, to)` could match `condition`: a rank
+    /// check per source, no set built, no read. A subscriber woken by a
+    /// commit asks this before paging; with tag criteria the answer is
+    /// usually no, and the wakeup costs a few lookups.
     pub fn has_matches_between(
         &self,
         from: Position,
@@ -2804,24 +3155,17 @@ impl EventStoreEngine {
         if from.0 >= to {
             return false;
         }
-        let seg_list = self.segments.read().clone();
+        let list = self.segments.read().clone();
         let probe = Probe::new(condition);
-        for (i, &base) in seg_list.bases.iter().enumerate() {
-            if base >= to {
-                break;
-            }
-            let seg_end = seg_list.bases.get(i + 1).copied().unwrap_or(u64::MAX);
-            if seg_end <= from.0 {
-                continue;
-            }
-            let seg_path = segment::segment_path(&self.dir, base);
-            let possible = self.index_for(base, &seg_path).and_then(|index| {
-                Ok(index.might_match(&probe)? && index.any_match_in(&probe, from.0, to)?)
-            });
+        for source in list.sources(from.0, to) {
+            let (lo, hi) = source.range();
+            let possible = self
+                .view
+                .with_resolved(&list, &source, &probe, true, |r| r.any_in(lo, hi));
             match possible {
-                Ok(false) => {}
+                Ok(Some(false)) => {}
                 // A match, or cannot tell: let the read decide.
-                Ok(true) | Err(_) => return true,
+                Ok(Some(true)) | Ok(None) | Err(_) => return true,
             }
         }
         false
@@ -2970,39 +3314,30 @@ impl EventStoreEngine {
             return Position(0);
         }
 
-        let seg_list = self.segments.read().clone();
+        let list = self.segments.read().clone();
         let probe = Probe::new(&crate::system::marker_condition());
-        let mut pos = head - 1;
-
-        for &base in seg_list.bases.iter().rev() {
-            if base >= head {
-                continue;
-            }
-            let seg_path = segment::segment_path(&self.dir, base);
-            let system = match self
-                .index_for(base, &seg_path)
-                .and_then(|index| index.matching(&probe))
-            {
-                Ok(system) => system,
+        for source in list.sources(0, head).iter().rev() {
+            let (lo, hi) = source.range();
+            // The last position of the source that is not a system event.
+            let visible = self
+                .view
+                .with_resolved(&list, source, &probe, true, |system| {
+                    let mut position = hi - 1;
+                    while system.first_at_or_after(position)? == Some(position) {
+                        if position == lo {
+                            return Ok(None);
+                        }
+                        position -= 1;
+                    }
+                    Ok(Some(position))
+                });
+            match visible {
+                Ok(Some(Some(position))) => return Position(position + 1),
+                Ok(Some(None)) => {}
                 // Unreadable index: fall back to the true head rather
                 // than under-reporting and stranding a client's cursor.
-                Err(_) => return Position(head),
-            };
-
-            loop {
-                let is_system = system.as_ref().is_some_and(|bm| bm.contains(pos));
-                if !is_system {
-                    return Position(pos + 1);
-                }
-                if pos == base {
-                    break; // Continue into the previous segment.
-                }
-                pos -= 1;
+                Ok(None) | Err(_) => return Position(head),
             }
-            if base == 0 {
-                break;
-            }
-            pos = base - 1;
         }
 
         // Every position is a system event — nothing visible has ever landed.
@@ -3025,25 +3360,15 @@ impl EventStoreEngine {
             return Ok(None);
         }
 
-        let seg_list = self.segments.read().clone();
+        let list = self.segments.read().clone();
         let probe = Probe::new(condition);
-        for &base in seg_list.bases.iter().rev() {
-            if base >= bound {
-                continue;
-            }
-            let seg_path = segment::segment_path(&self.dir, base);
-            let index = self.index_for(base, &seg_path)?;
-            if !index.might_match(&probe)? {
-                continue;
-            }
-            if let Some(mut positions) = index.matching(&probe)? {
-                // The index is written before the watermark advances, so
-                // positions at or past the bound may be present — they are
-                // not committed reads and must not be returned.
-                positions.remove_from(bound);
-                if let Some(max) = positions.max() {
-                    return Ok(Some(Position(max)));
-                }
+        for source in list.sources(0, bound).iter().rev() {
+            let (lo, hi) = source.range();
+            let found = self.view.with_resolved(&list, source, &probe, true, |r| {
+                Ok(r.last_before(hi)?.filter(|&p| p >= lo))
+            })?;
+            if let Some(Some(position)) = found {
+                return Ok(Some(Position(position)));
             }
         }
         Ok(None)
@@ -3109,70 +3434,14 @@ impl EventStoreEngine {
     ) -> Result<Vec<SequencedEvent>, Error> {
         let timer = Timer::start();
         crate::system::validate_client_condition(condition)?;
-        let head = self.watermark.get();
-
-        // Read cached segment list — no readdir syscall.
-        let seg_list = self.segments.read().clone();
-        if seg_list.bases.is_empty() || head == 0 {
-            return Ok(vec![]);
-        }
-
         let mut events = Vec::new();
-
-        let probe = Probe::new(condition);
-        let everything = probe.takes_everything();
-
-        for (i, &base) in seg_list.bases.iter().enumerate() {
-            let is_last = i + 1 == seg_list.bases.len();
-            // seg_end is the last position present in this segment.
-            let seg_end = if !is_last {
-                seg_list.bases[i + 1] - 1
-            } else {
-                head - 1
-            };
-
-            if base >= head {
-                break;
+        self.walk_matching(from_position, condition, None, |_, record| {
+            let (stored, _) = format::deserialize_event(record.body)?;
+            if !crate::system::is_system_name(&stored.name) {
+                events.push(stored.into_sequenced());
             }
-            if seg_end < from_position.0 {
-                continue;
-            }
-
-            let seg_path = segment::segment_path(&self.dir, base);
-            let index = self.index_for(base, &seg_path)?;
-            // Sealed segments: key filter first, so a segment that cannot
-            // hold a match is skipped without a directory lookup.
-            // (A condition that takes everything has nothing to rule out.)
-            if !everything && seg_list.is_sealed(i) {
-                let ruled_out = !index.might_match(&probe)?;
-                self.metrics.record_bloom_check(ruled_out);
-                if ruled_out {
-                    continue;
-                }
-            }
-            let Some(matching_positions) =
-                self.matching_in_segment(&*index, &probe, from_position.0)?
-            else {
-                continue; // No matches in this segment.
-            };
-            let mut reader = self.reader_for(&index, base, &seg_path)?;
-
-            // Direct seek via the offset table — O(K) in matching events.
-            self.metrics.record_direct_seek();
-            for pos in matching_positions.iter() {
-                if pos >= head {
-                    break;
-                }
-                if let Some(offset) = index.offset_of(pos)? {
-                    let stored = reader.read_event_at(pos, offset)?;
-                    if crate::system::is_system_name(&stored.name) {
-                        continue;
-                    }
-                    events.push(stored.into_sequenced());
-                }
-            }
-        }
-
+            Ok(Walk::Next)
+        })?;
         self.metrics.record_source(events.len(), timer.elapsed_us());
         Ok(events)
     }
@@ -3334,72 +3603,296 @@ impl EventStoreEngine {
         up_to: Option<Position>,
         mut visit: impl FnMut(u64, crate::segment::reader::StoredRecord<'_>) -> Result<Walk, Error>,
     ) -> Result<(), Error> {
-        const CHUNK: usize = 256;
         let head = match up_to {
             Some(bound) => self.watermark.get().min(bound.0),
             None => self.watermark.get(),
         };
-        let seg_list = self.segments.read().clone();
-        if seg_list.bases.is_empty() || head == 0 {
+        let list = self.segments.read().clone();
+        if list.bases.is_empty() || head == 0 {
             return Ok(());
         }
         let probe = Probe::new(condition);
-        let everything = probe.takes_everything();
-        let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(CHUNK);
-        for (i, &base) in seg_list.bases.iter().enumerate() {
-            if base >= head {
-                break;
+        let mut locate = Locate::new(self, &list);
+        self.view.for_each_match(
+            &list,
+            &probe,
+            from.0,
+            head,
+            |ruled_out| self.metrics.record_bloom_check(ruled_out),
+            |set| {
+                self.metrics.record_direct_seek();
+                locate.each_record(set.iter(), &mut visit)
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Plans a read without reading it: where every event matching
+    /// `condition` with position in `[from, min(watermark, up_to))` is, up
+    /// to `limit` of them, in position order (ADR-0010).
+    ///
+    /// Each location names the segment, the event's position, and the
+    /// exact byte range of its record in the segment file (header
+    /// included), found from the index alone: key tables for which
+    /// positions match, the segments' `.idx` locators for where they are.
+    /// No segment body is read, so a cold read can fetch exactly these
+    /// bytes from wherever the segment lives. The one exception is the last
+    /// event written to the active segment, whose end the index does not
+    /// know yet; its record header is read from the local file, which an
+    /// active segment always is.
+    ///
+    /// Visibility is the caller's to apply after fetching, as the local
+    /// read path does: system events and excluded names are in the plan.
+    pub fn plan_read(
+        &self,
+        condition: &SourcingCondition,
+        from: Position,
+        up_to: Position,
+        limit: usize,
+    ) -> Result<ReadPlan, Error> {
+        let head = self.watermark.get().min(up_to.0);
+        let mut plan = ReadPlan::default();
+        if from.0 >= head {
+            plan.complete = true;
+            return Ok(plan);
+        }
+        if limit == 0 {
+            return Ok(plan);
+        }
+        let list = self.segments.read().clone();
+        let probe = Probe::new(condition);
+        let mut locate = Locate::new(self, &list);
+        let walked = self.view.for_each_match(
+            &list,
+            &probe,
+            from.0,
+            head,
+            |_| {},
+            |set| {
+                locate.each_location(set.iter(), |location| {
+                    plan.records.push(location);
+                    Ok(if plan.records.len() >= limit {
+                        Walk::Stop
+                    } else {
+                        Walk::Next
+                    })
+                })
+            },
+        )?;
+        plan.complete = matches!(walked, Walk::Next);
+        Ok(plan)
+    }
+
+    /// Runs index merges until the final segments have every merged table
+    /// they should (ADR-0010), in this thread, and says what they cost.
+    /// The background merger does the same on its own; this is for tools
+    /// and tests, and for stores opened with background merges off.
+    pub fn merge_index(&self) -> Result<MergeTotals, Error> {
+        self.merge.run_to_completion()
+    }
+
+    /// One merge step, stopped where `at` says: what a crash there leaves.
+    #[doc(hidden)]
+    pub fn merge_index_step(
+        &self,
+        at: impl FnMut(crate::log_index::MergeStep) -> bool,
+    ) -> Result<bool, Error> {
+        Ok(self.merge.step(at)?.is_some())
+    }
+
+    /// The shape and size of the log's index right now.
+    pub fn index_stats(&self) -> IndexStats {
+        let list = self.segments.read().clone();
+        let mut stats = IndexStats {
+            merged_tables: list.tables.len(),
+            merged_bytes: list.tables.iter().map(|t| t.file_len()).sum(),
+            merged_until: list.tables.last().map_or(0, |t| t.end()),
+            merge_totals: self.merge.totals(),
+            rebuilt_at_open: self.rebuilt_at_open,
+            ..IndexStats::default()
+        };
+        for keys in list.keys.values() {
+            stats.segment_tables += 1;
+            if let SegmentKeys::Mapped(table) = keys {
+                stats.segment_table_bytes += table.file_len();
             }
-            let seg_end = match seg_list.bases.get(i + 1) {
-                Some(next) => next - 1,
-                None => head - 1,
-            };
-            if seg_end < from.0 {
-                continue;
-            }
-            let seg_path = segment::segment_path(&self.dir, base);
-            let (matching, mut reader) = {
-                let index = self.index_for(base, &seg_path)?;
-                if !everything && seg_list.is_sealed(i) && !index.might_match(&probe)? {
-                    continue;
-                }
-                // Already-consumed positions are dropped up front so a cursor
-                // advancing through the log doesn't re-skip the prefix.
-                let Some(matching) = self.matching_in_segment(&*index, &probe, from.0)? else {
-                    continue;
-                };
-                let reader = self.reader_for(&index, base, &seg_path)?;
-                (matching, reader)
-            };
-            let mut positions = matching.iter().take_while(|&p| p < head).peekable();
-            while positions.peek().is_some() {
-                offsets.clear();
-                {
-                    let index = self.index_for(base, &seg_path)?;
-                    for pos in positions.by_ref() {
-                        if let Some(offset) = index.offset_of(pos)? {
-                            offsets.push((pos, offset));
-                            if offsets.len() == CHUNK {
-                                break;
-                            }
-                        }
+        }
+        stats
+    }
+}
+
+/// Maps positions to their segments' records, keeping the segment it is in
+/// at hand: a merged table's matches run across many segments.
+struct Locate<'a> {
+    engine: &'a EventStoreEngine,
+    list: &'a SegmentList,
+    reader: Option<(usize, RecordReader)>,
+    offsets: Vec<(u64, u64)>,
+}
+
+impl<'a> Locate<'a> {
+    /// Offsets are collected under the segment's index a chunk at a time and
+    /// the records read after it is released, so a long read never holds up
+    /// the writer, which needs the active index to append.
+    const CHUNK: usize = 256;
+
+    fn new(engine: &'a EventStoreEngine, list: &'a SegmentList) -> Self {
+        Self {
+            engine,
+            list,
+            reader: None,
+            offsets: Vec::with_capacity(Self::CHUNK),
+        }
+    }
+
+    /// The segment holding `position`, and where it ends.
+    fn segment_of(&self, position: u64) -> Result<(usize, u64, u64), Error> {
+        let index = self
+            .list
+            .bases
+            .partition_point(|&b| b <= position)
+            .checked_sub(1)
+            .ok_or(Error::PositionNotFound { position })?;
+        Ok((index, self.list.bases[index], self.list.end_of(index)))
+    }
+
+    /// Visits the record of every position, in order, until `visit` stops.
+    fn each_record(
+        &mut self,
+        positions: impl Iterator<Item = u64>,
+        visit: &mut impl FnMut(u64, crate::segment::reader::StoredRecord<'_>) -> Result<Walk, Error>,
+    ) -> Result<Walk, Error> {
+        let mut positions = positions.peekable();
+        while let Some(&first) = positions.peek() {
+            let (segment, base, end) = self.segment_of(first)?;
+            let path = segment::segment_path(&self.engine.dir, base);
+            self.offsets.clear();
+            {
+                let index = self.engine.index_for(base, &path)?;
+                while let Some(&position) = positions.peek() {
+                    if position >= end || self.offsets.len() == Self::CHUNK {
+                        break;
+                    }
+                    positions.next();
+                    if let Some(offset) = index.offset_of(position)? {
+                        self.offsets.push((position, offset));
                     }
                 }
-                for &(pos, offset) in &offsets {
-                    if let Walk::Stop = visit(pos, reader.record_at(pos, offset)?)? {
-                        return Ok(());
-                    }
+                if !matches!(self.reader, Some((at, _)) if at == segment) {
+                    self.reader = Some((segment, self.engine.reader_for(&index, base, &path)?));
+                }
+            }
+            let reader = &mut self.reader.as_mut().unwrap().1;
+            for &(position, offset) in &self.offsets {
+                if let Walk::Stop = visit(position, reader.record_at(position, offset)?)? {
+                    return Ok(Walk::Stop);
                 }
             }
         }
-        Ok(())
+        Ok(Walk::Next)
     }
+
+    /// Calls `found` with the location of every position, in order, from
+    /// the index alone, until it stops.
+    fn each_location(
+        &mut self,
+        positions: impl Iterator<Item = u64>,
+        mut found: impl FnMut(RecordLocation) -> Result<Walk, Error>,
+    ) -> Result<Walk, Error> {
+        let mut positions = positions.peekable();
+        let mut located = Vec::with_capacity(Self::CHUNK);
+        while let Some(&first) = positions.peek() {
+            let (_, base, end) = self.segment_of(first)?;
+            let path = segment::segment_path(&self.engine.dir, base);
+            located.clear();
+            let mut unknown_end = None;
+            {
+                let index = self.engine.index_for(base, &path)?;
+                while let Some(&position) = positions.peek() {
+                    if position >= end || located.len() == Self::CHUNK {
+                        break;
+                    }
+                    positions.next();
+                    let (Some(offset), len) =
+                        (index.offset_of(position)?, index.record_len(position)?)
+                    else {
+                        continue;
+                    };
+                    if len.is_none() {
+                        unknown_end = Some(located.len());
+                    }
+                    located.push(RecordLocation {
+                        segment_base: base,
+                        position,
+                        offset,
+                        len: len.unwrap_or(0),
+                    });
+                }
+            }
+            if let Some(at) = unknown_end {
+                // The last event of the active segment: its own header says.
+                let reader = self.engine.active_segment_reader(base, &path)?;
+                let location = &mut located[at];
+                location.len = reader.record_len_at(location.offset)?;
+            }
+            for location in located.drain(..) {
+                if let Walk::Stop = found(location)? {
+                    return Ok(Walk::Stop);
+                }
+            }
+        }
+        Ok(Walk::Next)
+    }
+}
+
+/// Where one event's record is: what a cold read fetches (ADR-0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordLocation {
+    /// The segment holding it, by its base position.
+    pub segment_base: u64,
+    pub position: u64,
+    /// Byte offset of the record in the segment file.
+    pub offset: u64,
+    /// Exact length of the record, its header included.
+    pub len: u32,
+}
+
+/// The records a read would return, located: see
+/// [`EventStoreEngine::plan_read`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadPlan {
+    pub records: Vec<RecordLocation>,
+    /// Whether the plan reached the end of the range. `false` when it
+    /// stopped at the limit, whether or not anything follows.
+    pub complete: bool,
+}
+
+/// The shape and size of a log's index (ADR-0010).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexStats {
+    pub merged_tables: usize,
+    pub merged_bytes: u64,
+    /// The position merged tables reach (they cover a prefix of the log).
+    pub merged_until: u64,
+    /// Sealed segments with their own key table (merged tables do not
+    /// cover them yet).
+    pub segment_tables: usize,
+    pub segment_table_bytes: u64,
+    pub merge_totals: MergeTotals,
+    /// Index files the last open rebuilt from their segments: zero unless
+    /// some were missing or damaged.
+    pub rebuilt_at_open: usize,
 }
 
 impl Drop for EventStoreEngine {
     fn drop(&mut self) {
         // Stops the subscription dispatcher and lets live streams notice.
         self.feed.close();
+        // A merge stops at its next key and leaves no file behind.
+        self.merge.stop();
+        if let Some(merger) = self.merger.lock().unwrap().take() {
+            let _ = merger.join();
+        }
     }
 }
 
@@ -3798,11 +4291,11 @@ fn scan_replication_boundary(path: &Path, from: Position) -> Result<Vec<Boundary
 /// memory while its `.idx` is written, mapped after).
 enum IndexRef<'a> {
     Active(parking_lot::RwLockReadGuard<'a, SegmentIndex>),
-    Sealed(Arc<dyn SegmentKeys>),
+    Sealed(Arc<dyn Locator>),
 }
 
 impl std::ops::Deref for IndexRef<'_> {
-    type Target = dyn SegmentKeys + 'static;
+    type Target = dyn Locator + 'static;
     fn deref(&self) -> &Self::Target {
         match self {
             IndexRef::Active(guard) => &**guard,
@@ -3811,48 +4304,8 @@ impl std::ops::Deref for IndexRef<'_> {
     }
 }
 
-/// Maps the `.idx` of every sealed segment (every segment but the active
-/// one), in log order. A sealed segment whose index is missing (a crash
-/// between a rotation and its background seal), from an older format, or
-/// damaged gets it rebuilt from the segment first, so every read path can
-/// assume a sealed segment has a valid index. Opening one reads its header
-/// and control summary, a few hundred bytes; the segment is read only when
-/// its index has to be rebuilt.
-fn open_sealed_indexes(
-    dir: &Path,
-    active_base: u64,
-) -> Result<Vec<(u64, Arc<SealedIndex>)>, Error> {
-    let mut sealed = Vec::new();
-    for base in segment::list_segment_files(dir)? {
-        if base >= active_base {
-            continue;
-        }
-        let seg_path = segment::segment_path(dir, base);
-        let idx_path = seg_path.with_extension("idx");
-        // Filters of the format before version 3 lived beside the index.
-        remove_if_exists(&seg_path.with_extension("bloom"))?;
-        let index = match SealedIndex::open(&idx_path, base) {
-            Ok(index) => index,
-            Err(error) => {
-                match &error {
-                    Error::Io(io) if io.kind() == io::ErrorKind::NotFound => {
-                        tracing::info!(base, "sealed segment has no index; rebuilding it")
-                    }
-                    Error::Corrupted { message } => tracing::warn!(
-                        base,
-                        reason = %message,
-                        "sealed segment index is unusable; rebuilding it from the segment"
-                    ),
-                    _ => return Err(error),
-                }
-                SegmentIndex::build_from_segment(&seg_path)?.write_to_disk(&seg_path)?;
-                SealedIndex::open(&idx_path, base)?
-            }
-        };
-        sealed.push((base, Arc::new(index)));
-    }
-    Ok(sealed)
-}
+#[cfg(test)]
+mod index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3861,6 +4314,7 @@ mod tests {
     use crate::criteria::{Criterion, SourcingCondition};
     use crate::event::AppendEvent;
     use crate::event::Tag;
+    use crate::segment::sealed_index::SealedIndex;
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag::from_str(key, value)
@@ -5461,8 +5915,12 @@ mod tests {
         engine.shutdown();
     }
 
+    /// The DCB check reads key tables only, which stay mapped (or pinned)
+    /// for as long as a sealed segment exists: with every sealed segment's
+    /// locator unmapped, as the mapping cap would leave them, inline staging
+    /// still answers without the disk, conflicts included.
     #[tokio::test]
-    async fn inline_staging_never_reads_an_index_from_disk() {
+    async fn inline_staging_needs_no_sealed_locator() {
         let dir = tempfile::tempdir().unwrap();
         let opts = StoreOptions {
             max_segment_size: 1024,
@@ -5481,12 +5939,11 @@ mod tests {
         engine.seals.wait_idle();
         let list = engine.segments.read().clone();
         assert!(list.sealed_count > 2);
-        // Unmap every sealed index but the last, as the mapping cap would.
-        for &base in &list.bases[..list.sealed_count - 1] {
+        for &base in &list.bases[..list.sealed_count] {
             engine.cache.invalidate(base);
         }
 
-        // Marker 0 reaches every sealed segment; one is mapped.
+        // Marker 0 reaches every sealed segment.
         let request = || {
             conditional(
                 0,
@@ -5494,22 +5951,27 @@ mod tests {
                 vec![make_event("OrderPlaced", vec![tag("orderId", "nobody")])],
             )
         };
-        assert!(
-            engine.stage_pre_cached(&client(request())).is_none(),
-            "an evicted index is a reason to leave the async worker"
-        );
+        assert!(matches!(
+            engine.stage_pre_cached(&client(request())),
+            Some(Ok(Pre::Checked(_)))
+        ));
         let staging = engine.stage_inline(client(request()));
-        assert!(matches!(staging, Staging::NeedsPool(_)));
-        // The pool path reads the disk and answers.
+        assert!(matches!(staging, Staging::Done(Ok(_))));
         outcome(settle(&engine, staging).await).unwrap();
 
-        // The conflict a cold segment holds is still found.
-        let conflict = conditional(
-            0,
-            &["o-0"],
-            vec![make_event("OrderPlaced", vec![tag("orderId", "o-0")])],
-        );
-        let staging = engine.stage_inline(client(conflict));
+        // The conflict the oldest segment holds is found the same way.
+        let conflict = || {
+            conditional(
+                0,
+                &["o-0"],
+                vec![make_event("OrderPlaced", vec![tag("orderId", "o-0")])],
+            )
+        };
+        assert!(matches!(
+            engine.stage_pre_cached(&client(conflict())),
+            Some(Ok(Pre::Conflict(Position(0))))
+        ));
+        let staging = engine.stage_inline(client(conflict()));
         assert_eq!(outcome(settle(&engine, staging).await), Err(0));
         engine.shutdown();
     }
@@ -6106,7 +6568,7 @@ mod tests {
             let path = segment::segment_path(dir.path(), *base);
             let rebuilt = SegmentIndex::build_from_segment(&path)
                 .unwrap()
-                .encode_sealed()
+                .encode_locator()
                 .unwrap();
             assert!(&rebuilt == bytes, "segment {base}: rebuild differs");
             std::fs::remove_file(path.with_extension("idx")).unwrap();
@@ -6271,7 +6733,10 @@ mod tests {
         assert_eq!(scanned.epochs.last_epoch(), Some(4));
 
         let writer = SegmentWriter::open(dir.path(), 4 * 1024).unwrap();
-        let sealed = open_sealed_indexes(dir.path(), writer.active_base_position()).unwrap();
+        let bases = segment::list_segment_files(dir.path()).unwrap();
+        let sealed = crate::log_index::open(dir.path(), &bases, writer.active_base_position())
+            .unwrap()
+            .locators;
         assert!(sealed.iter().any(|(_, index)| !index.controls().is_empty()));
         let active = writer.active_index_handle();
         let summarized = recover_native_control_state(

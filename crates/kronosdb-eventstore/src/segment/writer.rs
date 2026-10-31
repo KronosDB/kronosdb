@@ -779,7 +779,9 @@ impl SegmentWriter {
         // the guard is released — whoever sees the swap also finds it.
         let sealed_index = {
             let mut active = self.active_index.write();
-            let sealed = Arc::new(std::mem::replace(&mut *active, SegmentIndex::new(new_base)));
+            let mut sealed = std::mem::replace(&mut *active, SegmentIndex::new(new_base));
+            sealed.set_data_len(self.write_offset);
+            let sealed = Arc::new(sealed);
             if let Some(cache) = &self.index_cache {
                 cache.pin_sealed(self.active_base_position, Arc::clone(&sealed));
             }

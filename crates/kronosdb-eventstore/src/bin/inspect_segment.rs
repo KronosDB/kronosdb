@@ -316,10 +316,16 @@ fn print_overhead(path: &Path) -> Result<(), String> {
         stats.watermark_checkpoints, stats.watermark_checkpoint_bytes
     );
 
-    let index_bytes = std::fs::metadata(path.with_extension("idx"))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    println!("  index_companion:     {index_bytes} bytes");
+    let len_of = |extension: &str| {
+        std::fs::metadata(path.with_extension(extension))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+    println!("  locator (.idx):      {} bytes", len_of("idx"));
+    println!(
+        "  own keys (.keys):    {} bytes (0 once a merged table covers it)",
+        len_of("keys")
+    );
 
     Ok(())
 }
