@@ -30,20 +30,12 @@ name = "payments"
 
 Point the server at it with `--manifest`, `KRONOSDB_MANIFEST`, or a `manifest = "..."` key in `kronosdb.toml`; a `kronosdb-manifest.toml` in the working directory is picked up automatically. In a cluster, give every node the same manifest (on Kubernetes: mount one ConfigMap into each pod). Contexts can still be created at runtime through the admin console or API — those are replicated to all nodes through consensus.
 
-## Performance
-
-Measured against PostgreSQL 16 and Axon Server at strictly equal durability
-(every append fsync'd and quorum-acknowledged before the response): faster
-single-event appends, 2× at batch 10, 2.4–3.3× on wide DCB command
-handling, 300k+ durable events/s bulk ingest on one node via multi-context
-scaling, and hard-kill restart to ready in under 0.4 seconds.
-
 ## Ready to use
 
 Start using it today with:
 
 - **Kronos-ts** — A TypeScript framework inspired by Axon Framework 5 that can be used to build event-sourced applications on Node. [kronos-ts](https://github.com/KronosDB/kronos-ts)
-- **Axon Framework** — the [axon-kronosdb-connector](https://github.com/KronosDB/axon-kronosdb-connector) connects Axon Framework 5.3+ applications to KronosDB. Use connector 0.6 or later with KronosDB 0.11 or later; earlier connector versions speak gRPC and only work with KronosDB 0.10 and earlier.
+- **Axon Framework** — the [axon-kronosdb-connector](https://github.com/KronosDB/axon-kronosdb-connector) connects Axon Framework 5.3+ applications to KronosDB.
 
 ## License
 
