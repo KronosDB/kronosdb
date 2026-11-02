@@ -63,12 +63,7 @@ impl std::fmt::Debug for ArchiveStore {
 impl ArchiveStore {
     /// The archive at `raw_url`, as for [`crate::tier::Archiver::from_url`].
     pub fn from_url(raw_url: &str) -> Result<Arc<Self>, Error> {
-        let url = url::Url::parse(raw_url).map_err(|error| Error::Rejected {
-            message: format!("invalid archive url {raw_url}: {error}"),
-        })?;
-        let (store, prefix) = object_store::parse_url(&url).map_err(|error| Error::Rejected {
-            message: format!("unsupported archive url {raw_url}: {error}"),
-        })?;
+        let (store, prefix) = open_store(raw_url)?;
         Ok(Arc::new(Self {
             store: Arc::from(store),
             prefix,
@@ -461,6 +456,20 @@ impl RemoteSegments {
     }
 }
 
+/// The object store at `raw_url` and the prefix inside it. Cloud settings
+/// and credentials come from the environment, the standard variables of
+/// each provider (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, ...); without
+/// credentials there, S3 uses the instance's role.
+pub(crate) fn open_store(raw_url: &str) -> Result<(Box<dyn ObjectStore>, ObjectPath), Error> {
+    let url = url::Url::parse(raw_url).map_err(|error| Error::Rejected {
+        message: format!("invalid archive url {raw_url}: {error}"),
+    })?;
+    let settings = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
+    object_store::parse_url_opts(&url, settings).map_err(|error| Error::Rejected {
+        message: format!("unsupported archive url {raw_url}: {error}"),
+    })
+}
+
 fn archive_error(base: u64, error: object_store::Error) -> Error {
     match error {
         object_store::Error::NotFound { .. } => Error::Internal {
@@ -469,5 +478,19 @@ fn archive_error(base: u64, error: object_store::Error) -> Error {
         error => Error::Unavailable {
             message: format!("reading segment {base} from the archive: {error}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// S3 settings come from the environment: a region set there reaches
+    /// the store instead of the builder's default.
+    #[test]
+    fn s3_urls_take_their_settings_from_the_environment() {
+        // SAFETY: no other test in this crate reads or writes these.
+        unsafe { std::env::set_var("AWS_REGION", "eu-north-1") };
+        let (store, _) = super::open_store("s3://some-bucket/prefix").unwrap();
+        let shown = format!("{store:?}");
+        assert!(shown.contains("eu-north-1"), "{shown}");
     }
 }
