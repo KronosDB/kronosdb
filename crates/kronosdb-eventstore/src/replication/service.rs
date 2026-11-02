@@ -1845,9 +1845,13 @@ mod tests {
     }
 
     fn archive_options(tier: &Path, voters: &[u64]) -> StoreOptions {
+        capped_options(tier, voters, None)
+    }
+
+    fn capped_options(tier: &Path, voters: &[u64], cap: Option<u64>) -> StoreOptions {
         let url = url::Url::from_directory_path(tier).unwrap().to_string();
         StoreOptions {
-            archive: Some(crate::remote::ArchiveStore::from_url(&url).unwrap()),
+            archive: Some(crate::remote::ArchiveStore::from_url(&url, cap).unwrap()),
             ..options(voters)
         }
     }
@@ -1876,10 +1880,13 @@ mod tests {
         let leader =
             EventStoreEngine::open_with_store_options(&leader_dir, &archive_options(&tier, &[0]))
                 .unwrap();
-        for i in 0..200 {
+        for i in 0..400 {
             append(&leader, &format!("late-{i}"), &big);
         }
         leader.wait_for_seals();
+        // Merged tables replace the own tables of the segments they cover,
+        // so the archive gets those instead.
+        leader.merge_index().unwrap();
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(
@@ -2038,5 +2045,137 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::Corrupted { .. }), "{error}");
         assert!(error.to_string().contains("not a prefix"), "{error}");
+    }
+
+    fn assert_same_events(got: &[(u64, String, Vec<u8>)], expected: &[(u64, String, Vec<u8>)]) {
+        let differs = got.iter().zip(expected).position(|(a, b)| a != b);
+        assert!(
+            got.len() == expected.len() && differs.is_none(),
+            "{} events, expected {}; first difference at index {differs:?}: {:?} vs {:?}",
+            got.len(),
+            expected.len(),
+            differs.map(|i| (&got[i].0, &got[i].1)),
+            differs.map(|i| (&expected[i].0, &expected[i].1)),
+        );
+    }
+
+    fn everything(engine: &EventStoreEngine) -> Vec<(u64, String, Vec<u8>)> {
+        let condition = crate::criteria::SourcingCondition {
+            criteria: vec![crate::criteria::Criterion {
+                names: vec![],
+                tags: vec![],
+            }],
+        };
+        engine
+            .source(Position(0), &condition)
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.position.0, event.identifier, event.payload))
+            .collect()
+    }
+
+    /// A node with a cap joins with the locators and key tables of the
+    /// segments it would not keep, and downloads only the bodies it keeps.
+    #[test]
+    fn a_capped_node_joins_without_the_bodies_it_would_not_keep() {
+        let archived = archived_leader();
+        let leader = &archived.leader;
+        let up_to = leader.evicted_end();
+        assert!(
+            archived
+                .tier
+                .join("default")
+                .join("index")
+                .read_dir()
+                .unwrap()
+                .any(|entry| {
+                    let name = entry.unwrap().file_name().into_string().unwrap();
+                    segment::merge::parse_table_file_name(&name).is_some_and(|(base, end)| {
+                        leader
+                            .archivable_segments()
+                            .iter()
+                            .filter(|s| base <= s.base && s.end <= end)
+                            .count()
+                            > 1
+                    })
+                }),
+            "the fixture should archive a merged table"
+        );
+        let dir = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("capped")
+            .join("default");
+        let cap = 2 * SEGMENT_SIZE;
+        let follower = EventStoreEngine::create_with_store_options(
+            &dir,
+            &capped_options(&archived.tier, &[0, 1, 2], Some(cap)),
+        )
+        .unwrap();
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        let TailStart::Truncate { position: 0, prev } = start else {
+            panic!("expected a cut at 0, got {start:?}");
+        };
+        follower
+            .truncate_to_matching(Position(0), Some(prev))
+            .unwrap();
+        follower.apply_archived(up_to).unwrap();
+        assert_eq!(follower.local_tail().0, up_to);
+        assert!(
+            follower.evicted_end() > 0,
+            "nothing was installed without its body"
+        );
+        let bodies: u64 = follower
+            .sealed_bodies()
+            .iter()
+            .map(|segment| std::fs::metadata(&segment.path).unwrap().len())
+            .sum();
+        assert!(
+            bodies <= cap,
+            "{bodies} bytes of bodies kept under a cap of {cap}"
+        );
+
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        assert!(matches!(start, TailStart::ExactCursor), "{start:?}");
+        follow(leader, &follower, &start).unwrap();
+        // What the Tail's watermark frame does once the bytes are across.
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        follower.wait_for_seals();
+        let expected = everything(leader);
+        assert_same_events(&everything(&follower), &expected);
+        // Merging goes on over what was installed.
+        follower.merge_index().unwrap();
+        assert_same_events(&everything(&follower), &expected);
+
+        // A restart finds the installed segments, also when a crash stopped
+        // the install between creating the new active segment and removing
+        // the empty one it moved past.
+        follower.shutdown();
+        drop(follower);
+        let empty = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("empty")
+            .join("default");
+        let fresh = EventStoreEngine::create_with_store_options(&empty, &options(&[0])).unwrap();
+        fresh.shutdown();
+        drop(fresh);
+        std::fs::copy(
+            segment::segment_path(&empty, 0),
+            segment::segment_path(&dir, 0),
+        )
+        .unwrap();
+        let follower = EventStoreEngine::open_with_store_options(
+            &dir,
+            &capped_options(&archived.tier, &[0, 1, 2], Some(cap)),
+        )
+        .unwrap();
+        assert!(!segment::segment_path(&dir, 0).exists());
+        // A restarted member hides what its last checkpoint does not cover
+        // until the leader's watermark comes again.
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        assert_same_events(&everything(&follower), &expected);
     }
 }

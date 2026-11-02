@@ -712,6 +712,48 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Moves an active segment that holds no record forward to start at
+    /// `new_base`: the segments before it are installed from the archive
+    /// without their bodies (ADR-0011). The new file is made durable before
+    /// the old one goes, so a crash leaves both, which opening recognises.
+    /// Preserves the shared active-index handle used by readers.
+    pub fn restart_empty_at(&mut self, new_base: u64) -> Result<(), Error> {
+        if self.has_records()
+            || !self.pending_seals.is_empty()
+            || new_base <= self.active_base_position
+        {
+            return Err(Error::Internal {
+                message: format!(
+                    "segment {} cannot be moved to {new_base}: it holds records or is not \
+                     the newest",
+                    self.active_base_position
+                ),
+            });
+        }
+        let path = segment_path(&self.dir, new_base);
+        let mut file = create_segment_file(&path)?;
+        let prepared = (|| -> Result<(), Error> {
+            write_segment_header(&mut file, new_base)?;
+            preallocate(&file, self.max_segment_size)?;
+            file.sync_all()?;
+            sync_dir(&self.dir)?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        let old = segment_path(&self.dir, self.active_base_position);
+        *self.active_index.write() = SegmentIndex::new(new_base);
+        self.active_file = file;
+        self.active_base_position = new_base;
+        self.write_offset = SEGMENT_HEADER_SIZE as u64;
+        self.next_position = Position(new_base);
+        std::fs::remove_file(&old)?;
+        sync_dir(&self.dir)?;
+        Ok(())
+    }
+
     /// Returns the base position of the currently active segment.
     pub fn active_base_position(&self) -> u64 {
         self.active_base_position
