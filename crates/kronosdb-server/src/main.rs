@@ -88,7 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let archive = config
         .archive_url
         .as_deref()
-        .map(kronosdb_eventstore::remote::ArchiveStore::from_url)
+        .map(|url| {
+            kronosdb_eventstore::remote::ArchiveStore::from_url(url, config.archive_max_local_bytes)
+        })
         .transpose()?;
     if config.archive_max_local_bytes.is_some() && archive.is_none() {
         return Err("archive max-local-bytes is set without an archive url".into());

@@ -22,7 +22,7 @@ fn options(tier: Option<&Path>) -> StoreOptions {
         max_segment_size: SEGMENT_SIZE,
         background_index_merge: false,
         index_merge_rate: 0,
-        archive: tier.map(|tier| ArchiveStore::from_url(&archive_url(tier)).unwrap()),
+        archive: tier.map(|tier| ArchiveStore::from_url(&archive_url(tier), None).unwrap()),
         ..StoreOptions::default()
     }
 }

@@ -1,10 +1,11 @@
 //! A node joins a cluster whose leader has evicted its oldest segments
 //! (ADR-0011). Node 1 runs alone with an archive and a cap on local bytes,
-//! so most of its history is only in the archive. Node 2 starts empty and is
-//! adopted as a learner: the leader sends it to the archive for what it no
-//! longer holds, the learner reads that from the archive itself, and then
-//! tails the rest. It must end byte-identical to the log, every event
-//! readable on it, and promotable once caught up.
+//! so most of its history is only in the archive. Node 2 starts empty, with
+//! the same cap, and is adopted as a learner: the leader sends it to the
+//! archive for what it no longer holds, the learner installs the segments
+//! its cap would not keep as locators and key tables only, downloads the
+//! rest, and then tails what follows. Every segment body it holds must be
+//! the log's, every event readable on it, and it promotable once caught up.
 
 mod crash_harness;
 use crash_harness::*;
@@ -95,7 +96,7 @@ async fn run() {
         archive: Some(ArchiveSpawn {
             url: url.clone(),
             interval_secs: 1,
-            max_local_bytes: None,
+            max_local_bytes: Some(2 * SEGMENT_SIZE),
         }),
         max_snapshot_size: None,
     })
@@ -164,7 +165,19 @@ async fn run() {
         };
         assert!(bytes == &expected, "segment {name} differs on node 2");
     }
-    assert!(from_archive > 0, "node 2 read nothing from the archive");
+    // The oldest segments were installed without their bodies.
+    let dir2 = data2.join("default");
+    let bodiless = std::fs::read_dir(&dir2)
+        .expect("list node 2")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "idx" && !path.with_extension("seg").exists()).then_some(())
+        })
+        .count();
+    assert!(
+        bodiless > 0,
+        "node 2 holds every body: nothing was installed without one"
+    );
 
     // --- And every event reads the same on both.
     let events1 = source_all(&client1).await;
@@ -172,7 +185,8 @@ async fn run() {
     assert_eq!(events1.len(), 150 * 16);
     assert!(events1 == events2, "node 2 reads different events");
     eprintln!(
-        "archive_cold_join: {} segments on node 2, {from_archive} of them from the archive",
+        "archive_cold_join: node 2 holds {} bodies ({from_archive} downloaded from the archive) \
+         and {bodiless} segments without one",
         log2.len()
     );
 

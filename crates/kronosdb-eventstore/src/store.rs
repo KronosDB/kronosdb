@@ -2214,7 +2214,7 @@ impl EventStoreEngine {
                  archive, which this node has not configured"
             ),
         })?);
-        let mut applied = 0;
+        let mut applied = self.install_archived_prefix(&archive, up_to)?;
         loop {
             let cursor = self.replication_cursor()?;
             let base = cursor.segment_base;
@@ -2277,6 +2277,283 @@ impl EventStoreEngine {
             self.adopt_watermark(epoch, Position(summary.end));
             applied += 1;
         }
+    }
+
+    /// The first step of [`apply_archived`](Self::apply_archived) on a node
+    /// with a cap on local bytes whose log is empty past its evicted prefix
+    /// (a node joining, typically): the archived segments its cap would not
+    /// let it keep are installed without their bodies, as locators and key
+    /// tables only, about 5% of their size, instead of being downloaded to
+    /// be evicted again. The newest that fit the cap are left to be
+    /// downloaded whole. Returns the segments installed.
+    fn install_archived_prefix(
+        &self,
+        archive: &crate::remote::RemoteSegments,
+        up_to: u64,
+    ) -> Result<usize, Error> {
+        let Some(cap) = archive.max_local_bytes() else {
+            return Ok(0);
+        };
+        let cursor = self.replication_cursor()?;
+        let first = cursor.segment_base;
+        if first >= up_to
+            || cursor.byte_offset != segment::SEGMENT_HEADER_SIZE as u64
+            || self.evicted.end() != first
+        {
+            return Ok(0);
+        }
+        let listing = archive.listing()?;
+        let wanted: Vec<(u64, u64)> = listing
+            .segments
+            .range(first..up_to)
+            .map(|(&base, &len)| (base, len))
+            .collect();
+        // The newest segments up to the cap keep their bodies.
+        let mut kept = 0u64;
+        let mut skip = wanted.len();
+        while skip > 0 && kept + wanted[skip - 1].1 <= cap {
+            kept += wanted[skip - 1].1;
+            skip -= 1;
+        }
+        if skip == 0 {
+            return Ok(0);
+        }
+
+        // Summaries chain the segments; a gap is a segment the archive lost.
+        let mut summaries = Vec::new();
+        let mut next = first;
+        for &(base, _) in &wanted {
+            if base != next {
+                return Err(Error::Unavailable {
+                    message: format!(
+                        "the archive does not hold segment {next}, which this node needs"
+                    ),
+                });
+            }
+            let summary = archive.summary(base)?.ok_or_else(|| Error::Unavailable {
+                message: format!("the archive does not hold segment {base}, which this node needs"),
+            })?;
+            next = summary.end;
+            summaries.push(summary);
+        }
+        if next != up_to {
+            return Err(Error::Unavailable {
+                message: format!("the archive ends at {next}, short of the leader's {up_to}"),
+            });
+        }
+
+        // Key tables: a segment's own, or a merged one covering it. A merged
+        // table reaching past the skipped segments takes the segments it
+        // covers along, so none is left half covered.
+        // A table over exactly one segment is that segment's own.
+        let ranges: std::collections::BTreeSet<(u64, u64)> = summaries
+            .iter()
+            .map(|summary| (summary.base, summary.end))
+            .collect();
+        let mut own = std::collections::BTreeSet::new();
+        let mut merged_tables = Vec::new();
+        for &range in &listing.tables {
+            if ranges.contains(&range) {
+                own.insert(range);
+            } else {
+                merged_tables.push(range);
+            }
+        }
+        let mut end = summaries[skip - 1].end;
+        let merged = loop {
+            let merged: Vec<(u64, u64)> = maximal_tables(&merged_tables, first, end);
+            let uncovered = summaries
+                .iter()
+                .take_while(|summary| summary.end <= end)
+                .find(|summary| {
+                    !own.contains(&(summary.base, summary.end))
+                        && !merged
+                            .iter()
+                            .any(|&(b, e)| b <= summary.base && summary.end <= e)
+                });
+            let Some(summary) = uncovered else {
+                break merged;
+            };
+            match merged_tables
+                .iter()
+                .filter(|&&(b, e)| b <= summary.base && summary.end <= e)
+                .map(|&(_, e)| e)
+                .max()
+            {
+                Some(table_end) if table_end > end && table_end <= up_to => end = table_end,
+                _ => {
+                    return Err(Error::Unavailable {
+                        message: format!(
+                            "the archive holds no key table for segment {}",
+                            summary.base
+                        ),
+                    });
+                }
+            }
+        };
+        let installed: Vec<&crate::tier::SegmentSummary> = summaries
+            .iter()
+            .take_while(|summary| summary.end <= end)
+            .collect();
+
+        let mut files = Vec::new();
+        for summary in &installed {
+            let path = segment::segment_path(&self.dir, summary.base);
+            files.push((
+                "segments",
+                format!("{:020}.idx", summary.base),
+                path.with_extension("idx"),
+            ));
+            let covered = merged
+                .iter()
+                .any(|&(b, e)| b <= summary.base && summary.end <= e);
+            if !covered {
+                files.push((
+                    "index",
+                    segment::merge::table_file_name(summary.base, summary.end),
+                    path.with_extension("keys"),
+                ));
+            }
+        }
+        for &(base, table_end) in &merged {
+            files.push((
+                "index",
+                segment::merge::table_file_name(base, table_end),
+                segment::merge::table_path(&self.dir, base, table_end),
+            ));
+        }
+        if archive.download_all(&files)?.contains(&false) {
+            return Err(Error::Unavailable {
+                message: "an archived locator or key table disappeared while it was installed"
+                    .into(),
+            });
+        }
+        self.install_evicted(&installed, &merged)?;
+        tracing::info!(
+            dir = %self.dir.display(),
+            segments = installed.len(),
+            from = first,
+            to = end,
+            "installed archived segments without their bodies"
+        );
+        Ok(installed.len())
+    }
+
+    /// Makes `segments`, whose locators and key tables (`tables` the merged
+    /// ones) are on disk, the evicted prefix of this log, and moves its
+    /// empty active segment to where they end.
+    fn install_evicted(
+        &self,
+        segments: &[&crate::tier::SegmentSummary],
+        tables: &[(u64, u64)],
+    ) -> Result<(), Error> {
+        self.drain_pending()?;
+        let first = segments[0].base;
+        let end = segments[segments.len() - 1].end;
+        let mut writer = self.writer.lock();
+        let mut list = self.segments.write();
+        if writer.active_base_position() != first
+            || writer.has_records()
+            || self.evicted.end() != first
+            || list.bases.last() != Some(&first)
+        {
+            return Err(Error::Internal {
+                message: format!(
+                    "archived segments from {first} can only be installed on a log empty from there"
+                ),
+            });
+        }
+
+        let mut locators = Vec::with_capacity(segments.len());
+        for summary in segments {
+            let path = segment::segment_path(&self.dir, summary.base);
+            let locator = SealedIndex::open(&path.with_extension("idx"), summary.base)?;
+            use crate::segment::query::Locator;
+            if locator.data_len() != summary.data_len
+                || summary.base + locator.event_count() != summary.end
+            {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "the archived locator of segment {} does not match its summary",
+                        summary.base
+                    ),
+                });
+            }
+            locators.push((summary.base, Arc::new(locator)));
+        }
+        let mut merged = Vec::with_capacity(tables.len());
+        for &(base, table_end) in tables {
+            let table =
+                KeyTableFile::open(&segment::merge::table_path(&self.dir, base, table_end))?;
+            if table.base() != base || table.end() != table_end {
+                return Err(Error::Corrupted {
+                    message: format!("the archived key table {base}-{table_end} is another range"),
+                });
+            }
+            merged.push(Arc::new(table));
+        }
+        let mut keys = (*list.keys).clone();
+        for summary in segments {
+            if tables
+                .iter()
+                .any(|&(b, e)| b <= summary.base && summary.end <= e)
+            {
+                continue;
+            }
+            let path = segment::segment_path(&self.dir, summary.base).with_extension("keys");
+            let table = KeyTableFile::open(&path)?;
+            if table.base() != summary.base || table.end() != summary.end {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "the archived key table of segment {} is another range",
+                        summary.base
+                    ),
+                });
+            }
+            keys.insert(summary.base, SegmentKeys::Mapped(Arc::new(table)));
+        }
+        let mut all_tables = (*list.tables).clone();
+        all_tables.extend(merged);
+        all_tables.sort_by_key(|table| table.base());
+        let entries: Vec<segment::merge::ManifestEntry> = all_tables
+            .iter()
+            .map(|table| segment::merge::ManifestEntry::of(table))
+            .collect();
+        segment::merge::write_manifest(&self.dir, &entries)?;
+
+        // The point of no return: the active segment moves past them.
+        writer.restart_empty_at(end)?;
+        {
+            let mut epochs = self.epochs.lock();
+            for (base, locator) in locators {
+                for control in locator.controls() {
+                    if let crate::segment::format::ControlRecord::EpochChange {
+                        epoch,
+                        start_position,
+                        ..
+                    } = control.record
+                    {
+                        epochs.record(epoch, start_position);
+                    }
+                }
+                self.cache.adopt(base, locator);
+            }
+        }
+        let bases = Arc::make_mut(&mut list.bases);
+        bases.pop();
+        bases.extend(segments.iter().map(|summary| summary.base));
+        bases.push(end);
+        list.sealed_count += segments.len();
+        list.keys = Arc::new(keys);
+        list.tables = Arc::new(all_tables);
+        self.evicted.end.store(end, Ordering::Release);
+        self.local_tail.store(end, Ordering::Release);
+        self.durable_tail.store(end, Ordering::Release);
+        *self.active_mmap.lock() = None;
+        drop(list);
+        drop(writer);
+        self.adopt_watermark(self.replication_epoch(), Position(end));
+        Ok(())
     }
 
     /// Waits until a replicated frame's local segment bytes are fdatasync'd.
@@ -4554,6 +4831,26 @@ fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error
     Ok(Some(last_crc))
 }
 
+/// The merged key tables among `tables` within `[from, to)` that no other
+/// one contains: aligned blocks are nested or disjoint, so these are
+/// disjoint.
+fn maximal_tables(tables: &[(u64, u64)], from: u64, to: u64) -> Vec<(u64, u64)> {
+    let mut inside: Vec<(u64, u64)> = tables
+        .iter()
+        .copied()
+        .filter(|&(base, end)| from <= base && end <= to)
+        .collect();
+    inside.sort_by_key(|&(base, end)| (base, std::cmp::Reverse(end)));
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (base, end) in inside {
+        if out.last().is_some_and(|&(_, last_end)| base < last_end) {
+            continue;
+        }
+        out.push((base, end));
+    }
+    out
+}
+
 /// Most bytes of an archived segment applied in one go: the size of a large
 /// Tail frame.
 const ARCHIVED_CHUNK: usize = 4 << 20;
@@ -4586,6 +4883,23 @@ fn archived_chunk_end(bytes: &[u8], start: usize) -> Result<usize, Error> {
         end = next;
     }
     Ok(end)
+}
+
+/// Whether the segment file at `path` holds no record: its first record
+/// header is missing or zero.
+fn holds_no_record(path: &Path) -> Result<bool, Error> {
+    let file = std::fs::File::open(path)?;
+    let mut header = [0u8; segment::RECORD_HEADER_SIZE];
+    match crate::segment::blocks::read_exact_at(
+        &file,
+        segment::SEGMENT_HEADER_SIZE as u64,
+        segment::RECORD_HEADER_SIZE,
+    ) {
+        Ok(bytes) => header.copy_from_slice(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(true),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(header.iter().all(|&byte| byte == 0))
 }
 
 /// What a sequential walk reads one segment's events from.
@@ -4702,8 +5016,32 @@ impl Evicted {
 /// prefix. Segments are found by their bodies and, below the first body,
 /// by their locators: those were evicted. A locator without a body after
 /// the first body is a lost segment.
+///
+/// An install of archived segments without their bodies that a crash
+/// interrupted can leave the empty segment it moved past behind: a body
+/// with no record, not the newest, with a locator beside it. A sealed
+/// segment always holds a record, so that file is removed.
 fn discover_segments(dir: &Path, active_base: u64) -> Result<(Vec<u64>, u64), Error> {
-    let bodies = segment::list_segment_files(dir)?;
+    let mut bodies = segment::list_segment_files(dir)?;
+    let stale: Vec<u64> = bodies
+        .iter()
+        .copied()
+        .filter(|&base| base < active_base)
+        .filter(|&base| {
+            let path = segment::segment_path(dir, base);
+            path.with_extension("idx").exists() && holds_no_record(&path).unwrap_or(false)
+        })
+        .collect();
+    for base in stale {
+        tracing::warn!(
+            dir = %dir.display(),
+            base,
+            "removing the empty segment an interrupted install of archived segments left"
+        );
+        std::fs::remove_file(segment::segment_path(dir, base))?;
+        segment::writer::sync_dir(dir)?;
+        bodies.retain(|&body| body != base);
+    }
     let first_body = bodies.first().copied().unwrap_or(active_base);
     let mut bases = bodies.clone();
     for base in segment::list_locator_files(dir)? {

@@ -39,6 +39,18 @@ pub const BLOCK: u64 = 256 * 1024;
 /// The most one request fetches.
 pub const MAX_GET: u64 = 8 * 1024 * 1024;
 
+/// Files downloaded at once when a node installs archived segments.
+const DOWNLOADS_IN_FLIGHT: usize = 32;
+
+/// What [`RemoteSegments::listing`] finds.
+#[derive(Debug, Default)]
+pub struct ArchiveListing {
+    /// Archived segments by base, with their data length.
+    pub segments: std::collections::BTreeMap<u64, u64>,
+    /// Ranges of the archived key tables, ascending.
+    pub tables: Vec<(u64, u64)>,
+}
+
 /// Default memory budget of the cache of fetched blocks, per context.
 pub const DEFAULT_CACHE_BYTES: usize = 64 << 20;
 
@@ -49,6 +61,9 @@ pub struct ArchiveStore {
     prefix: ObjectPath,
     io: IoRuntime,
     cache_bytes: usize,
+    /// The cap on sealed bytes this node keeps on disk, if any: a node
+    /// catching up from the archive skips the bodies it would evict anyway.
+    max_local_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for ArchiveStore {
@@ -56,19 +71,23 @@ impl std::fmt::Debug for ArchiveStore {
         f.debug_struct("ArchiveStore")
             .field("prefix", &self.prefix)
             .field("cache_bytes", &self.cache_bytes)
+            .field("max_local_bytes", &self.max_local_bytes)
             .finish()
     }
 }
 
 impl ArchiveStore {
-    /// The archive at `raw_url`, as for [`crate::tier::Archiver::from_url`].
-    pub fn from_url(raw_url: &str) -> Result<Arc<Self>, Error> {
+    /// The archive at `raw_url`, as for [`crate::tier::Archiver::from_url`],
+    /// for a node that keeps at most `max_local_bytes` of sealed segments on
+    /// disk (`None`: all of them).
+    pub fn from_url(raw_url: &str, max_local_bytes: Option<u64>) -> Result<Arc<Self>, Error> {
         let (store, prefix) = open_store(raw_url)?;
         Ok(Arc::new(Self {
             store: Arc::from(store),
             prefix,
             io: IoRuntime::new()?,
             cache_bytes: DEFAULT_CACHE_BYTES,
+            max_local_bytes,
         }))
     }
 
@@ -192,6 +211,122 @@ impl RemoteSegments {
             .clone()
             .join("segments")
             .join(format!("{base:020}.seg"))
+    }
+
+    /// The cap on sealed bytes this node keeps on disk, if any.
+    pub fn max_local_bytes(&self) -> Option<u64> {
+        self.archive.max_local_bytes
+    }
+
+    /// What the archive holds of this context: each archived segment (one
+    /// with a summary) by base, with its data length, and the ranges of its
+    /// key tables.
+    pub fn listing(&self) -> Result<ArchiveListing, Error> {
+        let store = Arc::clone(&self.archive.store);
+        let prefix = self.context.clone();
+        let objects = self.archive.block_on(async move {
+            use futures_util::TryStreamExt;
+            store
+                .list(Some(&prefix))
+                .map_ok(|meta| {
+                    let name = meta.location.filename().unwrap_or_default().to_string();
+                    (name, meta.size)
+                })
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|error| Error::Unavailable {
+                    message: format!("listing the archive: {error}"),
+                })
+        })?;
+        let mut sizes = std::collections::BTreeMap::new();
+        let mut summaries = BTreeSet::new();
+        let mut tables = Vec::new();
+        for (name, size) in objects {
+            if let Some(range) = crate::segment::merge::parse_table_file_name(&name) {
+                tables.push(range);
+            } else if let Some((stem, extension)) = name.split_once('.')
+                && let Ok(base) = stem.parse::<u64>()
+            {
+                match extension {
+                    "seg" => {
+                        sizes.insert(base, size);
+                    }
+                    "sum" => {
+                        summaries.insert(base);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sizes.retain(|base, _| summaries.contains(base));
+        tables.sort_unstable();
+        Ok(ArchiveListing {
+            segments: sizes,
+            tables,
+        })
+    }
+
+    /// Downloads every `(kind, name, local)` as [`download`](Self::download)
+    /// does, many at once. Returns which the archive held.
+    pub fn download_all(&self, files: &[(&str, String, PathBuf)]) -> Result<Vec<bool>, Error> {
+        let store = Arc::clone(&self.archive.store);
+        let requests: Vec<(ObjectPath, PathBuf)> = files
+            .iter()
+            .map(|(kind, name, local)| {
+                (
+                    self.context.clone().join(*kind).join(name.as_str()),
+                    local.clone(),
+                )
+            })
+            .collect();
+        let held = self.archive.block_on(async move {
+            use futures_util::StreamExt;
+            let results: Vec<Result<bool, Error>> = futures_util::stream::iter(requests)
+                .map(|(object, local)| {
+                    let store = Arc::clone(&store);
+                    async move {
+                        let bytes = match store.get(&object).await {
+                            Ok(result) => result.bytes().await.map(Some),
+                            Err(object_store::Error::NotFound { .. }) => Ok(None),
+                            Err(error) => Err(error),
+                        }
+                        .map_err(|error| Error::Unavailable {
+                            message: format!("downloading {object} from the archive: {error}"),
+                        })?;
+                        let Some(bytes) = bytes else {
+                            return Ok(false);
+                        };
+                        let write = move || -> Result<(), Error> {
+                            if let Some(parent) = local.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let tmp = download_path(&local);
+                            std::fs::write(&tmp, &bytes)?;
+                            std::fs::File::open(&tmp)?.sync_all()?;
+                            std::fs::rename(&tmp, &local)?;
+                            Ok(())
+                        };
+                        tokio::task::spawn_blocking(write).await.map_err(|error| {
+                            Error::Internal {
+                                message: format!("writing a download: {error}"),
+                            }
+                        })??;
+                        Ok(true)
+                    }
+                })
+                .buffered(DOWNLOADS_IN_FLIGHT)
+                .collect()
+                .await;
+            results.into_iter().collect::<Result<Vec<_>, _>>()
+        })?;
+        for dir in files
+            .iter()
+            .filter_map(|(_, _, local)| local.parent())
+            .collect::<BTreeSet<_>>()
+        {
+            crate::segment::writer::sync_dir(dir)?;
+        }
+        Ok(held)
     }
 
     /// Requests made to the archive so far.
@@ -445,7 +580,7 @@ impl RemoteSegments {
         let Some(bytes) = bytes else {
             return Ok(false);
         };
-        let tmp = local.with_extension("download");
+        let tmp = download_path(local);
         std::fs::write(&tmp, &bytes)?;
         std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, local)?;
@@ -468,6 +603,14 @@ pub(crate) fn open_store(raw_url: &str) -> Result<(Box<dyn ObjectStore>, ObjectP
     object_store::parse_url_opts(&url, settings).map_err(|error| Error::Rejected {
         message: format!("unsupported archive url {raw_url}: {error}"),
     })
+}
+
+/// Where a download is written before it is renamed to `local`: next to
+/// it, under its full name, so two downloads never share one.
+fn download_path(local: &Path) -> PathBuf {
+    let mut name = local.file_name().unwrap_or_default().to_os_string();
+    name.push(".download");
+    local.with_file_name(name)
 }
 
 fn archive_error(base: u64, error: object_store::Error) -> Error {
