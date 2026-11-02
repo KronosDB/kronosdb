@@ -51,7 +51,7 @@ async fn run() {
         peers: Vec::new(),
         group_commit_ms: Some(2),
         segment_size: Some(SEGMENT_SIZE),
-        backup: None,
+        archive: None,
         max_snapshot_size: None,
     })
     .expect("spawn node 1");
@@ -124,7 +124,7 @@ async fn run() {
         peers,
         group_commit_ms: Some(2),
         segment_size: Some(SEGMENT_SIZE),
-        backup: None,
+        archive: None,
         max_snapshot_size: None,
     })
     .expect("spawn node 2");

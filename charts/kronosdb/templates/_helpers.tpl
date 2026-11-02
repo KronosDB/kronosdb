@@ -88,11 +88,11 @@ env:
   - name: KRONOSDB_MANIFEST
     value: /etc/kronosdb/manifest.toml
   {{- end }}
-  {{- if $root.Values.backup.url }}
-  - name: KRONOSDB_BACKUP_URL
-    value: {{ $root.Values.backup.url | quote }}
-  - name: KRONOSDB_BACKUP_INTERVAL_SECS
-    value: {{ $root.Values.backup.intervalSecs | quote }}
+  {{- if $root.Values.archive.url }}
+  - name: KRONOSDB_ARCHIVE_URL
+    value: {{ $root.Values.archive.url | quote }}
+  - name: KRONOSDB_ARCHIVE_INTERVAL_SECS
+    value: {{ $root.Values.archive.intervalSecs | quote }}
   {{- end }}
   {{- if or $root.Values.auth.accessToken $root.Values.auth.existingSecret }}
   - name: KRONOSDB_ACCESS_TOKEN
@@ -129,10 +129,10 @@ env:
   {{- with $root.Values.config.extraEnv }}
   {{- toYaml . | nindent 2 }}
   {{- end }}
-{{- if $root.Values.backup.credentialsSecret }}
+{{- if $root.Values.archive.credentialsSecret }}
 envFrom:
   - secretRef:
-      name: {{ $root.Values.backup.credentialsSecret }}
+      name: {{ $root.Values.archive.credentialsSecret }}
 {{- end }}
 volumeMounts:
   - { name: data, mountPath: /data }

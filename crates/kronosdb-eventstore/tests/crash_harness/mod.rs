@@ -174,8 +174,8 @@ pub struct SpawnConfig {
     /// Event segment cap in bytes. Small values let tests seal many segments
     /// quickly (cold-join catch-up). `None` keeps the 256 MB default.
     pub segment_size: Option<u64>,
-    /// Object-store URL + pass interval for the ADR-0002 backup uploader.
-    pub backup: Option<(String, u64)>,
+    /// Object-store URL + pass interval of the archive tier (ADR-0011).
+    pub archive: Option<(String, u64)>,
     /// Snapshot state cap in bytes (`max-snapshot-size`). `None` keeps the
     /// 4 MB default.
     pub max_snapshot_size: Option<u64>,
@@ -277,9 +277,9 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     if let Some(bytes) = cfg.segment_size {
         cmd.env("KRONOSDB_SEGMENT_SIZE", bytes.to_string());
     }
-    if let Some((url, interval_secs)) = &cfg.backup {
-        cmd.env("KRONOSDB_BACKUP_URL", url)
-            .env("KRONOSDB_BACKUP_INTERVAL_SECS", interval_secs.to_string());
+    if let Some((url, interval_secs)) = &cfg.archive {
+        cmd.env("KRONOSDB_ARCHIVE_URL", url)
+            .env("KRONOSDB_ARCHIVE_INTERVAL_SECS", interval_secs.to_string());
     }
     if let Some(bytes) = cfg.max_snapshot_size {
         cmd.env("KRONOSDB_MAX_SNAPSHOT_SIZE", bytes.to_string());

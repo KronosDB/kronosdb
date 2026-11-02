@@ -450,12 +450,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(addr = %config.listen_addr, "listening");
 
     cluster.start_replication()?;
-    if let Some(backup_url) = &config.backup_url {
-        cluster.start_backup(kronosdb_eventstore::tier::TierConfig {
-            url: backup_url.clone(),
-            interval: Duration::from_secs(config.backup_interval_secs),
+    if let Some(archive_url) = &config.archive_url {
+        cluster.start_archive(kronosdb_eventstore::tier::TierConfig {
+            url: archive_url.clone(),
+            interval: Duration::from_secs(config.archive_interval_secs),
         })?;
-        info!(url = %backup_url, interval_secs = config.backup_interval_secs, "segment backup enabled");
+        info!(url = %archive_url, interval_secs = config.archive_interval_secs, "archive enabled");
     }
     cluster.start_scheduler(Duration::from_secs(1));
     if let Some(ref manifest_path) = config.manifest {

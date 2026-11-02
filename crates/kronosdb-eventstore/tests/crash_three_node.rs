@@ -74,7 +74,7 @@ async fn run_one_iteration(iter: usize) {
             peers: peers_str.clone(),
             group_commit_ms: Some(2),
             segment_size: None,
-            backup: None,
+            archive: None,
             max_snapshot_size: None,
         };
         srvs.push(spawn_server(&cfg).expect("spawn node"));
@@ -282,7 +282,7 @@ async fn post_restart_verify(
         peers: peers_str.clone(),
         group_commit_ms: Some(2),
         segment_size: None,
-        backup: None,
+        archive: None,
         max_snapshot_size: None,
     };
     srvs[leader_idx] = spawn_server(&cfg).expect("respawn killed node");

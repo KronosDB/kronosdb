@@ -14,11 +14,11 @@ Endpoints (in-cluster):
 !! Admin console auth is DISABLED — anyone reaching port 9240 can browse
    events and mutate cluster membership. Set admin.authMode=token.
 {{- end }}
-{{- if not .Values.backup.url }}
+{{- if not .Values.learners.replicas }}
 
-Backup is disabled (backup.url is empty). Quorum protects against node
-loss, not against operator or application mistakes replicated to every
-node. Point backup.url at an object store for sealed-segment backup.
+No backup (learners.replicas is 0). Quorum protects against losing a
+minority of the voters. A passive-backup learner, best in another zone,
+keeps a near-real-time copy beyond that.
 {{- end }}
 {{- if not .Values.persistence.storageClassName }}
 

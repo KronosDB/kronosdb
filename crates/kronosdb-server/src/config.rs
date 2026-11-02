@@ -91,14 +91,14 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_GROUP_COMMIT_MS")]
     group_commit_ms: Option<u64>,
 
-    /// Object-store URL for sealed-segment backup (ADR-0002 stage 1), e.g.
-    /// file:///backups/kronosdb or s3://bucket/prefix. Unset = backups off.
-    #[arg(long, env = "KRONOSDB_BACKUP_URL")]
-    backup_url: Option<String>,
+    /// Object-store URL of the archive tier (ADR-0011), e.g.
+    /// file:///archive/kronosdb or s3://bucket/prefix. Unset = no archive.
+    #[arg(long, env = "KRONOSDB_ARCHIVE_URL")]
+    archive_url: Option<String>,
 
-    /// Seconds between backup passes on the claimed leader (default 30).
-    #[arg(long, env = "KRONOSDB_BACKUP_INTERVAL_SECS")]
-    backup_interval_secs: Option<u64>,
+    /// Seconds between archive passes on the claimed leader (default 30).
+    #[arg(long, env = "KRONOSDB_ARCHIVE_INTERVAL_SECS")]
+    archive_interval_secs: Option<u64>,
 
     /// Command dispatch timeout in seconds.
     #[arg(long, env = "KRONOSDB_COMMAND_TIMEOUT")]
@@ -250,7 +250,7 @@ struct ConfigFile {
     storage: StorageConfig,
 
     #[serde(default)]
-    backup: BackupFileConfig,
+    archive: ArchiveFileConfig,
 
     #[serde(default)]
     timeouts: TimeoutConfig,
@@ -286,7 +286,7 @@ struct StorageConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
-struct BackupFileConfig {
+struct ArchiveFileConfig {
     url: Option<String>,
     #[serde(rename = "interval-secs")]
     interval_secs: Option<u64>,
@@ -452,9 +452,9 @@ pub struct ServerConfig {
     /// Maximum snapshot state size in bytes; larger appends are rejected.
     pub max_snapshot_size: u64,
     pub group_commit_ms: u64,
-    /// Object-store URL for sealed-segment backup; None = backups disabled.
-    pub backup_url: Option<String>,
-    pub backup_interval_secs: u64,
+    /// Object-store URL of the archive tier; None = no archive.
+    pub archive_url: Option<String>,
+    pub archive_interval_secs: u64,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
     /// Bounded permit-wait on saturated command handlers (false = fail fast).
@@ -519,7 +519,7 @@ impl ServerConfig {
         const DEFAULT_BLOCK_SIZE: usize = kronosdb_eventstore::segment::blocks::DEFAULT_BLOCK_SIZE;
         const DEFAULT_READAHEAD_BLOCKS: usize =
             kronosdb_eventstore::segment::blocks::DEFAULT_READAHEAD_BLOCKS;
-        const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 30;
+        const DEFAULT_ARCHIVE_INTERVAL_SECS: u64 = 30;
         const DEFAULT_COMMAND_TIMEOUT: u64 = 30;
         const DEFAULT_QUERY_TIMEOUT: u64 = 30;
         const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5;
@@ -649,11 +649,11 @@ impl ServerConfig {
                 .unwrap_or_else(|| "auto".to_string()),
             dev: cli.dev.or(file_config.dev).unwrap_or(false),
             group_commit_ms: cli.group_commit_ms.unwrap_or(0),
-            backup_url: cli.backup_url.or(file_config.backup.url),
-            backup_interval_secs: cli
-                .backup_interval_secs
-                .or(file_config.backup.interval_secs)
-                .unwrap_or(DEFAULT_BACKUP_INTERVAL_SECS),
+            archive_url: cli.archive_url.or(file_config.archive.url),
+            archive_interval_secs: cli
+                .archive_interval_secs
+                .or(file_config.archive.interval_secs)
+                .unwrap_or(DEFAULT_ARCHIVE_INTERVAL_SECS),
             command_timeout_secs: cli
                 .command_timeout
                 .or(file_config.timeouts.command_timeout)
