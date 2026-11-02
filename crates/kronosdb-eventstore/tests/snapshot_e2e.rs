@@ -24,7 +24,7 @@ fn single_node_config(data_dir: std::path::PathBuf) -> SpawnConfig {
         peers: vec![],
         group_commit_ms: Some(2),
         segment_size: None,
-        backup: None,
+        archive: None,
         max_snapshot_size: None,
     }
 }

@@ -39,44 +39,53 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Starts the ADR-0002 stage-1 backup loop. Runs on every node but only
-    /// the claimed leader uploads; after failover the new leader continues
-    /// from the shared manifest. Object-store failures are logged and
-    /// retried next interval — they can never touch the write path.
-    pub fn start_backup(self: &Arc<Self>, config: crate::tier::TierConfig) -> Result<(), Error> {
+    /// Starts the archive loop (ADR-0011). Runs on every node but only the
+    /// claimed leader archives; after failover the new leader lists the
+    /// archive and continues where it ends. Object-store failures are logged
+    /// and retried next interval: they never touch the write path.
+    pub fn start_archive(self: &Arc<Self>, config: crate::tier::TierConfig) -> Result<(), Error> {
         let archiver = crate::tier::Archiver::from_url(&config.url)?;
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.run_backup_loop(archiver, config.interval).await;
+            manager.run_archive_loop(archiver, config.interval).await;
         });
         Ok(())
     }
 
-    async fn run_backup_loop(self: Arc<Self>, archiver: crate::tier::Archiver, interval: Duration) {
+    async fn run_archive_loop(
+        self: Arc<Self>,
+        archiver: crate::tier::Archiver,
+        interval: Duration,
+    ) {
         loop {
             tokio::time::sleep(interval).await;
-            let Some(claim) = self.control.claim() else {
-                continue;
-            };
-            if !claim.writable || claim.leader_id != self.cluster_config.node_id {
+            let leading = self.control.claim().is_some_and(|claim| {
+                claim.writable && claim.leader_id == self.cluster_config.node_id
+            });
+            if !leading {
+                // Another node archives meanwhile; list again when this one
+                // leads again.
+                archiver.forget().await;
                 continue;
             }
             for context in self.context_manager.list_contexts() {
                 let Ok(engine) = self.context_manager.get_context(&context) else {
                     continue;
                 };
-                match archiver.run_backup_pass(&context, &engine).await {
-                    Ok(report) if report.uploaded > 0 => {
+                match archiver.run_archive_pass(&context, &engine).await {
+                    Ok(report) if report.segments + report.tables + report.deleted > 0 => {
                         tracing::info!(
                             context,
-                            uploaded = report.uploaded,
-                            archived_total = report.uploaded + report.already_archived,
-                            "backup pass shipped sealed segments"
+                            segments = report.segments,
+                            tables = report.tables,
+                            deleted = report.deleted,
+                            archived_end = report.archived_end,
+                            "archive pass"
                         );
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        tracing::warn!(%error, context, "backup pass failed; retrying next interval");
+                        tracing::warn!(%error, context, "archive pass failed; retrying next interval");
                     }
                 }
             }

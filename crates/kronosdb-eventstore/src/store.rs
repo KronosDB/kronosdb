@@ -2325,7 +2325,7 @@ impl EventStoreEngine {
     }
 
     /// Sealed segments whose bytes are final on every node: the archival
-    /// units for tiered storage (ADR-0002).
+    /// units of the archive tier (ADR-0011).
     ///
     /// A segment is final once its end lies strictly below the watermark,
     /// the rule index merging uses too (ADR-0010). At the watermark is not
@@ -2352,6 +2352,21 @@ impl EventStoreEngine {
             }
         }
         out
+    }
+
+    /// The live merged key tables (ADR-0010), for archiving with the
+    /// segments they cover. A table can be superseded and deleted by a merge
+    /// before the caller reads it.
+    pub fn archivable_tables(&self) -> Result<Vec<ArchivableTable>, Error> {
+        Ok(segment::merge::read_manifest(&self.dir)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| ArchivableTable {
+                base: entry.base,
+                end: entry.end,
+                path: segment::merge::table_path(&self.dir, entry.base, entry.end),
+            })
+            .collect())
     }
 
     /// Waits until every segment sealed so far has its companions on disk.
@@ -4181,7 +4196,7 @@ fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error
     Ok(Some(last_crc))
 }
 
-/// One sealed, watermark-covered segment eligible for archival (ADR-0002).
+/// One final segment, eligible for the archive (ADR-0011).
 #[derive(Debug, Clone)]
 pub struct ArchivableSegment {
     /// First position in the segment (also its filename base).
@@ -4193,6 +4208,14 @@ pub struct ArchivableSegment {
     /// `data_len` (from the segment's `.idx`), not the file: a crash between
     /// rotation and the seal's sync can leave a sealed file at its
     /// preallocated length.
+    pub path: PathBuf,
+}
+
+/// One live merged key table: covers the final segments in `[base, end)`.
+#[derive(Debug, Clone)]
+pub struct ArchivableTable {
+    pub base: u64,
+    pub end: u64,
     pub path: PathBuf,
 }
 
@@ -6773,7 +6796,7 @@ mod tests {
     /// The `.idx` of a segment is a function of the segment: the one the
     /// seal wrote from the live index, the one a rebuild from the file
     /// writes, and the one a reopened store writes after losing it are the
-    /// same bytes. (Archived indexes, ADR-0002, rely on this.)
+    /// same bytes. (The archive tier, ADR-0011, relies on this.)
     #[test]
     fn a_rebuilt_index_is_byte_identical_to_the_sealed_one() {
         let dir = tempfile::tempdir().unwrap();

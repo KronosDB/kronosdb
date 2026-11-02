@@ -65,7 +65,7 @@ async fn run_one_iteration(iter: usize) {
                 peers: peers.clone(),
                 group_commit_ms: Some(2),
                 segment_size: None,
-                backup: None,
+                archive: None,
                 max_snapshot_size: None,
             })
             .expect("spawn node"),

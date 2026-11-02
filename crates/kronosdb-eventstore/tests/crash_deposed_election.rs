@@ -42,7 +42,7 @@ fn spawn_config(
         peers: peers.to_vec(),
         group_commit_ms: Some(2),
         segment_size: None,
-        backup: None,
+        archive: None,
         max_snapshot_size: None,
     }
 }

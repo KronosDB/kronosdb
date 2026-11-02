@@ -2,8 +2,8 @@
 #
 # The defaults produce a production-shaped 3-voter Raft cluster. The two
 # decisions you cannot skip: storage (use local NVMe — replicated network
-# volumes pay for replication twice; quorum + object-store backup is the
-# durability story) and auth (set the tokens, or consciously run open).
+# volumes pay for replication twice; quorum plus passive-backup learners is
+# the durability story) and auth (set the tokens, or consciously run open).
 
 image:
   repository: ghcr.io/kronosdb/kronosdb
@@ -17,7 +17,8 @@ image:
 replicas: 3
 
 # Passive-backup learners: replicate everything, never vote, never serve
-# writes. Useful as an analytics read target or a warm copy in another zone.
+# writes. The backup: a near-real-time copy, best in another zone. Also
+# useful as an analytics read target.
 learners:
   replicas: 0
 
@@ -32,8 +33,8 @@ resources:
 
 persistence:
   # Strongly prefer a local-NVMe class (e.g. openebs-lvm, topolvm,
-  # local-path on bare metal). Acked writes are quorum-replicated; the
-  # object-store backup (below) covers node loss beyond quorum.
+  # local-path on bare metal). Acked writes are quorum-replicated;
+  # passive-backup learners (above) cover node loss beyond quorum.
   storageClassName: ""
   size: 100Gi
 
@@ -77,10 +78,11 @@ contexts: []
 # watching it; on current servers this just causes needless restarts.
 rollOnManifestChange: false
 
-backup:
-  # Object-store URL (s3://…, gs://…, file://…) enabling sealed-segment
-  # backup. Leave empty to disable. Cloud credentials come from the
-  # environment — point credentialsSecret at a Secret with AWS_* keys etc.
+archive:
+  # Object-store URL (s3://…, gs://…, file://…) of the archive tier: the
+  # leader copies final segments and their index there. Leave empty to
+  # disable. Cloud credentials come from the environment — point
+  # credentialsSecret at a Secret with AWS_* keys etc.
   url: ""
   intervalSecs: 30
   credentialsSecret: ""
