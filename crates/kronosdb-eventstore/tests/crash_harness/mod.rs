@@ -88,6 +88,15 @@ pub async fn read_events(
         .collect())
 }
 
+/// The archive tier a spawned server uses (ADR-0011).
+pub struct ArchiveSpawn {
+    pub url: String,
+    /// Seconds between archive and eviction passes.
+    pub interval_secs: u64,
+    /// The cap on sealed bytes kept on disk; `None` keeps everything.
+    pub max_local_bytes: Option<u64>,
+}
+
 pub struct ServerHandle {
     pub child: Child,
     pub listen: SocketAddr,
@@ -174,8 +183,8 @@ pub struct SpawnConfig {
     /// Event segment cap in bytes. Small values let tests seal many segments
     /// quickly (cold-join catch-up). `None` keeps the 256 MB default.
     pub segment_size: Option<u64>,
-    /// Object-store URL + pass interval of the archive tier (ADR-0011).
-    pub archive: Option<(String, u64)>,
+    /// The archive tier (ADR-0011).
+    pub archive: Option<ArchiveSpawn>,
     /// Snapshot state cap in bytes (`max-snapshot-size`). `None` keeps the
     /// 4 MB default.
     pub max_snapshot_size: Option<u64>,
@@ -277,9 +286,14 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     if let Some(bytes) = cfg.segment_size {
         cmd.env("KRONOSDB_SEGMENT_SIZE", bytes.to_string());
     }
-    if let Some((url, interval_secs)) = &cfg.archive {
-        cmd.env("KRONOSDB_ARCHIVE_URL", url)
-            .env("KRONOSDB_ARCHIVE_INTERVAL_SECS", interval_secs.to_string());
+    if let Some(archive) = &cfg.archive {
+        cmd.env("KRONOSDB_ARCHIVE_URL", &archive.url).env(
+            "KRONOSDB_ARCHIVE_INTERVAL_SECS",
+            archive.interval_secs.to_string(),
+        );
+        if let Some(bytes) = archive.max_local_bytes {
+            cmd.env("KRONOSDB_ARCHIVE_MAX_LOCAL_BYTES", bytes.to_string());
+        }
     }
     if let Some(bytes) = cfg.max_snapshot_size {
         cmd.env("KRONOSDB_MAX_SNAPSHOT_SIZE", bytes.to_string());

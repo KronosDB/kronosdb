@@ -1,0 +1,342 @@
+//! Evicted segments (ADR-0011): a store whose oldest segment bodies live
+//! only in the archive reads exactly what it read with them local.
+
+use std::path::Path;
+
+use super::*;
+use crate::append::AppendRequest;
+use crate::criteria::Criterion;
+use crate::event::{AppendEvent, Tag};
+use crate::remote::ArchiveStore;
+use crate::tier::Archiver;
+
+const SEGMENT_SIZE: u64 = 4 * 1024;
+const FIRST_TIMESTAMP: i64 = 1_700_000_000_000;
+
+fn archive_url(tier: &Path) -> String {
+    url::Url::from_directory_path(tier).unwrap().to_string()
+}
+
+fn options(tier: Option<&Path>) -> StoreOptions {
+    StoreOptions {
+        max_segment_size: SEGMENT_SIZE,
+        background_index_merge: false,
+        index_merge_rate: 0,
+        archive: tier.map(|tier| ArchiveStore::from_url(&archive_url(tier)).unwrap()),
+        ..StoreOptions::default()
+    }
+}
+
+/// A store under `<root>/default` of 400 events in ~40 segments, every
+/// event tagged with its order and timestamped one second after the last.
+fn filled_store(root: &Path, tier: &Path) -> EventStoreEngine {
+    let store =
+        EventStoreEngine::create_with_store_options(&root.join("default"), &options(Some(tier)))
+            .unwrap();
+    for batch in 0..50u32 {
+        store
+            .append(AppendRequest {
+                condition: None,
+                events: (0..8u32)
+                    .map(|i| {
+                        let n = batch * 8 + i;
+                        AppendEvent {
+                            identifier: format!("e-{n}"),
+                            name: "Placed".into(),
+                            version: "1".into(),
+                            timestamp: FIRST_TIMESTAMP + i64::from(n) * 1000,
+                            payload: vec![b'p'; 200 + (n % 7) as usize * 40],
+                            metadata: vec![],
+                            tags: vec![Tag::from_str("order", &format!("o-{}", n % 13))],
+                        }
+                    })
+                    .collect(),
+            })
+            .unwrap();
+    }
+    store.wait_for_seals();
+    store.merge_index().unwrap();
+    store
+}
+
+fn archive(store: &EventStoreEngine, tier: &Path) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let report = runtime
+        .block_on(
+            Archiver::from_url(&archive_url(tier))
+                .unwrap()
+                .run_archive_pass("default", store),
+        )
+        .unwrap();
+    assert!(report.segments > 0);
+}
+
+/// Evicts the oldest `count` segments.
+fn evict(store: &EventStoreEngine, count: usize) {
+    for segment in store.archivable_segments().iter().take(count) {
+        store.evict_segment(segment.base).unwrap();
+        assert!(!segment.path.exists());
+    }
+}
+
+fn order(value: &str) -> SourcingCondition {
+    SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![],
+            tags: vec![Tag::from_str("order", value)],
+        }],
+    }
+}
+
+fn everything() -> SourcingCondition {
+    SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![],
+            tags: vec![],
+        }],
+    }
+}
+
+/// What the tests compare: every kind of read that touches segment bodies.
+#[derive(Debug, PartialEq)]
+struct Reads {
+    all: Vec<(u64, String, Vec<u8>)>,
+    orders: Vec<Vec<u64>>,
+    tags: Vec<Vec<Tag>>,
+    walked: Vec<(u64, Vec<u8>)>,
+    sequence_at: Vec<Option<Position>>,
+}
+
+fn reads(store: &EventStoreEngine) -> Result<Reads, Error> {
+    let head = store.watermark.get();
+    let all = store
+        .source(Position(0), &everything())?
+        .into_iter()
+        .map(|event| (event.position.0, event.identifier, event.payload))
+        .collect();
+    let orders = ["o-0", "o-5", "o-12"]
+        .iter()
+        .map(|value| {
+            store
+                .source(Position(0), &order(value))
+                .map(|events| events.iter().map(|event| event.position.0).collect())
+        })
+        .collect::<Result<_, _>>()?;
+    let tags = [0, 37, 211, 399]
+        .iter()
+        .map(|&position| store.get_tags(Position(position)))
+        .collect::<Result<_, _>>()?;
+    let mut walked = Vec::new();
+    store.view.visit_events(0, head, |position, name, _, _| {
+        walked.push((position, name.to_vec()));
+        true
+    })?;
+    let sequence_at = [0, 1, 150, 399, 400, 10_000]
+        .iter()
+        .map(|&seconds| store.get_sequence_at(FIRST_TIMESTAMP + seconds * 1000))
+        .collect::<Result<_, _>>()?;
+    Ok(Reads {
+        all,
+        orders,
+        tags,
+        walked,
+        sequence_at,
+    })
+}
+
+#[test]
+fn evicted_segments_read_like_local_ones() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = filled_store(root.path(), tier.path());
+    let expected = reads(&store).unwrap();
+    assert_eq!(expected.all.len(), 400);
+    assert_eq!(expected.sequence_at[2], Some(Position(150)));
+
+    archive(&store, tier.path());
+    let segments = store.archivable_segments();
+    assert!(segments.len() > 20, "{} segments", segments.len());
+    evict(&store, segments.len() - 3);
+    assert_eq!(store.evicted_end(), segments[segments.len() - 3].base);
+
+    assert_eq!(reads(&store).unwrap(), expected);
+    let remote = store.evicted.archive(0).unwrap();
+    let requests = remote.requests();
+    assert!(requests > 0);
+
+    // A second round is served from the blocks fetched by the first.
+    assert_eq!(reads(&store).unwrap(), expected);
+    assert_eq!(remote.requests(), requests);
+}
+
+#[test]
+fn a_reopened_store_finds_its_evicted_segments() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let store = filled_store(root.path(), tier.path());
+    let expected = reads(&store).unwrap();
+    archive(&store, tier.path());
+    evict(&store, 10);
+    let evicted_end = store.evicted_end();
+    let evicted = store.archivable_segments()[..10].to_vec();
+    store.shutdown();
+    drop(store);
+
+    // An evicted segment that also lost its companions gets them back from
+    // the archive: they cannot be rebuilt from a body that is gone.
+    let lost = &evicted[3];
+    std::fs::remove_file(lost.path.with_extension("idx")).unwrap();
+    let _ = std::fs::remove_file(lost.path.with_extension("keys"));
+
+    let store =
+        EventStoreEngine::open_with_store_options(&dir, &options(Some(tier.path()))).unwrap();
+    assert_eq!(store.evicted_end(), evicted_end);
+    assert!(lost.path.with_extension("idx").exists());
+    assert_eq!(reads(&store).unwrap(), expected);
+}
+
+#[test]
+fn without_an_archive_evicted_segments_cannot_be_read() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let store = filled_store(root.path(), tier.path());
+    archive(&store, tier.path());
+    evict(&store, 5);
+    store.shutdown();
+    drop(store);
+
+    let store = EventStoreEngine::open_with_store_options(&dir, &options(None)).unwrap();
+    let Err(error) = store.source(Position(0), &everything()) else {
+        panic!("read an evicted segment");
+    };
+    assert!(matches!(error, Error::Rejected { .. }), "{error}");
+}
+
+#[test]
+fn a_damaged_archived_record_is_corrupted() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = filled_store(root.path(), tier.path());
+    archive(&store, tier.path());
+    evict(&store, 1);
+
+    let object = tier
+        .path()
+        .join("default")
+        .join("segments")
+        .join(format!("{:020}.seg", 0));
+    let mut bytes = std::fs::read(&object).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    std::fs::write(&object, bytes).unwrap();
+
+    let Err(error) = store.source(Position(0), &everything()) else {
+        panic!("read an evicted segment");
+    };
+    assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+}
+
+#[test]
+fn only_the_oldest_final_segment_with_a_body_is_evicted() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = filled_store(root.path(), tier.path());
+    archive(&store, tier.path());
+    let segments = store.archivable_segments();
+
+    let error = store.evict_segment(segments[1].base).unwrap_err();
+    assert!(matches!(error, Error::Rejected { .. }), "{error}");
+    assert!(segments[1].path.exists());
+
+    let active = *store.segments.read().bases.last().unwrap();
+    let error = store.evict_segment(active).unwrap_err();
+    assert!(matches!(error, Error::Rejected { .. }), "{error}");
+
+    store.evict_segment(segments[0].base).unwrap();
+    store.evict_segment(segments[1].base).unwrap();
+    assert_eq!(store.evicted_end(), segments[1].end);
+}
+
+fn local_bytes(store: &EventStoreEngine) -> u64 {
+    store
+        .sealed_bodies()
+        .iter()
+        .map(|segment| std::fs::metadata(&segment.path).unwrap().len())
+        .sum()
+}
+
+fn evict_down_to(
+    store: Arc<EventStoreEngine>,
+    tier: &Path,
+    max_local_bytes: u64,
+) -> Result<crate::tier::EvictionPassReport, Error> {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        Archiver::from_url(&archive_url(tier))
+            .unwrap()
+            .run_eviction_pass(&[("default".to_string(), store)], max_local_bytes)
+            .await
+    })
+}
+
+#[test]
+fn eviction_keeps_the_oldest_segments_in_the_archive_only() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = Arc::new(filled_store(root.path(), tier.path()));
+    let expected = reads(&store).unwrap();
+    archive(&store, tier.path());
+    let before = local_bytes(&store);
+    let cap = before / 2;
+
+    let report = evict_down_to(Arc::clone(&store), tier.path(), cap).unwrap();
+    assert!(report.evicted > 0);
+    assert!(report.local_bytes <= cap, "{report:?}");
+    assert_eq!(report.local_bytes, local_bytes(&store));
+    assert_eq!(report.freed, before - report.local_bytes);
+    // The evicted segments are exactly the oldest ones.
+    let segments = store.archivable_segments();
+    for segment in &segments {
+        assert_eq!(segment.path.exists(), segment.base >= store.evicted_end());
+    }
+    assert_eq!(reads(&store).unwrap(), expected);
+
+    // Under the cap, a pass does nothing.
+    let again = evict_down_to(Arc::clone(&store), tier.path(), cap).unwrap();
+    assert_eq!(again.evicted, 0);
+}
+
+#[test]
+fn segments_not_yet_archived_are_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = Arc::new(filled_store(root.path(), tier.path()));
+    let report = evict_down_to(Arc::clone(&store), tier.path(), 0).unwrap();
+    assert_eq!(report.evicted, 0);
+    assert_eq!(report.waiting, vec!["default".to_string()]);
+    assert_eq!(store.evicted_end(), 0);
+}
+
+#[test]
+fn a_segment_unlike_its_archived_copy_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = Arc::new(filled_store(root.path(), tier.path()));
+    archive(&store, tier.path());
+    let summary = tier
+        .path()
+        .join("default")
+        .join("segments")
+        .join(format!("{:020}.sum", 0));
+    let mut archived: crate::tier::SegmentSummary =
+        serde_json::from_slice(&std::fs::read(&summary).unwrap()).unwrap();
+    archived.blake3 = "0".repeat(64);
+    std::fs::write(&summary, serde_json::to_vec(&archived).unwrap()).unwrap();
+
+    let error = evict_down_to(Arc::clone(&store), tier.path(), 0).unwrap_err();
+    assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+    assert_eq!(store.evicted_end(), 0);
+    assert!(store.archivable_segments()[0].path.exists());
+}

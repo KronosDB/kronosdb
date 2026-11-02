@@ -568,6 +568,16 @@ impl IndexCache {
         self.pinned.lock().remove(&base_position);
     }
 
+    /// Lets go of every handle on a segment's body, which is about to be
+    /// evicted (ADR-0011), so deleting the file frees its space. Its index
+    /// stays cached. Readers holding a handle keep reading.
+    pub fn drop_body(&self, base_position: u64) {
+        self.sealed_files.pop(base_position);
+        self.files.pop(base_position);
+        self.blocks.invalidate(base_position);
+        self.mmaps.pop(base_position);
+    }
+
     /// Registers a freshly sealed segment's index before its `.idx` exists.
     /// Idempotent. Reads of the segment resolve through the pinned copy
     /// until `unpin_sealed`.

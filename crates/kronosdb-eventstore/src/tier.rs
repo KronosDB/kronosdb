@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
@@ -54,8 +55,12 @@ pub struct TierConfig {
     /// Object store URL, e.g. `file:///archive/kronosdb` or `s3://bucket/prefix`.
     /// Cloud credentials come from the environment (standard SDK variables).
     pub url: String,
-    /// Delay between archive passes on the claimed leader.
+    /// Delay between archive passes on the claimed leader, and between
+    /// eviction passes on every node.
     pub interval: Duration,
+    /// Most bytes of sealed segments this node keeps on disk; past it, the
+    /// oldest archived segments are evicted. `None` never evicts.
+    pub max_local_bytes: Option<u64>,
 }
 
 /// What `segments/<base>.sum` holds: the commit of one archived segment.
@@ -80,6 +85,18 @@ pub struct ArchivePassReport {
     pub deleted: usize,
     /// End of the archived prefix after the pass.
     pub archived_end: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct EvictionPassReport {
+    /// Segments evicted.
+    pub evicted: usize,
+    /// Bytes their bodies held.
+    pub freed: u64,
+    /// Bytes of sealed segments still on disk.
+    pub local_bytes: u64,
+    /// Contexts whose oldest local segment is not archived yet.
+    pub waiting: Vec<String>,
 }
 
 /// What the archiver knows of one context's archive. Built by listing it
@@ -466,6 +483,86 @@ impl Archiver {
         deleted
     }
 
+    /// Evicts the oldest archived segments of `engines` while the sealed
+    /// segments on this node's disk hold more than `max_local_bytes`: across
+    /// contexts, the segment sealed longest ago first. Runs on every node,
+    /// each under its own cap.
+    ///
+    /// A segment is evicted only once its summary is in the archive and the
+    /// blake3 of this node's data bytes equals the summary's. A mismatch is
+    /// real divergence: the context's segments are kept and the pass fails.
+    pub async fn run_eviction_pass(
+        &self,
+        engines: &[(String, Arc<EventStoreEngine>)],
+        max_local_bytes: u64,
+    ) -> Result<EvictionPassReport, Error> {
+        let mut report = EvictionPassReport::default();
+        let mut local = 0u64;
+        for (_, engine) in engines {
+            for segment in engine.sealed_bodies() {
+                local += file_len(&segment.path).await?.unwrap_or(0);
+            }
+        }
+        let mut open: Vec<&(String, Arc<EventStoreEngine>)> = engines.iter().collect();
+        while local > max_local_bytes {
+            // Each context's oldest final segment with a body, and when it
+            // was sealed.
+            let mut oldest = None;
+            let mut done = Vec::new();
+            for (i, (_, engine)) in open.iter().enumerate() {
+                let evicted_end = engine.evicted_end();
+                let Some(segment) = engine
+                    .archivable_segments()
+                    .into_iter()
+                    .find(|segment| segment.base >= evicted_end)
+                else {
+                    done.push(i);
+                    continue;
+                };
+                let sealed = tokio::fs::metadata(&segment.path).await?.modified()?;
+                if oldest.as_ref().is_none_or(|(_, _, at)| sealed < *at) {
+                    oldest = Some((i, segment, sealed));
+                }
+            }
+            let Some((i, segment, _)) = oldest else {
+                break;
+            };
+            let (context, engine) = open[i];
+            match self.summary(context, segment.base).await? {
+                None => {
+                    report.waiting.push(context.clone());
+                    done.push(i);
+                }
+                Some(archived) => match local_summary(&segment).await? {
+                    // Its seal is in flight or it was evicted meanwhile:
+                    // the next pass looks again.
+                    None => done.push(i),
+                    Some(own) if own != archived => {
+                        return Err(diverged(context, &own, &archived));
+                    }
+                    Some(own) => {
+                        let engine = Arc::clone(engine);
+                        let base = segment.base;
+                        tokio::task::spawn_blocking(move || engine.evict_segment(base))
+                            .await
+                            .map_err(|error| Error::Internal {
+                                message: format!("evicting segment {base}: {error}"),
+                            })??;
+                        local = local.saturating_sub(own.data_len);
+                        report.evicted += 1;
+                        report.freed += own.data_len;
+                    }
+                },
+            }
+            done.sort_unstable();
+            for i in done.into_iter().rev() {
+                open.remove(i);
+            }
+        }
+        report.local_bytes = local;
+        Ok(report)
+    }
+
     /// Streams the first `len` bytes of `path` to `object`, verifies the
     /// stored size, and returns their blake3. A file shorter than `len` is
     /// `Error::Corrupted`: its index says it holds more.
@@ -526,14 +623,20 @@ impl Archiver {
 }
 
 /// The summary this node's copy of `segment` would have; `None` while its
-/// seal is in flight.
+/// seal is in flight, or once its body is evicted.
 async fn local_summary(segment: &ArchivableSegment) -> Result<Option<SegmentSummary>, Error> {
     let idx_path = segment.path.with_extension("idx");
     if file_len(&idx_path).await?.is_none() {
         return Ok(None);
     }
     let data_len = SealedIndex::open(&idx_path, segment.base)?.data_len();
-    let mut data = tokio::fs::File::open(&segment.path).await?.take(data_len);
+    let file = match tokio::fs::File::open(&segment.path).await {
+        Ok(file) => file,
+        // Evicted: the archive is all there is to compare with.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut data = file.take(data_len);
     let mut hasher = blake3::Hasher::new();
     let mut total = 0u64;
     let mut chunk = vec![0u8; UPLOAD_CHUNK];

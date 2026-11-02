@@ -84,6 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it before the first store opens.
     let open_files = kronosdb_eventstore::cache::raise_open_file_limit();
     tracing::debug!(open_files, "open-file limit");
+    // Evicted segments are read from the archive (ADR-0011).
+    let archive = config
+        .archive_url
+        .as_deref()
+        .map(kronosdb_eventstore::remote::ArchiveStore::from_url)
+        .transpose()?;
+    if config.archive_max_local_bytes.is_some() && archive.is_none() {
+        return Err("archive max-local-bytes is set without an archive url".into());
+    }
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
         mapping_budget: kronosdb_eventstore::cache::MappingBudget::shared(),
@@ -97,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         voters: voter_ids,
         index_merge_rate: config.index_merge_rate,
         background_index_merge: true,
+        archive,
     };
     let contexts = Arc::new(ContextManager::with_options(
         &config.data_dir,
@@ -454,8 +464,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster.start_archive(kronosdb_eventstore::tier::TierConfig {
             url: archive_url.clone(),
             interval: Duration::from_secs(config.archive_interval_secs),
+            max_local_bytes: config.archive_max_local_bytes,
         })?;
-        info!(url = %archive_url, interval_secs = config.archive_interval_secs, "archive enabled");
+        info!(
+            url = %archive_url,
+            interval_secs = config.archive_interval_secs,
+            max_local_bytes = config.archive_max_local_bytes,
+            "archive enabled"
+        );
     }
     cluster.start_scheduler(Duration::from_secs(1));
     if let Some(ref manifest_path) = config.manifest {

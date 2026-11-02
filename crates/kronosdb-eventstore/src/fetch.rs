@@ -1,5 +1,5 @@
 //! Records fetched by byte range: the read path for sealed segments that are
-//! not mapped.
+//! not mapped, from their local file or, once evicted, from the archive.
 //!
 //! A read is planned from the index alone (ADR-0010): for each matching
 //! position, the segment's locator gives the record's byte offset and exact
@@ -15,9 +15,11 @@
 //! its locator says is `Error::Corrupted`.
 
 use std::fs::File;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::error::Error;
+use crate::remote::RemoteSegments;
 use crate::segment::blocks::read_exact_at;
 use crate::segment::query::Locator;
 use crate::segment::reader::{StoredRecord, record_in};
@@ -30,10 +32,17 @@ pub const COALESCE_GAP: u64 = 16 * 1024;
 /// size rather than one buffer as large as the segment.
 pub const MAX_RUN: u64 = 1024 * 1024;
 
+/// Where a segment's bytes are read from.
+enum Source {
+    File(Arc<File>),
+    /// Evicted: its archived copy.
+    Archive(Arc<RemoteSegments>),
+}
+
 /// The records of one sealed segment that a read asked for, read from its
-/// file.
+/// file or its archived copy.
 pub struct FetchedRecords {
-    file: Arc<File>,
+    source: Source,
     locator: Arc<dyn Locator>,
     /// What the last `load` fetched: disjoint byte ranges of the segment in
     /// ascending order, as (start offset, bytes).
@@ -45,8 +54,18 @@ pub struct FetchedRecords {
 impl FetchedRecords {
     /// A reader over the segment `locator` describes, whose file is `file`.
     pub fn new(file: Arc<File>, locator: Arc<dyn Locator>) -> Self {
+        Self::over(Source::File(file), locator)
+    }
+
+    /// A reader over the evicted segment `locator` describes, reading its
+    /// archived copy.
+    pub fn archived(archive: Arc<RemoteSegments>, locator: Arc<dyn Locator>) -> Self {
+        Self::over(Source::Archive(archive), locator)
+    }
+
+    fn over(source: Source, locator: Arc<dyn Locator>) -> Self {
         Self {
-            file,
+            source,
             locator,
             runs: Vec::new(),
             single: Vec::new(),
@@ -71,10 +90,13 @@ impl FetchedRecords {
                 _ => ranges.push((offset, end)),
             }
         }
-        for (start, end) in ranges {
-            let bytes = self.read(start, end - start)?;
-            self.runs.push((start, bytes));
-        }
+        let ranges: Vec<Range<u64>> = ranges.into_iter().map(|(start, end)| start..end).collect();
+        let fetched = self.read_ranges(&ranges)?;
+        self.runs = ranges
+            .iter()
+            .map(|range| range.start)
+            .zip(fetched)
+            .collect();
         Ok(())
     }
 
@@ -94,7 +116,9 @@ impl FetchedRecords {
                 &bytes[from..from + len as usize]
             }
             None => {
-                self.single = self.read(offset, len)?;
+                self.single = self
+                    .read_ranges(std::slice::from_ref(&(offset..offset + len)))?
+                    .remove(0);
                 &self.single[..]
             }
         };
@@ -123,16 +147,32 @@ impl FetchedRecords {
             })
     }
 
-    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
-        read_exact_at(&self.file, offset, len as usize).map_err(|error| match error.kind() {
-            std::io::ErrorKind::UnexpectedEof => Error::Corrupted {
-                message: format!(
-                    "segment {} ends before bytes {offset}..{} its index places records in",
-                    self.locator.base_position(),
-                    offset + len
-                ),
-            },
-            _ => error.into(),
-        })
+    /// The bytes of each range: one `pread` each from a file, all at once
+    /// from the archive.
+    fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Vec<u8>>, Error> {
+        let file = match &self.source {
+            Source::Archive(archive) => {
+                return archive.read(self.locator.base_position(), ranges);
+            }
+            Source::File(file) => file,
+        };
+        ranges
+            .iter()
+            .map(|range| {
+                read_exact_at(file, range.start, (range.end - range.start) as usize).map_err(
+                    |error| match error.kind() {
+                        std::io::ErrorKind::UnexpectedEof => Error::Corrupted {
+                            message: format!(
+                                "segment {} ends before bytes {}..{} its index places records in",
+                                self.locator.base_position(),
+                                range.start,
+                                range.end
+                            ),
+                        },
+                        _ => error.into(),
+                    },
+                )
+            })
+            .collect()
     }
 }

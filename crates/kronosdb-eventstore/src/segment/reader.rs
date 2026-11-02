@@ -252,6 +252,17 @@ pub struct StoredRecord<'a> {
     pub framed: &'a [u8],
 }
 
+/// The event records of `data`, which starts at a record boundary and is
+/// read like `SegmentReader::events_from` reads a mapping: bytes fetched
+/// from the middle of a segment.
+pub(crate) fn events_in(data: &[u8], up_to: Position) -> EventRecords<'_> {
+    EventRecords {
+        data,
+        offset: 0,
+        up_to: up_to.0,
+    }
+}
+
 /// Event records read sequentially from a byte offset: see
 /// `SegmentReader::events_from`.
 pub struct EventRecords<'a> {

@@ -85,6 +85,11 @@ archive:
   # credentialsSecret at a Secret with AWS_* keys etc.
   url: ""
   intervalSecs: 30
+  # Most bytes of sealed segments each node keeps on disk. Past it, the
+  # oldest archived segments are evicted and read back from the archive by
+  # range, which is slower than a local read: set it only when the disk
+  # cannot hold the whole log. Empty keeps everything.
+  maxLocalBytes: ""
   credentialsSecret: ""
 
 auth:

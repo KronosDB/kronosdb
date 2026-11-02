@@ -100,6 +100,12 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_ARCHIVE_INTERVAL_SECS")]
     archive_interval_secs: Option<u64>,
 
+    /// Most bytes of sealed segments this node keeps on disk; past it, the
+    /// oldest archived segments are evicted and read from the archive.
+    /// Unset = keep everything.
+    #[arg(long, env = "KRONOSDB_ARCHIVE_MAX_LOCAL_BYTES")]
+    archive_max_local_bytes: Option<u64>,
+
     /// Command dispatch timeout in seconds.
     #[arg(long, env = "KRONOSDB_COMMAND_TIMEOUT")]
     command_timeout: Option<u64>,
@@ -290,6 +296,8 @@ struct ArchiveFileConfig {
     url: Option<String>,
     #[serde(rename = "interval-secs")]
     interval_secs: Option<u64>,
+    #[serde(rename = "max-local-bytes")]
+    max_local_bytes: Option<u64>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -455,6 +463,8 @@ pub struct ServerConfig {
     /// Object-store URL of the archive tier; None = no archive.
     pub archive_url: Option<String>,
     pub archive_interval_secs: u64,
+    /// Most bytes of sealed segments kept on disk; None = never evict.
+    pub archive_max_local_bytes: Option<u64>,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
     /// Bounded permit-wait on saturated command handlers (false = fail fast).
@@ -654,6 +664,9 @@ impl ServerConfig {
                 .archive_interval_secs
                 .or(file_config.archive.interval_secs)
                 .unwrap_or(DEFAULT_ARCHIVE_INTERVAL_SECS),
+            archive_max_local_bytes: cli
+                .archive_max_local_bytes
+                .or(file_config.archive.max_local_bytes),
             command_timeout_secs: cli
                 .command_timeout
                 .or(file_config.timeouts.command_timeout)

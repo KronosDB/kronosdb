@@ -76,6 +76,26 @@ pub fn base_position_from_path(path: &Path) -> Option<u64> {
     stem.parse::<u64>().ok()
 }
 
+/// Lists the base positions of the locators (`.idx`) in a directory, sorted
+/// ascending. A sealed segment whose body was evicted (ADR-0011) has one and
+/// no `.seg`.
+pub fn list_locator_files(dir: &Path) -> Result<Vec<u64>, std::io::Error> {
+    let mut positions = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("idx")
+            && let Some(base) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok())
+        {
+            positions.push(base);
+        }
+    }
+    positions.sort();
+    Ok(positions)
+}
+
 /// Lists all segment base positions in a directory, sorted ascending.
 pub fn list_segment_files(dir: &Path) -> Result<Vec<u64>, std::io::Error> {
     let mut positions = Vec::new();

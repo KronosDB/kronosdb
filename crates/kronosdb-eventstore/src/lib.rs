@@ -15,6 +15,7 @@ pub(crate) mod inline_breaker;
 pub mod log_index;
 pub mod metrics;
 pub mod raft;
+pub mod remote;
 pub mod replication;
 pub mod scheduler;
 pub mod segment;

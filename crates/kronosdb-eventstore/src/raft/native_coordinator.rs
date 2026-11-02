@@ -39,17 +39,71 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Starts the archive loop (ADR-0011). Runs on every node but only the
-    /// claimed leader archives; after failover the new leader lists the
-    /// archive and continues where it ends. Object-store failures are logged
-    /// and retried next interval: they never touch the write path.
+    /// Starts the archive loops (ADR-0011). The archive loop runs on every
+    /// node but only the claimed leader archives; after failover the new
+    /// leader lists the archive and continues where it ends. With a cap on
+    /// local bytes, every node also evicts its own oldest archived segments.
+    /// Object-store failures are logged and retried next interval: they
+    /// never touch the write path.
     pub fn start_archive(self: &Arc<Self>, config: crate::tier::TierConfig) -> Result<(), Error> {
         let archiver = crate::tier::Archiver::from_url(&config.url)?;
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager.run_archive_loop(archiver, config.interval).await;
         });
+        if let Some(max_local_bytes) = config.max_local_bytes {
+            let evictor = crate::tier::Archiver::from_url(&config.url)?;
+            let manager = Arc::clone(self);
+            tokio::spawn(async move {
+                manager
+                    .run_eviction_loop(evictor, config.interval, max_local_bytes)
+                    .await;
+            });
+        }
         Ok(())
+    }
+
+    async fn run_eviction_loop(
+        self: Arc<Self>,
+        archiver: crate::tier::Archiver,
+        interval: Duration,
+        max_local_bytes: u64,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let engines: Vec<(String, Arc<crate::store::EventStoreEngine>)> = self
+                .context_manager
+                .list_contexts()
+                .into_iter()
+                .filter_map(|context| {
+                    let engine = self.context_manager.get_context(&context).ok()?;
+                    Some((context, engine))
+                })
+                .collect();
+            match archiver.run_eviction_pass(&engines, max_local_bytes).await {
+                Ok(report) => {
+                    if report.evicted > 0 {
+                        tracing::info!(
+                            evicted = report.evicted,
+                            freed = report.freed,
+                            local_bytes = report.local_bytes,
+                            "eviction pass"
+                        );
+                    }
+                    if report.local_bytes > max_local_bytes {
+                        tracing::warn!(
+                            local_bytes = report.local_bytes,
+                            max_local_bytes,
+                            waiting = ?report.waiting,
+                            "over the local cap: the archive has not caught up"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "eviction pass failed; nothing more is evicted until it succeeds");
+                }
+            }
+        }
     }
 
     async fn run_archive_loop(
