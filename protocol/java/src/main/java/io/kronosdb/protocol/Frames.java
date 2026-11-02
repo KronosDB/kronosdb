@@ -14,7 +14,7 @@ public final class Frames {
     public static final int PROTOCOL_VERSION = 2;
 
     /** CRC32C of the schema source, for checking generated code is in sync. */
-    public static final String SCHEMA_HASH = "56aaeb68";
+    public static final String SCHEMA_HASH = "d1c0db3f";
 
     /** Bytes every connection starts with, before the client's Hello. Do not modify. */
     public static final byte[] PREFACE = "KRONOSDB".getBytes(StandardCharsets.US_ASCII);
@@ -169,6 +169,7 @@ public final class Frames {
             case 0x9103 -> TailWatermark.decode(r);
             case 0x9104 -> TailNeedSnapshot.decode(r);
             case 0x9105 -> TailTruncate.decode(r);
+            case 0x910a -> TailNeedArchive.decode(r);
             case 0x1102 -> ForwardAppend.decode(r);
             case 0x9106 -> ForwardAppended.decode(r);
             case 0x9107 -> ForwardAppendConflict.decode(r);

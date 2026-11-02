@@ -238,6 +238,25 @@ impl SegmentReplicationService {
                     .await;
             }
             TailStart::ExactCursor => (open.from_position, None, true),
+            // What follows the cut is evicted here (ADR-0011): the follower
+            // makes the cut, reads the rest from the archive, and comes back.
+            TailStart::Truncate { position, prev }
+                if engine.evicted_end() > 0 && position <= engine.evicted_end() =>
+            {
+                return need_archive(
+                    &out,
+                    open.context,
+                    NeedArchive {
+                        epoch,
+                        leader_id: self.node_id,
+                        announce_epoch: open.epoch_seen != epoch && !open.recovery_source,
+                        from_position: open.from_position,
+                        truncate: (position, prev),
+                        up_to: engine.evicted_end(),
+                    },
+                )
+                .await;
+            }
             TailStart::Truncate { position, prev } => (position, Some((position, prev)), false),
         };
 
@@ -482,6 +501,62 @@ async fn need_snapshot(
             available_from,
             watermark,
             reason,
+        }))
+        .await;
+    Ok(())
+}
+
+/// How a follower that needs evicted segments is sent to the archive.
+struct NeedArchive {
+    epoch: u64,
+    leader_id: u64,
+    /// Whether the follower has to be told the epoch first, as a session
+    /// tells it before its first frame.
+    announce_epoch: bool,
+    from_position: u64,
+    /// The cut the follower's log needs before it continues.
+    truncate: (u64, Option<u32>),
+    /// The first segment this node still holds.
+    up_to: u64,
+}
+
+/// The follower needs bytes this node has evicted to the archive (ADR-0011):
+/// it gets the cut its log needs, then reads the evicted segments from the
+/// archive itself and opens a new Tail at `up_to`. Ends the stream.
+async fn need_archive(out: &StreamSender, context: &str, need: NeedArchive) -> Result<(), Error> {
+    if need.announce_epoch {
+        send(
+            out,
+            Frame::TailEpochChange(p::TailEpochChange {
+                epoch: need.epoch,
+                leader_id: need.leader_id,
+                start_position: need.from_position,
+            }),
+        )
+        .await?;
+    }
+    let (position, prev) = need.truncate;
+    send(
+        out,
+        Frame::TailTruncate(p::TailTruncate {
+            epoch: need.epoch,
+            position,
+            has_boundary: true,
+            prev_record_crc: prev.unwrap_or(0),
+            prev_at_segment_start: prev.is_none(),
+        }),
+    )
+    .await?;
+    tracing::info!(
+        context,
+        cut = position,
+        up_to = need.up_to,
+        "follower needs evicted segments: sent to the archive"
+    );
+    let _ = out
+        .finish(&Frame::TailNeedArchive(p::TailNeedArchive {
+            context,
+            up_to: need.up_to,
         }))
         .await;
     Ok(())
@@ -1757,5 +1832,211 @@ mod tests {
             matches!(start, TailStart::Truncate { position: 6, .. }),
             "expected a cut at the leader's tail, got {start:?}"
         );
+    }
+
+    /// A leader whose oldest segments are evicted to the archive, and a
+    /// follower that has fallen behind into them (ADR-0011).
+    struct Archived {
+        _tmp: tempfile::TempDir,
+        tier: PathBuf,
+        leader_dir: PathBuf,
+        leader: EventStoreEngine,
+        follower: PathBuf,
+    }
+
+    fn archive_options(tier: &Path, voters: &[u64]) -> StoreOptions {
+        let url = url::Url::from_directory_path(tier).unwrap().to_string();
+        StoreOptions {
+            archive: Some(crate::remote::ArchiveStore::from_url(&url).unwrap()),
+            ..options(voters)
+        }
+    }
+
+    fn archived_leader() -> Archived {
+        let tmp = tempfile::tempdir().unwrap();
+        let tier = tmp.path().join("tier");
+        std::fs::create_dir_all(&tier).unwrap();
+        // Contexts live in directories named after them, and so does their
+        // archive.
+        let leader_dir = tmp.path().join("leader").join("default");
+        let follower = tmp.path().join("follower").join("default");
+        let big = "x".repeat(2000);
+        {
+            let engine =
+                EventStoreEngine::create_with_store_options(&leader_dir, &options(&[0])).unwrap();
+            take_over(&engine, 1);
+            for i in 0..40 {
+                append(&engine, &format!("early-{i}"), &big);
+            }
+            engine.persist_watermark_checkpoint().unwrap();
+            engine.shutdown();
+        }
+        copy_log(&leader_dir, &follower);
+
+        let leader =
+            EventStoreEngine::open_with_store_options(&leader_dir, &archive_options(&tier, &[0]))
+                .unwrap();
+        for i in 0..200 {
+            append(&leader, &format!("late-{i}"), &big);
+        }
+        leader.wait_for_seals();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(
+                crate::tier::Archiver::from_url(
+                    url::Url::from_directory_path(&tier).unwrap().as_ref(),
+                )
+                .unwrap()
+                .run_archive_pass("default", &leader),
+            )
+            .unwrap();
+        let archivable = leader.archivable_segments();
+        for segment in &archivable[..archivable.len() - 1] {
+            leader.evict_segment(segment.base).unwrap();
+        }
+        Archived {
+            _tmp: tmp,
+            tier,
+            leader_dir,
+            leader,
+            follower,
+        }
+    }
+
+    /// Every segment's valid bytes, an evicted one's from the archive.
+    fn leader_bytes(archived: &Archived) -> Vec<(u64, Vec<u8>)> {
+        let mut bytes = log_bytes(&archived.leader_dir);
+        for segment in archived.leader.archivable_segments() {
+            if segment.base >= archived.leader.evicted_end() {
+                continue;
+            }
+            let object = archived
+                .tier
+                .join("default")
+                .join("segments")
+                .join(format!("{:020}.seg", segment.base));
+            bytes.push((segment.base, std::fs::read(object).unwrap()));
+        }
+        bytes.sort_by_key(|(base, _)| *base);
+        bytes
+    }
+
+    #[test]
+    fn a_follower_behind_the_evicted_segments_catches_up_from_the_archive() {
+        let archived = archived_leader();
+        let leader = &archived.leader;
+        let evicted_end = leader.evicted_end();
+        assert!(evicted_end > 0);
+        let follower = EventStoreEngine::open_with_store_options(
+            &archived.follower,
+            &archive_options(&archived.tier, &[0, 1, 2]),
+        )
+        .unwrap();
+        assert!(follower.local_tail().0 < evicted_end);
+
+        // The leader cannot serve what comes next: the follower makes the
+        // cut it is given, its boundary read from the archive, ...
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        let TailStart::Truncate { position, prev } = start else {
+            panic!("expected a cut, got {start:?}");
+        };
+        assert!(position <= evicted_end);
+        follower
+            .truncate_to_matching(Position(position), Some(prev))
+            .unwrap();
+
+        // ... reads the evicted segments from the archive, ...
+        let applied = follower.apply_archived(evicted_end).unwrap();
+        assert!(applied > 0);
+        assert_eq!(follower.local_tail().0, evicted_end);
+
+        // ... and resumes exactly where the leader's segments start.
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        assert!(
+            matches!(start, TailStart::ExactCursor),
+            "expected an exact resume, got {start:?}"
+        );
+        follow(leader, &follower, &start).unwrap();
+        assert_eq!(follower.local_tail(), leader.local_tail());
+        follower.wait_for_seals();
+        assert_eq!(log_bytes(&archived.follower), leader_bytes(&archived));
+    }
+
+    /// A node joining with nothing starts at position 0, in a segment the
+    /// leader no longer holds: there is no boundary to read, only the
+    /// archive to catch up from.
+    #[test]
+    fn an_empty_node_joins_from_the_archive() {
+        let archived = archived_leader();
+        let leader = &archived.leader;
+        let empty = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("empty")
+            .join("default");
+        let follower = EventStoreEngine::create_with_store_options(
+            &empty,
+            &archive_options(&archived.tier, &[0, 1, 2]),
+        )
+        .unwrap();
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        let TailStart::Truncate { position: 0, prev } = start else {
+            panic!("expected a cut at 0, got {start:?}");
+        };
+        follower
+            .truncate_to_matching(Position(0), Some(prev))
+            .unwrap();
+        follower.apply_archived(leader.evicted_end()).unwrap();
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        assert!(matches!(start, TailStart::ExactCursor), "{start:?}");
+        follow(leader, &follower, &start).unwrap();
+        follower.wait_for_seals();
+        assert_eq!(log_bytes(&empty), leader_bytes(&archived));
+    }
+
+    #[test]
+    fn a_follower_without_the_archive_cannot_catch_up_from_it() {
+        let archived = archived_leader();
+        let follower = open_in_cluster(&archived.follower);
+        let error = follower
+            .apply_archived(archived.leader.evicted_end())
+            .unwrap_err();
+        assert!(matches!(error, Error::Rejected { .. }), "{error}");
+    }
+
+    #[test]
+    fn archived_bytes_that_do_not_continue_the_follower_are_refused() {
+        let archived = archived_leader();
+        let follower = EventStoreEngine::open_with_store_options(
+            &archived.follower,
+            &archive_options(&archived.tier, &[0, 1, 2]),
+        )
+        .unwrap();
+        let base = follower.replication_cursor().unwrap().segment_base;
+        let segments = archived.tier.join("default").join("segments");
+        let object = segments.join(format!("{base:020}.seg"));
+        let summary_path = segments.join(format!("{base:020}.sum"));
+        let original = std::fs::read(&object).unwrap();
+        let mut damaged = original.clone();
+        damaged[segment::SEGMENT_HEADER_SIZE + 20] ^= 0xff;
+        std::fs::write(&object, &damaged).unwrap();
+
+        // Bytes that are not what their summary says.
+        let error = follower
+            .apply_archived(archived.leader.evicted_end())
+            .unwrap_err();
+        assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+
+        // Bytes that match their summary but not what the follower holds.
+        let mut summary: crate::tier::SegmentSummary =
+            serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+        summary.blake3 = blake3::hash(&damaged).to_hex().to_string();
+        std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        let error = follower
+            .apply_archived(archived.leader.evicted_end())
+            .unwrap_err();
+        assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+        assert!(error.to_string().contains("not a prefix"), "{error}");
     }
 }

@@ -410,6 +410,7 @@ The rest of this document is generated from `kronosdb.schema`.
 | `0x9103` | [TailWatermark](#tailwatermark) | server |
 | `0x9104` | [TailNeedSnapshot](#tailneedsnapshot) | server |
 | `0x9105` | [TailTruncate](#tailtruncate) | server |
+| `0x910a` | [TailNeedArchive](#tailneedarchive) | server |
 | `0x1102` | [ForwardAppend](#forwardappend) | client |
 | `0x9106` | [ForwardAppended](#forwardappended) | server |
 | `0x9107` | [ForwardAppendConflict](#forwardappendconflict) | server |
@@ -1453,6 +1454,20 @@ bytes that come next.
 | `has_boundary` | bool |  |
 | `prev_record_crc` | u32 |  |
 | `prev_at_segment_start` | bool |  |
+
+#### TailNeedArchive
+
+Kind `0x910a`, sent by the server.
+
+The follower needs segments the leader has evicted to the archive tier
+(ADR-0011). It reads them from the archive itself, applies them as it
+applies Tail bytes, up to `up_to` (a segment base: the leader's first
+segment it still holds), and opens a new Tail from there.
+
+| Field | Type | |
+|---|---|---|
+| `context` | str16 |  |
+| `up_to` | u64 |  |
 
 #### ForwardAppend
 

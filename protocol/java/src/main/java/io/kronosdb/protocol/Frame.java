@@ -102,6 +102,7 @@ public sealed interface Frame permits
         TailWatermark,
         TailNeedSnapshot,
         TailTruncate,
+        TailNeedArchive,
         ForwardAppend,
         ForwardAppended,
         ForwardAppendConflict,

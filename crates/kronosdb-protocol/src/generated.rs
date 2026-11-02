@@ -8,7 +8,7 @@ use crate::codec::*;
 /// The protocol version this code speaks.
 pub const PROTOCOL_VERSION: u16 = 2;
 /// CRC32C of the schema source, for checking generated code is in sync.
-pub const SCHEMA_HASH: &str = "56aaeb68";
+pub const SCHEMA_HASH: &str = "d1c0db3f";
 
 /// Why a request failed. Unknown codes must be treated as `internal`.
 ///
@@ -5820,6 +5820,46 @@ impl TailTruncate {
     }
 }
 
+/// The follower needs segments the leader has evicted to the archive tier
+/// (ADR-0011). It reads them from the archive itself, applies them as it
+/// applies Tail bytes, up to `up_to` (a segment base: the leader's first
+/// segment it still holds), and opens a new Tail from there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailNeedArchive<'a> {
+    pub context: &'a str,
+    pub up_to: u64,
+}
+
+impl<'a> TailNeedArchive<'a> {
+    pub const KIND: u16 = 0x910a;
+
+    pub fn decode(r: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            context: r.str16()?,
+            up_to: r.u64()?,
+        })
+    }
+
+    pub fn encode(&self, w: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let context = &self.context;
+        put_str16(w, context, "TailNeedArchive.context")?;
+        let up_to = &self.up_to;
+        put_u64(w, *up_to);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn to_json(&self) -> serde_json::Value {
+        #[allow(unused_mut)]
+        let mut m = serde_json::Map::new();
+        let context = &self.context;
+        m.insert("context".into(), serde_json::json!(*context));
+        let up_to = &self.up_to;
+        m.insert("up_to".into(), serde_json::json!(up_to.to_string()));
+        serde_json::Value::Object(m)
+    }
+}
+
 /// An append a follower received, forwarded to the fenced leader.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForwardAppend<'a> {
@@ -6452,6 +6492,7 @@ pub enum Frame<'a> {
     TailWatermark(TailWatermark),
     TailNeedSnapshot(TailNeedSnapshot<'a>),
     TailTruncate(TailTruncate),
+    TailNeedArchive(TailNeedArchive<'a>),
     ForwardAppend(ForwardAppend<'a>),
     ForwardAppended(ForwardAppended),
     ForwardAppendConflict(ForwardAppendConflict),
@@ -6564,6 +6605,7 @@ impl<'a> Frame<'a> {
             Frame::TailWatermark(_) => TailWatermark::KIND,
             Frame::TailNeedSnapshot(_) => TailNeedSnapshot::KIND,
             Frame::TailTruncate(_) => TailTruncate::KIND,
+            Frame::TailNeedArchive(_) => TailNeedArchive::KIND,
             Frame::ForwardAppend(_) => ForwardAppend::KIND,
             Frame::ForwardAppended(_) => ForwardAppended::KIND,
             Frame::ForwardAppendConflict(_) => ForwardAppendConflict::KIND,
@@ -6676,6 +6718,7 @@ impl<'a> Frame<'a> {
             Frame::TailWatermark(_) => "TailWatermark",
             Frame::TailNeedSnapshot(_) => "TailNeedSnapshot",
             Frame::TailTruncate(_) => "TailTruncate",
+            Frame::TailNeedArchive(_) => "TailNeedArchive",
             Frame::ForwardAppend(_) => "ForwardAppend",
             Frame::ForwardAppended(_) => "ForwardAppended",
             Frame::ForwardAppendConflict(_) => "ForwardAppendConflict",
@@ -6814,6 +6857,7 @@ impl<'a> Frame<'a> {
             TailWatermark::KIND => Frame::TailWatermark(TailWatermark::decode(r)?),
             TailNeedSnapshot::KIND => Frame::TailNeedSnapshot(TailNeedSnapshot::decode(r)?),
             TailTruncate::KIND => Frame::TailTruncate(TailTruncate::decode(r)?),
+            TailNeedArchive::KIND => Frame::TailNeedArchive(TailNeedArchive::decode(r)?),
             ForwardAppend::KIND => Frame::ForwardAppend(ForwardAppend::decode(r)?),
             ForwardAppended::KIND => Frame::ForwardAppended(ForwardAppended::decode(r)?),
             ForwardAppendConflict::KIND => {
@@ -6929,6 +6973,7 @@ impl<'a> Frame<'a> {
             Frame::TailWatermark(f) => f.encode(w),
             Frame::TailNeedSnapshot(f) => f.encode(w),
             Frame::TailTruncate(f) => f.encode(w),
+            Frame::TailNeedArchive(f) => f.encode(w),
             Frame::ForwardAppend(f) => f.encode(w),
             Frame::ForwardAppended(f) => f.encode(w),
             Frame::ForwardAppendConflict(f) => f.encode(w),
@@ -7042,6 +7087,7 @@ impl<'a> Frame<'a> {
             Frame::TailWatermark(f) => f.to_json(),
             Frame::TailNeedSnapshot(f) => f.to_json(),
             Frame::TailTruncate(f) => f.to_json(),
+            Frame::TailNeedArchive(f) => f.to_json(),
             Frame::ForwardAppend(f) => f.to_json(),
             Frame::ForwardAppended(f) => f.to_json(),
             Frame::ForwardAppendConflict(f) => f.to_json(),
