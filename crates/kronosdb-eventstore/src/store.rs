@@ -5329,6 +5329,9 @@ mod tests {
             .iter()
             .map(|condition| mapped.source(Position(0), condition).unwrap())
             .collect();
+        // Shutting down does not wait for seals, and a seal still writing
+        // the companions of a segment would race the reopen rebuilding them.
+        mapped.seals.wait_idle();
         mapped.shutdown();
         drop(mapped);
 
