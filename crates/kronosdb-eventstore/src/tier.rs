@@ -128,14 +128,10 @@ pub struct Archiver {
 
 impl Archiver {
     /// Builds an archiver from an object-store URL. `file://` and `memory://`
-    /// need no credentials; `s3://` reads the standard AWS environment.
+    /// need no credentials; `s3://` reads the standard AWS environment, or
+    /// uses the instance's role.
     pub fn from_url(raw_url: &str) -> Result<Self, Error> {
-        let url = url::Url::parse(raw_url).map_err(|error| Error::Rejected {
-            message: format!("invalid archive url {raw_url}: {error}"),
-        })?;
-        let (store, prefix) = object_store::parse_url(&url).map_err(|error| Error::Rejected {
-            message: format!("unsupported archive url {raw_url}: {error}"),
-        })?;
+        let (store, prefix) = crate::remote::open_store(raw_url)?;
         Ok(Self {
             store,
             prefix,
