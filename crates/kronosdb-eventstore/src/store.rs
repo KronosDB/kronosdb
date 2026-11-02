@@ -26,7 +26,7 @@ use crate::segment::key_table::KeyTableFile;
 use crate::segment::merge;
 use crate::segment::query::{Locator, PositionSet, Probe, Resolved};
 use crate::segment::reader::{RecordReader, SegmentReader};
-use crate::segment::sealed_index::LoggedControl;
+use crate::segment::sealed_index::{LoggedControl, SealedIndex};
 use crate::segment::segment_index::SegmentIndex;
 use crate::segment::writer::{PendingSeal, SegmentWriter, sync_dir, sync_file};
 use crate::segment::{self, DEFAULT_SEGMENT_SIZE, format};
@@ -145,6 +145,7 @@ pub(crate) struct LogView {
     dir: PathBuf,
     segments: Arc<RwLock<SegmentList>>,
     cache: Arc<IndexCache>,
+    evicted: Arc<Evicted>,
     active_index: Arc<parking_lot::RwLock<SegmentIndex>>,
     active_mmap: ActiveMmap,
     max_segment_size: u64,
@@ -437,15 +438,36 @@ impl LogView {
                 )
             };
             let path = segment::segment_path(&self.dir, base);
-            let (offset, reader) = {
+            let (walk, stop) = {
                 let index = self.index_for(base, &path)?;
                 let offset = index
                     .offset_of(next)?
                     .ok_or(Error::PositionNotFound { position: next })?;
-                (offset, self.reader_for(&index, base, &path)?)
+                let stop = to.min(end);
+                if matches!(index, IndexRef::Sealed(_)) && self.evicted.contains(base) {
+                    let (bytes, stop) = self.fetch_window(base, &index, next, offset, stop, end)?;
+                    (SegmentWalk::Fetched(bytes), stop)
+                } else {
+                    match self.reader_for(&index, base, &path) {
+                        Ok(reader) => (SegmentWalk::Mapped(reader, offset as usize), stop),
+                        // Evicted between the check and the open: go again.
+                        Err(Error::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                && self.evicted.contains(base) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             };
-            let stop = to.min(end);
-            for record in reader.events_from(offset as usize, Position(stop)) {
+            let records = match &walk {
+                SegmentWalk::Mapped(reader, offset) => reader.events_from(*offset, Position(stop)),
+                SegmentWalk::Fetched(bytes) => {
+                    crate::segment::reader::events_in(bytes, Position(stop))
+                }
+            };
+            for record in records {
                 let (position, record) = record?;
                 if position != next {
                     return Err(Error::Internal {
@@ -469,6 +491,53 @@ impl LogView {
             }
         }
         Ok(next)
+    }
+
+    /// Fetches from the archive the bytes of evicted segment `base` that hold
+    /// its events `[next, stop)`, or a prefix of them of at most
+    /// `remote::MAX_GET` bytes ending at an event, and the position that
+    /// prefix stops at. `offset` is where `next` starts; the segment ends at
+    /// position `end`.
+    fn fetch_window(
+        &self,
+        base: u64,
+        index: &IndexRef<'_>,
+        next: u64,
+        offset: u64,
+        stop: u64,
+        end: u64,
+    ) -> Result<(Vec<u8>, u64), Error> {
+        let archive = self.evicted.archive(base)?;
+        let data_len = archive.data_len(base)?;
+        let byte_at = |position: u64| -> Result<u64, Error> {
+            if position >= end {
+                return Ok(data_len);
+            }
+            index
+                .offset_of(position)?
+                .ok_or(Error::PositionNotFound { position })
+        };
+        let window = crate::remote::MAX_GET;
+        let mut stop = stop;
+        if byte_at(stop)? - offset > window {
+            // The furthest event boundary within the window; at least one
+            // event, however large.
+            let (mut lo, mut hi) = (next + 1, stop - 1);
+            let mut best = next + 1;
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if byte_at(mid)? - offset <= window {
+                    best = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            stop = best;
+        }
+        let window = offset..byte_at(stop)?;
+        let bytes = archive.read(base, std::slice::from_ref(&window))?.remove(0);
+        Ok((bytes, stop))
     }
 }
 
@@ -1304,6 +1373,9 @@ pub struct StoreOptions {
     /// Whether index merges run in the background. Off, they run only when
     /// [`EventStoreEngine::merge_index`] is called.
     pub background_index_merge: bool,
+    /// The archive evicted segments are read from (ADR-0011). Without one,
+    /// a read of an evicted segment fails.
+    pub archive: Option<Arc<crate::remote::ArchiveStore>>,
 }
 
 /// Default write rate of background index merges.
@@ -1324,6 +1396,7 @@ impl Default for StoreOptions {
             voters: vec![DEFAULT_NODE_ID],
             index_merge_rate: DEFAULT_INDEX_MERGE_RATE,
             background_index_merge: true,
+            archive: None,
         }
     }
 }
@@ -1491,6 +1564,10 @@ pub struct EventStoreEngine {
     /// engine's segment list, index cache and active segment.
     view: LogView,
 
+    /// Which sealed segments are evicted, and the archive they are read
+    /// from (ADR-0011).
+    evicted: Arc<Evicted>,
+
     /// The active segment's in-memory index (bitmaps + position→offset
     /// table), maintained incrementally by the writer. Lets source queries
     /// direct-seek into the active segment instead of sequentially scanning
@@ -1561,6 +1638,7 @@ impl EventStoreEngine {
         let seg_writer = SegmentWriter::new(dir, Position(0), opts.max_segment_size)?;
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
+        let evicted = Arc::new(Evicted::new(dir, opts, 0)?);
         let feed = CommitFeed::new();
 
         let sync_state = Arc::new(SyncState::new());
@@ -1619,6 +1697,7 @@ impl EventStoreEngine {
             dir: dir.to_path_buf(),
             segments: Arc::clone(&segments),
             cache: Arc::clone(&cache),
+            evicted: Arc::clone(&evicted),
             active_index: Arc::clone(&active_index),
             active_mmap: Arc::new(parking_lot::Mutex::new(None)),
             max_segment_size: opts.max_segment_size,
@@ -1641,6 +1720,7 @@ impl EventStoreEngine {
             feed,
             active_mmap: Arc::clone(&view.active_mmap),
             view,
+            evicted,
             active_index,
             cache,
             seals,
@@ -1678,8 +1758,12 @@ impl EventStoreEngine {
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
 
-        // Build the cached segment list from disk (one-time cost on startup).
-        let all_bases = segment::list_segment_files(dir)?;
+        // Build the cached segment list from disk (one-time cost on startup):
+        // every segment with a body, and before them the evicted ones, which
+        // have only their locator (ADR-0011).
+        let (found, evicted_end) = discover_segments(dir, active_base)?;
+        let evicted = Arc::new(Evicted::new(dir, opts, evicted_end)?);
+        let all_bases = evicted.complete_prefix(dir, &found)?;
         let sealed_count = all_bases.iter().filter(|&&base| base < active_base).count();
 
         // Every sealed segment's `.idx` is mapped, and the key tables: the
@@ -1772,6 +1856,7 @@ impl EventStoreEngine {
             dir: dir.to_path_buf(),
             segments: Arc::clone(&segments),
             cache: Arc::clone(&cache),
+            evicted: Arc::clone(&evicted),
             active_index: Arc::clone(&active_index),
             active_mmap: Arc::new(parking_lot::Mutex::new(None)),
             max_segment_size: opts.max_segment_size,
@@ -1791,6 +1876,7 @@ impl EventStoreEngine {
             feed,
             active_mmap: Arc::clone(&view.active_mmap),
             view,
+            evicted,
             active_index,
             cache,
             seals,
@@ -2352,6 +2438,67 @@ impl EventStoreEngine {
             }
         }
         out
+    }
+
+    /// The sealed segments whose body is on this node's disk.
+    pub fn sealed_bodies(&self) -> Vec<ArchivableSegment> {
+        let evicted_end = self.evicted.end();
+        let list = self.segments.read();
+        list.bases
+            .windows(2)
+            .filter(|window| window[0] >= evicted_end)
+            .map(|window| ArchivableSegment {
+                base: window[0],
+                end: window[1],
+                path: segment::segment_path(&self.dir, window[0]),
+            })
+            .collect()
+    }
+
+    /// End of the evicted prefix (ADR-0011): segments below it have no
+    /// local body.
+    pub fn evicted_end(&self) -> u64 {
+        self.evicted.end()
+    }
+
+    /// Evicts segment `base`: deletes its local body, after which its bytes
+    /// are read from the archive. It must be final and the oldest segment
+    /// with a body, so the evicted segments stay a prefix of the log, and the
+    /// caller must have checked that the archive holds its data bytes.
+    /// Readers holding a mapping or open file keep reading.
+    pub fn evict_segment(&self, base: u64) -> Result<(), Error> {
+        self.evicted.archive(base)?;
+        let end = {
+            let list = self.segments.read();
+            let i = list
+                .bases
+                .binary_search(&base)
+                .map_err(|_| Error::Rejected {
+                    message: format!("there is no segment {base} to evict"),
+                })?;
+            match list.bases.get(i + 1) {
+                Some(&end) if end < self.watermark.get() => end,
+                _ => {
+                    return Err(Error::Rejected {
+                        message: format!("segment {base} is not final and cannot be evicted"),
+                    });
+                }
+            }
+        };
+        self.evicted
+            .end
+            .compare_exchange(base, end, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|evicted_end| Error::Rejected {
+                message: format!(
+                    "segment {base} is not the oldest with a body: the evicted prefix ends at \
+                     {evicted_end}"
+                ),
+            })?;
+        self.cache.drop_body(base);
+        let path = segment::segment_path(&self.dir, base);
+        std::fs::remove_file(&path)?;
+        crate::segment::writer::sync_dir(&self.dir)?;
+        Ok(())
     }
 
     /// The live merged key tables (ADR-0010), for archiving with the
@@ -3157,21 +3304,53 @@ impl EventStoreEngine {
             IndexRef::Active(_) => Ok(RecordReader::Mapped(
                 self.active_segment_reader(base, seg_path)?,
             )),
-            IndexRef::Sealed(sealed) => match self.read_mode {
-                ReadMode::Blocks => Ok(RecordReader::Sealed(self.cache.sealed_reader(
-                    seg_path,
-                    base,
+            IndexRef::Sealed(sealed) => {
+                let archived = || -> Result<RecordReader, Error> {
+                    Ok(RecordReader::Fetched(
+                        crate::fetch::FetchedRecords::archived(
+                            Arc::clone(self.evicted.archive(base)?),
+                            Arc::clone(sealed),
+                        ),
+                    ))
+                };
+                if self.evicted.contains(base) {
+                    return archived();
+                }
+                match self.local_reader(base, seg_path, sealed) {
+                    // Evicted between the check and the open.
+                    Err(Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && self.evicted.contains(base) =>
+                    {
+                        archived()
+                    }
+                    reader => reader,
+                }
+            }
+        }
+    }
+
+    /// The reader over sealed segment `base` from its local file.
+    fn local_reader(
+        &self,
+        base: u64,
+        seg_path: &Path,
+        sealed: &Arc<dyn Locator>,
+    ) -> Result<RecordReader, Error> {
+        match self.read_mode {
+            ReadMode::Blocks => Ok(RecordReader::Sealed(self.cache.sealed_reader(
+                seg_path,
+                base,
+                Arc::clone(sealed),
+            )?)),
+            // Past the mapping budget, mapping this segment would unmap
+            // another: read the records it is asked for instead.
+            ReadMode::Mapped => match self.cache.mapped_within_budget(seg_path, base)? {
+                Some(mmap) => Ok(RecordReader::Mapped(SegmentReader::from_shared_mmap(mmap)?)),
+                None => Ok(RecordReader::Fetched(crate::fetch::FetchedRecords::new(
+                    self.cache.segment_file(seg_path, base)?,
                     Arc::clone(sealed),
-                )?)),
-                // Past the mapping budget, mapping this segment would unmap
-                // another: read the records it is asked for instead.
-                ReadMode::Mapped => match self.cache.mapped_within_budget(seg_path, base)? {
-                    Some(mmap) => Ok(RecordReader::Mapped(SegmentReader::from_shared_mmap(mmap)?)),
-                    None => Ok(RecordReader::Fetched(crate::fetch::FetchedRecords::new(
-                        self.cache.segment_file(seg_path, base)?,
-                        Arc::clone(sealed),
-                    ))),
-                },
+                ))),
             },
         }
     }
@@ -3270,6 +3449,14 @@ impl EventStoreEngine {
 
             let seg_path = segment::segment_path(&self.dir, base);
 
+            if seg_list.is_sealed(i) && self.evicted.contains(base) {
+                let end = seg_list.bases[i + 1].min(head);
+                match self.archived_sequence_at(base, &seg_path, end, timestamp_millis)? {
+                    Some(position) => return Ok(Some(position)),
+                    None => continue,
+                }
+            }
+
             let reader = if seg_list.is_sealed(i) {
                 let mmap = self.cache.get_mmap(&seg_path, base)?;
                 SegmentReader::from_shared_mmap(mmap)?
@@ -3291,6 +3478,63 @@ impl EventStoreEngine {
         }
 
         Ok(None)
+    }
+
+    /// `get_sequence_at` within evicted segment `base`, up to position `end`.
+    /// A segment whose last event is older than `timestamp_millis` is
+    /// skipped after reading only that event, so a lookup does not download
+    /// the archive; that is exact while timestamps do not go backwards
+    /// from one segment to the next. Otherwise the segment is walked.
+    fn archived_sequence_at(
+        &self,
+        base: u64,
+        seg_path: &Path,
+        end: u64,
+        timestamp_millis: i64,
+    ) -> Result<Option<Position>, Error> {
+        if end <= base {
+            return Ok(None);
+        }
+        let locator = self.cache.get_index(seg_path, base)?;
+        let last = (base + locator.event_count()).min(end);
+        if last == base {
+            return Ok(None);
+        }
+        let offset = locator
+            .offset_of(last - 1)?
+            .ok_or(Error::PositionNotFound { position: last - 1 })?;
+        let newest = RecordReader::Fetched(crate::fetch::FetchedRecords::archived(
+            Arc::clone(self.evicted.archive(base)?),
+            Arc::clone(&locator),
+        ))
+        .read_event_at(last - 1, offset)?;
+        if newest.timestamp < timestamp_millis {
+            return Ok(None);
+        }
+
+        let mut found = None;
+        let mut failed = None;
+        self.view
+            .visit_events(base, last, |position, name, _, record| {
+                if crate::system::is_system_name_bytes(name) {
+                    return true;
+                }
+                match format::deserialize_event(record.body) {
+                    Ok((event, _)) if event.timestamp >= timestamp_millis => {
+                        found = Some(Position(position));
+                        false
+                    }
+                    Ok(_) => true,
+                    Err(error) => {
+                        failed = Some(error);
+                        false
+                    }
+                }
+            })?;
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(found),
+        }
     }
 
     /// Creates a live event stream subscription. Delivery is bounded by the
@@ -4196,6 +4440,142 @@ fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error
     Ok(Some(last_crc))
 }
 
+/// What a sequential walk reads one segment's events from.
+enum SegmentWalk {
+    /// A mapping, from a byte offset.
+    Mapped(SegmentReader, usize),
+    /// Bytes fetched from the archive, starting at an event.
+    Fetched(Vec<u8>),
+}
+
+/// Which sealed segments are evicted (ADR-0011): a prefix of the log whose
+/// bodies were deleted locally once archived. Their locators and key tables
+/// stay, so reads are planned as for any segment; their bytes are read from
+/// the archive.
+pub(crate) struct Evicted {
+    /// End of the evicted prefix: the base of the first segment with a body.
+    end: AtomicU64,
+    archive: Option<Arc<crate::remote::RemoteSegments>>,
+}
+
+impl Evicted {
+    fn new(dir: &Path, opts: &StoreOptions, end: u64) -> Result<Self, Error> {
+        Ok(Self {
+            end: AtomicU64::new(end),
+            archive: opts
+                .archive
+                .as_ref()
+                .map(|archive| archive.segments(dir).map(Arc::new))
+                .transpose()?,
+        })
+    }
+
+    /// End of the evicted prefix.
+    pub(crate) fn end(&self) -> u64 {
+        self.end.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn contains(&self, base: u64) -> bool {
+        base < self.end()
+    }
+
+    /// The archive to read evicted segment `base` from.
+    pub(crate) fn archive(&self, base: u64) -> Result<&Arc<crate::remote::RemoteSegments>, Error> {
+        self.archive.as_ref().ok_or_else(|| Error::Rejected {
+            message: format!(
+                "segment {base} is evicted to the archive, but no archive is configured"
+            ),
+        })
+    }
+
+    /// The bases of the evicted prefix, checked whole, followed by `rest`.
+    ///
+    /// The prefix is found by its locators, and segments follow one another
+    /// without gaps from position 0: each ends where its locator's events
+    /// end. A segment missing from the chain has lost its locator along with
+    /// its body, and an unreadable locator cannot be rebuilt from a body
+    /// that is gone, so both are downloaded from the archive. So is the own
+    /// key table of an evicted segment that lost it; one the archive no
+    /// longer holds is covered by a merged table.
+    fn complete_prefix(&self, dir: &Path, bases: &[u64]) -> Result<Vec<u64>, Error> {
+        let end = self.end();
+        let listed: std::collections::BTreeSet<u64> =
+            bases.iter().copied().filter(|&base| base < end).collect();
+        let mut out = Vec::with_capacity(bases.len());
+        let mut next = 0;
+        while next < end {
+            let path = segment::segment_path(dir, next);
+            let idx = path.with_extension("idx");
+            let mut locator = listed
+                .contains(&next)
+                .then(|| SealedIndex::open(&idx, next).ok())
+                .flatten();
+            if locator.is_none() {
+                let archive = self.archive(next)?;
+                let _ = std::fs::remove_file(&idx);
+                if !archive.download("segments", &format!("{next:020}.idx"), &idx)? {
+                    return Err(Error::Corrupted {
+                        message: format!(
+                            "evicted segment {next} has no readable locator, here or in the \
+                             archive"
+                        ),
+                    });
+                }
+                locator = Some(SealedIndex::open(&idx, next)?);
+            }
+            let segment_end = next + locator.expect("opened above").event_count();
+            if segment_end <= next || segment_end > end {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "the locator of evicted segment {next} ends at {segment_end}, outside \
+                         the evicted prefix ending at {end}"
+                    ),
+                });
+            }
+            let keys = path.with_extension("keys");
+            if !keys.exists()
+                && let Some(archive) = &self.archive
+            {
+                archive.download(
+                    "index",
+                    &segment::merge::table_file_name(next, segment_end),
+                    &keys,
+                )?;
+            }
+            out.push(next);
+            next = segment_end;
+        }
+        out.extend(bases.iter().copied().filter(|&base| base >= end));
+        Ok(out)
+    }
+}
+
+/// The bases of a log's segments, ascending, and the end of its evicted
+/// prefix. Segments are found by their bodies and, below the first body,
+/// by their locators: those were evicted. A locator without a body after
+/// the first body is a lost segment.
+fn discover_segments(dir: &Path, active_base: u64) -> Result<(Vec<u64>, u64), Error> {
+    let bodies = segment::list_segment_files(dir)?;
+    let first_body = bodies.first().copied().unwrap_or(active_base);
+    let mut bases = bodies.clone();
+    for base in segment::list_locator_files(dir)? {
+        if base >= active_base || bodies.binary_search(&base).is_ok() {
+            continue;
+        }
+        if base > first_body {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "segment {base} has a locator but no data, and is not evicted: segment \
+                     {first_body} before it still has its data"
+                ),
+            });
+        }
+        bases.push(base);
+    }
+    bases.sort_unstable();
+    Ok((bases, first_body))
+}
+
 /// One final segment, eligible for the archive (ADR-0011).
 #[derive(Debug, Clone)]
 pub struct ArchivableSegment {
@@ -4356,13 +4736,15 @@ impl std::ops::Deref for IndexRef<'_> {
 mod index_tests;
 
 #[cfg(test)]
+mod eviction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::append::AppendCondition;
     use crate::criteria::{Criterion, SourcingCondition};
     use crate::event::AppendEvent;
     use crate::event::Tag;
-    use crate::segment::sealed_index::SealedIndex;
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag::from_str(key, value)

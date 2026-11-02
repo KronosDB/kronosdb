@@ -93,6 +93,10 @@ env:
     value: {{ $root.Values.archive.url | quote }}
   - name: KRONOSDB_ARCHIVE_INTERVAL_SECS
     value: {{ $root.Values.archive.intervalSecs | quote }}
+  {{- if $root.Values.archive.maxLocalBytes }}
+  - name: KRONOSDB_ARCHIVE_MAX_LOCAL_BYTES
+    value: {{ $root.Values.archive.maxLocalBytes | quote }}
+  {{- end }}
   {{- end }}
   {{- if or $root.Values.auth.accessToken $root.Values.auth.existingSecret }}
   - name: KRONOSDB_ACCESS_TOKEN
