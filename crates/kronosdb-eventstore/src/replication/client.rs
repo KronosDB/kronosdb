@@ -159,6 +159,7 @@ async fn run_tail(
         }
     };
 
+    let mut archive_up_to = None;
     while let Some(frame) = stream.next().await.map_err(wire::net_error)? {
         match frame.decode().map_err(|error| Error::Internal {
             message: format!("malformed Tail frame: {error}"),
@@ -275,6 +276,10 @@ async fn run_tail(
                     "Tail truncated to the leader's boundary"
                 );
             }
+            Frame::TailNeedArchive(need) => {
+                archive_up_to = Some(need.up_to);
+                break;
+            }
             Frame::TailNeedSnapshot(snapshot) => {
                 return Err(Error::Rejected {
                     message: format!(
@@ -291,9 +296,32 @@ async fn run_tail(
         }
     }
 
-    Err(Error::Unavailable {
-        message: "leader closed Tail stream".into(),
-    })
+    let Some(up_to) = archive_up_to else {
+        return Err(Error::Unavailable {
+            message: "leader closed Tail stream".into(),
+        });
+    };
+    // The leader has evicted what comes next (ADR-0011): read it from the
+    // archive, then open a new Tail where the leader's segments start.
+    ack_task.abort();
+    drop(stream);
+    let before = engine.local_tail().0;
+    let applied = {
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || engine.apply_archived(up_to))
+            .await
+            .map_err(|error| Error::Internal {
+                message: format!("catching up from the archive: {error}"),
+            })??
+    };
+    tracing::info!(
+        context = %config.context,
+        segments = applied,
+        from = before,
+        to = engine.local_tail().0,
+        "caught up from the archive"
+    );
+    Box::pin(run_tail(engine, config, stop_at)).await
 }
 
 async fn wait_durable(engine: Arc<EventStoreEngine>, write: ReplicatedWrite) -> Result<(), Error> {

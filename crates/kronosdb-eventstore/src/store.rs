@@ -2110,11 +2110,10 @@ impl EventStoreEngine {
         let active_end = writer.write_offset();
         let seg_list = self.segments.read().clone();
         drop(writer);
-        let (first_index, first_offset) =
-            match locate_event_anchor(&self.dir, &seg_list.bases, from)? {
-                Some(anchor) => (anchor.segment_index, anchor.end_offset),
-                None => (0, segment::SEGMENT_HEADER_SIZE as u64),
-            };
+        let (first_index, first_offset) = match self.event_anchor(&seg_list.bases, from)? {
+            Some(anchor) => (anchor.segment_index, anchor.end_offset),
+            None => (0, segment::SEGMENT_HEADER_SIZE as u64),
+        };
 
         let mut slices = Vec::new();
         for (index, &base) in seg_list.bases.iter().enumerate().skip(first_index) {
@@ -2197,6 +2196,87 @@ impl EventStoreEngine {
             durable_position: result.durable_position,
             byte_count: bytes.len() as u64,
         })
+    }
+
+    /// Catches this follower up from the archive (ADR-0011) to `up_to`, a
+    /// segment base: the leader's first segment it still holds. Each archived
+    /// segment from the one this log ends in is downloaded, checked against
+    /// its summary's blake3, and applied as Tail bytes are: the bytes this
+    /// log does not have yet, then the rotation to the next segment. What
+    /// this log already holds of the first one must be the archive's bytes.
+    /// The archived bytes are committed, so the watermark follows them, and
+    /// the segments they fill become final here. Returns the segments
+    /// applied.
+    pub fn apply_archived(&self, up_to: u64) -> Result<usize, Error> {
+        let archive = Arc::clone(self.evicted.archive(up_to).map_err(|_| Error::Rejected {
+            message: format!(
+                "the leader keeps segments from {up_to} on and the earlier ones only in its \
+                 archive, which this node has not configured"
+            ),
+        })?);
+        let mut applied = 0;
+        loop {
+            let cursor = self.replication_cursor()?;
+            let base = cursor.segment_base;
+            if base >= up_to {
+                return Ok(applied);
+            }
+            let summary = archive.summary(base)?.ok_or_else(|| Error::Unavailable {
+                message: format!(
+                    "the archive does not hold segment {base}, which this node needs to catch up"
+                ),
+            })?;
+            let bytes = archive.fetch_segment(&summary)?;
+            let offset = cursor.byte_offset as usize;
+            if offset > bytes.len() {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "segment {base} runs to byte {offset} here, past the archived {}",
+                        bytes.len()
+                    ),
+                });
+            }
+            let path = segment::segment_path(&self.dir, base);
+            let local =
+                crate::segment::blocks::read_exact_at(&std::fs::File::open(&path)?, 0, offset)?;
+            if local != bytes[..offset] {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "segment {base} here is not a prefix of the archived segment {base}"
+                    ),
+                });
+            }
+
+            let epoch = self.replication_epoch();
+            let mut last_write = None;
+            let mut start = offset;
+            while start < bytes.len() {
+                let end = archived_chunk_end(&bytes, start)?;
+                let write = self.apply_replicated_records(
+                    epoch,
+                    base,
+                    self.local_tail(),
+                    &bytes[start..end],
+                )?;
+                last_write = Some(write);
+                start = end;
+            }
+            if self.local_tail().0 != summary.end {
+                return Err(Error::Corrupted {
+                    message: format!(
+                        "archived segment {base} ends at position {}, its summary says {}",
+                        self.local_tail().0,
+                        summary.end
+                    ),
+                });
+            }
+            if let Some(write) = last_write {
+                self.wait_replicated_durable(write)?;
+            }
+            self.rotate_replicated(epoch, Position(summary.end))?;
+            self.adopt_watermark(epoch, Position(summary.end));
+            applied += 1;
+        }
     }
 
     /// Waits until a replicated frame's local segment bytes are fdatasync'd.
@@ -2407,7 +2487,41 @@ impl EventStoreEngine {
     /// verify that the history they keep is this log's.
     pub fn replication_boundary_event(&self, pos: Position) -> Result<Option<u32>, Error> {
         let bases = self.segments.read().bases.clone();
-        Ok(locate_event_anchor(&self.dir, &bases, pos)?.map(|anchor| anchor.crc))
+        Ok(self.event_anchor(&bases, pos)?.map(|anchor| anchor.crc))
+    }
+
+    /// [`locate_event_anchor`], also when the anchor is in an evicted
+    /// segment (ADR-0011): positions are events, so the last event before
+    /// `pos` is the one at `pos - 1`, and its locator says where it is.
+    fn event_anchor(&self, bases: &[u64], pos: Position) -> Result<Option<EventAnchor>, Error> {
+        // Nothing is before position 0, wherever segment 0 is.
+        let Some(last) = pos.0.checked_sub(1) else {
+            return Ok(None);
+        };
+        {
+            let index = bases
+                .partition_point(|&base| base <= last)
+                .saturating_sub(1);
+            let base = bases[index];
+            if self.evicted.contains(base) {
+                let path = segment::segment_path(&self.dir, base);
+                let locator = self.cache.get_index(&path, base)?;
+                let missing = || Error::PositionNotFound { position: last };
+                let offset = locator.offset_of(last)?.ok_or_else(missing)?;
+                let len = locator.record_len(last)?.ok_or_else(missing)?;
+                let mut reader = RecordReader::Fetched(crate::fetch::FetchedRecords::archived(
+                    Arc::clone(self.evicted.archive(base)?),
+                    locator,
+                ));
+                let record = reader.record_at(last, offset)?;
+                return Ok(Some(EventAnchor {
+                    segment_index: index,
+                    end_offset: offset + u64::from(len),
+                    crc: crc32c::crc32c_append(crc32c::crc32c(&[record.flags]), record.body),
+                }));
+            }
+        }
+        locate_event_anchor(&self.dir, bases, pos)
     }
 
     /// Sealed segments whose bytes are final on every node: the archival
@@ -4438,6 +4552,40 @@ fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error
         offset += header.total_len() as u64;
     }
     Ok(Some(last_crc))
+}
+
+/// Most bytes of an archived segment applied in one go: the size of a large
+/// Tail frame.
+const ARCHIVED_CHUNK: usize = 4 << 20;
+
+/// Where the chunk of archived segment bytes starting at record boundary
+/// `start` ends: whole records, at most [`ARCHIVED_CHUNK`] bytes unless one
+/// record alone is larger.
+fn archived_chunk_end(bytes: &[u8], start: usize) -> Result<usize, Error> {
+    let mut end = start;
+    while end < bytes.len() {
+        let header: &[u8; segment::RECORD_HEADER_SIZE] = bytes
+            .get(end..end + segment::RECORD_HEADER_SIZE)
+            .and_then(|header| header.try_into().ok())
+            .ok_or_else(|| Error::Corrupted {
+                message: format!("archived segment bytes end inside a record header at {end}"),
+            })?;
+        let record =
+            crate::segment::record::parse_header(header)?.ok_or_else(|| Error::Corrupted {
+                message: format!("archived segment data holds an empty record at {end}"),
+            })?;
+        let next = end + record.total_len();
+        if next > bytes.len() {
+            return Err(Error::Corrupted {
+                message: format!("archived segment bytes end inside the record at {end}"),
+            });
+        }
+        if next - start > ARCHIVED_CHUNK && end > start {
+            break;
+        }
+        end = next;
+    }
+    Ok(end)
 }
 
 /// What a sequential walk reads one segment's events from.

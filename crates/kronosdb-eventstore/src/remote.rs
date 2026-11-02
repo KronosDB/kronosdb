@@ -361,6 +361,76 @@ impl RemoteSegments {
         Ok(out)
     }
 
+    /// The summary of archived segment `base`; `None` when the archive does
+    /// not hold it.
+    pub fn summary(&self, base: u64) -> Result<Option<crate::tier::SegmentSummary>, Error> {
+        let store = Arc::clone(&self.archive.store);
+        let object = self
+            .context
+            .clone()
+            .join("segments")
+            .join(format!("{base:020}.sum"));
+        let bytes = self.archive.block_on(async move {
+            match store.get(&object).await {
+                Ok(result) => result.bytes().await.map(Some),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(error) => Err(error),
+            }
+            .map_err(|error| Error::Unavailable {
+                message: format!("reading {object} from the archive: {error}"),
+            })
+        })?;
+        bytes
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| Error::Corrupted {
+                    message: format!("archived summary of segment {base}: {error}"),
+                })
+            })
+            .transpose()
+    }
+
+    /// The whole archived segment `summary` describes, checked against its
+    /// blake3: what a node catching up from the archive applies. Fetched in
+    /// requests of [`MAX_GET`] bytes at once, past the block cache.
+    pub fn fetch_segment(&self, summary: &crate::tier::SegmentSummary) -> Result<Vec<u8>, Error> {
+        let base = summary.base;
+        let ranges: Vec<Range<u64>> = (0..summary.data_len)
+            .step_by(MAX_GET as usize)
+            .map(|start| start..(start + MAX_GET).min(summary.data_len))
+            .collect();
+        let store = Arc::clone(&self.archive.store);
+        let object = self.segment_object(base);
+        let parts = self.archive.block_on(async move {
+            futures_util::future::try_join_all(
+                ranges
+                    .into_iter()
+                    .map(|range| store.get_range(&object, range)),
+            )
+            .await
+            .map_err(|error| archive_error(base, error))
+        })?;
+        let mut bytes = Vec::with_capacity(summary.data_len as usize);
+        for part in parts {
+            bytes.extend_from_slice(&part);
+        }
+        self.requests
+            .fetch_add(summary.data_len.div_ceil(MAX_GET).max(1), Ordering::Relaxed);
+        self.fetched_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if bytes.len() as u64 != summary.data_len
+            || blake3::hash(&bytes).to_hex().as_str() != summary.blake3
+        {
+            return Err(Error::Corrupted {
+                message: format!(
+                    "archived segment {base} does not match its summary ({} bytes, expected {})",
+                    bytes.len(),
+                    summary.data_len
+                ),
+            });
+        }
+        Ok(bytes)
+    }
+
     /// Downloads the archived `<kind>/<name>` of this context to `local`,
     /// through a temporary file renamed into place. `false` when the
     /// archive does not hold it.

@@ -4,7 +4,7 @@
 /** The protocol version this code speaks. */
 export const PROTOCOL_VERSION = 2;
 /** CRC32C of the schema source, for checking generated code is in sync. */
-export const SCHEMA_HASH = "56aaeb68";
+export const SCHEMA_HASH = "d1c0db3f";
 
 /** The peer sent bytes that violate the protocol. */
 export class ProtocolError extends Error {}
@@ -3166,6 +3166,29 @@ export function encodeTailTruncate(w: Writer, v: TailTruncate): void {
 }
 
 /**
+ * The follower needs segments the leader has evicted to the archive tier
+ * (ADR-0011). It reads them from the archive itself, applies them as it
+ * applies Tail bytes, up to `up_to` (a segment base: the leader's first
+ * segment it still holds), and opens a new Tail from there.
+ */
+export type TailNeedArchive = {
+  context: string;
+  upTo: bigint;
+};
+
+export function decodeTailNeedArchive(r: Reader): TailNeedArchive {
+  return {
+    context: readStr16(r),
+    upTo: readU64(r),
+  };
+}
+
+export function encodeTailNeedArchive(w: Writer, v: TailNeedArchive): void {
+  writeStr16(w, v.context, "TailNeedArchive.context");
+  writeU64(w, v.upTo);
+}
+
+/**
  * An append a follower received, forwarded to the fenced leader.
  */
 export type ForwardAppend = {
@@ -3549,6 +3572,7 @@ export const FrameKind = {
   TailWatermark: 0x9103,
   TailNeedSnapshot: 0x9104,
   TailTruncate: 0x9105,
+  TailNeedArchive: 0x910a,
   ForwardAppend: 0x1102,
   ForwardAppended: 0x9106,
   ForwardAppendConflict: 0x9107,
@@ -3660,6 +3684,7 @@ export type Frame =
   | { name: "TailWatermark"; body: TailWatermark }
   | { name: "TailNeedSnapshot"; body: TailNeedSnapshot }
   | { name: "TailTruncate"; body: TailTruncate }
+  | { name: "TailNeedArchive"; body: TailNeedArchive }
   | { name: "ForwardAppend"; body: ForwardAppend }
   | { name: "ForwardAppended"; body: ForwardAppended }
   | { name: "ForwardAppendConflict"; body: ForwardAppendConflict }
@@ -3776,6 +3801,7 @@ export function decodeFrameBody(kind: number, r: Reader): Frame | undefined {
     case 0x9103: return { name: "TailWatermark", body: decodeTailWatermark(r) };
     case 0x9104: return { name: "TailNeedSnapshot", body: decodeTailNeedSnapshot(r) };
     case 0x9105: return { name: "TailTruncate", body: decodeTailTruncate(r) };
+    case 0x910a: return { name: "TailNeedArchive", body: decodeTailNeedArchive(r) };
     case 0x1102: return { name: "ForwardAppend", body: decodeForwardAppend(r) };
     case 0x9106: return { name: "ForwardAppended", body: decodeForwardAppended(r) };
     case 0x9107: return { name: "ForwardAppendConflict", body: decodeForwardAppendConflict(r) };
@@ -3895,6 +3921,7 @@ export function encodeFrame(w: Writer, stream: number, flags: number, frame: Fra
     case "TailWatermark": encodeTailWatermark(w, frame.body); break;
     case "TailNeedSnapshot": encodeTailNeedSnapshot(w, frame.body); break;
     case "TailTruncate": encodeTailTruncate(w, frame.body); break;
+    case "TailNeedArchive": encodeTailNeedArchive(w, frame.body); break;
     case "ForwardAppend": encodeForwardAppend(w, frame.body); break;
     case "ForwardAppended": encodeForwardAppended(w, frame.body); break;
     case "ForwardAppendConflict": encodeForwardAppendConflict(w, frame.body); break;

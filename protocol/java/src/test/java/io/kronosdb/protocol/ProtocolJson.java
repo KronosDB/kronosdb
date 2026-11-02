@@ -1874,6 +1874,20 @@ final class ProtocolJson {
                 Json.bool(m.get("prev_at_segment_start")));
     }
 
+    static Object toJson(TailNeedArchive v) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("context", v.context());
+        m.put("up_to", Long.toUnsignedString(v.upTo()));
+        return m;
+    }
+
+    static TailNeedArchive tailNeedArchiveFromJson(Object j) {
+        Map<String, Object> m = Json.object(j);
+        return new TailNeedArchive(
+                Json.str(m.get("context")),
+                Json.u64(m.get("up_to")));
+    }
+
     static Object toJson(ForwardAppend v) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("context", v.context());
@@ -2153,6 +2167,7 @@ final class ProtocolJson {
             case TailWatermark v -> toJson(v);
             case TailNeedSnapshot v -> toJson(v);
             case TailTruncate v -> toJson(v);
+            case TailNeedArchive v -> toJson(v);
             case ForwardAppend v -> toJson(v);
             case ForwardAppended v -> toJson(v);
             case ForwardAppendConflict v -> toJson(v);
@@ -2269,6 +2284,7 @@ final class ProtocolJson {
             case "TailWatermark" -> tailWatermarkFromJson(body);
             case "TailNeedSnapshot" -> tailNeedSnapshotFromJson(body);
             case "TailTruncate" -> tailTruncateFromJson(body);
+            case "TailNeedArchive" -> tailNeedArchiveFromJson(body);
             case "ForwardAppend" -> forwardAppendFromJson(body);
             case "ForwardAppended" -> forwardAppendedFromJson(body);
             case "ForwardAppendConflict" -> forwardAppendConflictFromJson(body);

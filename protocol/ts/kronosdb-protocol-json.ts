@@ -1900,6 +1900,20 @@ export function TailTruncateFromJson(j: J): P.TailTruncate {
   };
 }
 
+export function TailNeedArchiveToJson(v: P.TailNeedArchive): J {
+  return {
+    context: v.context,
+    up_to: v.upTo.toString(),
+  };
+}
+
+export function TailNeedArchiveFromJson(j: J): P.TailNeedArchive {
+  return {
+    context: String(j.context),
+    upTo: BigInt(j.up_to),
+  };
+}
+
 export function ForwardAppendToJson(v: P.ForwardAppend): J {
   return {
     context: v.context,
@@ -2178,6 +2192,7 @@ export function frameBodyToJson(frame: Frame): J {
     case "TailWatermark": return TailWatermarkToJson(frame.body);
     case "TailNeedSnapshot": return TailNeedSnapshotToJson(frame.body);
     case "TailTruncate": return TailTruncateToJson(frame.body);
+    case "TailNeedArchive": return TailNeedArchiveToJson(frame.body);
     case "ForwardAppend": return ForwardAppendToJson(frame.body);
     case "ForwardAppended": return ForwardAppendedToJson(frame.body);
     case "ForwardAppendConflict": return ForwardAppendConflictToJson(frame.body);
@@ -2290,6 +2305,7 @@ export function frameFromJson(name: string, body: J): Frame {
     case "TailWatermark": return { name: "TailWatermark", body: TailWatermarkFromJson(body) };
     case "TailNeedSnapshot": return { name: "TailNeedSnapshot", body: TailNeedSnapshotFromJson(body) };
     case "TailTruncate": return { name: "TailTruncate", body: TailTruncateFromJson(body) };
+    case "TailNeedArchive": return { name: "TailNeedArchive", body: TailNeedArchiveFromJson(body) };
     case "ForwardAppend": return { name: "ForwardAppend", body: ForwardAppendFromJson(body) };
     case "ForwardAppended": return { name: "ForwardAppended", body: ForwardAppendedFromJson(body) };
     case "ForwardAppendConflict": return { name: "ForwardAppendConflict", body: ForwardAppendConflictFromJson(body) };

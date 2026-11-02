@@ -948,6 +948,15 @@ frame TailTruncate = 0x9105 {
   prev_at_segment_start: bool
 }
 
+/// The follower needs segments the leader has evicted to the archive tier
+/// (ADR-0011). It reads them from the archive itself, applies them as it
+/// applies Tail bytes, up to `up_to` (a segment base: the leader's first
+/// segment it still holds), and opens a new Tail from there.
+frame TailNeedArchive = 0x910A {
+  context: str16
+  up_to: u64
+}
+
 /// An append a follower received, forwarded to the fenced leader.
 frame ForwardAppend = 0x1102 {
   context: str16
