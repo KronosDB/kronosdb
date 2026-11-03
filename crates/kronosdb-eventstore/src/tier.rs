@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
@@ -99,6 +100,107 @@ pub struct EvictionPassReport {
     pub waiting: Vec<String>,
 }
 
+/// What the archive loops last did on this node (ADR-0011), for metrics:
+/// archiving per context while this node leads, and eviction.
+#[derive(Debug, Default)]
+pub struct ArchiveStatus {
+    contexts: std::sync::Mutex<BTreeMap<String, ContextArchiveStatus>>,
+    max_local_bytes: AtomicU64,
+    evicted_segments: AtomicU64,
+    evicted_bytes: AtomicU64,
+    eviction_failures: AtomicU64,
+}
+
+/// Archiving of one context, as this node last saw it while leading.
+#[derive(Debug, Clone, Default)]
+pub struct ContextArchiveStatus {
+    /// End of the archived prefix.
+    pub archived_end: u64,
+    /// When a pass last succeeded, in milliseconds since the epoch; 0 for
+    /// never.
+    pub last_success_ms: u64,
+    /// Passes that failed.
+    pub failures: u64,
+}
+
+/// Eviction on this node.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvictionStatus {
+    /// The cap on sealed segment bytes; 0 for none.
+    pub max_local_bytes: u64,
+    /// Segments evicted since startup.
+    pub evicted_segments: u64,
+    /// Bytes those held.
+    pub evicted_bytes: u64,
+    /// Passes that failed.
+    pub failures: u64,
+}
+
+impl ArchiveStatus {
+    fn context(&self, context: &str, update: impl FnOnce(&mut ContextArchiveStatus)) {
+        let mut contexts = self.contexts.lock().unwrap_or_else(|e| e.into_inner());
+        update(contexts.entry(context.to_string()).or_default());
+    }
+
+    /// A pass over `context` succeeded.
+    pub fn archived(&self, context: &str, archived_end: u64) {
+        self.context(context, |status| {
+            status.archived_end = archived_end;
+            status.last_success_ms = now_millis().max(0) as u64;
+        });
+    }
+
+    /// A pass over `context` failed.
+    pub fn archive_failed(&self, context: &str) {
+        self.context(context, |status| status.failures += 1);
+    }
+
+    /// This node stopped leading: another archives now.
+    pub fn not_archiving(&self) {
+        self.contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// The contexts this node archives.
+    pub fn contexts(&self) -> Vec<(String, ContextArchiveStatus)> {
+        self.contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, status)| (name.clone(), status.clone()))
+            .collect()
+    }
+
+    pub fn set_max_local_bytes(&self, max_local_bytes: u64) {
+        self.max_local_bytes
+            .store(max_local_bytes, Ordering::Relaxed);
+    }
+
+    /// An eviction pass succeeded.
+    pub fn evicted(&self, report: &EvictionPassReport) {
+        self.evicted_segments
+            .fetch_add(report.evicted as u64, Ordering::Relaxed);
+        self.evicted_bytes
+            .fetch_add(report.freed, Ordering::Relaxed);
+    }
+
+    /// An eviction pass failed.
+    pub fn eviction_failed(&self) {
+        self.eviction_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn eviction(&self) -> EvictionStatus {
+        EvictionStatus {
+            max_local_bytes: self.max_local_bytes.load(Ordering::Relaxed),
+            evicted_segments: self.evicted_segments.load(Ordering::Relaxed),
+            evicted_bytes: self.evicted_bytes.load(Ordering::Relaxed),
+            failures: self.eviction_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// What the archiver knows of one context's archive. Built by listing it
 /// the first time a pass runs, then kept up to date by the passes.
 struct ContextArchive {
@@ -129,7 +231,8 @@ pub struct Archiver {
 impl Archiver {
     /// Builds an archiver from an object-store URL. `file://` and `memory://`
     /// need no credentials; `s3://` reads the standard AWS environment, or
-    /// uses the instance's role.
+    /// uses the instance's role; `gs://` and `az://` their providers'
+    /// environments.
     pub fn from_url(raw_url: &str) -> Result<Self, Error> {
         let (store, prefix) = crate::remote::open_store(raw_url)?;
         Ok(Self {
@@ -579,6 +682,28 @@ impl Archiver {
             });
         }
         let mut data = file.take(len);
+        // One request for what fits in one part; parts, uploaded as they
+        // are read, for the rest.
+        if len <= UPLOAD_CHUNK as u64 {
+            let mut bytes = Vec::with_capacity(len as usize);
+            data.read_to_end(&mut bytes).await?;
+            if bytes.len() as u64 != len {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "{} ended at {} bytes while uploading its {len}",
+                        path.display(),
+                        bytes.len()
+                    ),
+                )));
+            }
+            let blake3 = blake3::hash(&bytes).to_hex().to_string();
+            self.store
+                .put(object, PutPayload::from(bytes))
+                .await
+                .map_err(tier_err)?;
+            return self.verify_size(object, len).await.map(|()| blake3);
+        }
         let upload = self.store.put_multipart(object).await.map_err(tier_err)?;
         let mut writer = WriteMultipart::new(upload);
         let mut hasher = blake3::Hasher::new();
@@ -604,17 +729,23 @@ impl Archiver {
             )));
         }
 
+        self.verify_size(object, total).await?;
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    /// Checks the store holds `len` bytes at `object`, just uploaded.
+    async fn verify_size(&self, object: &ObjectPath, len: u64) -> Result<(), Error> {
         let head = self.store.head(object).await.map_err(tier_err)?;
-        if head.size != total {
+        if head.size != len {
             return Err(Error::Corrupted {
                 message: format!(
-                    "archive verification failed for {object}: uploaded {total} bytes, the \
+                    "archive verification failed for {object}: uploaded {len} bytes, the \
                      store reports {}",
                     head.size
                 ),
             });
         }
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(())
     }
 }
 
@@ -1059,5 +1190,40 @@ mod tests {
             .collect();
         expected.insert((merged.base, merged.end));
         assert_eq!(archived_tables(tier.path()), expected);
+    }
+
+    /// A file larger than one part goes up in parts, on the object store at
+    /// `KRONOSDB_TEST_ARCHIVE_URL` (see the eviction tests). Skipped when
+    /// unset.
+    #[tokio::test]
+    async fn a_large_file_reaches_the_environments_archive_in_parts() {
+        let Ok(base) = std::env::var("KRONOSDB_TEST_ARCHIVE_URL") else {
+            eprintln!("skipped: KRONOSDB_TEST_ARCHIVE_URL is not set");
+            return;
+        };
+        let archiver = Archiver::from_url(&base).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large");
+        let len = 2 * UPLOAD_CHUNK + 12_345;
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let object = archiver
+            .prefix
+            .clone()
+            .join(format!("large-{}", now_millis()));
+        let blake3 = archiver
+            .upload_file(&path, len as u64, &object)
+            .await
+            .unwrap();
+        assert_eq!(blake3, blake3::hash(&bytes).to_hex().to_string());
+        let stored = archiver
+            .store
+            .get(&object)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(stored == bytes, "the stored object differs");
     }
 }

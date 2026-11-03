@@ -36,7 +36,7 @@ tracing = "0.1"
 fs2 = "0.4"
 
 # The archive tier (ADR-0011): final segments and their index in object storage
-object_store = { version = "0.14", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
 url = "2"
 serde_json = "1"
 blake3 = "1"

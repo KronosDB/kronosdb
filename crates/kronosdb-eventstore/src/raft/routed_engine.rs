@@ -267,6 +267,10 @@ impl EventStore for NativeEngine {
         self.local_engine.has_matches_between(from, to, condition)
     }
 
+    fn reads_archive_from(&self, from: Position) -> bool {
+        self.local_engine.reads_archive_from(from)
+    }
+
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
         self.local_engine.get_sequence_at(timestamp_millis)
     }

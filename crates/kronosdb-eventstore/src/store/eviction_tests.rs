@@ -33,6 +33,12 @@ fn filled_store(root: &Path, tier: &Path) -> EventStoreEngine {
     let store =
         EventStoreEngine::create_with_store_options(&root.join("default"), &options(Some(tier)))
             .unwrap();
+    fill(&store);
+    store
+}
+
+/// Appends `filled_store`'s events, waits for their seals and merges.
+fn fill(store: &EventStoreEngine) {
     for batch in 0..50u32 {
         store
             .append(AppendRequest {
@@ -56,7 +62,6 @@ fn filled_store(root: &Path, tier: &Path) -> EventStoreEngine {
     }
     store.wait_for_seals();
     store.merge_index().unwrap();
-    store
 }
 
 fn archive(store: &EventStoreEngine, tier: &Path) {
@@ -516,4 +521,96 @@ fn a_download_that_dies_fails_the_read() {
         panic!("read evicted segments from a store that panics");
     };
     assert!(matches!(error, Error::Unavailable { .. }), "{error}");
+}
+
+/// Every step of the archive against the object store at
+/// `KRONOSDB_TEST_ARCHIVE_URL`, configured by its provider's environment
+/// variables: S3 or an S3-compatible store, GCS, Azure, or their
+/// emulators. Skipped when unset. Each run writes under a prefix of its own.
+#[test]
+fn an_archive_at_the_environments_url_serves_every_step() {
+    let Ok(base) = std::env::var("KRONOSDB_TEST_ARCHIVE_URL") else {
+        eprintln!("skipped: KRONOSDB_TEST_ARCHIVE_URL is not set");
+        return;
+    };
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let url = format!("{}/run-{run}", base.trim_end_matches('/'));
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let with_archive = || StoreOptions {
+        archive: Some(ArchiveStore::from_url(&url, None).unwrap()),
+        ..options(None)
+    };
+    let store = EventStoreEngine::create_with_store_options(&dir, &with_archive()).unwrap();
+    fill(&store);
+    let expected = reads(&store).unwrap();
+
+    // Archiving: summaries created only if absent, a second pass finds
+    // everything there, and superseded tables are deleted.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let archiver = Archiver::from_url(&url)
+        .unwrap()
+        .with_delete_grace(std::time::Duration::ZERO);
+    let first = runtime
+        .block_on(archiver.run_archive_pass("default", &store))
+        .unwrap();
+    assert!(first.segments > 20, "{first:?}");
+    let again = Archiver::from_url(&url)
+        .unwrap()
+        .with_delete_grace(std::time::Duration::ZERO);
+    let second = runtime
+        .block_on(again.run_archive_pass("default", &store))
+        .unwrap();
+    assert_eq!(second.segments, 0, "{second:?}");
+    assert_eq!(second.archived_end, first.archived_end);
+
+    // What a joining node reads: the listing, summaries, whole segments.
+    let remote = store.evicted.archive(0).unwrap();
+    let listing = remote.listing().unwrap();
+    let segments = store.archivable_segments();
+    assert_eq!(listing.segments.len(), segments.len());
+    assert!(!listing.tables.is_empty());
+    let bases: Vec<u64> = segments.iter().map(|segment| segment.base).collect();
+    for summary in remote.summaries(&bases).unwrap() {
+        let summary = summary.expect("every archived segment has a summary");
+        remote.fetch_segment(&summary).unwrap();
+    }
+
+    // Eviction and ranged reads, before and after a restart.
+    evict(&store, segments.len() - 3);
+    assert_eq!(reads(&store).unwrap(), expected);
+    store.shutdown();
+    drop(store);
+    let store = EventStoreEngine::open_with_store_options(&dir, &with_archive()).unwrap();
+    assert_eq!(store.evicted_end(), segments[segments.len() - 3].base);
+    assert_eq!(reads(&store).unwrap(), expected);
+}
+
+/// A read from below the end of the evicted prefix may wait on the
+/// archive; the server reads those off its async runtime. One from past it
+/// reads only local segments.
+#[test]
+fn reads_from_evicted_positions_are_told_apart() {
+    use crate::api::EventStore;
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = filled_store(root.path(), tier.path());
+    assert!(
+        !store.reads_archive_from(Position(0)),
+        "nothing is evicted yet"
+    );
+    archive(&store, tier.path());
+    evict(&store, 5);
+    let evicted_end = store.evicted_end();
+    assert!(store.reads_archive_from(Position(0)));
+    assert!(store.reads_archive_from(Position(evicted_end - 1)));
+    assert!(!store.reads_archive_from(Position(evicted_end)));
+    assert_eq!(
+        store.final_end(),
+        store.archivable_segments().last().unwrap().end
+    );
+    assert!(store.sealed_body_bytes() > 0);
 }

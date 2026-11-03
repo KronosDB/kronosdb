@@ -190,6 +190,74 @@ async fn run() {
         log2.len()
     );
 
+    // --- What /metrics says about it: the leader archived and evicted,
+    // and the learner read its evicted segments from the archive.
+    let ctx = "{context=\"default\"}";
+    // A leader reports archiving after its first pass in its epoch; the
+    // promotion just installed a new one.
+    let deadline = Instant::now() + TIMEOUT;
+    let archived = loop {
+        let archived = metric(
+            srv1.admin,
+            &format!("kronosdb_archive_archived_position{ctx}"),
+        )
+        .await;
+        if archived.is_some_and(|end| end > 0) || Instant::now() > deadline {
+            break archived;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        archived.is_some_and(|end| end > 0),
+        "archived position {archived:?}"
+    );
+    let lag = metric(srv1.admin, &format!("kronosdb_archive_lag_events{ctx}")).await;
+    assert!(lag.is_some(), "no archive lag on the leader");
+    let evicted = metric(srv1.admin, "kronosdb_archive_evicted_segments_total").await;
+    assert!(
+        evicted.is_some_and(|count| count > 0),
+        "evicted segments {evicted:?}"
+    );
+    assert_eq!(
+        metric(srv1.admin, "kronosdb_archive_max_local_bytes").await,
+        Some(2 * SEGMENT_SIZE)
+    );
+    let evicted_end = metric(
+        srv2.admin,
+        &format!("kronosdb_archive_evicted_position{ctx}"),
+    )
+    .await;
+    assert!(
+        evicted_end.is_some_and(|end| end > 0),
+        "learner evicted to {evicted_end:?}"
+    );
+    let read = metric(
+        srv2.admin,
+        &format!("kronosdb_archive_read_bytes_total{ctx}"),
+    )
+    .await;
+    assert!(
+        read.is_some_and(|bytes| bytes > 0),
+        "learner read {read:?} bytes from the archive"
+    );
+    assert_eq!(
+        metric(
+            srv2.admin,
+            &format!("kronosdb_archive_read_failures_total{ctx}")
+        )
+        .await,
+        Some(0)
+    );
+    assert_eq!(
+        metric(
+            srv2.admin,
+            &format!("kronosdb_archive_archived_position{ctx}")
+        )
+        .await,
+        None,
+        "a learner does not archive"
+    );
+
     srv1.kill();
     let mut srv2 = srv2;
     srv2.kill();

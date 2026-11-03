@@ -97,6 +97,15 @@ pub trait EventStore: Send + Sync {
         true
     }
 
+    /// Whether a read from `from` on may wait on the archive (ADR-0011):
+    /// part of what lies there is evicted, and reading it takes a round
+    /// trip to object storage, or until the request gives up when the
+    /// archive is down. Such a read belongs off the async runtime.
+    fn reads_archive_from(&self, from: Position) -> bool {
+        let _ = from;
+        false
+    }
+
     /// Returns the position of the first event with timestamp >= the given millis-since-epoch.
     /// Returns `None` if no such event exists (empty store or all events are older).
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error>;

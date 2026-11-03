@@ -10,7 +10,7 @@ use crate::admin::layout::{self, format_number, format_timestamp, html_escape};
 
 // ── Types ──────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct EventsQuery {
     pub context: Option<String>,
     /// Page number (1-based). Used to compute the position window.
@@ -39,7 +39,7 @@ pub async fn page(
             .unwrap_or_else(|| "default".into())
     });
 
-    let initial_html = render_events(&state, &selected, &params);
+    let initial_html = render_events_blocking(&state, &selected, &params).await;
 
     let mut context_options = String::new();
     for name in &contexts {
@@ -235,7 +235,16 @@ pub async fn events_fragment(
             .cloned()
             .unwrap_or_else(|| "default".into())
     });
-    Html(render_events(&state, &selected, &params))
+    Html(render_events_blocking(&state, &selected, &params).await)
+}
+
+/// [`render_events`] on the blocking pool: the page may read evicted
+/// segments, which waits on the archive (ADR-0011).
+async fn render_events_blocking(state: &AdminState, context: &str, params: &EventsQuery) -> String {
+    let (state, context, params) = (state.clone(), context.to_string(), params.clone());
+    tokio::task::spawn_blocking(move || render_events(&state, &context, &params))
+        .await
+        .unwrap_or_else(|error| events_error_html(&format!("Query failed: {error}")))
 }
 
 // ── Core render ────────────────────────────────────────────────────

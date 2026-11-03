@@ -145,6 +145,7 @@ impl ArchiveStore {
             flights: Mutex::new(HashMap::new()),
             requests: AtomicU64::new(0),
             fetched_bytes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
         })
     }
 
@@ -263,6 +264,7 @@ pub struct RemoteSegments {
     flights: Mutex<HashMap<BlockKey, Arc<Flight>>>,
     requests: AtomicU64,
     fetched_bytes: AtomicU64,
+    failures: AtomicU64,
 }
 
 impl std::fmt::Debug for RemoteSegments {
@@ -402,6 +404,11 @@ impl RemoteSegments {
         self.requests.load(Ordering::Relaxed)
     }
 
+    /// Reads of segment bytes from the archive that failed so far.
+    pub fn failures(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
     /// Bytes fetched from the archive so far.
     pub fn fetched_bytes(&self) -> u64 {
         self.fetched_bytes.load(Ordering::Relaxed)
@@ -533,7 +540,8 @@ impl RemoteSegments {
             let gets = runs.iter().map(|run| store.get_range(&object, run.clone()));
             let fetched = futures_util::future::try_join_all(gets)
                 .await
-                .map_err(|error| archive_error(base, error).to_string())
+                // The reader waiting on the flight says which segment.
+                .map_err(|error| error.to_string())
                 .and_then(|parts| {
                     this.requests
                         .fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -570,6 +578,7 @@ impl RemoteSegments {
                     }
                 }
                 Err(error) => {
+                    this.failures.fetch_add(1, Ordering::Relaxed);
                     for (block, flight) in &blocks {
                         flights.remove(&(base, *block));
                         flight.finish(Err(error.clone()));
@@ -668,15 +677,20 @@ impl RemoteSegments {
             .collect();
         let store = Arc::clone(&self.archive.store);
         let object = self.segment_object(base);
-        let parts = self.archive.block_on(async move {
-            futures_util::future::try_join_all(
-                ranges
-                    .into_iter()
-                    .map(|range| store.get_range(&object, range)),
-            )
-            .await
-            .map_err(|error| archive_error(base, error))
-        })?;
+        let parts = self
+            .archive
+            .block_on(async move {
+                futures_util::future::try_join_all(
+                    ranges
+                        .into_iter()
+                        .map(|range| store.get_range(&object, range)),
+                )
+                .await
+                .map_err(|error| archive_error(base, error))
+            })
+            .inspect_err(|_| {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+            })?;
         let mut bytes = Vec::with_capacity(summary.data_len as usize);
         for part in parts {
             bytes.extend_from_slice(&part);
@@ -734,13 +748,112 @@ impl RemoteSegments {
 /// each provider (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, ...); without
 /// credentials there, S3 uses the instance's role.
 pub(crate) fn open_store(raw_url: &str) -> Result<(Box<dyn ObjectStore>, ObjectPath), Error> {
+    open_store_with(raw_url, std::iter::empty::<(&str, &str)>())
+}
+
+/// [`open_store`] with `options` (keys as the provider names them, such as
+/// `aws_endpoint`) over what the environment says.
+pub(crate) fn open_store_with<'a>(
+    raw_url: &str,
+    options: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(Box<dyn ObjectStore>, ObjectPath), Error> {
+    use object_store::ObjectStoreScheme;
+    let options: Vec<(&str, &str)> = options.into_iter().collect();
     let url = url::Url::parse(raw_url).map_err(|error| Error::Rejected {
         message: format!("invalid archive url {raw_url}: {error}"),
     })?;
-    let settings = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
-    object_store::parse_url_opts(&url, settings).map_err(|error| Error::Rejected {
+    let unsupported = |error: object_store::Error| Error::Rejected {
         message: format!("unsupported archive url {raw_url}: {error}"),
-    })
+    };
+    let (scheme, path) = ObjectStoreScheme::parse(&url).map_err(|error| Error::Rejected {
+        message: format!("unsupported archive url {raw_url}: {error}"),
+    })?;
+    let path = ObjectPath::parse(path).map_err(|error| Error::Rejected {
+        message: format!("invalid archive url {raw_url}: {error}"),
+    })?;
+    let url = url.to_string();
+    let store: Box<dyn ObjectStore> = match scheme {
+        ObjectStoreScheme::Local => Box::new(object_store::local::LocalFileSystem::new()),
+        ObjectStoreScheme::Memory => Box::new(object_store::memory::InMemory::new()),
+        ObjectStoreScheme::AmazonS3 => Box::new(
+            options
+                .iter()
+                .try_fold(s3_builder().with_url(url), |builder, &(key, value)| {
+                    key.parse::<object_store::aws::AmazonS3ConfigKey>()
+                        .map(|key| builder.with_config(key, value))
+                })
+                .map_err(unsupported)?
+                .with_retry(retry())
+                .build()
+                .map_err(unsupported)?,
+        ),
+        ObjectStoreScheme::GoogleCloudStorage => Box::new(
+            options
+                .iter()
+                .try_fold(
+                    object_store::gcp::GoogleCloudStorageBuilder::from_env().with_url(url),
+                    |builder, &(key, value)| {
+                        key.parse::<object_store::gcp::GoogleConfigKey>()
+                            .map(|key| builder.with_config(key, value))
+                    },
+                )
+                .map_err(unsupported)?
+                .with_retry(retry())
+                .build()
+                .map_err(unsupported)?,
+        ),
+        ObjectStoreScheme::MicrosoftAzure => Box::new(
+            options
+                .iter()
+                .try_fold(
+                    object_store::azure::MicrosoftAzureBuilder::from_env().with_url(url),
+                    |builder, &(key, value)| {
+                        key.parse::<object_store::azure::AzureConfigKey>()
+                            .map(|key| builder.with_config(key, value))
+                    },
+                )
+                .map_err(unsupported)?
+                .with_retry(retry())
+                .build()
+                .map_err(unsupported)?,
+        ),
+        // Plain HTTP (WebDAV) has no create-if-absent, which committing a
+        // segment by its summary needs.
+        other => {
+            return Err(Error::Rejected {
+                message: format!(
+                    "unsupported archive url {raw_url}: {other:?} cannot create an object only \
+                     if it is absent; use s3:// (or an S3-compatible store), gs://, az:// or \
+                     file://"
+                ),
+            });
+        }
+    };
+    Ok((store, path))
+}
+
+/// How long a request to the archive is retried before it fails. A read
+/// waiting on an archive that is down fails after about this long, as
+/// [`Error::Unavailable`], instead of the client's default three minutes.
+pub(crate) const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// S3 from the environment, uploading with a SHA-256 checksum unless the
+/// environment names another: a bucket under object lock (WORM) refuses
+/// uploads without one, and every upload is checked on arrival.
+fn s3_builder() -> object_store::aws::AmazonS3Builder {
+    let builder = object_store::aws::AmazonS3Builder::from_env();
+    if std::env::var_os("AWS_CHECKSUM_ALGORITHM").is_some() {
+        builder
+    } else {
+        builder.with_checksum_algorithm(object_store::aws::Checksum::SHA256)
+    }
+}
+
+fn retry() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        retry_timeout: RETRY_TIMEOUT,
+        ..object_store::RetryConfig::default()
+    }
 }
 
 /// Where a download is written before it is renamed to `local`: next to
@@ -764,6 +877,10 @@ fn archive_error(base: u64, error: object_store::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::error::Error;
+
     /// S3 settings come from the environment: a region set there reaches
     /// the store instead of the builder's default.
     #[test]
@@ -773,5 +890,79 @@ mod tests {
         let (store, _) = super::open_store("s3://some-bucket/prefix").unwrap();
         let shown = format!("{store:?}");
         assert!(shown.contains("eu-north-1"), "{shown}");
+    }
+
+    /// Each provider's store is built from its own url form, and the
+    /// archive keeps only the path inside the bucket or container.
+    #[test]
+    fn gcs_and_azure_urls_open_their_stores() {
+        for (url, store, prefix) in [
+            (
+                "gs://some-bucket/kb/archive",
+                "GoogleCloudStorage",
+                "kb/archive",
+            ),
+            (
+                "https://account.blob.core.windows.net/container/kb",
+                "MicrosoftAzure",
+                "kb",
+            ),
+        ] {
+            let (opened, path) = super::open_store(url).unwrap();
+            assert!(format!("{opened:?}").contains(store), "{url}: {opened:?}");
+            assert_eq!(path.as_ref(), prefix, "{url}");
+        }
+    }
+
+    /// A store that cannot create an object only if it is absent cannot
+    /// commit segments by their summaries.
+    #[test]
+    fn plain_http_is_refused() {
+        let error = super::open_store("http://example.com/archive")
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("only if it is absent"),
+            "{error}"
+        );
+    }
+
+    /// An archive that takes connections and never answers fails a
+    /// request after about `RETRY_TIMEOUT`, as unavailable, not after the
+    /// client's default of three minutes of retries.
+    #[test]
+    fn a_request_to_an_archive_that_never_answers_fails_in_bounded_time() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+        let (store, _) = super::open_store_with(
+            "s3://bucket/kb",
+            [
+                ("aws_endpoint", endpoint.as_str()),
+                ("aws_allow_http", "true"),
+                ("aws_access_key_id", "test"),
+                ("aws_secret_access_key", "test"),
+                ("aws_region", "eu-north-1"),
+            ],
+        )
+        .unwrap();
+        let archive = super::ArchiveStore::over_store(Arc::from(store), "kb".into(), None).unwrap();
+        let segments = archive
+            .segments(std::path::Path::new("/nowhere/default"))
+            .unwrap();
+        let began = std::time::Instant::now();
+        let error = segments.summary(0).unwrap_err();
+        let took = began.elapsed();
+        assert!(matches!(error, Error::Unavailable { .. }), "{error}");
+        assert!(
+            took < super::RETRY_TIMEOUT * 2,
+            "failed after {took:?}, retry timeout {:?}",
+            super::RETRY_TIMEOUT
+        );
     }
 }

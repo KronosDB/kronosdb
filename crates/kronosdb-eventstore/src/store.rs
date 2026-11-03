@@ -2885,6 +2885,30 @@ impl EventStoreEngine {
         out
     }
 
+    /// Where the final segments end: what an archive that is caught up
+    /// holds up to (ADR-0011).
+    pub fn final_end(&self) -> u64 {
+        let watermark = self.watermark.get();
+        let list = self.segments.read();
+        list.bases
+            .iter()
+            .skip(1)
+            .copied()
+            .take_while(|&end| end < watermark)
+            .last()
+            .unwrap_or(0)
+    }
+
+    /// Bytes of the sealed segment bodies on this node's disk: what a cap on
+    /// local bytes counts. A stat per segment.
+    pub fn sealed_body_bytes(&self) -> u64 {
+        self.sealed_bodies()
+            .iter()
+            .filter_map(|segment| std::fs::metadata(&segment.path).ok())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
     /// The sealed segments whose body is on this node's disk.
     pub fn sealed_bodies(&self) -> Vec<ArchivableSegment> {
         let evicted_end = self.evicted.end();
@@ -2904,6 +2928,16 @@ impl EventStoreEngine {
     /// local body.
     pub fn evicted_end(&self) -> u64 {
         self.evicted.end()
+    }
+
+    /// What reads of evicted segments have asked of the archive, if one is
+    /// configured.
+    pub fn archive_reads(&self) -> Option<ArchiveReads> {
+        self.evicted.archive.as_ref().map(|archive| ArchiveReads {
+            requests: archive.requests(),
+            fetched_bytes: archive.fetched_bytes(),
+            failures: archive.failures(),
+        })
     }
 
     /// Evicts segment `base`: deletes its local body, after which its bytes
@@ -4878,6 +4912,10 @@ impl EventStore for EventStoreEngine {
         self.has_matches_between(from, to, condition)
     }
 
+    fn reads_archive_from(&self, from: Position) -> bool {
+        from.0 < self.evicted.end()
+    }
+
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
         self.get_sequence_at(timestamp_millis)
     }
@@ -5203,6 +5241,18 @@ fn discover_segments(dir: &Path, active_base: u64) -> Result<(Vec<u64>, u64), Er
     }
     bases.sort_unstable();
     Ok((bases, first_body))
+}
+
+/// Counters of a context's reads from the archive (ADR-0011), since the
+/// store opened.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArchiveReads {
+    /// Ranged requests made.
+    pub requests: u64,
+    /// Segment bytes fetched.
+    pub fetched_bytes: u64,
+    /// Reads that failed: the archive unreachable, or a short answer.
+    pub failures: u64,
 }
 
 /// One final segment, eligible for the archive (ADR-0011).
