@@ -2740,7 +2740,9 @@ impl EventStoreEngine {
                 )
             }
             Some(expected) => {
-                let anchor = locate_event_anchor(&self.dir, &seg_list.bases, pos)?;
+                // A node that installed archived segments without their
+                // bodies has its last event in the archive (ADR-0011).
+                let anchor = self.event_anchor(&seg_list.bases, pos)?;
                 if expected != anchor.map(|anchor| anchor.crc) {
                     return Err(Error::Corrupted {
                         message: format!(
@@ -2751,6 +2753,20 @@ impl EventStoreEngine {
                     });
                 }
                 match anchor {
+                    // An evicted segment is final, byte for byte the same
+                    // everywhere: a cut can only come after all of it.
+                    Some(anchor) if self.evicted.contains(seg_list.bases[anchor.segment_index]) => {
+                        let next = anchor.segment_index + 1;
+                        if seg_list.bases.get(next) != Some(&pos.0) {
+                            return Err(Error::Corrupted {
+                                message: format!(
+                                    "the leader cuts at {} inside archived segment {}",
+                                    pos.0, seg_list.bases[anchor.segment_index]
+                                ),
+                            });
+                        }
+                        (next, segment::SEGMENT_HEADER_SIZE as u64)
+                    }
                     Some(anchor) => (anchor.segment_index, anchor.end_offset),
                     None => (0, segment::SEGMENT_HEADER_SIZE as u64),
                 }
