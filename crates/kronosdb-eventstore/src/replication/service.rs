@@ -2302,4 +2302,64 @@ mod tests {
             archived.leader.evicted_end()
         );
     }
+
+    /// The leader evicts past a joined node's tail before the node comes
+    /// back for the rest. The node's last event is in a segment it installed
+    /// without its body, so the cut is checked against that event as the
+    /// archive holds it.
+    #[test]
+    fn a_node_whose_last_event_is_evicted_continues_from_the_archive() {
+        let archived = archived_leader_with(700, Some(11));
+        let leader = &archived.leader;
+        let dir = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("behind")
+            .join("default");
+        let options = capped_options(&archived.tier, &[0, 1, 2], Some(SEGMENT_SIZE));
+        let follower = EventStoreEngine::create_with_store_options(&dir, &options).unwrap();
+        follower
+            .truncate_to_matching(Position(0), Some(None))
+            .unwrap();
+        follower.apply_archived(leader.evicted_end()).unwrap();
+        let tail = follower.local_tail().0;
+        assert_eq!(
+            follower.evicted_end(),
+            tail,
+            "the node should hold no body before its tail"
+        );
+
+        let archivable = leader.archivable_segments();
+        for segment in &archivable[..archivable.len() - 1] {
+            if segment.base >= leader.evicted_end() {
+                leader.evict_segment(segment.base).unwrap();
+            }
+        }
+        assert!(
+            leader.evicted_end() > tail,
+            "the leader should evict past the node"
+        );
+
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        let TailStart::Truncate { position, prev } = start else {
+            panic!("expected a cut at the node's tail, got {start:?}");
+        };
+        assert_eq!(position, tail);
+        let prev_crc = prev.expect("the leader has an event before the cut");
+        assert!(matches!(
+            follower.truncate_to_matching(Position(position), Some(Some(prev_crc ^ 1))),
+            Err(Error::Corrupted { .. })
+        ));
+        follower
+            .truncate_to_matching(Position(position), Some(prev))
+            .unwrap();
+        follower.apply_archived(leader.evicted_end()).unwrap();
+
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        follow(leader, &follower, &start).unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        follower.wait_for_seals();
+        assert_same_events(&everything(&follower), &everything(leader));
+    }
 }
