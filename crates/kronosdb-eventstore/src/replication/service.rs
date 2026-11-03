@@ -2129,10 +2129,15 @@ mod tests {
             .truncate_to_matching(Position(0), Some(prev))
             .unwrap();
         follower.apply_archived(up_to).unwrap();
-        assert_eq!(follower.local_tail().0, up_to);
+        assert!(follower.local_tail().0 >= up_to);
         assert!(
             follower.evicted_end() > 0,
             "nothing was installed without its body"
+        );
+        assert!(
+            follower.archive_fetched_bytes() <= cap,
+            "{} segment bytes fetched under a cap of {cap}",
+            follower.archive_fetched_bytes()
         );
         let bodies: u64 = follower
             .sealed_bodies()
@@ -2187,56 +2192,114 @@ mod tests {
         assert_same_events(&everything(&follower), &expected);
     }
 
-    /// The leader evicted up to the middle of a merged table: the segments
-    /// under that table have no key table of their own in the archive, and
-    /// the table reaches past what the follower may install. The install
-    /// stops before them and they are downloaded whole.
-    #[test]
-    fn a_capped_join_stops_before_a_merged_table_it_cannot_install() {
-        let archived = archived_leader_with(700, Some(11));
+    /// The merged tables of `archived`'s archive.
+    fn archived_tables(archived: &Archived) -> Vec<(u64, u64)> {
+        std::fs::read_dir(archived.tier.join("default").join("index"))
+            .unwrap()
+            .filter_map(|entry| {
+                segment::merge::parse_table_file_name(entry.unwrap().file_name().to_str()?)
+            })
+            .collect()
+    }
+
+    /// Bytes of the archived segment bodies.
+    fn archived_bytes(archived: &Archived) -> u64 {
+        std::fs::read_dir(archived.tier.join("default").join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "seg"))
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum()
+    }
+
+    /// Joins a node with `cap` to `archived`'s leader, which evicted into the
+    /// middle of a merged table, and checks it reads every event the same,
+    /// after merging and after a restart. Returns it with the table's end.
+    fn join_capped_into_a_table(
+        archived: &Archived,
+        name: &str,
+        cap: u64,
+    ) -> (EventStoreEngine, u64) {
         let leader = &archived.leader;
-        let tables: Vec<(u64, u64)> =
-            std::fs::read_dir(archived.tier.join("default").join("index"))
-                .unwrap()
-                .filter_map(|entry| {
-                    segment::merge::parse_table_file_name(entry.unwrap().file_name().to_str()?)
-                })
-                .collect();
         let up_to = leader.evicted_end();
-        assert!(
-            tables
-                .iter()
-                .any(|&(base, end)| base < up_to && up_to < end),
-            "the fixture should evict into the middle of a merged table: {tables:?}, up to {up_to}"
-        );
+        let straddling = archived_tables(archived)
+            .into_iter()
+            .find(|&(base, end)| base < up_to && up_to < end)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fixture should evict into the middle of a merged table: {:?}, up to {up_to}",
+                    archived_tables(archived)
+                )
+            });
 
         let dir = archived
             .follower
             .parent()
             .unwrap()
-            .join("capped")
+            .join(name)
             .join("default");
-        let follower = EventStoreEngine::create_with_store_options(
-            &dir,
-            &capped_options(&archived.tier, &[0, 1, 2], Some(SEGMENT_SIZE)),
-        )
-        .unwrap();
+        let options = capped_options(&archived.tier, &[0, 1, 2], Some(cap));
+        let follower = EventStoreEngine::create_with_store_options(&dir, &options).unwrap();
         follower
             .truncate_to_matching(Position(0), Some(None))
             .unwrap();
         follower.apply_archived(up_to).unwrap();
-        assert_eq!(follower.local_tail().0, up_to);
+        // The table the leader evicted into came along, with the segments
+        // past what the leader evicted that it covers.
+        assert_eq!(follower.local_tail().0, straddling.1);
         assert!(
-            follower.evicted_end() > 0,
-            "nothing was installed without its body"
+            follower.archive_fetched_bytes() <= cap,
+            "{} segment bytes fetched under a cap of {cap}",
+            follower.archive_fetched_bytes()
         );
-        assert!(follower.evicted_end() < up_to);
 
         let start = plan_tail_start(leader, &describe(&follower)).unwrap();
         assert!(matches!(start, TailStart::ExactCursor), "{start:?}");
         follow(leader, &follower, &start).unwrap();
         follower.adopt_watermark(leader.replication_epoch(), leader.head());
         follower.wait_for_seals();
-        assert_same_events(&everything(&follower), &everything(leader));
+        let expected = everything(leader);
+        assert_same_events(&everything(&follower), &expected);
+        follower.merge_index().unwrap();
+        assert_same_events(&everything(&follower), &expected);
+
+        let evicted_end = follower.evicted_end();
+        follower.shutdown();
+        drop(follower);
+        let follower = EventStoreEngine::open_with_store_options(&dir, &options).unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        assert_eq!(follower.evicted_end(), evicted_end);
+        assert_same_events(&everything(&follower), &expected);
+        (follower, straddling.1)
+    }
+
+    /// The leader evicted up to the middle of a merged table, by bytes: the
+    /// segments under that table have no key table of their own in the
+    /// archive. A capped node joining installs the table anyway, with every
+    /// segment it covers, including those the leader still holds, and
+    /// downloads no body it would evict again.
+    #[test]
+    fn a_capped_join_takes_the_merged_table_the_leader_evicted_into() {
+        let archived = archived_leader_with(700, Some(11));
+        let (follower, table_end) = join_capped_into_a_table(&archived, "capped", SEGMENT_SIZE);
+        assert!(follower.evicted_end() > archived.leader.evicted_end());
+        assert!(follower.evicted_end() <= table_end);
+    }
+
+    /// A node with room under its cap for more than the leader sends gets
+    /// the newest installed segments' bodies back from the archive; the
+    /// older ones stay evicted.
+    #[test]
+    fn a_joining_node_gets_back_the_bodies_its_cap_has_room_for() {
+        let archived = archived_leader_with(700, Some(11));
+        let cap = archived_bytes(&archived) - 3 * SEGMENT_SIZE;
+        let (follower, table_end) = join_capped_into_a_table(&archived, "roomy", cap);
+        assert!(follower.evicted_end() > 0, "nothing stayed evicted");
+        assert!(
+            follower.evicted_end() < archived.leader.evicted_end(),
+            "no body came back: evicted to {}, the leader to {}, the table ends at {table_end}",
+            follower.evicted_end(),
+            archived.leader.evicted_end()
+        );
     }
 }

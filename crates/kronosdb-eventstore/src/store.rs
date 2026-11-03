@@ -2302,11 +2302,21 @@ impl EventStoreEngine {
 
     /// The first step of [`apply_archived`](Self::apply_archived) on a node
     /// with a cap on local bytes whose log is empty past its evicted prefix
-    /// (a node joining, typically): the archived segments its cap would not
-    /// let it keep are installed without their bodies, as locators and key
-    /// tables only, about 5% of their size, instead of being downloaded to
-    /// be evicted again. The newest that fit the cap are left to be
-    /// downloaded whole. Returns the segments installed.
+    /// (a node joining, typically): the archived segments are installed
+    /// without their bodies, as locators and key tables only, about 5% of
+    /// their size, instead of being downloaded to be evicted again. Then the
+    /// newest of them get their bodies back as far as the cap allows, next to
+    /// what the leader will send. Returns the segments installed.
+    ///
+    /// The installed segments are a run of archived key tables from where
+    /// this log ends, each the widest starting where the last one ended,
+    /// up to `up_to` or the first table that reaches it. That last table
+    /// usually covers segments the leader still holds: the leader evicts by
+    /// bytes, not where its merged tables end, and the tables beneath a
+    /// merged one are not kept in the archive. The install takes them along,
+    /// so it ends past `up_to` and the Tail resumes from there. A segment
+    /// with no table starting at it ends the install; from there on the
+    /// segments are downloaded whole.
     fn install_archived_prefix(
         &self,
         archive: &crate::remote::RemoteSegments,
@@ -2324,97 +2334,74 @@ impl EventStoreEngine {
             return Ok(0);
         }
         let listing = archive.listing()?;
-        let wanted: Vec<(u64, u64)> = listing
-            .segments
-            .range(first..up_to)
-            .map(|(&base, &len)| (base, len))
-            .collect();
-        // The newest segments up to the cap keep their bodies.
-        let mut kept = 0u64;
-        let mut skip = wanted.len();
-        while skip > 0 && kept + wanted[skip - 1].1 <= cap {
-            kept += wanted[skip - 1].1;
-            skip -= 1;
-        }
-        if skip == 0 {
-            return Ok(0);
-        }
 
-        // Summaries chain the segments; a gap is a segment the archive lost.
-        let mut summaries = Vec::new();
-        let mut next = first;
-        for &(base, _) in &wanted {
-            if base != next {
-                return Err(Error::Unavailable {
-                    message: format!(
-                        "the archive does not hold segment {next}, which this node needs"
-                    ),
-                });
-            }
-            let summary = archive.summary(base)?.ok_or_else(|| Error::Unavailable {
-                message: format!("the archive does not hold segment {base}, which this node needs"),
-            })?;
-            next = summary.end;
-            summaries.push(summary);
-        }
-        if next != up_to {
-            return Err(Error::Unavailable {
-                message: format!("the archive ends at {next}, short of the leader's {up_to}"),
-            });
-        }
-
-        // Key tables: a segment's own, or a merged one covering it. A merged
-        // table reaching past the skipped segments takes the segments it
-        // covers along, so none is left half covered. A table over exactly
-        // one segment is that segment's own.
-        let ranges: std::collections::BTreeSet<(u64, u64)> = summaries
-            .iter()
-            .map(|summary| (summary.base, summary.end))
-            .collect();
-        let mut own = std::collections::BTreeSet::new();
-        let mut merged_tables = Vec::new();
-        for &range in &listing.tables {
-            if ranges.contains(&range) {
-                own.insert(range);
-            } else {
-                merged_tables.push(range);
+        // The widest archived table starting at each position.
+        let mut widest = std::collections::BTreeMap::new();
+        for &(base, end) in &listing.tables {
+            if base >= first {
+                let at = widest.entry(base).or_insert(end);
+                *at = (*at).max(end);
             }
         }
-        // In log order, each segment is installed with the widest merged
-        // table covering it, or else its own table. A merged table reaching
-        // past what the leader evicted covers segments this node will
-        // receive by Tail, so it cannot be installed: the install stops
-        // before a segment with no table it can install, and the rest are
-        // downloaded whole.
-        let target = summaries[skip - 1].end;
-        let candidates = maximal_tables(&merged_tables, first, up_to);
-        let mut merged = Vec::new();
         let mut end = first;
-        let mut at = 0;
-        while at < summaries.len() && end < target {
-            let summary = &summaries[at];
-            if let Some(&(base, table_end)) = candidates
-                .iter()
-                .find(|&&(base, table_end)| base == summary.base && summary.end <= table_end)
-            {
-                merged.push((base, table_end));
-                end = table_end;
-                while at < summaries.len() && summaries[at].end <= table_end {
-                    at += 1;
-                }
-            } else if own.contains(&(summary.base, summary.end)) {
-                end = summary.end;
-                at += 1;
-            } else {
+        let mut tables = Vec::new();
+        while end < up_to {
+            let Some(&table_end) = widest.get(&end) else {
                 break;
-            }
+            };
+            tables.push((end, table_end));
+            end = table_end;
         }
         if end == first {
             return Ok(0);
         }
-        let installed: Vec<&crate::tier::SegmentSummary> = summaries
+
+        // What the leader sends from `end` on counts against the cap first;
+        // the bodies of the newest installed segments fill what is left.
+        let sizes: Vec<(u64, u64)> = listing
+            .segments
+            .range(first..end)
+            .map(|(&base, &len)| (base, len))
+            .collect();
+        let sent: u64 = listing.segments.range(end..).map(|(_, &len)| len).sum();
+        let room = cap.saturating_sub(sent);
+        let installed_bytes: u64 = sizes.iter().map(|&(_, len)| len).sum();
+        if installed_bytes <= room {
+            return Ok(0);
+        }
+
+        // Summaries chain the segments; a gap is a segment the archive lost.
+        let bases: Vec<u64> = sizes.iter().map(|&(base, _)| base).collect();
+        let mut summaries = Vec::with_capacity(bases.len());
+        let mut next = first;
+        for (base, summary) in bases.iter().zip(archive.summaries(&bases)?) {
+            let summary = summary
+                .filter(|_| *base == next)
+                .ok_or_else(|| Error::Unavailable {
+                    message: format!(
+                        "the archive does not hold segment {next}, which this node needs"
+                    ),
+                })?;
+            next = summary.end;
+            summaries.push(summary);
+        }
+        if next != end {
+            return Err(Error::Unavailable {
+                message: format!(
+                    "the archived segments end at {next}, short of the key table ending at {end}"
+                ),
+            });
+        }
+        let installed: Vec<&crate::tier::SegmentSummary> = summaries.iter().collect();
+        // A table over exactly one segment is that segment's own.
+        let own: std::collections::BTreeSet<(u64, u64)> = summaries
             .iter()
-            .take_while(|summary| summary.end <= end)
+            .map(|summary| (summary.base, summary.end))
+            .collect();
+        let merged: Vec<(u64, u64)> = tables
+            .iter()
+            .copied()
+            .filter(|range| !own.contains(range))
             .collect();
 
         let mut files = Vec::new();
@@ -2425,10 +2412,7 @@ impl EventStoreEngine {
                 format!("{:020}.idx", summary.base),
                 path.with_extension("idx"),
             ));
-            let covered = merged
-                .iter()
-                .any(|&(b, e)| b <= summary.base && summary.end <= e);
-            if !covered {
+            if tables.contains(&(summary.base, summary.end)) {
                 files.push((
                     "index",
                     segment::merge::table_file_name(summary.base, summary.end),
@@ -2450,14 +2434,63 @@ impl EventStoreEngine {
             });
         }
         self.install_evicted(&installed, &merged)?;
+
+        // Bodies back, newest first, so the evicted segments stay a prefix.
+        let mut kept = 0u64;
+        let mut restored = 0;
+        for summary in installed.iter().rev() {
+            let len = listing.segments[&summary.base];
+            if kept + len > room {
+                break;
+            }
+            self.restore_evicted(archive, summary)?;
+            kept += len;
+            restored += 1;
+        }
         tracing::info!(
             dir = %self.dir.display(),
             segments = installed.len(),
+            bodies = restored,
             from = first,
             to = end,
+            leader_evicted_to = up_to,
             "installed archived segments without their bodies"
         );
         Ok(installed.len())
+    }
+
+    /// Gives the newest evicted segment, `summary`'s, its body back from the
+    /// archive: written in place, then no longer evicted.
+    fn restore_evicted(
+        &self,
+        archive: &crate::remote::RemoteSegments,
+        summary: &crate::tier::SegmentSummary,
+    ) -> Result<(), Error> {
+        if self.evicted.end() != summary.end {
+            return Err(Error::Internal {
+                message: format!(
+                    "segment {} is not the newest evicted: the evicted prefix ends at {}",
+                    summary.base,
+                    self.evicted.end()
+                ),
+            });
+        }
+        archive.restore_body(summary, &segment::segment_path(&self.dir, summary.base))?;
+        self.evicted
+            .end
+            .compare_exchange(
+                summary.end,
+                summary.base,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|evicted_end| Error::Internal {
+                message: format!(
+                    "the evicted prefix moved to {evicted_end} while segment {} got its body back",
+                    summary.base
+                ),
+            })?;
+        Ok(())
     }
 
     /// Makes `segments`, whose locators and key tables (`tables` the merged
@@ -2932,6 +2965,15 @@ impl EventStoreEngine {
     #[cfg(test)]
     pub(crate) fn wait_for_seals(&self) {
         self.seals.wait_idle();
+    }
+
+    /// Segment bytes fetched from the archive so far.
+    #[cfg(test)]
+    pub(crate) fn archive_fetched_bytes(&self) -> u64 {
+        self.evicted
+            .archive
+            .as_ref()
+            .map_or(0, |archive| archive.fetched_bytes())
     }
 
     /// Installs a claimed epoch and exact voter set, aborting all prior-epoch
@@ -4950,26 +4992,6 @@ fn record_crc_ending_at(path: &Path, byte_end: u64) -> Result<Option<u32>, Error
         offset += header.total_len() as u64;
     }
     Ok(Some(last_crc))
-}
-
-/// The merged key tables among `tables` within `[from, to)` that no other
-/// one contains: aligned blocks are nested or disjoint, so these are
-/// disjoint.
-fn maximal_tables(tables: &[(u64, u64)], from: u64, to: u64) -> Vec<(u64, u64)> {
-    let mut inside: Vec<(u64, u64)> = tables
-        .iter()
-        .copied()
-        .filter(|&(base, end)| from <= base && end <= to)
-        .collect();
-    inside.sort_by_key(|&(base, end)| (base, std::cmp::Reverse(end)));
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for (base, end) in inside {
-        if out.last().is_some_and(|&(_, last_end)| base < last_end) {
-            continue;
-        }
-        out.push((base, end));
-    }
-    out
 }
 
 /// Most bytes of an archived segment applied in one go: the size of a large
