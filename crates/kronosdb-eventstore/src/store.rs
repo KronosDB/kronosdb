@@ -2365,8 +2365,8 @@ impl EventStoreEngine {
 
         // Key tables: a segment's own, or a merged one covering it. A merged
         // table reaching past the skipped segments takes the segments it
-        // covers along, so none is left half covered.
-        // A table over exactly one segment is that segment's own.
+        // covers along, so none is left half covered. A table over exactly
+        // one segment is that segment's own.
         let ranges: std::collections::BTreeSet<(u64, u64)> = summaries
             .iter()
             .map(|summary| (summary.base, summary.end))
@@ -2380,38 +2380,38 @@ impl EventStoreEngine {
                 merged_tables.push(range);
             }
         }
-        let mut end = summaries[skip - 1].end;
-        let merged = loop {
-            let merged: Vec<(u64, u64)> = maximal_tables(&merged_tables, first, end);
-            let uncovered = summaries
+        // In log order, each segment is installed with the widest merged
+        // table covering it, or else its own table. A merged table reaching
+        // past what the leader evicted covers segments this node will
+        // receive by Tail, so it cannot be installed: the install stops
+        // before a segment with no table it can install, and the rest are
+        // downloaded whole.
+        let target = summaries[skip - 1].end;
+        let candidates = maximal_tables(&merged_tables, first, up_to);
+        let mut merged = Vec::new();
+        let mut end = first;
+        let mut at = 0;
+        while at < summaries.len() && end < target {
+            let summary = &summaries[at];
+            if let Some(&(base, table_end)) = candidates
                 .iter()
-                .take_while(|summary| summary.end <= end)
-                .find(|summary| {
-                    !own.contains(&(summary.base, summary.end))
-                        && !merged
-                            .iter()
-                            .any(|&(b, e)| b <= summary.base && summary.end <= e)
-                });
-            let Some(summary) = uncovered else {
-                break merged;
-            };
-            match merged_tables
-                .iter()
-                .filter(|&&(b, e)| b <= summary.base && summary.end <= e)
-                .map(|&(_, e)| e)
-                .max()
+                .find(|&&(base, table_end)| base == summary.base && summary.end <= table_end)
             {
-                Some(table_end) if table_end > end && table_end <= up_to => end = table_end,
-                _ => {
-                    return Err(Error::Unavailable {
-                        message: format!(
-                            "the archive holds no key table for segment {}",
-                            summary.base
-                        ),
-                    });
+                merged.push((base, table_end));
+                end = table_end;
+                while at < summaries.len() && summaries[at].end <= table_end {
+                    at += 1;
                 }
+            } else if own.contains(&(summary.base, summary.end)) {
+                end = summary.end;
+                at += 1;
+            } else {
+                break;
             }
-        };
+        }
+        if end == first {
+            return Ok(0);
+        }
         let installed: Vec<&crate::tier::SegmentSummary> = summaries
             .iter()
             .take_while(|summary| summary.end <= end)

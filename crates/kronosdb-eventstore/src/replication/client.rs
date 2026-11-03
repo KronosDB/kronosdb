@@ -312,7 +312,17 @@ async fn run_tail(
             .await
             .map_err(|error| Error::Internal {
                 message: format!("catching up from the archive: {error}"),
-            })??
+            })?
+            .inspect_err(|error| {
+                // The session is retried from scratch; say why, since the
+                // retry loop only says that it reconnects.
+                tracing::warn!(
+                    context = %config.context,
+                    up_to,
+                    %error,
+                    "catching up from the archive failed"
+                );
+            })?
     };
     tracing::info!(
         context = %config.context,

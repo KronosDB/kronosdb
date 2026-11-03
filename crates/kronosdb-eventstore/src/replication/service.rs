@@ -1857,6 +1857,13 @@ mod tests {
     }
 
     fn archived_leader() -> Archived {
+        archived_leader_with(400, None)
+    }
+
+    /// `late` events after the follower's copy; the leader evicts its final
+    /// segments up to the one `evict_before` names (an index), or all but
+    /// the last.
+    fn archived_leader_with(late: usize, evict_before: Option<usize>) -> Archived {
         let tmp = tempfile::tempdir().unwrap();
         let tier = tmp.path().join("tier");
         std::fs::create_dir_all(&tier).unwrap();
@@ -1880,7 +1887,7 @@ mod tests {
         let leader =
             EventStoreEngine::open_with_store_options(&leader_dir, &archive_options(&tier, &[0]))
                 .unwrap();
-        for i in 0..400 {
+        for i in 0..late {
             append(&leader, &format!("late-{i}"), &big);
         }
         leader.wait_for_seals();
@@ -1898,7 +1905,8 @@ mod tests {
             )
             .unwrap();
         let archivable = leader.archivable_segments();
-        for segment in &archivable[..archivable.len() - 1] {
+        let evicted = evict_before.unwrap_or(archivable.len() - 1);
+        for segment in &archivable[..evicted] {
             leader.evict_segment(segment.base).unwrap();
         }
         Archived {
@@ -2177,5 +2185,58 @@ mod tests {
         // until the leader's watermark comes again.
         follower.adopt_watermark(leader.replication_epoch(), leader.head());
         assert_same_events(&everything(&follower), &expected);
+    }
+
+    /// The leader evicted up to the middle of a merged table: the segments
+    /// under that table have no key table of their own in the archive, and
+    /// the table reaches past what the follower may install. The install
+    /// stops before them and they are downloaded whole.
+    #[test]
+    fn a_capped_join_stops_before_a_merged_table_it_cannot_install() {
+        let archived = archived_leader_with(700, Some(11));
+        let leader = &archived.leader;
+        let tables: Vec<(u64, u64)> =
+            std::fs::read_dir(archived.tier.join("default").join("index"))
+                .unwrap()
+                .filter_map(|entry| {
+                    segment::merge::parse_table_file_name(entry.unwrap().file_name().to_str()?)
+                })
+                .collect();
+        let up_to = leader.evicted_end();
+        assert!(
+            tables
+                .iter()
+                .any(|&(base, end)| base < up_to && up_to < end),
+            "the fixture should evict into the middle of a merged table: {tables:?}, up to {up_to}"
+        );
+
+        let dir = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("capped")
+            .join("default");
+        let follower = EventStoreEngine::create_with_store_options(
+            &dir,
+            &capped_options(&archived.tier, &[0, 1, 2], Some(SEGMENT_SIZE)),
+        )
+        .unwrap();
+        follower
+            .truncate_to_matching(Position(0), Some(None))
+            .unwrap();
+        follower.apply_archived(up_to).unwrap();
+        assert_eq!(follower.local_tail().0, up_to);
+        assert!(
+            follower.evicted_end() > 0,
+            "nothing was installed without its body"
+        );
+        assert!(follower.evicted_end() < up_to);
+
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        assert!(matches!(start, TailStart::ExactCursor), "{start:?}");
+        follow(leader, &follower, &start).unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        follower.wait_for_seals();
+        assert_same_events(&everything(&follower), &everything(leader));
     }
 }
