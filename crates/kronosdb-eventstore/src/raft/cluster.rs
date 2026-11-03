@@ -107,6 +107,8 @@ pub struct ClusterManager {
     handler_clear_once: tokio::sync::OnceCell<()>,
     pub(super) coordinator_started: AtomicBool,
     pub(super) cluster_config: ClusterConfig,
+    /// What the archive loops last did (ADR-0011), for metrics.
+    pub(super) archive_status: Arc<crate::tier::ArchiveStatus>,
 }
 
 impl ClusterManager {
@@ -138,6 +140,7 @@ impl ClusterManager {
             handler_clear_once: tokio::sync::OnceCell::new(),
             coordinator_started: AtomicBool::new(false),
             cluster_config,
+            archive_status: Arc::default(),
         }
     }
 
@@ -451,6 +454,11 @@ impl ClusterManager {
     /// Shared claimed-leader gate used by the native data plane and its services.
     pub fn replication_control(&self) -> Arc<ReplicationControl> {
         Arc::clone(&self.control)
+    }
+
+    /// What the archive loops last did (ADR-0011).
+    pub fn archive_status(&self) -> &crate::tier::ArchiveStatus {
+        &self.archive_status
     }
 
     /// True when the committed native claim still matches OpenRaft's current

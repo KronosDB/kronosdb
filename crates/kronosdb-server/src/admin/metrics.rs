@@ -55,14 +55,20 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
 
     // One directory walk per context per scrape — a blocking recursive
     // stat, so it runs on the blocking pool, not a runtime worker.
-    let data_bytes: Vec<(String, u64)> = tokio::task::spawn_blocking(move || {
-        sized
-            .into_iter()
-            .map(|(label, engine)| (label, engine.data_dir_bytes()))
-            .collect()
-    })
-    .await
-    .unwrap_or_default();
+    let (data_bytes, local_bytes): (Vec<(String, u64)>, u64) =
+        tokio::task::spawn_blocking(move || {
+            let local_bytes = sized
+                .iter()
+                .map(|(_, engine)| engine.sealed_body_bytes())
+                .sum();
+            let data_bytes = sized
+                .into_iter()
+                .map(|(label, engine)| (label, engine.data_dir_bytes()))
+                .collect();
+            (data_bytes, local_bytes)
+        })
+        .await
+        .unwrap_or_default();
 
     macro_rules! engine_family {
         ($metric:literal, $kind:literal, $help:literal, $field:ident) => {
@@ -229,6 +235,143 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         "Segment rotations since startup",
         segment_rotations
     );
+
+    // ── Archive tier (ADR-0011) ──
+    {
+        let status = state.cluster.archive_status();
+        let archiving = status.contexts();
+        let per_context =
+            |value: &dyn Fn(&kronosdb_eventstore::tier::ContextArchiveStatus) -> u64| {
+                archiving
+                    .iter()
+                    .map(|(name, status)| (ctx_label(name), value(status)))
+                    .collect::<Vec<_>>()
+            };
+        family(
+            &mut out,
+            "kronosdb_archive_archived_position",
+            "gauge",
+            "End of the archived prefix; reported by the node that archives (the leader)",
+            &per_context(&|status| status.archived_end),
+        );
+        // Against the log as it is now: a pass that cannot reach the
+        // archive leaves its last archived position, and the lag grows.
+        let lag: Vec<(String, u64)> = archiving
+            .iter()
+            .filter_map(|(name, status)| {
+                let engine = state.contexts.get_context(name).ok()?;
+                Some((
+                    ctx_label(name),
+                    engine.final_end().saturating_sub(status.archived_end),
+                ))
+            })
+            .collect();
+        family(
+            &mut out,
+            "kronosdb_archive_lag_events",
+            "gauge",
+            "Events in final segments not archived yet; reported by the leader",
+            &lag,
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_last_success_timestamp_seconds",
+            "gauge",
+            "When an archive pass last succeeded (0 for never); reported by the leader",
+            &per_context(&|status| status.last_success_ms / 1000),
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_pass_failures_total",
+            "counter",
+            "Archive passes that failed while this node led",
+            &per_context(&|status| status.failures),
+        );
+
+        let eviction = status.eviction();
+        family(
+            &mut out,
+            "kronosdb_archive_max_local_bytes",
+            "gauge",
+            "Cap on sealed segment bytes kept on disk; 0 when nothing is evicted",
+            &[(String::new(), eviction.max_local_bytes)],
+        );
+        if eviction.max_local_bytes > 0 {
+            family(
+                &mut out,
+                "kronosdb_archive_local_bytes",
+                "gauge",
+                "Sealed segment bytes on disk, which the cap bounds; above the cap, the archive is behind",
+                &[(String::new(), local_bytes)],
+            );
+        }
+        family(
+            &mut out,
+            "kronosdb_archive_evicted_segments_total",
+            "counter",
+            "Segment bodies evicted to the archive",
+            &[(String::new(), eviction.evicted_segments)],
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_evicted_bytes_total",
+            "counter",
+            "Bytes of the segment bodies evicted to the archive",
+            &[(String::new(), eviction.evicted_bytes)],
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_eviction_failures_total",
+            "counter",
+            "Eviction passes that failed",
+            &[(String::new(), eviction.failures)],
+        );
+
+        let mut evicted = Vec::new();
+        let mut requests = Vec::new();
+        let mut fetched = Vec::new();
+        let mut failures = Vec::new();
+        for name in state.contexts.list_contexts() {
+            let Ok(engine) = state.contexts.get_context(&name) else {
+                continue;
+            };
+            let Some(reads) = engine.archive_reads() else {
+                continue;
+            };
+            evicted.push((ctx_label(&name), engine.evicted_end()));
+            requests.push((ctx_label(&name), reads.requests));
+            fetched.push((ctx_label(&name), reads.fetched_bytes));
+            failures.push((ctx_label(&name), reads.failures));
+        }
+        family(
+            &mut out,
+            "kronosdb_archive_evicted_position",
+            "gauge",
+            "End of the evicted prefix: events below it are read from the archive",
+            &evicted,
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_read_requests_total",
+            "counter",
+            "Ranged requests to the archive for evicted segments",
+            &requests,
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_read_bytes_total",
+            "counter",
+            "Segment bytes fetched from the archive",
+            &fetched,
+        );
+        family(
+            &mut out,
+            "kronosdb_archive_read_failures_total",
+            "counter",
+            "Reads from the archive that failed (unreachable, or a short answer)",
+            &failures,
+        );
+    }
 
     // ── Metadata Raft metrics (node-wide) ──
     if let Some(raft) = state.cluster.raft_node() {

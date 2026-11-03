@@ -79,10 +79,13 @@ contexts: []
 rollOnManifestChange: false
 
 archive:
-  # Object-store URL (s3://…, gs://…, file://…) of the archive tier: the
-  # leader copies final segments and their index there. Leave empty to
-  # disable. Cloud credentials come from the environment — point
-  # credentialsSecret at a Secret with AWS_* keys etc.
+  # Object-store URL of the archive tier: s3://bucket/prefix (also any
+  # S3-compatible store, with AWS_ENDPOINT), gs://bucket/prefix,
+  # az://container/prefix or file://…. The leader copies final segments and
+  # their index there. Leave empty to disable. Settings and credentials come
+  # from each provider's environment variables (AWS_*, GOOGLE_*, AZURE_*):
+  # point credentialsSecret at a Secret holding them, or use the pod's
+  # workload identity.
   url: ""
   intervalSecs: 30
   # Most bytes of sealed segments each node keeps on disk. Past it, the

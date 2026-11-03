@@ -4,6 +4,7 @@
 //! them after a four-byte count, the marker goes after them, and the body is
 //! sent as it is. Nothing is decoded or re-encoded on the way out.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,7 +13,7 @@ use kronosdb_eventstore::append::RecordAppend;
 use kronosdb_eventstore::criteria::SourcingCondition;
 use kronosdb_eventstore::error::Error;
 use kronosdb_eventstore::event::Position;
-use kronosdb_eventstore::store::PageBounds;
+use kronosdb_eventstore::store::{PageBounds, RecordPage};
 use kronosdb_protocol as p;
 use kronosdb_protocol::net::Failure;
 use kronosdb_protocol::net::server::{ServerStream, StreamSender};
@@ -56,8 +57,61 @@ fn finish_events_body(mut body: Vec<u8>, count: u32, marker: Option<u64>) -> Byt
 /// Sends `[from, up_to)` as Events frames; the last carries END and `marker`.
 /// The first page is read on the caller; later pages yield first, so a long
 /// read never holds the connection's reader.
+/// Runs `read` on `store`: inline, or on the blocking pool when it may wait
+/// on the archive (`archive`), so the connection and the runtime's workers
+/// go on serving everything else meanwhile.
+async fn reading<T: Send + 'static>(
+    store: Arc<dyn EventStore>,
+    archive: bool,
+    read: impl FnOnce(&dyn EventStore) -> Result<T, Error> + Send + 'static,
+) -> Result<T, Failure> {
+    if !archive {
+        return read(store.as_ref()).map_err(convert::failure);
+    }
+    tokio::task::spawn_blocking(move || read(store.as_ref()))
+        .await
+        .map_err(|error| {
+            convert::failure(Error::Internal {
+                message: format!("reading from the archive: {error}"),
+            })
+        })?
+        .map_err(convert::failure)
+}
+
+/// One page of `condition`'s records in `[from, up_to)`, as
+/// [`EventStore::read_records`] copies them. A page that may reach evicted
+/// segments waits on the archive, so it is read on the blocking pool: the
+/// connection and the runtime's workers go on serving everything else.
+async fn read_page(
+    store: &Arc<dyn EventStore>,
+    condition: &SourcingCondition,
+    from: Position,
+    up_to: Position,
+    batch: usize,
+    exclude: &[String],
+) -> Result<(RecordPage, Vec<u8>), Failure> {
+    let archive = store.reads_archive_from(from);
+    let condition = condition.clone();
+    let exclude = exclude.to_vec();
+    reading(Arc::clone(store), archive, move |store| {
+        let mut body = events_body();
+        let page = store.read_records(
+            &condition,
+            &PageBounds {
+                limit: batch,
+                max_bytes: MAX_BATCH_BYTES,
+                exclude_names: &exclude,
+                ..PageBounds::new(from, up_to)
+            },
+            &mut body,
+        )?;
+        Ok((page, body))
+    })
+    .await
+}
+
 async fn send_range(
-    store: &dyn EventStore,
+    store: &Arc<dyn EventStore>,
     from: Position,
     condition: &SourcingCondition,
     up_to: Position,
@@ -66,18 +120,7 @@ async fn send_range(
 ) -> Result<(), Failure> {
     let mut cursor = from;
     loop {
-        let mut body = events_body();
-        let page = store
-            .read_records(
-                condition,
-                &PageBounds {
-                    limit: batch,
-                    max_bytes: MAX_BATCH_BYTES,
-                    ..PageBounds::new(cursor, up_to)
-                },
-                &mut body,
-            )
-            .map_err(convert::failure)?;
+        let (page, body) = read_page(store, condition, cursor, up_to, batch, &[]).await?;
         let last = !page.full;
         let body = finish_events_body(body, page.count, last.then_some(up_to.0));
         if out.send_shared(p::Events::KIND, last, body).await.is_err() || last {
@@ -136,7 +179,7 @@ pub async fn source(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
     // the marker the client appends against describe the same log.
     let marker = store.head();
     send_range(
-        store.as_ref(),
+        &store,
         Position(req.from),
         &condition,
         marker,
@@ -156,9 +199,14 @@ pub async fn snapshotted_source(ctx: Ctx, stream: ServerStream) -> Result<(), Fa
     // Marker first, then the snapshot bounded by it: snapshot, events and
     // marker form one consistent view of the log.
     let marker = store.head();
-    let snapshot = store
-        .get_snapshot(req.key, Some(marker))
-        .map_err(convert::failure)?;
+    // Where the snapshot's record is, only the lookup knows: with any
+    // segment evicted it may be there.
+    let key = req.key.to_vec();
+    let archive = store.reads_archive_from(Position(0));
+    let snapshot = reading(Arc::clone(&store), archive, move |store| {
+        store.get_snapshot(&key, Some(marker))
+    })
+    .await?;
     // A snapshot's position is next-exclusive: the first unfolded event sits
     // at it, so the replay starts there, not after it.
     let from = snapshot.as_ref().map_or(Position(0), |s| s.position);
@@ -173,7 +221,7 @@ pub async fn snapshotted_source(ctx: Ctx, stream: ServerStream) -> Result<(), Fa
     )
     .await?;
     send_range(
-        store.as_ref(),
+        &store,
         from,
         &condition,
         marker,
@@ -254,19 +302,8 @@ pub async fn subscribe(ctx: Ctx, mut stream: ServerStream) -> Result<(), Failure
                     events.advance_cursor(bound);
                     continue;
                 }
-                let mut body = events_body();
-                let page = store
-                    .read_records(
-                        &condition,
-                        &PageBounds {
-                            limit: batch,
-                            max_bytes: MAX_BATCH_BYTES,
-                            exclude_names: &exclude,
-                            ..PageBounds::new(events.cursor, bound)
-                        },
-                        &mut body,
-                    )
-                    .map_err(convert::failure)?;
+                let (page, body) =
+                    read_page(&store, &condition, events.cursor, bound, batch, &exclude).await?;
                 if page.count > 0 {
                     let body = finish_events_body(body, page.count, None);
                     if out.send_shared(p::Events::KIND, false, body).await.is_err() {
@@ -327,10 +364,10 @@ pub async fn get_tags(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
     let Ok(p::Frame::GetTags(req)) = stream.request.decode() else {
         return Err(invalid("malformed GetTags"));
     };
-    let tags = ctx
-        .store(req.context, Access::Read)?
-        .get_tags(Position(req.position))
-        .map_err(convert::failure)?;
+    let store = ctx.store(req.context, Access::Read)?;
+    let position = Position(req.position);
+    let archive = store.reads_archive_from(position);
+    let tags = reading(store, archive, move |store| store.get_tags(position)).await?;
     let tags = tags
         .iter()
         .map(|t| p::Tag {
@@ -401,10 +438,10 @@ pub async fn get_snapshot(ctx: Ctx, stream: ServerStream) -> Result<(), Failure>
     let Ok(p::Frame::GetSnapshot(req)) = frame.decode() else {
         return Err(invalid("malformed GetSnapshot"));
     };
-    let snapshot = ctx
-        .store(req.context, Access::Read)?
-        .get_snapshot(req.key, None)
-        .map_err(convert::failure)?;
+    let store = ctx.store(req.context, Access::Read)?;
+    let key = req.key.to_vec();
+    let archive = store.reads_archive_from(Position(0));
+    let snapshot = reading(store, archive, move |store| store.get_snapshot(&key, None)).await?;
     finish(
         &stream.out,
         &p::Frame::SnapshotResult(p::SnapshotResult {

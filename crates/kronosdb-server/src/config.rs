@@ -91,8 +91,8 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_GROUP_COMMIT_MS")]
     group_commit_ms: Option<u64>,
 
-    /// Object-store URL of the archive tier (ADR-0011), e.g.
-    /// file:///archive/kronosdb or s3://bucket/prefix. Unset = no archive.
+    /// Object-store URL of the archive tier (ADR-0011): s3://, gs://, az://
+    /// or file://, e.g. s3://bucket/prefix. Unset = no archive.
     #[arg(long, env = "KRONOSDB_ARCHIVE_URL")]
     archive_url: Option<String>,
 

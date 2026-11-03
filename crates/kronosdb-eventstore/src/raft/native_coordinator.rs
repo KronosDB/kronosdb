@@ -52,6 +52,7 @@ impl ClusterManager {
             manager.run_archive_loop(archiver, config.interval).await;
         });
         if let Some(max_local_bytes) = config.max_local_bytes {
+            self.archive_status.set_max_local_bytes(max_local_bytes);
             let evictor = crate::tier::Archiver::from_url(&config.url)?;
             let manager = Arc::clone(self);
             tokio::spawn(async move {
@@ -82,6 +83,7 @@ impl ClusterManager {
                 .collect();
             match archiver.run_eviction_pass(&engines, max_local_bytes).await {
                 Ok(report) => {
+                    self.archive_status.evicted(&report);
                     if report.evicted > 0 {
                         tracing::info!(
                             evicted = report.evicted,
@@ -100,6 +102,7 @@ impl ClusterManager {
                     }
                 }
                 Err(error) => {
+                    self.archive_status.eviction_failed();
                     tracing::error!(%error, "eviction pass failed; nothing more is evicted until it succeeds");
                 }
             }
@@ -120,13 +123,19 @@ impl ClusterManager {
                 // Another node archives meanwhile; list again when this one
                 // leads again.
                 archiver.forget().await;
+                self.archive_status.not_archiving();
                 continue;
             }
             for context in self.context_manager.list_contexts() {
                 let Ok(engine) = self.context_manager.get_context(&context) else {
                     continue;
                 };
-                match archiver.run_archive_pass(&context, &engine).await {
+                let result = archiver.run_archive_pass(&context, &engine).await;
+                match &result {
+                    Ok(report) => self.archive_status.archived(&context, report.archived_end),
+                    Err(_) => self.archive_status.archive_failed(&context),
+                }
+                match result {
                     Ok(report) if report.segments + report.tables + report.deleted > 0 => {
                         tracing::info!(
                             context,

@@ -383,6 +383,25 @@ pub async fn admin_post(
     Ok((status, body))
 }
 
+/// One sample of a Prometheus metric from a node's `/metrics`: the value
+/// on the line `<name><labels> <value>`; `None` when absent.
+pub async fn metric(addr: SocketAddr, name_and_labels: &str) -> Option<u64> {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.ok()?;
+    let response = String::from_utf8_lossy(&response);
+    response.lines().find_map(|line| {
+        let (key, value) = line.rsplit_once(' ')?;
+        (key == name_and_labels)
+            .then(|| value.parse().ok())
+            .flatten()
+    })
+}
+
 pub async fn wait_for_raft_leader(
     servers: &[ServerHandle],
     timeout: Duration,
