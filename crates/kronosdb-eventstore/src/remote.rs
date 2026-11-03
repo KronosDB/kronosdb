@@ -582,29 +582,79 @@ impl RemoteSegments {
     /// The summary of archived segment `base`; `None` when the archive does
     /// not hold it.
     pub fn summary(&self, base: u64) -> Result<Option<crate::tier::SegmentSummary>, Error> {
+        Ok(self.summaries(&[base])?.pop().flatten())
+    }
+
+    /// The summaries of archived segments `bases`, read many at once, in
+    /// the same order; `None` for one the archive does not hold.
+    pub fn summaries(
+        &self,
+        bases: &[u64],
+    ) -> Result<Vec<Option<crate::tier::SegmentSummary>>, Error> {
         let store = Arc::clone(&self.archive.store);
-        let object = self
-            .context
-            .clone()
-            .join("segments")
-            .join(format!("{base:020}.sum"));
-        let bytes = self.archive.block_on(async move {
-            match store.get(&object).await {
-                Ok(result) => result.bytes().await.map(Some),
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(error) => Err(error),
-            }
-            .map_err(|error| Error::Unavailable {
-                message: format!("reading {object} from the archive: {error}"),
+        let objects: Vec<(u64, ObjectPath)> = bases
+            .iter()
+            .map(|&base| {
+                let object = self
+                    .context
+                    .clone()
+                    .join("segments")
+                    .join(format!("{base:020}.sum"));
+                (base, object)
             })
-        })?;
-        bytes
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| Error::Corrupted {
-                    message: format!("archived summary of segment {base}: {error}"),
-                })
-            })
-            .transpose()
+            .collect();
+        self.archive.block_on(async move {
+            use futures_util::StreamExt;
+            let results: Vec<Result<Option<crate::tier::SegmentSummary>, Error>> =
+                futures_util::stream::iter(objects)
+                    .map(|(base, object)| {
+                        let store = Arc::clone(&store);
+                        async move {
+                            let bytes = match store.get(&object).await {
+                                Ok(result) => result.bytes().await.map(Some),
+                                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                                Err(error) => Err(error),
+                            }
+                            .map_err(|error| Error::Unavailable {
+                                message: format!("reading {object} from the archive: {error}"),
+                            })?;
+                            bytes
+                                .map(|bytes| {
+                                    serde_json::from_slice(&bytes).map_err(|error| {
+                                        Error::Corrupted {
+                                            message: format!(
+                                                "archived summary of segment {base}: {error}"
+                                            ),
+                                        }
+                                    })
+                                })
+                                .transpose()
+                        }
+                    })
+                    .buffered(DOWNLOADS_IN_FLIGHT)
+                    .collect()
+                    .await;
+            results.into_iter().collect()
+        })
+    }
+
+    /// Downloads archived segment `summary`'s body, checked against its
+    /// blake3, to `local`: written beside it and renamed into place once on
+    /// disk.
+    pub fn restore_body(
+        &self,
+        summary: &crate::tier::SegmentSummary,
+        local: &Path,
+    ) -> Result<(), Error> {
+        let bytes = self.fetch_segment(summary)?;
+        let tmp = download_path(local);
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, local)?;
+        if let Some(parent) = local.parent() {
+            crate::segment::writer::sync_dir(parent)?;
+        }
+        Ok(())
     }
 
     /// The whole archived segment `summary` describes, checked against its
