@@ -6,10 +6,16 @@
 //! archive's `segments/<base>.seg`. They are fetched in aligned blocks of
 //! [`BLOCK`] bytes: a block several readers want is downloaded once (the
 //! first to ask fetches it, the others wait for it), and recent blocks stay
-//! in a small in-memory cache, so subscribers catching up over the same cold
-//! range, or a hot old aggregate, do not pay a request each. Neighbouring
-//! missing blocks go in one request of up to [`MAX_GET`] bytes, and one
-//! read's requests run concurrently.
+//! in a small in-memory cache, so processors replaying the same cold range
+//! together fetch it once. Neighbouring missing blocks go in one request of
+//! up to [`MAX_GET`] bytes, and all requests run concurrently.
+//!
+//! Reads from the archive are rare (it holds what a node's disk cannot), so
+//! what matters is that a read does not pay a round trip per segment, and a
+//! replay runs at the network's pace rather than one round trip at a time.
+//! Reads plan ahead from the index alone and [`RemoteSegments::prefetch`]
+//! the next [`READAHEAD`] bytes of blocks in one go, across every segment
+//! they span.
 //!
 //! Reads are synchronous to their callers, which are blocking read threads:
 //! requests run on a small runtime of the archive's own and the caller
@@ -37,7 +43,11 @@ use crate::segment::sealed_index::SealedIndex;
 pub const BLOCK: u64 = 256 * 1024;
 
 /// The most one request fetches.
-pub const MAX_GET: u64 = 8 * 1024 * 1024;
+pub const MAX_GET: u64 = 4 * 1024 * 1024;
+
+/// Bytes of blocks a read plans and prefetches ahead of itself in evicted
+/// segments; it plans the next stretch halfway through this one.
+pub const READAHEAD: u64 = 32 * 1024 * 1024;
 
 /// Files downloaded at once when a node installs archived segments.
 const DOWNLOADS_IN_FLIGHT: usize = 32;
@@ -51,8 +61,17 @@ pub struct ArchiveListing {
     pub tables: Vec<(u64, u64)>,
 }
 
+/// The blocks holding `ranges`.
+fn blocks_of(ranges: &[Range<u64>]) -> BTreeSet<u64> {
+    ranges
+        .iter()
+        .filter(|range| range.end > range.start)
+        .flat_map(|range| range.start / BLOCK..=(range.end - 1) / BLOCK)
+        .collect()
+}
+
 /// Default memory budget of the cache of fetched blocks, per context.
-pub const DEFAULT_CACHE_BYTES: usize = 64 << 20;
+pub const DEFAULT_CACHE_BYTES: usize = 128 << 20;
 
 /// An archive as cold reads see it: its object store, and the runtime its
 /// requests run on. One per process, shared by every context.
@@ -84,6 +103,22 @@ impl ArchiveStore {
         let (store, prefix) = open_store(raw_url)?;
         Ok(Arc::new(Self {
             store: Arc::from(store),
+            prefix,
+            io: IoRuntime::new()?,
+            cache_bytes: DEFAULT_CACHE_BYTES,
+            max_local_bytes,
+        }))
+    }
+
+    /// An archive over `store` itself, its objects under `prefix`: for
+    /// tests that wrap a store (to delay or break it).
+    pub fn over_store(
+        store: Arc<dyn ObjectStore>,
+        prefix: ObjectPath,
+        max_local_bytes: Option<u64>,
+    ) -> Result<Arc<Self>, Error> {
+        Ok(Arc::new(Self {
+            store,
             prefix,
             io: IoRuntime::new()?,
             cache_bytes: DEFAULT_CACHE_BYTES,
@@ -151,6 +186,39 @@ impl Drop for IoRuntime {
     fn drop(&mut self) {
         if let Some(runtime) = self.0.take() {
             runtime.shutdown_background();
+        }
+    }
+}
+
+/// The blocks a download task owes its waiters. If the task never gets to
+/// answer them (it panicked, or the runtime shut down and dropped it), they
+/// are answered with an error here, so no reader waits forever.
+struct Pending {
+    segments: Arc<RemoteSegments>,
+    base: u64,
+    blocks: Option<Vec<(u64, Arc<Flight>)>>,
+}
+
+fn blocks_len(pending: &Pending) -> usize {
+    pending.blocks.as_ref().map_or(0, Vec::len)
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let Some(blocks) = self.blocks.take() else {
+            return;
+        };
+        let mut flights = self
+            .segments
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (block, flight) in blocks {
+            flights.remove(&(self.base, block));
+            flight.finish(Err(format!(
+                "the download of segment {} was abandoned",
+                self.base
+            )));
         }
     }
 }
@@ -352,7 +420,7 @@ impl RemoteSegments {
     }
 
     /// The bytes of each of `ranges` of segment `base`.
-    pub fn read(&self, base: u64, ranges: &[Range<u64>]) -> Result<Vec<Vec<u8>>, Error> {
+    pub fn read(self: &Arc<Self>, base: u64, ranges: &[Range<u64>]) -> Result<Vec<Vec<u8>>, Error> {
         let data_len = self.data_len(base)?;
         if let Some(range) = ranges.iter().find(|range| range.end > data_len) {
             return Err(Error::Corrupted {
@@ -363,56 +431,8 @@ impl RemoteSegments {
                 ),
             });
         }
-        let wanted: BTreeSet<u64> = ranges
-            .iter()
-            .filter(|range| range.end > range.start)
-            .flat_map(|range| range.start / BLOCK..=(range.end - 1) / BLOCK)
-            .collect();
-
-        let mut have: HashMap<u64, Bytes> = HashMap::new();
-        let mut mine = Vec::new();
-        let mut theirs = Vec::new();
-        {
-            let mut blocks = self.blocks.lock().unwrap();
-            let mut flights = self.flights.lock().unwrap();
-            for &block in &wanted {
-                if let Some(bytes) = blocks.get(&(base, block)) {
-                    have.insert(block, bytes.clone());
-                } else if let Some(flight) = flights.get(&(base, block)) {
-                    theirs.push((block, Arc::clone(flight)));
-                } else {
-                    let flight = Arc::new(Flight::default());
-                    flights.insert((base, block), Arc::clone(&flight));
-                    mine.push((block, flight));
-                }
-            }
-        }
-
-        if !mine.is_empty() {
-            let fetched = self.fetch_blocks(base, data_len, mine.iter().map(|(block, _)| *block));
-            let mut blocks = self.blocks.lock().unwrap();
-            let mut flights = self.flights.lock().unwrap();
-            match &fetched {
-                Ok(fetched) => {
-                    for ((block, flight), bytes) in mine.iter().zip(fetched) {
-                        blocks.put((base, *block), bytes.clone());
-                        flights.remove(&(base, *block));
-                        flight.finish(Ok(bytes.clone()));
-                        have.insert(*block, bytes.clone());
-                    }
-                }
-                Err(error) => {
-                    for (block, flight) in &mine {
-                        flights.remove(&(base, *block));
-                        flight.finish(Err(error.to_string()));
-                    }
-                }
-            }
-            drop(flights);
-            drop(blocks);
-            fetched?;
-        }
-        for (block, flight) in theirs {
+        let (mut have, waiting) = self.reserve(base, data_len, blocks_of(ranges));
+        for (block, flight) in waiting {
             let bytes = flight.wait().map_err(|message| Error::Unavailable {
                 message: format!("reading segment {base} from the archive: {message}"),
             })?;
@@ -437,58 +457,126 @@ impl RemoteSegments {
             .collect())
     }
 
-    /// Fetches `blocks` (ascending) of segment `base`, neighbours in one
-    /// request, all requests at once. Returns each block's bytes.
-    fn fetch_blocks(
-        &self,
+    /// Starts downloading the blocks holding `ranges` of each segment that
+    /// are neither cached nor on their way, all at once, without waiting:
+    /// a read that wants them later finds them cached or waits for them.
+    /// What a read is about to need, or a scan will need next.
+    pub fn prefetch(self: &Arc<Self>, wanted: &[(u64, Vec<Range<u64>>)]) -> Result<(), Error> {
+        for (base, ranges) in wanted {
+            let data_len = self.data_len(*base)?;
+            let blocks = blocks_of(ranges)
+                .into_iter()
+                .filter(|&block| block * BLOCK < data_len)
+                .collect();
+            self.reserve(*base, data_len, blocks);
+        }
+        Ok(())
+    }
+
+    /// For each of `wanted` (blocks of segment `base`): its bytes when
+    /// cached, or the download that brings them, which this call starts
+    /// for the blocks nobody is fetching yet.
+    #[allow(clippy::type_complexity)]
+    fn reserve(
+        self: &Arc<Self>,
         base: u64,
         data_len: u64,
-        blocks: impl Iterator<Item = u64>,
-    ) -> Result<Vec<Bytes>, Error> {
+        wanted: BTreeSet<u64>,
+    ) -> (HashMap<u64, Bytes>, Vec<(u64, Arc<Flight>)>) {
+        let mut have = HashMap::new();
+        let mut waiting = Vec::new();
+        let mut mine = Vec::new();
+        {
+            let mut blocks = self.blocks.lock().unwrap();
+            let mut flights = self.flights.lock().unwrap();
+            for block in wanted {
+                if let Some(bytes) = blocks.get(&(base, block)) {
+                    have.insert(block, bytes.clone());
+                } else if let Some(flight) = flights.get(&(base, block)) {
+                    waiting.push((block, Arc::clone(flight)));
+                } else {
+                    let flight = Arc::new(Flight::default());
+                    flights.insert((base, block), Arc::clone(&flight));
+                    waiting.push((block, Arc::clone(&flight)));
+                    mine.push((block, flight));
+                }
+            }
+        }
+        if !mine.is_empty() {
+            self.spawn_fetch(base, data_len, mine);
+        }
+        (have, waiting)
+    }
+
+    /// Downloads `blocks` (ascending) of segment `base` on the archive's
+    /// runtime, neighbours in one request of up to [`MAX_GET`] bytes, all
+    /// requests at once; then caches them and lets their waiters go.
+    fn spawn_fetch(self: &Arc<Self>, base: u64, data_len: u64, blocks: Vec<(u64, Arc<Flight>)>) {
         let mut runs: Vec<Range<u64>> = Vec::new();
-        for block in blocks {
+        for &(block, _) in &blocks {
             let (start, end) = (block * BLOCK, ((block + 1) * BLOCK).min(data_len));
             match runs.last_mut() {
                 Some(run) if run.end == start && end - run.start <= MAX_GET => run.end = end,
                 _ => runs.push(start..end),
             }
         }
+        let this = Arc::clone(self);
         let store = Arc::clone(&self.archive.store);
         let object = self.segment_object(base);
-        let requested = runs.clone();
-        let fetched = self.archive.block_on(async move {
-            let gets = requested
-                .iter()
-                .map(|run| store.get_range(&object, run.clone()));
-            futures_util::future::try_join_all(gets)
+        let mut pending = Pending {
+            segments: Arc::clone(self),
+            base,
+            blocks: Some(blocks),
+        };
+        let count = blocks_len(&pending);
+        self.archive.io.handle().spawn(async move {
+            let gets = runs.iter().map(|run| store.get_range(&object, run.clone()));
+            let fetched = futures_util::future::try_join_all(gets)
                 .await
-                .map_err(|error| archive_error(base, error))
-        })?;
-        self.requests
-            .fetch_add(runs.len() as u64, Ordering::Relaxed);
-
-        let mut out = Vec::new();
-        for (run, bytes) in runs.iter().zip(fetched) {
-            if bytes.len() as u64 != run.end - run.start {
-                return Err(Error::Unavailable {
-                    message: format!(
-                        "the archive returned {} bytes of segment {base} for {}..{}",
-                        bytes.len(),
-                        run.start,
-                        run.end
-                    ),
+                .map_err(|error| archive_error(base, error).to_string())
+                .and_then(|parts| {
+                    this.requests
+                        .fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    let mut out = Vec::with_capacity(count);
+                    for (run, bytes) in runs.iter().zip(parts) {
+                        if bytes.len() as u64 != run.end - run.start {
+                            return Err(format!(
+                                "the archive returned {} bytes of segment {base} for {}..{}",
+                                bytes.len(),
+                                run.start,
+                                run.end
+                            ));
+                        }
+                        this.fetched_bytes
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        let mut at = 0;
+                        while at < bytes.len() {
+                            let end = (at + BLOCK as usize).min(bytes.len());
+                            out.push(bytes.slice(at..end));
+                            at = end;
+                        }
+                    }
+                    Ok(out)
                 });
+            let mut cache = this.blocks.lock().unwrap();
+            let mut flights = this.flights.lock().unwrap();
+            let blocks = pending.blocks.take().expect("answered once");
+            match fetched {
+                Ok(fetched) => {
+                    for ((block, flight), bytes) in blocks.iter().zip(fetched) {
+                        cache.put((base, *block), bytes.clone());
+                        flights.remove(&(base, *block));
+                        flight.finish(Ok(bytes));
+                    }
+                }
+                Err(error) => {
+                    for (block, flight) in &blocks {
+                        flights.remove(&(base, *block));
+                        flight.finish(Err(error.clone()));
+                    }
+                }
             }
-            self.fetched_bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            let mut at = 0;
-            while at < bytes.len() {
-                let end = (at + BLOCK as usize).min(bytes.len());
-                out.push(bytes.slice(at..end));
-                at = end;
-            }
-        }
-        Ok(out)
+        });
     }
 
     /// The summary of archived segment `base`; `None` when the archive does

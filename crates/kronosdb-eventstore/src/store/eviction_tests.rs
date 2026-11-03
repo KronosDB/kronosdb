@@ -340,3 +340,180 @@ fn a_segment_unlike_its_archived_copy_is_kept() {
     assert_eq!(store.evicted_end(), 0);
     assert!(store.archivable_segments()[0].path.exists());
 }
+
+/// A read across many evicted segments plans ahead and fetches them all at
+/// once: against a store that answers every request after a delay, it takes
+/// a few delays, not one per segment. So does a scan of the evicted log.
+#[test]
+fn a_read_across_evicted_segments_waits_about_one_round_trip() {
+    use object_store::ObjectStore;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let store = filled_store(root.path(), tier.path());
+    archive(&store, tier.path());
+    let segments = store.archivable_segments();
+    evict(&store, segments.len() - 1);
+    let evicted = segments.len() - 1;
+    assert!(evicted >= 20, "{evicted} segments evicted");
+    store.shutdown();
+    drop(store);
+
+    let slow: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        in_memory_copy(tier.path()),
+        ThrottleConfig {
+            wait_get_per_call: DELAY,
+            ..ThrottleConfig::default()
+        },
+    ));
+    let archive =
+        ArchiveStore::over_store(slow, object_store::path::Path::default(), None).unwrap();
+    let store = EventStoreEngine::open_with_store_options(
+        &dir,
+        &StoreOptions {
+            archive: Some(archive),
+            ..options(None)
+        },
+    )
+    .unwrap();
+
+    // Order o-0 is in one batch of ten events in thirteen, so it is
+    // spread over most segments.
+    let started = std::time::Instant::now();
+    let read = store.source(Position(0), &order("o-0")).unwrap();
+    let took = started.elapsed();
+    assert!(!read.is_empty());
+    let touched = {
+        let list = store.segments.read();
+        let mut bases: Vec<u64> = read
+            .iter()
+            .map(|event| {
+                let at = list.bases.partition_point(|&b| b <= event.position.0) - 1;
+                list.bases[at]
+            })
+            .collect();
+        bases.dedup();
+        bases.len()
+    };
+    eprintln!("a read over {touched} evicted segments took {took:?}, delay {DELAY:?}");
+    assert!(touched >= 10, "the read touched only {touched} segments");
+    assert!(
+        took < DELAY * 4,
+        "a read over {touched} evicted segments took {took:?}, {} delays",
+        took.as_millis() / DELAY.as_millis()
+    );
+
+    let started = std::time::Instant::now();
+    assert_eq!(store.source(Position(0), &everything()).unwrap().len(), 400);
+    let took = started.elapsed();
+    eprintln!("a scan over {evicted} evicted segments took {took:?}");
+    assert!(
+        took < DELAY * 4,
+        "a scan over {evicted} evicted segments took {took:?}"
+    );
+
+    // A subscription catching up walks the log the same way.
+    let fresh = EventStoreEngine::open_with_store_options(
+        &dir,
+        &StoreOptions {
+            archive: Some(
+                ArchiveStore::over_store(
+                    Arc::new(ThrottledStore::new(
+                        in_memory_copy(tier.path()),
+                        ThrottleConfig {
+                            wait_get_per_call: DELAY,
+                            ..ThrottleConfig::default()
+                        },
+                    )),
+                    object_store::path::Path::default(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            ..options(None)
+        },
+    )
+    .unwrap();
+    let head = fresh.watermark.get();
+    let started = std::time::Instant::now();
+    let mut walked = 0;
+    fresh
+        .view
+        .visit_events(0, head, |_, _, _, _| {
+            walked += 1;
+            true
+        })
+        .unwrap();
+    let took = started.elapsed();
+    eprintln!("a subscription walk over {evicted} evicted segments took {took:?}");
+    assert_eq!(walked, 400);
+    assert!(took < DELAY * 4, "a subscription walk took {took:?}");
+}
+
+/// The archive under `tier`, copied into a store in memory.
+fn in_memory_copy(tier: &Path) -> Arc<object_store::memory::InMemory> {
+    use object_store::ObjectStoreExt;
+    let memory = Arc::new(object_store::memory::InMemory::new());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut dirs = vec![tier.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let name = path
+                .strip_prefix(tier)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let bytes = std::fs::read(&path).unwrap();
+            runtime
+                .block_on(memory.put(&object_store::path::Path::from(name), bytes.into()))
+                .unwrap();
+        }
+    }
+    memory
+}
+
+/// A download that dies (its store panics) answers the read with an error
+/// instead of leaving it waiting.
+#[test]
+fn a_download_that_dies_fails_the_read() {
+    use object_store::ObjectStore;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let store = filled_store(root.path(), tier.path());
+    archive(&store, tier.path());
+    evict(&store, 3);
+    store.shutdown();
+    drop(store);
+
+    // The throttle does not support a file store's answers and panics.
+    let dying: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        object_store::local::LocalFileSystem::new_with_prefix(tier.path()).unwrap(),
+        ThrottleConfig::default(),
+    ));
+    let archive =
+        ArchiveStore::over_store(dying, object_store::path::Path::default(), None).unwrap();
+    let store = EventStoreEngine::open_with_store_options(
+        &dir,
+        &StoreOptions {
+            archive: Some(archive),
+            ..options(None)
+        },
+    )
+    .unwrap();
+    let Err(error) = store.source(Position(0), &everything()) else {
+        panic!("read evicted segments from a store that panics");
+    };
+    assert!(matches!(error, Error::Unavailable { .. }), "{error}");
+}

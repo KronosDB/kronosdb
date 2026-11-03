@@ -536,6 +536,27 @@ impl LogView {
             stop = best;
         }
         let window = offset..byte_at(stop)?;
+        // What the walk reads next, so it never waits for it: the next
+        // `READAHEAD` bytes, through as many evicted segments as they span.
+        let mut left = crate::remote::READAHEAD;
+        let mut wanted = Vec::new();
+        let (mut at, mut from, mut len) = (base, window.end, data_len);
+        let bases = Arc::clone(&self.segments.read().bases);
+        loop {
+            let take = (len - from.min(len)).min(left);
+            if take > 0 {
+                wanted.push((at, std::iter::once(from..from + take).collect()));
+                left -= take;
+            }
+            let next = bases.partition_point(|&b| b <= at);
+            match bases.get(next) {
+                Some(&next) if left > 0 && self.evicted.contains(next) => {
+                    (at, from, len) = (next, 0, archive.data_len(next)?);
+                }
+                _ => break,
+            }
+        }
+        archive.prefetch(&wanted)?;
         let bytes = archive.read(base, std::slice::from_ref(&window))?.remove(0);
         Ok((bytes, stop))
     }
@@ -4282,7 +4303,7 @@ impl EventStoreEngine {
             return Ok(());
         }
         let probe = Probe::new(condition);
-        let mut locate = Locate::new(self, &list);
+        let mut locate = Locate::new(self, &list).reading_ahead(&probe, head);
         self.view.for_each_match(
             &list,
             &probe,
@@ -4398,6 +4419,22 @@ struct Locate<'a> {
     list: &'a SegmentList,
     reader: Option<(usize, RecordReader)>,
     offsets: Vec<(u64, u64)>,
+    ahead: Option<ReadAhead<'a>>,
+}
+
+/// What a read plans ahead of itself in evicted segments (ADR-0011): the
+/// records it will visit, found from the index alone, whose blocks are
+/// downloaded all at once before it reaches them, a stretch of
+/// [`crate::remote::READAHEAD`] bytes of blocks at a time. A read touching
+/// many evicted segments waits about one round trip, and a scan never waits
+/// for the stretch it is in.
+struct ReadAhead<'a> {
+    probe: &'a Probe,
+    head: u64,
+    /// Positions below this are planned.
+    planned_to: u64,
+    /// Where the read plans the next stretch: halfway through this one.
+    refill_at: u64,
 }
 
 impl<'a> Locate<'a> {
@@ -4412,7 +4449,90 @@ impl<'a> Locate<'a> {
             list,
             reader: None,
             offsets: Vec::with_capacity(Self::CHUNK),
+            ahead: None,
         }
+    }
+
+    /// Plans and prefetches ahead of the read for `probe` up to `head` where
+    /// it runs through evicted segments.
+    fn reading_ahead(mut self, probe: &'a Probe, head: u64) -> Self {
+        self.ahead = Some(ReadAhead {
+            probe,
+            head,
+            planned_to: 0,
+            refill_at: 0,
+        });
+        self
+    }
+
+    /// Before the read reaches `position`: if it is in the evicted prefix
+    /// and past the point to plan again, plans the next stretch and starts
+    /// downloading it.
+    fn read_ahead(&mut self, position: u64) -> Result<(), Error> {
+        let evicted_end = self.engine.evicted.end();
+        let Some(ahead) = self.ahead.as_mut() else {
+            return Ok(());
+        };
+        if position >= evicted_end || position < ahead.refill_at {
+            return Ok(());
+        }
+        let from = position.max(ahead.planned_to);
+        let to = ahead.head.min(evicted_end);
+        let budget = crate::remote::READAHEAD / crate::remote::BLOCK;
+        let mut blocks: std::collections::BTreeSet<(u64, u64)> = Default::default();
+        let mut wanted: std::collections::BTreeMap<u64, Vec<std::ops::Range<u64>>> =
+            Default::default();
+        let mut last = from;
+        let mut half = None;
+        let mut planner = Locate::new(self.engine, self.list);
+        let walked = if from < to {
+            self.engine.view.for_each_match(
+                self.list,
+                ahead.probe,
+                from,
+                to,
+                |_| {},
+                |set| {
+                    planner.each_location(set.iter(), |location| {
+                        let end = location.offset + u64::from(location.len);
+                        for block in location.offset / crate::remote::BLOCK
+                            ..=(end.max(location.offset + 1) - 1) / crate::remote::BLOCK
+                        {
+                            blocks.insert((location.segment_base, block));
+                        }
+                        wanted
+                            .entry(location.segment_base)
+                            .or_default()
+                            .push(location.offset..end);
+                        last = location.position + 1;
+                        if half.is_none() && blocks.len() as u64 >= budget / 2 {
+                            half = Some(location.position);
+                        }
+                        Ok(if blocks.len() as u64 >= budget {
+                            Walk::Stop
+                        } else {
+                            Walk::Next
+                        })
+                    })
+                },
+            )?
+        } else {
+            Walk::Next
+        };
+        ahead.planned_to = if matches!(walked, Walk::Next) {
+            to
+        } else {
+            last
+        };
+        ahead.refill_at = match walked {
+            Walk::Next => u64::MAX,
+            Walk::Stop => half.unwrap_or(last),
+        };
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let wanted: Vec<(u64, Vec<std::ops::Range<u64>>)> = wanted.into_iter().collect();
+        self.engine.evicted.archive(wanted[0].0)?.prefetch(&wanted)
     }
 
     /// The segment holding `position`, and where it ends.
@@ -4435,6 +4555,7 @@ impl<'a> Locate<'a> {
         let mut positions = positions.peekable();
         while let Some(&first) = positions.peek() {
             let (segment, base, end) = self.segment_of(first)?;
+            self.read_ahead(first)?;
             let path = segment::segment_path(&self.engine.dir, base);
             self.offsets.clear();
             {
