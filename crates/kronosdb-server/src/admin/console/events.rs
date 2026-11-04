@@ -20,6 +20,10 @@ pub struct EventsQuery {
     pub name: Option<String>,
     /// Filter by tag key=value.
     pub tag: Option<String>,
+    /// Search evicted segments too (ADR-0011). Off by default: a filtered
+    /// query walks from the oldest event it may see, which on a node with a
+    /// cap means downloading the archive, again on every live refresh.
+    pub archived: Option<bool>,
 }
 
 const DEFAULT_EVENT_LIMIT: usize = 50;
@@ -94,6 +98,7 @@ pub async fn page(
 <script>
 var evCurrentPage = 1;
 var evExpandedPositions = {{}};
+var evArchived = {archived};
 
 // Live by default on page 1
 var evLiveInterval = setInterval(function() {{ evLiveRefresh(); }}, 3000);
@@ -107,7 +112,15 @@ function evBuildUrl(page) {{
   var tag = document.getElementById('ev-tag').value.trim();
   if (name) p.set('name', name);
   if (tag) p.set('tag', tag);
+  if (evArchived) p.set('archived', 'true');
   return '/fragments/events?' + p.toString();
+}}
+
+// Searching the archive downloads it: once, not on every live refresh.
+function evIncludeArchived() {{
+  evArchived = true;
+  evSetLive(false);
+  evQuery(1);
 }}
 
 function evLiveRefresh() {{
@@ -211,6 +224,7 @@ document.getElementById('ev-tag')?.addEventListener('keydown', function(e) {{ if
 </script>"##,
         name_val = html_escape(name_val),
         tag_val = html_escape(tag_val),
+        archived = params.archived.unwrap_or(false),
     );
 
     Html(layout::layout(
@@ -284,8 +298,21 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
         // Fetch page*limit events, paginate the result. This scales to the page depth,
         // not the total store size — acceptable for filtered browsing.
         let fetch_limit = limit * page as usize;
-        let from = Position(tail);
-        match store.source_internal(from, &condition, fetch_limit) {
+        // From the first event on this node's disk unless asked to search
+        // the archive: evicted segments are what the operator chose not
+        // to read.
+        let evicted_end = store.evicted_end();
+        let local_only = !params.archived.unwrap_or(false) && evicted_end > tail;
+        let from = Position(if local_only { evicted_end } else { tail });
+        let archived_note = if local_only {
+            format!(
+                r#"<div class="flex items-center gap-2 px-[18px] py-2 border-b border-k-subtle text-[11px] text-k-muted font-mono">Events before {} are in the archive and not searched. <button onclick="evIncludeArchived()" class="btn" data-variant="outline" data-size="xs">Search the archive</button></div>"#,
+                format_number(evicted_end),
+            )
+        } else {
+            String::new()
+        };
+        let table = match store.source_internal(from, &condition, fetch_limit) {
             Ok(mut events) => {
                 events.reverse();
                 let total_matching = events.len();
@@ -304,7 +331,8 @@ fn render_events(state: &AdminState, context: &str, params: &EventsQuery) -> Str
                 )
             }
             Err(e) => events_error_html(&format!("Query failed: {e}")),
-        }
+        };
+        archived_note + &table
     } else {
         // No filter: positions are contiguous, so compute an exact window.
         // Last event = head - 1. Page 1 shows [head-limit, head-1], newest first.
