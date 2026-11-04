@@ -52,8 +52,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{/* Shared container spec for voters and learners. Pass a dict with
      "root" (chart context) and "nodeType" ("standard"|"passive-backup")
      and "idOffset" (1 for voters, 101 for learners). */}}
+{{/* Fails unless .value is a whole number: int64 alone turns true into 1
+     and "30s" into 0. Pass a dict with "name" and "value". */}}
+{{- define "kronosdb.wholeNumber" -}}
+{{- $v := .value -}}
+{{- if kindIs "string" $v -}}
+{{- if not (regexMatch "^[0-9]+$" $v) -}}
+{{- fail (printf "%s must be a whole number, not %q." .name $v) -}}
+{{- end -}}
+{{- else if kindIs "float64" $v -}}
+{{- if ne $v (float64 (int64 $v)) -}}
+{{- fail (printf "%s must be a whole number, not %v." .name $v) -}}
+{{- end -}}
+{{- else if not (or (kindIs "int" $v) (kindIs "int64" $v)) -}}
+{{- fail (printf "%s must be a whole number, not %v." .name $v) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "kronosdb.container" -}}
 {{- $root := .root -}}
+{{- $nodeType := .nodeType -}}
 name: kronosdb
 image: {{ include "kronosdb.image" $root }}
 imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -83,7 +101,7 @@ env:
   - name: KRONOSDB_ACK_MODE
     value: {{ $root.Values.config.ackMode | quote }}
   - name: KRONOSDB_DRAIN_DEADLINE
-    value: {{ int64 $root.Values.config.drainDeadlineSecs | quote }}
+    value: {{ include "kronosdb.wholeNumber" (dict "name" "config.drainDeadlineSecs" "value" $root.Values.config.drainDeadlineSecs) }}{{ int64 $root.Values.config.drainDeadlineSecs | quote }}
   {{- if $root.Values.contexts }}
   - name: KRONOSDB_MANIFEST
     value: /etc/kronosdb/manifest.toml
@@ -95,6 +113,7 @@ env:
   {{- fail "archive.maxLocalBytes is set but archive.url is empty: evicted segments are read back from the archive, so a cap needs one. Set archive.url, or unset archive.maxLocalBytes." }}
   {{- end }}
   {{- if .url }}
+  {{- include "kronosdb.wholeNumber" (dict "name" "archive.intervalSecs" "value" .intervalSecs) }}
   {{- if lt (int64 .intervalSecs) 1 }}
   {{- fail "archive.intervalSecs must be at least 1." }}
   {{- end }}
@@ -102,7 +121,10 @@ env:
     value: {{ .url | quote }}
   - name: KRONOSDB_ARCHIVE_INTERVAL_SECS
     value: {{ int64 .intervalSecs | quote }}
-  {{- if .maxLocalBytes }}
+  {{- /* Learners are kept for backup: they keep every segment, so the
+         archive is never the only copy of the oldest ones. */}}
+  {{- if and .maxLocalBytes (ne $nodeType "passive-backup") }}
+  {{- include "kronosdb.wholeNumber" (dict "name" "archive.maxLocalBytes" "value" .maxLocalBytes) }}
   {{- if lt (int64 .maxLocalBytes) 1 }}
   {{- fail (printf "archive.maxLocalBytes must be a whole number of bytes above 0, not %v; leave it empty to keep every segment." .maxLocalBytes) }}
   {{- end }}
