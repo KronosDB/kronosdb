@@ -115,19 +115,34 @@ impl ClusterManager {
         interval: Duration,
     ) {
         let mut backoff: HashMap<String, crate::tier::PassBackoff> = HashMap::new();
+        // The epoch this node last archived under.
+        let mut led = None;
         loop {
             tokio::time::sleep(interval).await;
-            let leading = self.control.claim().is_some_and(|claim| {
-                claim.writable && claim.leader_id == self.cluster_config.node_id
-            });
-            if !leading {
-                // Another node archives meanwhile; list again when this one
-                // leads again.
+            let node_id = self.cluster_config.node_id;
+            let epoch = self
+                .control
+                .claim()
+                .filter(|claim| claim.writable && claim.leader_id == node_id)
+                .map(|claim| claim.epoch);
+            if epoch != led {
+                // Leading ended, or began again under a new epoch. Another
+                // node may have archived meanwhile: list again.
                 archiver.forget().await;
                 self.archive_status.not_archiving();
                 backoff.clear();
-                continue;
+                led = epoch;
             }
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            // Asked between segments: a pass over a long backlog stops soon
+            // after this node is deposed.
+            let still_leading = || {
+                self.control.claim().is_some_and(|claim| {
+                    claim.writable && claim.leader_id == node_id && claim.epoch == epoch
+                })
+            };
             for context in self.context_manager.list_contexts() {
                 let wait = backoff.entry(context.clone()).or_default();
                 if !wait.ready(std::time::Instant::now()) {
@@ -136,8 +151,19 @@ impl ClusterManager {
                 let Ok(engine) = self.context_manager.get_context(&context) else {
                     continue;
                 };
-                let result = archiver.run_archive_pass(&context, &engine).await;
+                let result = archiver
+                    .run_archive_pass_while(&context, &engine, still_leading)
+                    .await;
                 match result {
+                    Ok(report) if report.stopped => {
+                        tracing::info!(
+                            context,
+                            segments = report.segments,
+                            archived_end = report.archived_end,
+                            "stopped leading; archive pass ended early"
+                        );
+                        break;
+                    }
                     Ok(report) => {
                         wait.succeeded();
                         self.archive_status.archived(&context, report.archived_end);

@@ -124,6 +124,8 @@ pub struct ArchivePassReport {
     pub deleted: usize,
     /// End of the archived prefix after the pass.
     pub archived_end: u64,
+    /// This node stopped leading during the pass, which ended there.
+    pub stopped: bool,
 }
 
 #[derive(Debug, Default)]
@@ -428,6 +430,23 @@ impl Archiver {
         context: &str,
         engine: &EventStoreEngine,
     ) -> Result<ArchivePassReport, Error> {
+        self.run_archive_pass_while(context, engine, || true).await
+    }
+
+    /// [`run_archive_pass`] while `still_leading` says this node leads. It
+    /// is asked before each segment, before the tables and before the
+    /// deletes; once it says no, the pass ends there, `stopped`. So a node
+    /// deposed during a long pass stops writing to the archive within a
+    /// segment's upload, not at the end of the backlog.
+    ///
+    /// [`run_archive_pass`]: Self::run_archive_pass
+    pub async fn run_archive_pass_while(
+        &self,
+        context: &str,
+        engine: &EventStoreEngine,
+        still_leading: impl Fn() -> bool + Send + Sync,
+    ) -> Result<ArchivePassReport, Error> {
+        let mut report = ArchivePassReport::default();
         let mut leading = self.leading.lock().await;
         if !leading.checked {
             self.check_conditional_writes().await?;
@@ -438,11 +457,15 @@ impl Archiver {
             leading.contexts.insert(context.to_string(), state);
         }
         let state = leading.contexts.get_mut(context).expect("inserted above");
+        report.archived_end = state.archived_end;
 
-        let mut report = ArchivePassReport::default();
         for segment in engine.archivable_segments() {
             if segment.base < state.archived_end {
                 continue;
+            }
+            if !still_leading() {
+                report.stopped = true;
+                return Ok(report);
             }
             if segment.base != state.archived_end {
                 return Err(Error::Internal {
@@ -461,10 +484,18 @@ impl Archiver {
                 Archived::SealInFlight => break,
             }
             state.archived_end = segment.end;
+            report.archived_end = state.archived_end;
+        }
+        if !still_leading() {
+            report.stopped = true;
+            return Ok(report);
         }
         report.tables += self.archive_tables(context, engine, state).await?;
+        if !still_leading() {
+            report.stopped = true;
+            return Ok(report);
+        }
         report.deleted = self.delete_superseded(context, state).await;
-        report.archived_end = state.archived_end;
         Ok(report)
     }
 
@@ -1681,6 +1712,34 @@ mod tests {
         }
         let probe = std::fs::read(tier.path().join(CONDITIONAL_WRITE_CHECK)).unwrap();
         assert_eq!(probe, CONDITIONAL_WRITE_CHECK_BODY);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pass_ends_at_the_segment_where_its_node_stops_leading() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let engine = engine_in(data.path());
+        seal_segments(&engine, "a", 4).await;
+        let segments = engine.archivable_segments();
+        let archiver = archiver_for(tier.path(), DELETE_GRACE);
+
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let report = archiver
+            .run_archive_pass_while("default", &engine, || {
+                asked.fetch_add(1, Ordering::SeqCst) < 2
+            })
+            .await
+            .unwrap();
+        assert!(report.stopped);
+        assert_eq!(report.segments, 2);
+        assert_eq!(report.archived_end, segments[1].end);
+        let summary = |base: u64| format!("{base:020}.sum");
+        assert!(archived(tier.path(), &["segments", &summary(segments[1].base)]).is_some());
+        assert!(archived(tier.path(), &["segments", &summary(segments[2].base)]).is_none());
+
+        let report = archiver.run_archive_pass("default", &engine).await.unwrap();
+        assert!(!report.stopped);
+        assert_eq!(report.segments, segments.len() - 2);
     }
 
     #[test]
