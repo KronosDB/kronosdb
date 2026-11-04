@@ -39,8 +39,57 @@ spec:
           annotations:
             summary: "KronosDB volume {{ printf "{{ $labels.persistentvolumeclaim }}" }} below 20% free"
             description: >-
-              The store never deletes; disk exhaustion ends in fsync failure
-              and a poisoned engine. Grow the volume before it fills.
+              Without archive.maxLocalBytes the store keeps every segment;
+              with it, segments are evicted only once archived, so the disk
+              grows past the cap while archiving or eviction fails. Disk
+              exhaustion ends in fsync failure and a poisoned engine. Grow
+              the volume, or fix the archive, before it fills.
+
+        {{- if .Values.archive.url }}
+
+        - alert: KronosDBArchiveStalled
+          expr: >-
+            time() - max by (context) (kronosdb_archive_last_success_timestamp_seconds)
+            > {{ max (int64 .Values.alerts.archiveStalledSeconds) (mul 3 (int64 .Values.archive.intervalSecs)) }}
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Context {{ printf "{{ $labels.context }}" }} has not been archived for {{ printf "{{ $value | humanizeDuration }}" }}"
+            description: >-
+              The leader's archive passes keep failing
+              (kronosdb_archive_pass_failures_total). Final segments are
+              not copied to the archive, and nodes with a cap cannot evict,
+              so their disks grow past it. Check the object store's
+              reachability and credentials, and the leader's logs.
+
+        - alert: KronosDBArchiveLagHigh
+          expr: max by (context) (kronosdb_archive_lag_events) > {{ int64 .Values.alerts.archiveLagEvents }}
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Context {{ printf "{{ $labels.context }}" }} archive is {{ printf "{{ $value }}" }} events behind"
+            description: >-
+              Final segments are archived slower than they are written, or
+              not at all. Until they are archived, nodes with a cap cannot
+              evict them. Check archive pass failures and the bandwidth to
+              the object store.
+        {{- if .Values.archive.maxLocalBytes }}
+
+        - alert: KronosDBEvictionFailing
+          expr: sum by (pod) (increase(kronosdb_archive_eviction_failures_total[15m])) > 2
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Pod {{ printf "{{ $labels.pod }}" }} cannot evict archived segments"
+            description: >-
+              Eviction passes fail, so the node's disk grows past
+              archive.maxLocalBytes. The node must read the archive to
+              check what it evicts: check its access to the object store.
+              A segment that differs from its archived copy fails every
+              pass and is logged as divergence: investigate that before
+              anything else.
+        {{- end }}
+        {{- end }}
 
         - alert: KronosDBReplicationLagGrowing
           expr: max by (context) (kronosdb_replication_lag_events) > {{ .Values.alerts.replicationLagEvents }}
