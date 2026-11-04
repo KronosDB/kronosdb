@@ -212,9 +212,7 @@ impl ArchiveStore {
             context: self.prefix.clone().join(context),
             dir: dir.to_path_buf(),
             data_lens: Mutex::new(HashMap::new()),
-            requests: AtomicU64::new(0),
-            fetched_bytes: AtomicU64::new(0),
-            failures: AtomicU64::new(0),
+            stats: Arc::default(),
         })
     }
 
@@ -310,6 +308,8 @@ enum Failure {
     },
     /// The archive did not answer, or not in full. Asking again may work.
     Unavailable(String),
+    /// Writing the download here failed.
+    Local(Arc<std::io::Error>),
 }
 
 impl Failure {
@@ -320,22 +320,30 @@ impl Failure {
         }
     }
 
-    /// What a read of segment `base` reports.
-    fn into_error(self, base: u64) -> Error {
+    fn local(error: std::io::Error) -> Self {
+        Self::Local(Arc::new(error))
+    }
+
+    /// What a read of `what` (a segment, an object) reports.
+    fn into_error(self, what: &str) -> Error {
         match self {
             Self::Missing => Error::Internal {
-                message: format!("segment {base} is missing from the archive"),
+                message: format!("{what} is missing from the archive"),
             },
             Self::WrongSize { size, expected, by } => Error::Corrupted {
-                message: format!(
-                    "archived segment {base} is {size} bytes, where {by} says {expected}"
-                ),
+                message: format!("archived {what} is {size} bytes; {by} {expected}"),
             },
             Self::Unavailable(message) => Error::Unavailable {
-                message: format!("reading segment {base} from the archive: {message}"),
+                message: format!("reading {what} from the archive: {message}"),
             },
+            Self::Local(error) => Error::Io(std::io::Error::new(error.kind(), error)),
         }
     }
+}
+
+/// A download that did not finish within `timeout`.
+fn timed_out(timeout: std::time::Duration) -> Failure {
+    Failure::Unavailable(format!("no answer within {}s", timeout.as_secs_f64()))
 }
 
 /// Bytes `range` of `object`, which `by` says is `len` bytes long. An
@@ -461,9 +469,7 @@ pub struct RemoteSegments {
     dir: PathBuf,
     /// Data bytes of each archived segment, from its locator.
     data_lens: Mutex<HashMap<u64, u64>>,
-    requests: AtomicU64,
-    fetched_bytes: AtomicU64,
-    failures: AtomicU64,
+    stats: Arc<ReadStats>,
 }
 
 impl std::fmt::Debug for RemoteSegments {
@@ -536,9 +542,11 @@ impl RemoteSegments {
     }
 
     /// Downloads every `(kind, name, local)` as [`download`](Self::download)
-    /// does, many at once. Returns which the archive held.
+    /// does, many at once. Returns which the archive held. Each goes in
+    /// bounded requests straight to its file, so what the downloads hold in
+    /// memory stays within the node's in-flight budget.
     pub fn download_all(&self, files: &[(&str, String, PathBuf)]) -> Result<Vec<bool>, Error> {
-        let store = Arc::clone(&self.archive.store);
+        let archive = Arc::clone(&self.archive);
         let requests: Vec<(ObjectPath, PathBuf)> = files
             .iter()
             .map(|(kind, name, local)| {
@@ -550,39 +558,9 @@ impl RemoteSegments {
             .collect();
         let held = self.archive.block_on(async move {
             use futures_util::StreamExt;
+            let archive = &archive;
             let results: Vec<Result<bool, Error>> = futures_util::stream::iter(requests)
-                .map(|(object, local)| {
-                    let store = Arc::clone(&store);
-                    async move {
-                        let bytes = match store.get(&object).await {
-                            Ok(result) => result.bytes().await.map(Some),
-                            Err(object_store::Error::NotFound { .. }) => Ok(None),
-                            Err(error) => Err(error),
-                        }
-                        .map_err(|error| Error::Unavailable {
-                            message: format!("downloading {object} from the archive: {error}"),
-                        })?;
-                        let Some(bytes) = bytes else {
-                            return Ok(false);
-                        };
-                        let write = move || -> Result<(), Error> {
-                            if let Some(parent) = local.parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            let tmp = download_path(&local);
-                            std::fs::write(&tmp, &bytes)?;
-                            std::fs::File::open(&tmp)?.sync_all()?;
-                            std::fs::rename(&tmp, &local)?;
-                            Ok(())
-                        };
-                        tokio::task::spawn_blocking(write).await.map_err(|error| {
-                            Error::Internal {
-                                message: format!("writing a download: {error}"),
-                            }
-                        })??;
-                        Ok(true)
-                    }
-                })
+                .map(|(object, local)| async move { download_file(archive, &object, &local).await })
                 .buffered(DOWNLOADS_IN_FLIGHT)
                 .collect()
                 .await;
@@ -598,19 +576,20 @@ impl RemoteSegments {
         Ok(held)
     }
 
-    /// Requests made to the archive so far.
+    /// Requests for segment bytes made so far, by reads and whole-segment
+    /// downloads.
     pub fn requests(&self) -> u64 {
-        self.requests.load(Ordering::Relaxed)
+        self.stats.requests.load(Ordering::Relaxed)
     }
 
-    /// Requests for segment bytes that failed so far.
+    /// Reads and whole-segment downloads that failed so far.
     pub fn failures(&self) -> u64 {
-        self.failures.load(Ordering::Relaxed)
+        self.stats.failures.load(Ordering::Relaxed)
     }
 
-    /// Bytes fetched from the archive so far.
+    /// Bytes of segments fetched from the archive so far.
     pub fn fetched_bytes(&self) -> u64 {
-        self.fetched_bytes.load(Ordering::Relaxed)
+        self.stats.fetched_bytes.load(Ordering::Relaxed)
     }
 
     /// Bytes of segment `base`'s data, which is what its archived object
@@ -653,7 +632,7 @@ impl RemoteSegments {
                 {
                     flights.remove(&key);
                 }
-                failure.into_error(base)
+                failure.into_error(&format!("segment {base}"))
             })?;
             have.insert(block, bytes);
         }
@@ -797,32 +776,28 @@ impl RemoteSegments {
                         .await
                         .expect("the in-flight budget is never closed"),
                 };
-                this.requests.fetch_add(1, Ordering::Relaxed);
+                this.stats.requests.fetch_add(1, Ordering::Relaxed);
                 let bytes = get_range(
                     archive.store.as_ref(),
                     &object,
                     run,
                     data_len,
-                    "its locator",
+                    "its locator says",
                 )
                 .await;
                 (permit, bytes)
             })
             .await
             .map_or_else(
-                |_| {
-                    Err(Failure::Unavailable(format!(
-                        "no answer within {}s",
-                        timeout.as_secs_f64()
-                    )))
-                },
+                |_| Err(timed_out(timeout)),
                 // The permit goes once the blocks are cached, below.
                 |(permit, bytes)| bytes.map(|bytes| (permit, bytes)),
             );
             let blocks = pending.blocks.take().expect("answered once");
             match fetched {
                 Ok((_permit, bytes)) => {
-                    this.fetched_bytes
+                    this.stats
+                        .fetched_bytes
                         .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     // Each block is copied out: a slice would share the
                     // request's buffer, and one block left in the cache
@@ -839,7 +814,7 @@ impl RemoteSegments {
                     }
                 }
                 Err(failure) => {
-                    this.failures.fetch_add(1, Ordering::Relaxed);
+                    this.stats.failures.fetch_add(1, Ordering::Relaxed);
                     let mut flights = lock(&archive.flights);
                     for (block, flight) in &blocks {
                         flights.remove(&(this.id, base, *block));
@@ -910,17 +885,19 @@ impl RemoteSegments {
     }
 
     /// Downloads archived segment `summary`'s body, checked against its
-    /// blake3, to `local`: written beside it and renamed into place once on
-    /// disk.
+    /// blake3, to `local`: written beside it as it arrives, and renamed into
+    /// place once on disk and checked. It is never whole in memory.
     pub fn restore_body(
         &self,
         summary: &crate::tier::SegmentSummary,
         local: &Path,
     ) -> Result<(), Error> {
-        let bytes = self.fetch_segment(summary)?;
         let tmp = download_path(local);
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
+        let sink = Sink::File(tokio::fs::File::from_std(std::fs::File::create(&tmp)?));
+        if let Err(error) = self.download_segment(summary, sink) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
         std::fs::rename(&tmp, local)?;
         if let Some(parent) = local.parent() {
             crate::segment::writer::sync_dir(parent)?;
@@ -929,78 +906,210 @@ impl RemoteSegments {
     }
 
     /// The whole archived segment `summary` describes, checked against its
-    /// blake3: what a node catching up from the archive applies. Fetched in
-    /// requests of [`MAX_GET`] bytes at once, past the block cache.
+    /// blake3: what a node catching up from the archive applies. Fetched
+    /// past the block cache, as [`download_whole`] does.
     pub fn fetch_segment(&self, summary: &crate::tier::SegmentSummary) -> Result<Vec<u8>, Error> {
-        let base = summary.base;
-        let ranges: Vec<Range<u64>> = (0..summary.data_len)
-            .step_by(MAX_GET as usize)
-            .map(|start| start..(start + MAX_GET).min(summary.data_len))
-            .collect();
-        let store = Arc::clone(&self.archive.store);
-        let object = self.segment_object(base);
-        let summary_len = summary.data_len;
-        let parts = self
-            .archive
+        let sink = Sink::Memory(Vec::with_capacity(summary.data_len as usize));
+        match self.download_segment(summary, sink)? {
+            Sink::Memory(bytes) => Ok(bytes),
+            Sink::File(_) => unreachable!("downloaded to memory"),
+        }
+    }
+
+    /// Downloads archived segment `summary` into `sink`, checked against
+    /// the summary's length and blake3.
+    fn download_segment(
+        &self,
+        summary: &crate::tier::SegmentSummary,
+        mut sink: Sink,
+    ) -> Result<Sink, Error> {
+        let archive = Arc::clone(&self.archive);
+        let stats = Arc::clone(&self.stats);
+        let object = self.segment_object(summary.base);
+        let summary = summary.clone();
+        self.archive
             .block_on(async move {
-                futures_util::future::try_join_all(ranges.into_iter().map(|range| {
-                    get_range(store.as_ref(), &object, range, summary_len, "its summary")
-                }))
+                let what = format!("segment {}", summary.base);
+                let hash = download_whole(
+                    &archive,
+                    Some(&stats),
+                    &object,
+                    summary.data_len,
+                    "its summary says",
+                    &mut sink,
+                )
                 .await
-                .map_err(|failure| failure.into_error(base))
+                .map_err(|failure| failure.into_error(&what))?;
+                if hash.to_hex().as_str() != summary.blake3 {
+                    return Err(Error::Corrupted {
+                        message: format!(
+                            "archived {what} does not hash to its summary's blake3 {}",
+                            summary.blake3
+                        ),
+                    });
+                }
+                Ok(sink)
             })
             .inspect_err(|_| {
-                self.failures.fetch_add(1, Ordering::Relaxed);
-            })?;
-        let mut bytes = Vec::with_capacity(summary.data_len as usize);
-        for part in parts {
-            bytes.extend_from_slice(&part);
-        }
-        self.requests
-            .fetch_add(summary.data_len.div_ceil(MAX_GET).max(1), Ordering::Relaxed);
-        self.fetched_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if bytes.len() as u64 != summary.data_len
-            || blake3::hash(&bytes).to_hex().as_str() != summary.blake3
-        {
-            return Err(Error::Corrupted {
-                message: format!(
-                    "archived segment {base} does not match its summary ({} bytes, expected {})",
-                    bytes.len(),
-                    summary.data_len
-                ),
-            });
-        }
-        Ok(bytes)
+                self.stats.failures.fetch_add(1, Ordering::Relaxed);
+            })
     }
 
     /// Downloads the archived `<kind>/<name>` of this context to `local`,
     /// through a temporary file renamed into place. `false` when the
     /// archive does not hold it.
     pub fn download(&self, kind: &str, name: &str, local: &Path) -> Result<bool, Error> {
-        let store = Arc::clone(&self.archive.store);
-        let object = self.context.clone().join(kind).join(name);
-        let bytes = self.archive.block_on(async move {
-            match store.get(&object).await {
-                Ok(result) => result.bytes().await.map(Some),
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(error) => Err(error),
+        Ok(self.download_all(&[(kind, name.to_string(), local.to_path_buf())])?[0])
+    }
+}
+
+/// Bytes of one request of a whole-object download.
+pub const CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Requests in flight for one whole-object download. The client gives a
+/// request 30 seconds; four requests of [`CHUNK`] bytes sharing a link
+/// finish in that time on one faster than about 1.1 MB/s, and the node's
+/// in-flight budget bounds what all downloads share.
+const CHUNKS_IN_FLIGHT: usize = 4;
+
+/// What cold reads of one context have asked of the archive, kept where
+/// the download tasks can count too.
+#[derive(Debug, Default)]
+struct ReadStats {
+    requests: AtomicU64,
+    fetched_bytes: AtomicU64,
+    failures: AtomicU64,
+}
+
+/// Where a whole-object download is written, in order.
+enum Sink {
+    Memory(Vec<u8>),
+    File(tokio::fs::File),
+}
+
+impl Sink {
+    async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            Self::Memory(out) => {
+                out.extend_from_slice(bytes);
+                Ok(())
             }
-            .map_err(|error| Error::Unavailable {
-                message: format!("downloading {object} from the archive: {error}"),
-            })
-        })?;
-        let Some(bytes) = bytes else {
-            return Ok(false);
-        };
-        let tmp = download_path(local);
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
-        std::fs::rename(&tmp, local)?;
-        if let Some(parent) = local.parent() {
-            crate::segment::writer::sync_dir(parent)?;
+            Self::File(file) => file.write_all(bytes).await,
         }
-        Ok(true)
+    }
+
+    /// Puts what was written on disk.
+    async fn finish(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::File(file) => {
+                file.flush().await?;
+                file.sync_all().await
+            }
+        }
+    }
+}
+
+/// Downloads all `len` bytes of `object`, which `by` says is that long,
+/// into `sink` in order, and returns their blake3.
+///
+/// The object goes in ranged requests of [`CHUNK`] bytes,
+/// [`CHUNKS_IN_FLIGHT`] at a time, each bounded by the fetch timeout and
+/// holding its share of the node's in-flight budget until its bytes are
+/// written. One request for a whole segment (up to 256 MiB) would outlast
+/// the client's request timeout on a slow link, and would be retried from
+/// the start each time; and its bytes would all be in memory at once.
+async fn download_whole(
+    archive: &ArchiveStore,
+    stats: Option<&ReadStats>,
+    object: &ObjectPath,
+    len: u64,
+    by: &'static str,
+    sink: &mut Sink,
+) -> Result<blake3::Hash, Failure> {
+    use futures_util::StreamExt;
+    let timeout = archive.limits.fetch_timeout;
+    let mut chunks = futures_util::stream::iter((0..len).step_by(CHUNK as usize))
+        .map(|start| {
+            let range = start..(start + CHUNK).min(len);
+            async move {
+                tokio::time::timeout(timeout, async {
+                    let permit = Arc::clone(&archive.in_flight)
+                        .acquire_many_owned(archive.permits_for(range.end - range.start))
+                        .await
+                        .expect("the in-flight budget is never closed");
+                    if let Some(stats) = stats {
+                        stats.requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let bytes = get_range(archive.store.as_ref(), object, range, len, by).await?;
+                    if let Some(stats) = stats {
+                        stats
+                            .fetched_bytes
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                    Ok((permit, bytes))
+                })
+                .await
+                .unwrap_or_else(|_| Err(timed_out(timeout)))
+            }
+        })
+        .buffered(CHUNKS_IN_FLIGHT);
+    let mut hasher = blake3::Hasher::new();
+    while let Some(chunk) = chunks.next().await {
+        // The permit goes once the bytes are written.
+        let (_permit, bytes) = chunk?;
+        hasher.update(&bytes);
+        sink.write(&bytes).await.map_err(Failure::local)?;
+    }
+    sink.finish().await.map_err(Failure::local)?;
+    Ok(hasher.finalize())
+}
+
+/// Downloads `object` to `local`, through a temporary file beside it renamed
+/// into place once on disk. `false` when the archive does not hold it.
+async fn download_file(
+    archive: &ArchiveStore,
+    object: &ObjectPath,
+    local: &Path,
+) -> Result<bool, Error> {
+    let what = format!("{object}");
+    let timeout = archive.limits.fetch_timeout;
+    let size = match tokio::time::timeout(timeout, archive.store.head(object)).await {
+        Ok(Ok(meta)) => meta.size,
+        Ok(Err(object_store::Error::NotFound { .. })) => return Ok(false),
+        Ok(Err(error)) => return Err(Failure::of(error).into_error(&what)),
+        Err(_) => return Err(timed_out(timeout).into_error(&what)),
+    };
+    if let Some(parent) = local.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = download_path(local);
+    let mut sink = Sink::File(tokio::fs::File::create(&tmp).await?);
+    let downloaded = download_whole(
+        archive,
+        None,
+        object,
+        size,
+        "it was when the download began",
+        &mut sink,
+    )
+    .await;
+    drop(sink);
+    match downloaded {
+        Ok(_) => {
+            tokio::fs::rename(&tmp, local).await?;
+            Ok(true)
+        }
+        Err(failure) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            match failure {
+                // Deleted since it was listed: a superseded key table.
+                Failure::Missing => Ok(false),
+                failure => Err(failure.into_error(&what)),
+            }
+        }
     }
 }
 
@@ -1134,7 +1243,7 @@ fn download_path(local: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::error::Error;
 
@@ -1540,5 +1649,214 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(flights().is_empty());
+    }
+
+    /// A store that answers every GET after `delay` and records how much
+    /// was asked of it at once.
+    #[derive(Debug, Default)]
+    struct Recording {
+        inner: object_store::memory::InMemory,
+        delay: std::time::Duration,
+        gets: std::sync::atomic::AtomicU64,
+        unranged: std::sync::atomic::AtomicU64,
+        largest: std::sync::atomic::AtomicU64,
+        at_once: Mutex<(u64, u64)>,
+        most_at_once: Mutex<(u64, u64)>,
+    }
+
+    impl std::fmt::Display for Recording {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Recording({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for Recording {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if options.head {
+                return self.inner.get_opts(location, options).await;
+            }
+            let asked = match &options.range {
+                Some(object_store::GetRange::Bounded(range)) => range.end - range.start,
+                _ => {
+                    self.unranged.fetch_add(1, Relaxed);
+                    u64::MAX
+                }
+            };
+            self.gets.fetch_add(1, Relaxed);
+            self.largest.fetch_max(asked, Relaxed);
+            {
+                let mut now = self.at_once.lock().unwrap();
+                *now = (now.0 + 1, now.1.saturating_add(asked));
+                let mut most = self.most_at_once.lock().unwrap();
+                *most = (most.0.max(now.0), most.1.max(now.1));
+            }
+            tokio::time::sleep(self.delay).await;
+            let result = self.inner.get_opts(location, options).await;
+            let mut now = self.at_once.lock().unwrap();
+            *now = (now.0 - 1, now.1.saturating_sub(asked));
+            result
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// An archive over a store recording what is asked of it, each GET
+    /// answered after 20 ms so requests overlap, within `limits`.
+    fn recorded_archive(
+        limits: super::ArchiveLimits,
+    ) -> (Arc<Recording>, Arc<super::ArchiveStore>) {
+        let store = Arc::new(Recording {
+            delay: std::time::Duration::from_millis(20),
+            ..Recording::default()
+        });
+        let archive =
+            super::ArchiveStore::with_limits(store.clone(), "kb".into(), None, limits).unwrap();
+        (store, archive)
+    }
+
+    /// A whole segment is downloaded in ranged requests of at most `CHUNK`
+    /// bytes, a few at a time: one request for all of it would outlast the
+    /// client's request timeout on a slow link.
+    #[test]
+    fn a_whole_segment_is_downloaded_in_bounded_requests() {
+        let (store, archive) = recorded_archive(super::ArchiveLimits::default());
+        let bytes = data(5 * super::CHUNK as usize / 2 + 123);
+        put_segment(&store.inner, "default", 0, bytes.clone());
+        let remote = remote(&archive, "default", &[]);
+
+        assert_eq!(remote.fetch_segment(&summary_of(0, &bytes)).unwrap(), bytes);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(store.unranged.load(Relaxed), 0);
+        assert_eq!(store.gets.load(Relaxed), 3);
+        assert_eq!(store.largest.load(Relaxed), super::CHUNK);
+        assert_eq!(remote.requests(), 3);
+        assert_eq!(remote.fetched_bytes(), bytes.len() as u64);
+        assert!(store.most_at_once.lock().unwrap().0 <= super::CHUNKS_IN_FLIGHT as u64);
+    }
+
+    /// A body restored from the archive is written as it arrives and kept
+    /// only once its hash matches the summary's.
+    #[test]
+    fn a_restored_body_is_kept_only_when_it_matches_its_summary() {
+        let (store, archive) = recorded_archive(super::ArchiveLimits::default());
+        let bytes = data(3 * super::CHUNK as usize / 2);
+        put_segment(&store.inner, "default", 0, bytes.clone());
+        let remote = remote(&archive, "default", &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("0.seg");
+
+        let mut wrong = summary_of(0, &bytes);
+        wrong.blake3 = "0".repeat(64);
+        let error = remote.restore_body(&wrong, &local).unwrap_err();
+        assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        remote.restore_body(&summary_of(0, &bytes), &local).unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Many files downloaded at once go in bounded requests straight to
+    /// their files, and all of them together keep within the node's
+    /// in-flight budget. One the archive does not hold is reported.
+    #[test]
+    fn downloads_of_many_files_keep_within_the_in_flight_budget() {
+        let budget = 2 * super::CHUNK;
+        let (store, archive) = recorded_archive(super::ArchiveLimits {
+            in_flight_bytes: budget,
+            ..Default::default()
+        });
+        let remote = remote(&archive, "default", &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let mut expected = Vec::new();
+        for n in 0..6u64 {
+            let bytes = data(5 * super::CHUNK as usize / 2 + n as usize);
+            let object = object_store::path::Path::from(format!("kb/default/index/{n}.keys"));
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(object_store::ObjectStoreExt::put(
+                    &store.inner,
+                    &object,
+                    bytes.clone().into(),
+                ))
+                .unwrap();
+            files.push((
+                "index",
+                format!("{n}.keys"),
+                dir.path().join(format!("{n}.keys")),
+            ));
+            expected.push(bytes);
+        }
+        files.push(("index", "lost.keys".into(), dir.path().join("lost.keys")));
+
+        let held = remote.download_all(&files).unwrap();
+        assert_eq!(held, [true, true, true, true, true, true, false]);
+        for ((_, _, local), bytes) in files.iter().zip(&expected) {
+            assert_eq!(&std::fs::read(local).unwrap(), bytes);
+        }
+        assert!(!dir.path().join("lost.keys").exists());
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(store.unranged.load(Relaxed), 0);
+        assert_eq!(store.largest.load(Relaxed), super::CHUNK);
+        let (_, most_bytes) = *store.most_at_once.lock().unwrap();
+        assert!(most_bytes <= budget, "{most_bytes} bytes asked for at once");
     }
 }
