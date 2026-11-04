@@ -88,12 +88,24 @@ archive:
   # workload identity.
   url: ""
   intervalSecs: 30
-  # Most bytes of sealed segments each node keeps on disk. Past it, the
-  # oldest archived segments are evicted and read back from the archive by
-  # range, which is slower than a local read: set it only when the disk
-  # cannot hold the whole log. Needs url, and at least two segments
-  # (256 MiB each by default). A whole number of bytes; empty keeps
-  # everything.
+  # Most bytes each node keeps on disk for its contexts: segments, the
+  # active one included, and their index files. Past it, the oldest
+  # archived segments are evicted, across contexts the oldest first, and
+  # read back from the archive by range (about 100 ms a read, against a
+  # millisecond locally): set it only when the disk cannot hold the whole
+  # log. Needs url, and at least two segments (256 MiB each by default).
+  # A whole number of bytes; empty keeps everything.
+  #
+  # - Evicted events exist only in the bucket unless some node keeps
+  #   everything: keep one node without a cap (a learner kept for backup)
+  #   and turn on versioning or object lock for the bucket.
+  # - While the archive is unreachable nothing is evicted, and every capped
+  #   node grows past the cap at the ingest rate: size the volume for the
+  #   longest outage you want to ride out (ingest bytes per hour times its
+  #   hours) on top of the cap.
+  # - A small context whose reads must stay fast can lose its local bodies
+  #   first if its segments are the oldest: size the cap so it stays local,
+  #   or serve it from nodes without a cap.
   maxLocalBytes: ""
   credentialsSecret: ""
 
@@ -182,7 +194,7 @@ alerts:
   # Prometheus-operator PrometheusRule with the production alert set:
   # poisoned engine, stalled writes, disk almost full, replication lag,
   # ack degradation, DCB rejection spikes; with an archive, a stalled or
-  # lagging archive and failing eviction.
+  # lagging archive, failing eviction, and history kept only in the archive.
   enabled: false
   replicationLagEvents: 100000
   dcbRejectionsPerSecond: 10

@@ -101,9 +101,10 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_ARCHIVE_INTERVAL_SECS")]
     archive_interval_secs: Option<u64>,
 
-    /// Most bytes of sealed segments this node keeps on disk; past it, the
-    /// oldest archived segments are evicted and read from the archive.
-    /// Needs an archive URL. Unset = keep everything; 0 is refused.
+    /// Most bytes this node keeps on disk for its contexts' logs, segments
+    /// and their index files alike; past it, the oldest archived segments
+    /// are evicted and read from the archive. Needs an archive URL. Unset =
+    /// keep everything; 0 is refused.
     #[arg(long, env = "KRONOSDB_ARCHIVE_MAX_LOCAL_BYTES")]
     archive_max_local_bytes: Option<u64>,
 
@@ -464,7 +465,7 @@ pub struct ServerConfig {
     /// Object-store URL of the archive tier; None = no archive.
     pub archive_url: Option<String>,
     pub archive_interval_secs: u64,
-    /// Most bytes of sealed segments kept on disk; None = never evict.
+    /// Most bytes of the logs' files kept on disk; None = never evict.
     pub archive_max_local_bytes: Option<u64>,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
