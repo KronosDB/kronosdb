@@ -8,7 +8,7 @@
 //! first to ask fetches it, the others wait for it), and recent blocks stay
 //! in a small in-memory cache, so processors replaying the same cold range
 //! together fetch it once. Neighbouring missing blocks go in one request of
-//! up to [`MAX_GET`] bytes, and all requests run concurrently.
+//! up to [`MAX_GET`] bytes, and the requests run concurrently.
 //!
 //! Reads from the archive are rare (it holds what a node's disk cannot), so
 //! what matters is that a read does not pay a round trip per segment, and a
@@ -16,6 +16,13 @@
 //! Reads plan ahead from the index alone and [`RemoteSegments::prefetch`]
 //! the next [`READAHEAD`] bytes of blocks in one go, across every segment
 //! they span.
+//!
+//! The cache and the downloads in flight belong to the [`ArchiveStore`],
+//! one per node, so their memory is bounded for the node however many
+//! contexts and readers there are: the cache by its budget, the requests in
+//! flight by theirs ([`DEFAULT_IN_FLIGHT_BYTES`]). A read waits its turn for
+//! that budget; a prefetch takes only what is free and skips the rest,
+//! which its read then fetches when it gets there.
 //!
 //! Reads are synchronous to their callers, which are blocking read threads:
 //! requests run on a small runtime of the archive's own and the caller
@@ -75,18 +82,57 @@ fn blocks_of(ranges: &[Range<u64>]) -> BTreeSet<u64> {
         .collect()
 }
 
-/// Default memory budget of the cache of fetched blocks, per context.
+/// Default memory budget of the cache of fetched blocks, node-wide.
 pub const DEFAULT_CACHE_BYTES: usize = 128 << 20;
 
-/// An archive as cold reads see it: its object store, and the runtime its
-/// requests run on. One per process, shared by every context.
+/// Default bytes of segment requests in flight at once, node-wide: what
+/// downloads hold in memory before they reach the cache or a file. Two
+/// reads prefetching [`READAHEAD`] each fill it; past it, prefetches shrink
+/// and reads wait their turn.
+pub const DEFAULT_IN_FLIGHT_BYTES: u64 = 64 << 20;
+
+/// What an [`ArchiveStore`] may hold in memory and how long it waits.
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveLimits {
+    /// Bytes of the block cache.
+    pub cache_bytes: usize,
+    /// Bytes of segment requests in flight; at least one block.
+    pub in_flight_bytes: u64,
+    /// How long one download of segment bytes may take.
+    pub fetch_timeout: std::time::Duration,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            cache_bytes: DEFAULT_CACHE_BYTES,
+            in_flight_bytes: DEFAULT_IN_FLIGHT_BYTES,
+            fetch_timeout: FETCH_TIMEOUT,
+        }
+    }
+}
+
+/// An archive as cold reads see it: its object store, the runtime its
+/// requests run on, the cache of fetched blocks and the downloads in
+/// flight. One per process, shared by every context, so its memory bounds
+/// hold for the node.
 pub struct ArchiveStore {
     store: Arc<dyn ObjectStore>,
     prefix: ObjectPath,
     io: IoRuntime,
-    cache_bytes: usize,
-    /// How long one download of segment bytes may take: [`FETCH_TIMEOUT`].
-    fetch_timeout: std::time::Duration,
+    limits: ArchiveLimits,
+    /// Recent blocks of every context's evicted segments.
+    blocks: Mutex<LruCache<BlockKey, Bytes>>,
+    /// Blocks being downloaded, which other readers wait for.
+    flights: Mutex<HashMap<BlockKey, Arc<Flight>>>,
+    /// Blocks' worth of requests in flight: a request holds one permit per
+    /// block (a whole-object chunk, one per [`BLOCK`] of it) until its bytes
+    /// are cached or written.
+    in_flight: Arc<tokio::sync::Semaphore>,
+    /// The permits `in_flight` holds when nothing is in flight.
+    in_flight_blocks: u32,
+    /// Numbers each context's cold reads, which key their blocks.
+    next_context: AtomicU64,
     /// The cap on sealed bytes this node keeps on disk, if any: a node
     /// catching up from the archive skips the bodies it would evict anyway.
     max_local_bytes: Option<u64>,
@@ -96,8 +142,7 @@ impl std::fmt::Debug for ArchiveStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArchiveStore")
             .field("prefix", &self.prefix)
-            .field("cache_bytes", &self.cache_bytes)
-            .field("fetch_timeout", &self.fetch_timeout)
+            .field("limits", &self.limits)
             .field("max_local_bytes", &self.max_local_bytes)
             .finish()
     }
@@ -109,14 +154,12 @@ impl ArchiveStore {
     /// disk (`None`: all of them).
     pub fn from_url(raw_url: &str, max_local_bytes: Option<u64>) -> Result<Arc<Self>, Error> {
         let (store, prefix) = open_store(raw_url)?;
-        Ok(Arc::new(Self {
-            store: Arc::from(store),
+        Self::with_limits(
+            Arc::from(store),
             prefix,
-            io: IoRuntime::new()?,
-            cache_bytes: DEFAULT_CACHE_BYTES,
-            fetch_timeout: FETCH_TIMEOUT,
             max_local_bytes,
-        }))
+            ArchiveLimits::default(),
+        )
     }
 
     /// An archive over `store` itself, its objects under `prefix`: for
@@ -126,12 +169,30 @@ impl ArchiveStore {
         prefix: ObjectPath,
         max_local_bytes: Option<u64>,
     ) -> Result<Arc<Self>, Error> {
+        Self::with_limits(store, prefix, max_local_bytes, ArchiveLimits::default())
+    }
+
+    /// [`over_store`](Self::over_store) within `limits`.
+    pub fn with_limits(
+        store: Arc<dyn ObjectStore>,
+        prefix: ObjectPath,
+        max_local_bytes: Option<u64>,
+        limits: ArchiveLimits,
+    ) -> Result<Arc<Self>, Error> {
+        let cached = (limits.cache_bytes as u64 / BLOCK).max(1) as usize;
+        let in_flight_blocks = (limits.in_flight_bytes / BLOCK).clamp(1, u32::MAX.into()) as u32;
         Ok(Arc::new(Self {
             store,
             prefix,
             io: IoRuntime::new()?,
-            cache_bytes: DEFAULT_CACHE_BYTES,
-            fetch_timeout: FETCH_TIMEOUT,
+            limits,
+            blocks: Mutex::new(LruCache::new(
+                NonZeroUsize::new(cached).expect("at least one block"),
+            )),
+            flights: Mutex::new(HashMap::new()),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(in_flight_blocks as usize)),
+            in_flight_blocks,
+            next_context: AtomicU64::new(0),
             max_local_bytes,
         }))
     }
@@ -145,18 +206,23 @@ impl ArchiveStore {
             .ok_or_else(|| Error::Internal {
                 message: format!("context directory {} has no name", dir.display()),
             })?;
-        let blocks = (self.cache_bytes as u64 / BLOCK).max(1) as usize;
         Ok(RemoteSegments {
             archive: Arc::clone(self),
+            id: self.next_context.fetch_add(1, Ordering::Relaxed),
             context: self.prefix.clone().join(context),
             dir: dir.to_path_buf(),
             data_lens: Mutex::new(HashMap::new()),
-            blocks: Mutex::new(LruCache::new(NonZeroUsize::new(blocks).unwrap())),
-            flights: Mutex::new(HashMap::new()),
             requests: AtomicU64::new(0),
             fetched_bytes: AtomicU64::new(0),
             failures: AtomicU64::new(0),
         })
+    }
+
+    /// Permits a request of `bytes` takes from `in_flight`: one per block,
+    /// and never more than the budget holds, so a request larger than the
+    /// budget waits for all of it rather than for ever.
+    fn permits_for(&self, bytes: u64) -> u32 {
+        (bytes.div_ceil(BLOCK).max(1)).min(self.in_flight_blocks.into()) as u32
     }
 
     /// Runs `future` on the archive's runtime and waits for it.
@@ -169,7 +235,7 @@ impl ArchiveStore {
             let _ = done.send(future.await);
         });
         result.recv().map_err(|_| Error::Unavailable {
-            message: "the archive's runtime has shut down".into(),
+            message: "the archive's runtime shut down before the request finished".into(),
         })?
     }
 }
@@ -205,8 +271,9 @@ impl Drop for IoRuntime {
 /// answer them (it panicked, or the runtime shut down and dropped it), they
 /// are answered with an error here, so no reader waits forever.
 struct Pending {
-    segments: Arc<RemoteSegments>,
-    base: u64,
+    archive: Arc<ArchiveStore>,
+    /// The context's number and the segment's base.
+    segment: (u64, u64),
     blocks: Option<Waiters>,
 }
 
@@ -215,9 +282,10 @@ impl Drop for Pending {
         let Some(blocks) = self.blocks.take() else {
             return;
         };
-        let mut flights = lock(&self.segments.flights);
+        let (context, base) = self.segment;
+        let mut flights = lock(&self.archive.flights);
         for (block, flight) in blocks {
-            flights.remove(&(self.base, block));
+            flights.remove(&(context, base, block));
             flight.finish(Err(Failure::Unavailable(
                 "the download was abandoned".into(),
             )));
@@ -364,22 +432,35 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-type BlockKey = (u64, u64);
+/// A cached or downloading block: the number of its context's cold reads,
+/// its segment's base, and the block.
+type BlockKey = (u64, u64, u64);
 
 /// Blocks of one segment, each with the download that brings it.
 type Waiters = Vec<(u64, Arc<Flight>)>;
 
+/// Who asks for blocks.
+#[derive(Clone, Copy)]
+enum Ask {
+    /// A read, which waits for them.
+    Read,
+    /// A prefetch, which asks only for what the in-flight budget has room
+    /// for now.
+    Prefetch,
+}
+
 /// The archived segments of one context, read by range.
 pub struct RemoteSegments {
     archive: Arc<ArchiveStore>,
+    /// Keys this context's blocks in the archive's cache. A context opened
+    /// again gets a new number, so it never reads blocks cached before.
+    id: u64,
     /// `<prefix>/<context>`.
     context: ObjectPath,
     /// The context's local data directory, where the locators are.
     dir: PathBuf,
     /// Data bytes of each archived segment, from its locator.
     data_lens: Mutex<HashMap<u64, u64>>,
-    blocks: Mutex<LruCache<BlockKey, Bytes>>,
-    flights: Mutex<HashMap<BlockKey, Arc<Flight>>>,
     requests: AtomicU64,
     fetched_bytes: AtomicU64,
     failures: AtomicU64,
@@ -556,19 +637,21 @@ impl RemoteSegments {
                 ),
             });
         }
-        let (mut have, waiting) = self.reserve(base, data_len, blocks_of(ranges));
+        let (mut have, waiting, _) = self.reserve(base, data_len, blocks_of(ranges), Ask::Read);
         // Every download fails by its own deadline; this one is for a
         // download that never answers at all.
-        let deadline = std::time::Instant::now() + self.archive.fetch_timeout + RETRY_TIMEOUT;
+        let deadline =
+            std::time::Instant::now() + self.archive.limits.fetch_timeout + RETRY_TIMEOUT;
         for (block, flight) in waiting {
             let bytes = flight.wait(deadline).map_err(|failure| {
                 // A later read starts a download of its own.
-                let mut flights = lock(&self.flights);
+                let key = (self.id, base, block);
+                let mut flights = lock(&self.archive.flights);
                 if flights
-                    .get(&(base, block))
+                    .get(&key)
                     .is_some_and(|current| Arc::ptr_eq(current, &flight))
                 {
-                    flights.remove(&(base, block));
+                    flights.remove(&key);
                 }
                 failure.into_error(base)
             })?;
@@ -594,9 +677,13 @@ impl RemoteSegments {
     }
 
     /// Starts downloading the blocks holding `ranges` of each segment that
-    /// are neither cached nor on their way, all at once, without waiting:
-    /// a read that wants them later finds them cached or waits for them.
-    /// What a read is about to need, or a scan will need next.
+    /// are neither cached nor on their way, without waiting: a read that
+    /// wants them later finds them cached or waits for them. What a read is
+    /// about to need, or a scan will need next, nearest first.
+    ///
+    /// A prefetch only takes what is free of the node's in-flight budget:
+    /// it stops at the first request the budget has no room for, so what it
+    /// starts is the nearest part of what was asked, and it never queues.
     pub fn prefetch(self: &Arc<Self>, wanted: &[(u64, Vec<Range<u64>>)]) -> Result<(), Error> {
         for (base, ranges) in wanted {
             let data_len = self.data_len(*base)?;
@@ -604,119 +691,163 @@ impl RemoteSegments {
                 .into_iter()
                 .filter(|&block| block * BLOCK < data_len)
                 .collect();
-            self.reserve(*base, data_len, blocks);
+            let (_, _, whole) = self.reserve(*base, data_len, blocks, Ask::Prefetch);
+            if !whole {
+                break;
+            }
         }
         Ok(())
     }
 
     /// For each of `wanted` (blocks of segment `base`): its bytes when
     /// cached, or the download that brings them, which this call starts
-    /// for the blocks nobody is fetching yet.
+    /// for the blocks nobody is fetching yet. A read starts every download
+    /// it needs, each waiting its turn for the in-flight budget; a prefetch
+    /// starts them as far as the budget has room now, leaves the rest out
+    /// of what it returns, and says it stopped short (`false`).
     fn reserve(
         self: &Arc<Self>,
         base: u64,
         data_len: u64,
         wanted: BTreeSet<u64>,
-    ) -> (HashMap<u64, Bytes>, Waiters) {
+        ask: Ask,
+    ) -> (HashMap<u64, Bytes>, Waiters, bool) {
         let mut have = HashMap::new();
         let mut waiting = Vec::new();
-        let mut mine = Vec::new();
-        {
-            let mut blocks = self.blocks.lock().unwrap();
-            let mut flights = self.flights.lock().unwrap();
-            for block in wanted {
-                if let Some(bytes) = blocks.get(&(base, block)) {
-                    have.insert(block, bytes.clone());
-                } else if let Some(flight) = flights.get(&(base, block)) {
-                    waiting.push((block, Arc::clone(flight)));
-                } else {
-                    let flight = Arc::new(Flight::default());
-                    flights.insert((base, block), Arc::clone(&flight));
-                    waiting.push((block, Arc::clone(&flight)));
-                    mine.push((block, flight));
-                }
+        let mut missing = Vec::new();
+        let mut cache = lock(&self.archive.blocks);
+        let mut flights = lock(&self.archive.flights);
+        for block in wanted {
+            let key = (self.id, base, block);
+            if let Some(bytes) = cache.get(&key) {
+                have.insert(block, bytes.clone());
+            } else if let Some(flight) = flights.get(&key) {
+                waiting.push((block, Arc::clone(flight)));
+            } else {
+                missing.push(block);
             }
         }
-        if !mine.is_empty() {
-            self.spawn_fetch(base, data_len, mine);
-        }
-        (have, waiting)
-    }
 
-    /// Downloads `blocks` (ascending) of segment `base` on the archive's
-    /// runtime, neighbours in one request of up to [`MAX_GET`] bytes, each
-    /// request a task of its own; each caches its blocks and lets their
-    /// waiters go as soon as it has them.
-    fn spawn_fetch(self: &Arc<Self>, base: u64, data_len: u64, blocks: Waiters) {
-        let mut runs: Vec<(Range<u64>, Waiters)> = Vec::new();
-        for (block, flight) in blocks {
+        // Neighbouring blocks in one request, of at most `MAX_GET` bytes
+        // and never more than the in-flight budget.
+        let largest = MAX_GET.min(u64::from(self.archive.in_flight_blocks) * BLOCK);
+        let mut runs: Vec<(Range<u64>, Vec<u64>)> = Vec::new();
+        for block in missing {
             let (start, end) = (block * BLOCK, ((block + 1) * BLOCK).min(data_len));
             match runs.last_mut() {
-                Some((run, blocks)) if run.end == start && end - run.start <= MAX_GET => {
+                Some((run, blocks)) if run.end == start && end - run.start <= largest => {
                     run.end = end;
-                    blocks.push((block, flight));
+                    blocks.push(block);
                 }
-                _ => runs.push((start..end, vec![(block, flight)])),
+                _ => runs.push((start..end, vec![block])),
             }
         }
         for (run, blocks) in runs {
-            let this = Arc::clone(self);
-            let object = self.segment_object(base);
-            let mut pending = Pending {
-                segments: Arc::clone(self),
-                base,
-                blocks: Some(blocks),
+            let permits = self.archive.permits_for(run.end - run.start);
+            let permit = match ask {
+                Ask::Read => None,
+                Ask::Prefetch => {
+                    match Arc::clone(&self.archive.in_flight).try_acquire_many_owned(permits) {
+                        Ok(permit) => Some(permit),
+                        Err(_) => return (have, waiting, false),
+                    }
+                }
             };
-            self.archive.io.handle().spawn(async move {
+            let mine: Waiters = blocks
+                .into_iter()
+                .map(|block| {
+                    let flight = Arc::new(Flight::default());
+                    flights.insert((self.id, base, block), Arc::clone(&flight));
+                    waiting.push((block, Arc::clone(&flight)));
+                    (block, flight)
+                })
+                .collect();
+            self.spawn_fetch(base, data_len, run, mine, permit);
+        }
+        (have, waiting, true)
+    }
+
+    /// Downloads `run` of segment `base`, which holds `blocks`, on the
+    /// archive's runtime: once it holds `permit`, or its share of the
+    /// in-flight budget when it has none, it fetches the run, caches its
+    /// blocks and lets their waiters go.
+    fn spawn_fetch(
+        self: &Arc<Self>,
+        base: u64,
+        data_len: u64,
+        run: Range<u64>,
+        blocks: Waiters,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        let this = Arc::clone(self);
+        let object = self.segment_object(base);
+        let mut pending = Pending {
+            archive: Arc::clone(&self.archive),
+            segment: (self.id, base),
+            blocks: Some(blocks),
+        };
+        self.archive.io.handle().spawn(async move {
+            let archive = &this.archive;
+            let timeout = archive.limits.fetch_timeout;
+            let fetched = tokio::time::timeout(timeout, async {
+                let permit = match permit {
+                    Some(permit) => permit,
+                    None => Arc::clone(&archive.in_flight)
+                        .acquire_many_owned(archive.permits_for(run.end - run.start))
+                        .await
+                        .expect("the in-flight budget is never closed"),
+                };
                 this.requests.fetch_add(1, Ordering::Relaxed);
-                let timeout = this.archive.fetch_timeout;
-                let fetched = tokio::time::timeout(
-                    timeout,
-                    get_range(
-                        this.archive.store.as_ref(),
-                        &object,
-                        run,
-                        data_len,
-                        "its locator",
-                    ),
+                let bytes = get_range(
+                    archive.store.as_ref(),
+                    &object,
+                    run,
+                    data_len,
+                    "its locator",
                 )
-                .await
-                .unwrap_or_else(|_| {
+                .await;
+                (permit, bytes)
+            })
+            .await
+            .map_or_else(
+                |_| {
                     Err(Failure::Unavailable(format!(
                         "no answer within {}s",
                         timeout.as_secs_f64()
                     )))
-                });
-                let blocks = pending.blocks.take().expect("answered once");
-                match fetched {
-                    Ok(bytes) => {
-                        this.fetched_bytes
-                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        // Each block is copied out: a slice would share the
-                        // request's buffer, and one block left in the cache
-                        // would keep all of it alive.
-                        let mut cache = lock(&this.blocks);
-                        let mut flights = lock(&this.flights);
-                        for ((block, flight), bytes) in blocks
-                            .iter()
-                            .zip(bytes.chunks(BLOCK as usize).map(Bytes::copy_from_slice))
-                        {
-                            cache.put((base, *block), bytes.clone());
-                            flights.remove(&(base, *block));
-                            flight.finish(Ok(bytes));
-                        }
-                    }
-                    Err(failure) => {
-                        this.failures.fetch_add(1, Ordering::Relaxed);
-                        let mut flights = lock(&this.flights);
-                        for (block, flight) in &blocks {
-                            flights.remove(&(base, *block));
-                            flight.finish(Err(failure.clone()));
-                        }
+                },
+                // The permit goes once the blocks are cached, below.
+                |(permit, bytes)| bytes.map(|bytes| (permit, bytes)),
+            );
+            let blocks = pending.blocks.take().expect("answered once");
+            match fetched {
+                Ok((_permit, bytes)) => {
+                    this.fetched_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    // Each block is copied out: a slice would share the
+                    // request's buffer, and one block left in the cache
+                    // would keep all of it alive.
+                    let mut cache = lock(&archive.blocks);
+                    let mut flights = lock(&archive.flights);
+                    for ((block, flight), bytes) in blocks
+                        .iter()
+                        .zip(bytes.chunks(BLOCK as usize).map(Bytes::copy_from_slice))
+                    {
+                        cache.put((this.id, base, *block), bytes.clone());
+                        flights.remove(&(this.id, base, *block));
+                        flight.finish(Ok(bytes));
                     }
                 }
-            });
-        }
+                Err(failure) => {
+                    this.failures.fetch_add(1, Ordering::Relaxed);
+                    let mut flights = lock(&archive.flights);
+                    for (block, flight) in &blocks {
+                        flights.remove(&(this.id, base, *block));
+                        flight.finish(Err(failure.clone()));
+                    }
+                }
+            }
+        });
     }
 
     /// The summary of archived segment `base`; `None` when the archive does
@@ -1171,7 +1302,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let shared = {
-                let cache = remote.blocks.lock().unwrap();
+                let cache = archive.blocks.lock().unwrap();
                 assert_eq!(cache.len(), len.div_ceil(super::BLOCK as usize));
                 cache.iter().filter(|(_, bytes)| !bytes.is_unique()).count()
             };
@@ -1278,8 +1409,16 @@ mod tests {
                 ..ThrottleConfig::default()
             },
         ));
-        let mut archive = super::ArchiveStore::over_store(hanging, "kb".into(), None).unwrap();
-        Arc::get_mut(&mut archive).unwrap().fetch_timeout = std::time::Duration::from_millis(200);
+        let archive = super::ArchiveStore::with_limits(
+            hanging,
+            "kb".into(),
+            None,
+            super::ArchiveLimits {
+                fetch_timeout: std::time::Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let remote = remote(&archive, "default", &[(0, 1000)]);
 
         for _ in 0..2 {
@@ -1293,9 +1432,113 @@ mod tests {
                 .expect("the read waits on the download for ever")
                 .unwrap_err();
             assert!(matches!(error, Error::Unavailable { .. }), "{error}");
-            assert!(remote.flights.lock().unwrap().is_empty());
+            assert!(archive.flights.lock().unwrap().is_empty());
         }
         assert_eq!(remote.requests(), 2);
         assert_eq!(remote.failures(), 2);
+    }
+
+    /// Every context of one archive shares its block cache, so the cache's
+    /// budget holds for the node, not for each context.
+    #[test]
+    fn contexts_share_one_block_cache() {
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        let len = 4 * super::BLOCK;
+        for context in ["a", "b"] {
+            put_segment(memory.as_ref(), context, 0, data(len as usize));
+        }
+        let archive = super::ArchiveStore::with_limits(
+            memory,
+            "kb".into(),
+            None,
+            super::ArchiveLimits {
+                cache_bytes: len as usize,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let a = remote(&archive, "a", &[(0, len)]);
+        let b = remote(&archive, "b", &[(0, len)]);
+
+        read_one(&a, 0, 0..len).unwrap();
+        read_one(&b, 0, 0..len).unwrap();
+        assert_eq!(archive.blocks.lock().unwrap().len(), 4);
+        // `b`'s blocks took the room `a`'s had.
+        let requests = a.requests();
+        read_one(&a, 0, 0..len).unwrap();
+        assert!(a.requests() > requests);
+        let requests = b.requests();
+        read_one(&b, 0, 0..super::BLOCK).unwrap();
+        assert!(b.requests() > requests);
+    }
+
+    /// A prefetch starts downloads only as far as the node's in-flight
+    /// budget has room, nearest first, and never waits for it; a second
+    /// prefetch of the same blocks shares the downloads under way. A read
+    /// waits its turn for the budget instead.
+    #[test]
+    fn a_prefetch_takes_only_what_the_in_flight_budget_has_room_for() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        let len = 8 * super::BLOCK;
+        for base in [0, 100] {
+            put_segment(memory.as_ref(), "default", base, data(len as usize));
+        }
+        let hanging = Arc::new(ThrottledStore::new(
+            memory,
+            ThrottleConfig {
+                wait_get_per_call: std::time::Duration::from_secs(3600),
+                ..ThrottleConfig::default()
+            },
+        ));
+        let timeout = std::time::Duration::from_millis(300);
+        let archive = super::ArchiveStore::with_limits(
+            hanging,
+            "kb".into(),
+            None,
+            super::ArchiveLimits {
+                in_flight_bytes: 4 * super::BLOCK,
+                fetch_timeout: timeout,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let remote = remote(&archive, "default", &[(0, len), (100, len)]);
+        let flights = || -> Vec<(u64, u64)> {
+            let mut keys: Vec<(u64, u64)> = archive
+                .flights
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|&(_, base, block)| (base, block))
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+
+        let wanted: Vec<(u64, Vec<std::ops::Range<u64>>)> = [0, 100]
+            .into_iter()
+            .map(|base| (base, std::iter::once(0..len).collect()))
+            .collect();
+        let began = std::time::Instant::now();
+        remote.prefetch(&wanted).unwrap();
+        remote.prefetch(&wanted).unwrap();
+        assert!(began.elapsed() < timeout, "{:?}", began.elapsed());
+        assert_eq!(flights(), [(0, 0), (0, 1), (0, 2), (0, 3)]);
+        assert_eq!(archive.in_flight.available_permits(), 0);
+
+        // The read's download waits for the prefetches to give the budget
+        // back (they fail by their deadline), then fails by its own.
+        let error = read_one(&remote, 100, 0..100).unwrap_err();
+        assert!(matches!(error, Error::Unavailable { .. }), "{error}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while archive.in_flight.available_permits() < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the budget never came back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(flights().is_empty());
     }
 }
