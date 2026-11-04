@@ -3069,14 +3069,40 @@ impl EventStoreEngine {
             .unwrap_or(0)
     }
 
-    /// Bytes of the sealed segment bodies on this node's disk: what a cap on
-    /// local bytes counts. A stat per segment.
+    /// Bytes of the sealed segment bodies on this node's disk. A stat per
+    /// segment.
     pub fn sealed_body_bytes(&self) -> u64 {
         self.sealed_bodies()
             .iter()
             .filter_map(|segment| std::fs::metadata(&segment.path).ok())
             .map(|metadata| metadata.len())
             .sum()
+    }
+
+    /// Bytes of every file this log keeps on this node's disk: segment
+    /// bodies, the active one included, their locators and key tables, and
+    /// the merged tables. What a cap on local bytes counts (ADR-0011). A
+    /// stat per file.
+    pub fn local_bytes(&self) -> Result<u64, Error> {
+        fn sum(dir: &Path) -> Result<u64, Error> {
+            let mut bytes = 0;
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    bytes += sum(&entry.path())?;
+                } else if kind.is_file() {
+                    match entry.metadata() {
+                        Ok(metadata) => bytes += metadata.len(),
+                        // Removed since it was listed.
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            Ok(bytes)
+        }
+        sum(&self.dir)
     }
 
     /// The sealed segments whose body is on this node's disk.

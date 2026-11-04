@@ -88,6 +88,19 @@ spec:
               A segment that differs from its archived copy fails every
               pass and is logged as divergence: investigate that before
               anything else.
+
+        - alert: KronosDBHistoryOnlyInArchive
+          expr: min by (context) (kronosdb_archive_evicted_position) > 0
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Context {{ printf "{{ $labels.context }}" }} keeps its oldest events only in the archive"
+            description: >-
+              Every node has evicted the oldest segments of this context, so
+              the bucket holds the only copy of the events before position
+              {{ printf "{{ $value }}" }}: they are as durable as the bucket
+              is. Keep one node without a cap, such as a learner kept for
+              backup, and turn on versioning or object lock for the bucket.
         {{- end }}
         {{- end }}
 

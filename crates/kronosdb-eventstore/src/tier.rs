@@ -790,10 +790,12 @@ impl Archiver {
         deleted
     }
 
-    /// Evicts the oldest archived segments of `engines` while the sealed
-    /// segments on this node's disk hold more than `max_local_bytes`: across
-    /// contexts, the segment sealed longest ago first. Runs on every node,
-    /// each under its own cap.
+    /// Evicts the oldest archived segments of `engines` while their files
+    /// on this node's disk hold more than `max_local_bytes`: every file a
+    /// context keeps counts, bodies, the active segment, locators and key
+    /// tables, though only sealed bodies can be evicted. Across contexts,
+    /// the oldest segment goes first. Runs on every node, each under its own
+    /// cap.
     ///
     /// A segment is evicted only once its summary is in the archive and the
     /// blake3 of this node's data bytes equals the summary's. A mismatch is
@@ -810,7 +812,7 @@ impl Archiver {
         let mut local = 0u64;
         let mut open = Vec::new();
         for (context, engine) in engines {
-            match sealed_bytes(engine).await {
+            match local_bytes(engine).await {
                 Ok(bytes) => {
                     local += bytes;
                     open.push(EvictionCandidate {
@@ -1169,13 +1171,14 @@ async fn last_event_timestamp(
         .map(|event| event.timestamp)
 }
 
-/// Bytes of the sealed segment bodies `engine` holds on disk.
-async fn sealed_bytes(engine: &EventStoreEngine) -> Result<u64, Error> {
-    let mut bytes = 0;
-    for segment in engine.sealed_bodies() {
-        bytes += file_len(&segment.path).await?.unwrap_or(0);
-    }
-    Ok(bytes)
+/// Bytes of every file `engine` keeps on disk: what the cap counts.
+async fn local_bytes(engine: &Arc<EventStoreEngine>) -> Result<u64, Error> {
+    let engine = Arc::clone(engine);
+    tokio::task::spawn_blocking(move || engine.local_bytes())
+        .await
+        .map_err(|error| Error::Internal {
+            message: format!("counting local bytes: {error}"),
+        })?
 }
 
 /// The oldest final segment of `engine` with a body, if there is one.
@@ -2305,8 +2308,8 @@ mod tests {
                 if name == "late" {
                     file.set_modified(hour_ago).unwrap();
                 }
-                local += file.metadata().unwrap().len();
             }
+            local += engine.local_bytes().unwrap();
         }
 
         let report = archiver_for(tier.path(), DELETE_GRACE)
