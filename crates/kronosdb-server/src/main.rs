@@ -434,6 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listener = bind_listener(config.listen_addr)?;
+    let schedules = Arc::new(kronosdb_eventstore::scheduler::Schedules::default());
     let native_service = Arc::new(native::Native::new(native::Deps {
         cluster: Arc::clone(&cluster),
         auth: Arc::clone(&authenticator),
@@ -445,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
         max_snapshot_size: config.max_snapshot_size,
         hub: Arc::clone(&hub),
-        schedule_projections: Default::default(),
+        schedules: Arc::clone(&schedules),
     }));
     let native_config = Arc::new(kronosdb_protocol::net::server::ServerConfig {
         server_name: config.node_name.clone(),
@@ -475,7 +476,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "archive enabled"
         );
     }
-    cluster.start_scheduler(Duration::from_secs(1));
+    cluster.start_scheduler(Duration::from_secs(1), schedules);
     if let Some(ref manifest_path) = config.manifest {
         spawn_manifest_watch(Arc::clone(&cluster), manifest_path.clone());
     }

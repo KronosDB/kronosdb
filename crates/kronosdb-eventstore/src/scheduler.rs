@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::append::{AppendCondition, AppendRequest};
 use crate::criteria::{Criterion, SourcingCondition};
@@ -135,6 +136,20 @@ fn by_token(token: &str) -> SourcingCondition {
         criteria: vec![Criterion {
             names: vec![],
             tags: vec![token_tag(token)],
+        }],
+    }
+}
+
+/// Matches the scheduler's own events, by type alone. Not the `$sys`
+/// marker: that matches every system event, snapshot records with their
+/// state included, and on a node with evicted segments reading those waits
+/// on the archive. The target event a schedule fires is committed with its
+/// `$schedule.fired` in one batch, so the fired record alone resolves it.
+fn lifecycle() -> SourcingCondition {
+    SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![CREATED.into(), CANCELLED.into(), FIRED.into()],
+            tags: vec![],
         }],
     }
 }
@@ -279,10 +294,7 @@ impl Projection {
         if head <= self.cursor {
             return Ok(());
         }
-        // Every system event, not just this subsystem's: other subsystems'
-        // events carry no `$schedule` token and are skipped in `apply`.
-        let condition = crate::system::marker_condition();
-        let events = engine.source_internal(self.cursor, &condition, usize::MAX)?;
+        let events = engine.source_internal(self.cursor, &lifecycle(), usize::MAX)?;
         self.apply(events);
         self.cursor = head;
         Ok(())
@@ -345,6 +357,72 @@ impl Projection {
 
     pub fn is_empty(&self) -> bool {
         self.live.is_empty()
+    }
+}
+
+/// Every context's [`Projection`], shared by the scheduler loop and
+/// `ListSchedules` so the log is folded once per node.
+#[derive(Debug, Default)]
+pub struct Schedules {
+    contexts: Mutex<HashMap<String, Arc<Mutex<Projection>>>>,
+}
+
+impl Schedules {
+    /// The projection of `context`, created empty on first use. The map is
+    /// locked only to find it: folding one context never waits on another.
+    pub fn projection(&self, context: &str) -> Arc<Mutex<Projection>> {
+        let mut contexts = self.contexts.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(contexts.entry(context.to_string()).or_default())
+    }
+}
+
+/// One scheduler tick over one context: folds what is new, then, on the
+/// leader, fires what is due.
+///
+/// Blocking: folding may read evicted segments, which waits on the archive,
+/// and firing waits for the quorum. A tick whose context is still busy
+/// (an earlier tick waiting on the archive, or a `ListSchedules` folding)
+/// is skipped, not queued behind it; the next tick catches up.
+pub fn tick(
+    engine: &EventStoreEngine,
+    projection: &Mutex<Projection>,
+    leading: bool,
+    context: &str,
+) {
+    let mut projection = match projection.try_lock() {
+        Ok(projection) => projection,
+        Err(std::sync::TryLockError::WouldBlock) => return,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    // Folded on every node so a new leader starts warm.
+    if let Err(error) = projection.advance(engine) {
+        tracing::warn!(%error, context, "schedule projection stalled; retrying");
+        return;
+    }
+    if !leading {
+        return;
+    }
+    for live in projection.due(now_ms()) {
+        match fire(engine, &live) {
+            Ok(()) => tracing::debug!(
+                context,
+                token = live.token,
+                event = live.target.name,
+                "scheduled event fired"
+            ),
+            // The schedule resolved under us — cancelled, or already fired
+            // by the leader we took over from.
+            Err(Error::ConsistencyConditionViolated { .. }) => tracing::debug!(
+                context,
+                token = live.token,
+                "scheduled event already resolved; skipping"
+            ),
+            // Transient: the guard makes a retry next tick safe.
+            Err(error) => tracing::warn!(
+                %error, context, token = live.token,
+                "scheduled event failed to fire; retrying next tick"
+            ),
+        }
     }
 }
 
@@ -543,6 +621,63 @@ mod tests {
         }
         projection.advance(&engine).unwrap();
         assert!(projection.is_empty());
+    }
+
+    /// Snapshot records are system events too, and their state can be
+    /// large and evicted: the fold must not read them.
+    #[test]
+    fn the_fold_reads_only_schedule_events() {
+        let (_dir, engine) = engine();
+        crate::snapshot::append(&engine, b"k", vec![7; 4096], Position(0)).unwrap();
+        schedule(&engine, "tok", &spec("ReminderDue", 0)).unwrap();
+        cancel(&engine, "tok").unwrap();
+        schedule(&engine, "fires", &spec("ReminderDue", 0)).unwrap();
+        let mut projection = Projection::default();
+        projection.advance(&engine).unwrap();
+        fire(&engine, &projection.due(now_ms())[0]).unwrap();
+
+        let read = engine
+            .source_internal(Position(0), &lifecycle(), usize::MAX)
+            .unwrap();
+        let names: Vec<&str> = read.iter().map(|event| event.name.as_str()).collect();
+        assert_eq!(names, vec![CREATED, CANCELLED, CREATED, FIRED]);
+
+        projection.advance(&engine).unwrap();
+        assert!(projection.is_empty());
+    }
+
+    #[test]
+    fn only_a_leading_tick_fires() {
+        let (_dir, engine) = engine();
+        schedule(&engine, "tok", &spec("ReminderDue", 0)).unwrap();
+        let schedules = Schedules::default();
+        let projection = schedules.projection("default");
+
+        tick(&engine, &projection, false, "default");
+        assert_eq!(projection.lock().unwrap().len(), 1, "folded, not fired");
+        assert_eq!(engine.head(), Position(1));
+
+        tick(&engine, &projection, true, "default");
+        assert_eq!(engine.head(), Position(3), "target and fired appended");
+        // Shared: what the loop folded is what ListSchedules sees.
+        let listed = schedules.projection("default");
+        listed.lock().unwrap().advance(&engine).unwrap();
+        assert!(listed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tick_skips_a_context_that_is_still_busy() {
+        let (_dir, engine) = engine();
+        schedule(&engine, "tok", &spec("ReminderDue", 0)).unwrap();
+        let projection = Mutex::new(Projection::default());
+
+        let busy = projection.lock().unwrap();
+        tick(&engine, &projection, true, "default");
+        drop(busy);
+        assert_eq!(engine.head(), Position(1), "nothing fired while busy");
+
+        tick(&engine, &projection, true, "default");
+        assert_eq!(engine.head(), Position(3));
     }
 
     #[test]
