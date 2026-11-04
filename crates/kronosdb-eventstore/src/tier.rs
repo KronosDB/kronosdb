@@ -31,8 +31,11 @@
 //! it, and the merged tables of ADR-0010, uploaded once the segments they
 //! cover are archived. Both are deterministic, so a table's name fixes its
 //! bytes. A table inside another archived table's range is superseded and
-//! deleted after [`DELETE_GRACE`]; a bucket under object lock refuses, and
-//! the table stays.
+//! deleted after [`DELETE_GRACE`]. Under a GCS retention policy or an Azure
+//! immutability policy the store refuses, and the table stays. On a
+//! versioned S3 bucket under object lock the delete succeeds but only adds
+//! a delete marker: the locked version stays, and is billed, until its
+//! retention ends and a lifecycle rule expires noncurrent versions.
 //!
 //! An object up to 8 MiB goes up in one request, a larger one in 8 MiB
 //! parts, at most four in flight. A multipart upload that fails, or whose
@@ -697,8 +700,10 @@ impl Archiver {
 
     /// Deletes archived tables whose range lies inside another archived
     /// table's, once this node has known that table for the grace period.
-    /// Best effort: a table the store refuses to delete is kept and not
-    /// tried again. Returns how many it deleted.
+    /// Best effort: a table the store refuses to delete (a retention
+    /// policy, or credentials without delete) is kept and not tried again
+    /// while this node leads; one whose delete failed otherwise, as on a
+    /// 503, is tried again next pass. Returns how many it deleted.
     async fn delete_superseded(&self, context: &str, state: &mut ContextArchive) -> usize {
         // Tables are aligned blocks: nested or disjoint. In order of base,
         // widest first, a table is inside another exactly when an earlier
@@ -726,6 +731,7 @@ impl Archiver {
         }
 
         let mut deleted = 0;
+        let mut failed = None;
         for range in doomed {
             match self
                 .store
@@ -736,7 +742,7 @@ impl Archiver {
                     state.tables.remove(&range);
                     deleted += 1;
                 }
-                Err(error) => {
+                Err(error) if refuses_deletes(&error) => {
                     if state.kept.is_empty() {
                         tracing::warn!(
                             context,
@@ -747,7 +753,18 @@ impl Archiver {
                     }
                     state.kept.insert(range);
                 }
+                Err(error) => {
+                    failed.get_or_insert((error, 0)).1 += 1;
+                }
             }
+        }
+        if let Some((error, tables)) = failed {
+            tracing::warn!(
+                context,
+                %error,
+                tables,
+                "could not delete superseded key tables; retrying next pass"
+            );
         }
         deleted
     }
@@ -1204,6 +1221,21 @@ async fn file_len(path: &Path) -> Result<Option<u64>, Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Whether `error` is the store refusing a delete, which it will go on
+/// refusing: a retention policy (403 on GCS, 409 on Azure), credentials
+/// that may not delete, a store without deletes. Anything else, a 503 or a
+/// timeout, may pass.
+fn refuses_deletes(error: &object_store::Error) -> bool {
+    matches!(
+        error,
+        object_store::Error::PermissionDenied { .. }
+            | object_store::Error::NotImplemented { .. }
+            | object_store::Error::NotSupported { .. }
+            | object_store::Error::Precondition { .. }
+            | object_store::Error::AlreadyExists { .. }
+    )
 }
 
 fn is_not_found(error: &Error) -> bool {
@@ -1917,6 +1949,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.deleted, 0);
+        assert_eq!(archived_tables(tier.path()), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_that_failed_is_tried_again_one_refused_is_not() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let (engine, merged) = superseded_tables(data.path(), tier.path()).await;
+        let superseded = archived_tables(tier.path())
+            .iter()
+            .filter(|&&(base, end)| (base, end) != merged && base >= merged.0 && end <= merged.1)
+            .count();
+
+        // A 503: the next pass deletes what this one could not.
+        let (archiver, store) = faulty_archiver(
+            tier.path(),
+            Faults {
+                failing_deletes: 1,
+                ..Faults::default()
+            },
+        );
+        let archiver = archiver.with_delete_grace(Duration::ZERO);
+        let first = archiver.run_archive_pass("default", &engine).await.unwrap();
+        assert_eq!(first.deleted, superseded - 1);
+        let second = archiver.run_archive_pass("default", &engine).await.unwrap();
+        assert_eq!(second.deleted, 1);
+        assert_eq!(store.seen().deletes, superseded + 1);
+
+        // A retention policy: tried once, then kept.
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let (engine, _) = superseded_tables(data.path(), tier.path()).await;
+        let before = archived_tables(tier.path());
+        let (archiver, store) = faulty_archiver(
+            tier.path(),
+            Faults {
+                refuse_deletes: true,
+                ..Faults::default()
+            },
+        );
+        let archiver = archiver.with_delete_grace(Duration::ZERO);
+        for _ in 0..2 {
+            let report = archiver.run_archive_pass("default", &engine).await.unwrap();
+            assert_eq!(report.deleted, 0);
+        }
+        assert_eq!(store.seen().deletes, superseded);
         assert_eq!(archived_tables(tier.path()), before);
     }
 
