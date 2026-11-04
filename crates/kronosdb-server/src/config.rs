@@ -96,13 +96,14 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_ARCHIVE_URL")]
     archive_url: Option<String>,
 
-    /// Seconds between archive passes on the claimed leader (default 30).
+    /// Seconds between archive passes on the claimed leader, and between
+    /// eviction passes on every node (default 30; at least 1).
     #[arg(long, env = "KRONOSDB_ARCHIVE_INTERVAL_SECS")]
     archive_interval_secs: Option<u64>,
 
     /// Most bytes of sealed segments this node keeps on disk; past it, the
     /// oldest archived segments are evicted and read from the archive.
-    /// Unset = keep everything.
+    /// Needs an archive URL. Unset = keep everything; 0 is refused.
     #[arg(long, env = "KRONOSDB_ARCHIVE_MAX_LOCAL_BYTES")]
     archive_max_local_bytes: Option<u64>,
 
@@ -609,7 +610,7 @@ impl ServerConfig {
             }
         }
 
-        Ok(Self {
+        let config = Self {
             listen_addr,
             data_dir: cli
                 .data_dir
@@ -714,8 +715,68 @@ impl ServerConfig {
                     default.exists().then_some(default)
                 }),
             admin_auth,
-        })
+        };
+        if let Some(warning) = check_archive(
+            config.archive_url.is_some(),
+            config.archive_interval_secs,
+            config.archive_max_local_bytes,
+            config.segment_size,
+        )? {
+            tracing::warn!("{warning}");
+        }
+        Ok(config)
     }
+}
+
+/// Checks the `[archive]` settings against each other and the segment
+/// size: an error for settings that cannot work, a warning for ones that
+/// work badly.
+fn check_archive(
+    has_url: bool,
+    interval_secs: u64,
+    max_local_bytes: Option<u64>,
+    segment_size: u64,
+) -> Result<Option<String>, String> {
+    if interval_secs == 0 {
+        return Err("archive interval-secs must be at least 1".into());
+    }
+    let Some(cap) = max_local_bytes else {
+        return Ok(None);
+    };
+    if cap == 0 {
+        return Err(
+            "archive max-local-bytes must be above 0; leave it unset to keep every segment".into(),
+        );
+    }
+    if !has_url {
+        return Err("archive max-local-bytes is set without an archive url".into());
+    }
+    // Eviction runs between seals: below two segments, a node keeps at
+    // most one sealed body, and almost every read of sealed data goes to
+    // the archive.
+    Ok((cap < segment_size.saturating_mul(2)).then(|| {
+        format!(
+            "archive max-local-bytes ({cap}) is below twice the segment size ({segment_size}): \
+             almost every read of sealed segments will go to the archive"
+        )
+    }))
+}
+
+/// An object-store URL fit for logs: without credentials in its user info
+/// or its query (an Azure SAS token, a presigned signature).
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.split(['?', '#']).next().unwrap_or_default().to_string();
+    };
+    // User info cannot hold an unescaped '/', so the authority ends at the
+    // first one; a password with a '?' or '@' in it is still dropped whole.
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let location = format!("{host}{path}");
+    let location = location.split(['?', '#']).next().unwrap_or_default();
+    format!("{scheme}://{location}")
 }
 
 /// Resolves admin auth from CLI/env (priority) and the TOML file.
@@ -826,6 +887,41 @@ pub fn parse_peer_list(entries: &[String]) -> Result<Vec<PeerEntry>, Box<dyn std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_settings_that_cannot_work_are_refused() {
+        const SEGMENT: u64 = 256 << 20;
+        assert!(check_archive(true, 0, None, SEGMENT).is_err());
+        assert!(check_archive(false, 0, None, SEGMENT).is_err());
+        assert!(check_archive(true, 30, Some(0), SEGMENT).is_err());
+        assert!(check_archive(false, 30, Some(1 << 40), SEGMENT).is_err());
+        assert_eq!(check_archive(false, 30, None, SEGMENT), Ok(None));
+        assert_eq!(
+            check_archive(true, 30, Some(2 * SEGMENT), SEGMENT),
+            Ok(None)
+        );
+        let warning = check_archive(true, 30, Some(2 * SEGMENT - 1), SEGMENT).unwrap();
+        assert!(warning.unwrap().contains("below twice the segment size"));
+    }
+
+    #[test]
+    fn archive_urls_are_logged_without_credentials() {
+        for (url, logged) in [
+            ("s3://bucket/prefix", "s3://bucket/prefix"),
+            ("file:///var/lib/archive", "file:///var/lib/archive"),
+            ("s3://key:secret@bucket/prefix", "s3://bucket/prefix"),
+            ("s3://key:se?c@ret@bucket/p", "s3://bucket/p"),
+            (
+                "https://acct.blob.core.windows.net/c/p?sv=2024&sig=abc%2F",
+                "https://acct.blob.core.windows.net/c/p",
+            ),
+            ("az://container?sig=abc", "az://container"),
+            ("az://user:pw@container#frag", "az://container"),
+            ("not a url?token=1", "not a url"),
+        ] {
+            assert_eq!(redact_url(url), logged, "{url}");
+        }
+    }
 
     #[test]
     fn parse_peer_list_valid() {
