@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
 use object_store::path::Path as ObjectPath;
@@ -246,9 +246,12 @@ impl ArchiveStatus {
 struct ContextArchive {
     /// End of the archived prefix: the base of the next segment to archive.
     archived_end: u64,
-    /// Archived key tables by range, with when each was written, in
-    /// milliseconds since the epoch.
-    tables: BTreeMap<(u64, u64), i64>,
+    /// Archived key tables by range, with when this node first saw each:
+    /// when it listed the archive, or uploaded the table. The grace before
+    /// a superseded table is deleted runs from then, on this node's
+    /// monotonic clock, not from the store's `last_modified`: a store clock
+    /// ahead of this one would make a table uploaded a moment ago look old.
+    tables: BTreeMap<(u64, u64), Instant>,
     /// Superseded tables the store refused to delete. Left alone.
     kept: BTreeSet<(u64, u64)>,
 }
@@ -283,16 +286,16 @@ pub struct Archiver {
 #[derive(Debug, Default)]
 pub struct PassBackoff {
     failures: u32,
-    until: Option<std::time::Instant>,
+    until: Option<Instant>,
 }
 
 impl PassBackoff {
-    pub fn ready(&self, now: std::time::Instant) -> bool {
+    pub fn ready(&self, now: Instant) -> bool {
         self.until.is_none_or(|until| now >= until)
     }
 
     /// A pass failed at `now`. Returns how long the next waits.
-    pub fn failed(&mut self, now: std::time::Instant, interval: Duration) -> Duration {
+    pub fn failed(&mut self, now: Instant, interval: Duration) -> Duration {
         self.failures = self.failures.saturating_add(1);
         let wait = interval
             .saturating_mul(1 << self.failures.min(16))
@@ -519,7 +522,7 @@ impl Archiver {
             {
                 summaries.insert(base);
             } else if let Some(range) = parse_table_file_name(name) {
-                tables.insert(range, meta.last_modified.timestamp_millis());
+                tables.insert(range, Instant::now());
             }
         }
 
@@ -626,7 +629,7 @@ impl Archiver {
             let object = self.table_object(context, segment.base, segment.end);
             match self.upload_table(&keys_path, len, &object).await {
                 Ok(()) => {
-                    state.tables.insert(range, now_millis());
+                    state.tables.insert(range, Instant::now());
                 }
                 Err(error) if is_not_found(&error) => {}
                 Err(error) => return Err(error),
@@ -682,7 +685,7 @@ impl Archiver {
             let object = self.table_object(context, table.base, table.end);
             match self.upload_table(&table.path, len, &object).await {
                 Ok(()) => {
-                    state.tables.insert(range, now_millis());
+                    state.tables.insert(range, Instant::now());
                     uploaded += 1;
                 }
                 Err(error) if is_not_found(&error) => {}
@@ -693,27 +696,28 @@ impl Archiver {
     }
 
     /// Deletes archived tables whose range lies inside another archived
-    /// table's, once that table has been archived for the grace period.
+    /// table's, once this node has known that table for the grace period.
     /// Best effort: a table the store refuses to delete is kept and not
     /// tried again. Returns how many it deleted.
     async fn delete_superseded(&self, context: &str, state: &mut ContextArchive) -> usize {
         // Tables are aligned blocks: nested or disjoint. In order of base,
         // widest first, a table is inside another exactly when an earlier
         // one reaches at least as far.
-        let mut ranges: Vec<((u64, u64), i64)> = state
+        let mut ranges: Vec<((u64, u64), Instant)> = state
             .tables
             .iter()
             .map(|(&range, &at)| (range, at))
             .collect();
         ranges.sort_by_key(|&((base, end), _)| (base, std::cmp::Reverse(end)));
-        let grace = self.grace.as_millis() as i64;
-        let now = now_millis();
-        let mut cover: Option<(u64, i64)> = None;
+        let now = Instant::now();
+        let mut cover: Option<(u64, Instant)> = None;
         let mut doomed = Vec::new();
         for ((base, end), at) in ranges {
             match cover {
                 Some((cover_end, cover_at)) if end <= cover_end => {
-                    if now - cover_at >= grace && !state.kept.contains(&(base, end)) {
+                    if now.duration_since(cover_at) >= self.grace
+                        && !state.kept.contains(&(base, end))
+                    {
                         doomed.push((base, end));
                     }
                 }
@@ -1745,7 +1749,7 @@ mod tests {
     #[test]
     fn failed_passes_back_off_up_to_a_cap() {
         let interval = Duration::from_secs(30);
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut backoff = PassBackoff::default();
         assert!(backoff.ready(start));
         let waits: Vec<u64> = (0..6)
@@ -1867,6 +1871,53 @@ mod tests {
             .collect();
         expected.insert((merged.base, merged.end));
         assert_eq!(archived_tables(tier.path()), expected);
+    }
+
+    /// An engine whose archive holds a merged table and, still, the tables
+    /// it supersedes. Returns the merged table's range.
+    async fn superseded_tables(data: &Path, tier: &Path) -> (Arc<EventStoreEngine>, (u64, u64)) {
+        let engine = engine_in(data);
+        seal_segments(&engine, "a", 3).await;
+        archiver_for(tier, DELETE_GRACE)
+            .run_archive_pass("default", &engine)
+            .await
+            .unwrap();
+        seal_segments(&engine, "a", 9).await;
+        engine.merge_index().unwrap();
+        let merged = engine.archivable_tables().unwrap().remove(0);
+        archiver_for(tier, DELETE_GRACE)
+            .run_archive_pass("default", &engine)
+            .await
+            .unwrap();
+        let merged = (merged.base, merged.end);
+        let tables = archived_tables(tier);
+        assert!(tables.contains(&merged));
+        assert!(tables.len() > 2, "{tables:?}");
+        (engine, merged)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_grace_runs_from_when_the_leader_saw_the_covering_table() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let (engine, _) = superseded_tables(data.path(), tier.path()).await;
+        // The store's clock says every table was written an hour ago.
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        for entry in std::fs::read_dir(tier.path().join("default").join("index")).unwrap() {
+            std::fs::File::options()
+                .write(true)
+                .open(entry.unwrap().path())
+                .and_then(|file| file.set_modified(hour_ago))
+                .unwrap();
+        }
+        let before = archived_tables(tier.path());
+
+        let report = archiver_for(tier.path(), DELETE_GRACE)
+            .run_archive_pass("default", &engine)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(archived_tables(tier.path()), before);
     }
 
     /// A file larger than one part goes up in parts, on the object store at
