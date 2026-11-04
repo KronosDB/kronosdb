@@ -135,12 +135,18 @@ pub struct ArchivePassReport {
 pub struct EvictionPassReport {
     /// Segments evicted.
     pub evicted: usize,
-    /// Bytes their bodies held.
+    /// Bytes their files held.
     pub freed: u64,
     /// Bytes of sealed segments still on disk.
     pub local_bytes: u64,
     /// Contexts whose oldest local segment is not archived yet.
     pub waiting: Vec<String>,
+    /// Contexts whose oldest local segment differs from its archived copy:
+    /// real divergence, which no retry heals. Their segments are kept.
+    pub diverged: Vec<String>,
+    /// Contexts the pass could not finish, and why: the archive or the disk
+    /// failed. The next pass tries them again.
+    pub failed: Vec<(String, Error)>,
 }
 
 /// What the archive loops last did on this node (ADR-0011), for metrics:
@@ -152,6 +158,7 @@ pub struct ArchiveStatus {
     evicted_segments: AtomicU64,
     evicted_bytes: AtomicU64,
     eviction_failures: AtomicU64,
+    diverged: AtomicU64,
 }
 
 /// Archiving of one context, as this node last saw it while leading.
@@ -175,8 +182,13 @@ pub struct EvictionStatus {
     pub evicted_segments: u64,
     /// Bytes those held.
     pub evicted_bytes: u64,
-    /// Passes that failed.
+    /// Contexts an eviction pass could not finish, one per context and
+    /// pass: their archive or disk failed.
     pub failures: u64,
+    /// Contexts an eviction pass found diverged, one per context and pass:
+    /// a segment unlike its archived copy, which no retry heals. Alert on
+    /// any increase.
+    pub diverged: u64,
 }
 
 impl ArchiveStatus {
@@ -221,17 +233,16 @@ impl ArchiveStatus {
             .store(max_local_bytes, Ordering::Relaxed);
     }
 
-    /// An eviction pass succeeded.
+    /// An eviction pass ran.
     pub fn evicted(&self, report: &EvictionPassReport) {
         self.evicted_segments
             .fetch_add(report.evicted as u64, Ordering::Relaxed);
         self.evicted_bytes
             .fetch_add(report.freed, Ordering::Relaxed);
-    }
-
-    /// An eviction pass failed.
-    pub fn eviction_failed(&self) {
-        self.eviction_failures.fetch_add(1, Ordering::Relaxed);
+        self.eviction_failures
+            .fetch_add(report.failed.len() as u64, Ordering::Relaxed);
+        self.diverged
+            .fetch_add(report.diverged.len() as u64, Ordering::Relaxed);
     }
 
     pub fn eviction(&self) -> EvictionStatus {
@@ -240,6 +251,7 @@ impl ArchiveStatus {
             evicted_segments: self.evicted_segments.load(Ordering::Relaxed),
             evicted_bytes: self.evicted_bytes.load(Ordering::Relaxed),
             failures: self.eviction_failures.load(Ordering::Relaxed),
+            diverged: self.diverged.load(Ordering::Relaxed),
         }
     }
 }
@@ -783,77 +795,120 @@ impl Archiver {
     ///
     /// A segment is evicted only once its summary is in the archive and the
     /// blake3 of this node's data bytes equals the summary's. A mismatch is
-    /// real divergence: the context's segments are kept and the pass fails.
+    /// real divergence: that context's segments are kept, and it is
+    /// reported in `diverged`. A context that fails otherwise, its archive
+    /// or its disk, is reported in `failed`. Either way the pass goes on with
+    /// the other contexts, so the cap still holds for them.
     pub async fn run_eviction_pass(
         &self,
         engines: &[(String, Arc<EventStoreEngine>)],
         max_local_bytes: u64,
-    ) -> Result<EvictionPassReport, Error> {
+    ) -> EvictionPassReport {
         let mut report = EvictionPassReport::default();
         let mut local = 0u64;
-        for (_, engine) in engines {
-            for segment in engine.sealed_bodies() {
-                local += file_len(&segment.path).await?.unwrap_or(0);
+        let mut open = Vec::new();
+        for (context, engine) in engines {
+            match sealed_bytes(engine).await {
+                Ok(bytes) => {
+                    local += bytes;
+                    open.push(EvictionCandidate {
+                        context,
+                        engine,
+                        oldest: None,
+                    });
+                }
+                Err(error) => report.failed.push((context.clone(), error)),
             }
         }
-        let mut open: Vec<&(String, Arc<EventStoreEngine>)> = engines.iter().collect();
         while local > max_local_bytes {
-            // Each context's oldest final segment with a body, and when it
-            // was sealed.
-            let mut oldest = None;
-            let mut done = Vec::new();
-            for (i, (_, engine)) in open.iter().enumerate() {
-                let evicted_end = engine.evicted_end();
-                let Some(segment) = engine
-                    .archivable_segments()
-                    .into_iter()
-                    .find(|segment| segment.base >= evicted_end)
-                else {
-                    done.push(i);
-                    continue;
-                };
-                let sealed = tokio::fs::metadata(&segment.path).await?.modified()?;
-                if oldest.as_ref().is_none_or(|(_, _, at)| sealed < *at) {
-                    oldest = Some((i, segment, sealed));
+            // Each context's oldest final segment with a body, and its age,
+            // kept from one round to the next until it is evicted.
+            let mut i = 0;
+            while i < open.len() {
+                if open[i].oldest.is_none() {
+                    match oldest_body(open[i].engine).await {
+                        Ok(Some(oldest)) => open[i].oldest = Some(oldest),
+                        Ok(None) => {
+                            open.remove(i);
+                            continue;
+                        }
+                        Err(error) => {
+                            report.failed.push((open[i].context.clone(), error));
+                            open.remove(i);
+                            continue;
+                        }
+                    }
                 }
+                i += 1;
             }
-            let Some((i, segment, _)) = oldest else {
+            let Some(i) = (0..open.len()).min_by_key(|&i| open[i].oldest.as_ref().map(|o| o.age))
+            else {
                 break;
             };
-            let (context, engine) = open[i];
-            match self.summary(context, segment.base).await? {
-                None => {
-                    report.waiting.push(context.clone());
-                    done.push(i);
+            let candidate = &mut open[i];
+            let oldest = candidate.oldest.take().expect("found above");
+            match self
+                .evict(candidate.context, candidate.engine, &oldest.segment)
+                .await
+            {
+                Ok(Eviction::Evicted) => {
+                    local = local.saturating_sub(oldest.bytes);
+                    report.evicted += 1;
+                    report.freed += oldest.bytes;
                 }
-                Some(archived) => match local_summary(&segment).await? {
-                    // Its seal is in flight or it was evicted meanwhile:
-                    // the next pass looks again.
-                    None => done.push(i),
-                    Some(own) if own != archived => {
-                        return Err(diverged(context, &own, &archived));
-                    }
-                    Some(own) => {
-                        let engine = Arc::clone(engine);
-                        let base = segment.base;
-                        tokio::task::spawn_blocking(move || engine.evict_segment(base))
-                            .await
-                            .map_err(|error| Error::Internal {
-                                message: format!("evicting segment {base}: {error}"),
-                            })??;
-                        local = local.saturating_sub(own.data_len);
-                        report.evicted += 1;
-                        report.freed += own.data_len;
-                    }
-                },
-            }
-            done.sort_unstable();
-            for i in done.into_iter().rev() {
-                open.remove(i);
+                Ok(Eviction::NotArchived) => {
+                    report.waiting.push(candidate.context.clone());
+                    open.remove(i);
+                }
+                // Its seal is in flight or it was evicted meanwhile: the
+                // next pass looks again.
+                Ok(Eviction::Later) => {
+                    open.remove(i);
+                }
+                Ok(Eviction::Diverged(error)) => {
+                    tracing::error!(
+                        context = candidate.context,
+                        %error,
+                        "a segment differs from its archived copy; keeping this context's \
+                         segments"
+                    );
+                    report.diverged.push(candidate.context.clone());
+                    open.remove(i);
+                }
+                Err(error) => {
+                    report.failed.push((candidate.context.clone(), error));
+                    open.remove(i);
+                }
             }
         }
         report.local_bytes = local;
-        Ok(report)
+        report
+    }
+
+    /// Evicts `segment` of `engine` if the archive holds the same bytes.
+    async fn evict(
+        &self,
+        context: &str,
+        engine: &Arc<EventStoreEngine>,
+        segment: &ArchivableSegment,
+    ) -> Result<Eviction, Error> {
+        let Some(archived) = self.summary(context, segment.base).await? else {
+            return Ok(Eviction::NotArchived);
+        };
+        let Some(own) = local_summary(segment).await? else {
+            return Ok(Eviction::Later);
+        };
+        if own != archived {
+            return Ok(Eviction::Diverged(diverged(context, &own, &archived)));
+        }
+        let engine = Arc::clone(engine);
+        let base = segment.base;
+        tokio::task::spawn_blocking(move || engine.evict_segment(base))
+            .await
+            .map_err(|error| Error::Internal {
+                message: format!("evicting segment {base}: {error}"),
+            })??;
+        Ok(Eviction::Evicted)
     }
 
     /// Uploads a key table unless the archive holds it already. A table's
@@ -1055,6 +1110,72 @@ fn same_size(object: &ObjectPath, size: u64, len: u64) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+/// One context in an eviction pass.
+struct EvictionCandidate<'a> {
+    context: &'a String,
+    engine: &'a Arc<EventStoreEngine>,
+    /// Its oldest final segment with a body, once looked up.
+    oldest: Option<OldestBody>,
+}
+
+struct OldestBody {
+    segment: ArchivableSegment,
+    /// Bytes of its file.
+    bytes: u64,
+    /// When it was sealed, as far as this node can tell, in milliseconds
+    /// since the epoch: the oldest across contexts is evicted first.
+    age: i64,
+}
+
+enum Eviction {
+    Evicted,
+    /// Its summary is not in the archive yet.
+    NotArchived,
+    /// Its seal is in flight, or it was evicted meanwhile.
+    Later,
+    /// The archive holds other bytes for it.
+    Diverged(Error),
+}
+
+/// Bytes of the sealed segment bodies `engine` holds on disk.
+async fn sealed_bytes(engine: &EventStoreEngine) -> Result<u64, Error> {
+    let mut bytes = 0;
+    for segment in engine.sealed_bodies() {
+        bytes += file_len(&segment.path).await?.unwrap_or(0);
+    }
+    Ok(bytes)
+}
+
+/// The oldest final segment of `engine` with a body, if there is one.
+async fn oldest_body(engine: &EventStoreEngine) -> Result<Option<OldestBody>, Error> {
+    let evicted_end = engine.evicted_end();
+    let Some(segment) = engine
+        .archivable_segments()
+        .into_iter()
+        .find(|segment| segment.base >= evicted_end)
+    else {
+        return Ok(None);
+    };
+    let meta = match tokio::fs::metadata(&segment.path).await {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // When the file was last written: when the segment was sealed on the
+    // node that wrote it, but when it was downloaded on a node that caught
+    // up from the archive, so the order across contexts is only as good as
+    // that.
+    let age = meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64);
+    Ok(Some(OldestBody {
+        segment,
+        bytes: meta.len(),
+        age,
+    }))
 }
 
 /// A multipart upload with at most [`PARTS_IN_FLIGHT`] parts in flight.
@@ -2031,6 +2152,79 @@ mod tests {
         let report = archiver.run_archive_pass("default", &engine).await.unwrap();
         assert_eq!((report.tables, report.deleted), (0, 0));
         assert!(!archived_tables(tier.path()).contains(&merged));
+    }
+
+    /// An engine in `dir`, the context named as the directory, that can
+    /// evict to the archive in `tier`.
+    fn evictable_engine_in(dir: &Path, tier: &Path) -> Arc<EventStoreEngine> {
+        let url = url::Url::from_directory_path(tier).unwrap();
+        Arc::new(
+            EventStoreEngine::create_with_store_options(
+                dir,
+                &StoreOptions {
+                    max_segment_size: SEGMENT_SIZE,
+                    background_index_merge: false,
+                    index_merge_rate: 0,
+                    archive: Some(
+                        crate::remote::ArchiveStore::from_url(url.as_str(), None).unwrap(),
+                    ),
+                    ..StoreOptions::default()
+                },
+            )
+            .expect("engine"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_context_that_fails_or_diverged_holds_back_only_itself() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let mut engines = Vec::new();
+        for name in ["broken", "diverged", "healthy"] {
+            let engine = evictable_engine_in(&data.path().join(name), tier.path());
+            seal_segments(&engine, "a", 3).await;
+            archiver_for(tier.path(), DELETE_GRACE)
+                .run_archive_pass(name, &engine)
+                .await
+                .unwrap();
+            engines.push((name.to_string(), engine));
+        }
+        let summary = |context: &str| {
+            tier.path()
+                .join(context)
+                .join("segments")
+                .join(format!("{:020}.sum", 0))
+        };
+        // The archive fails for one context: its summary cannot be read.
+        std::fs::write(summary("broken"), b"not a summary").unwrap();
+        // Another log's segment for another.
+        let mut other: SegmentSummary =
+            serde_json::from_slice(&std::fs::read(summary("diverged")).unwrap()).unwrap();
+        other.blake3 = "0".repeat(64);
+        std::fs::write(summary("diverged"), serde_json::to_vec(&other).unwrap()).unwrap();
+
+        let report = archiver_for(tier.path(), DELETE_GRACE)
+            .run_eviction_pass(&engines, 0)
+            .await;
+        assert_eq!(report.diverged, ["diverged"]);
+        let failed: Vec<&str> = report
+            .failed
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(failed, ["broken"]);
+        let healthy = &engines[2].1;
+        let segments = healthy.archivable_segments();
+        assert_eq!(report.evicted, segments.len());
+        assert_eq!(healthy.evicted_end(), segments.last().unwrap().end);
+        assert_eq!(engines[0].1.evicted_end(), 0);
+        assert_eq!(engines[1].1.evicted_end(), 0);
+
+        let status = ArchiveStatus::default();
+        status.evicted(&report);
+        let eviction = status.eviction();
+        assert_eq!((eviction.failures, eviction.diverged), (1, 1));
+        assert_eq!(eviction.evicted_segments, segments.len() as u64);
     }
 
     /// A file larger than one part goes up in parts, on the object store at

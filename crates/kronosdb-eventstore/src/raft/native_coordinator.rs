@@ -81,30 +81,29 @@ impl ClusterManager {
                     Some((context, engine))
                 })
                 .collect();
-            match archiver.run_eviction_pass(&engines, max_local_bytes).await {
-                Ok(report) => {
-                    self.archive_status.evicted(&report);
-                    if report.evicted > 0 {
-                        tracing::info!(
-                            evicted = report.evicted,
-                            freed = report.freed,
-                            local_bytes = report.local_bytes,
-                            "eviction pass"
-                        );
-                    }
-                    if report.local_bytes > max_local_bytes {
-                        tracing::warn!(
-                            local_bytes = report.local_bytes,
-                            max_local_bytes,
-                            waiting = ?report.waiting,
-                            "over the local cap: the archive has not caught up"
-                        );
-                    }
-                }
-                Err(error) => {
-                    self.archive_status.eviction_failed();
-                    tracing::error!(%error, "eviction pass failed; nothing more is evicted until it succeeds");
-                }
+            let report = archiver.run_eviction_pass(&engines, max_local_bytes).await;
+            self.archive_status.evicted(&report);
+            if report.evicted > 0 {
+                tracing::info!(
+                    evicted = report.evicted,
+                    freed = report.freed,
+                    local_bytes = report.local_bytes,
+                    "eviction pass"
+                );
+            }
+            // A context that failed or diverged holds back only itself: the
+            // pass went on with the others.
+            for (context, error) in &report.failed {
+                tracing::warn!(%error, context, "eviction failed for this context; retrying next interval");
+            }
+            if report.local_bytes > max_local_bytes {
+                tracing::warn!(
+                    local_bytes = report.local_bytes,
+                    max_local_bytes,
+                    waiting = ?report.waiting,
+                    diverged = ?report.diverged,
+                    "over the local cap: the archive has not caught up"
+                );
             }
         }
     }
