@@ -478,6 +478,10 @@ impl ClusterManager {
                 };
                 let control = Arc::clone(&self.control);
                 Some(tokio::spawn(async move {
+                    // Sessions that fail one after another back off, and say
+                    // so: a follower that cannot catch up (the archive
+                    // unreachable, say) must not spin, nor go unnoticed.
+                    let mut failures = 0u32;
                     loop {
                         let current = control.claim();
                         if current
@@ -486,10 +490,20 @@ impl ClusterManager {
                         {
                             return;
                         }
-                        if let Err(error) = run_tail_session(Arc::clone(&engine), config.clone()).await {
-                            tracing::debug!(%error, %context, leader_id, epoch, "Tail session reconnecting");
+                        let started = std::time::Instant::now();
+                        let outcome = run_tail_session(Arc::clone(&engine), config.clone()).await;
+                        if started.elapsed() >= TAIL_SESSION_HEALTHY {
+                            failures = 0;
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if let Err(error) = outcome {
+                            failures = failures.saturating_add(1);
+                            if failures.is_multiple_of(TAIL_FAILURES_PER_WARNING) {
+                                tracing::warn!(%error, %context, leader_id, epoch, failures, "Tail sessions keep failing; this node is not catching up");
+                            } else {
+                                tracing::debug!(%error, %context, leader_id, epoch, "Tail session reconnecting");
+                            }
+                        }
+                        tokio::time::sleep(tail_retry_delay(failures)).await;
                     }
                 }))
             })
@@ -964,6 +978,19 @@ struct VoterCursors {
 struct CursorSnapshot {
     position: u64,
     log_epoch: u64,
+}
+
+/// A Tail session that lasted this long was working: failures before it no
+/// longer count towards backing off.
+const TAIL_SESSION_HEALTHY: Duration = Duration::from_secs(10);
+
+/// Consecutive failed Tail sessions per warning logged.
+const TAIL_FAILURES_PER_WARNING: u32 = 20;
+
+/// How long to wait before the next Tail session after `failures` in a row:
+/// a quarter second at first, doubling to at most two seconds.
+fn tail_retry_delay(failures: u32) -> Duration {
+    Duration::from_millis(250 << failures.saturating_sub(1).min(3))
 }
 
 #[cfg(test)]

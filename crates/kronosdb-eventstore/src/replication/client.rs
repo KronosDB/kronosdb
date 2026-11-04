@@ -61,6 +61,17 @@ async fn run_tail(
         });
     }
 
+    // A catch-up from the archive that a given-up session started still
+    // runs on its blocking thread: stop it before reading where the log ends.
+    {
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || engine.end_archive_catchup())
+            .await
+            .map_err(|error| Error::Internal {
+                message: format!("stopping a catch-up from the archive: {error}"),
+            })?;
+    }
+
     // A connection of its own: a replication frame can be tens of megabytes
     // and must not hold up Raft heartbeats or forwarded appends behind it.
     let connection = config.peers.dedicated(&config.leader_addr).await?;
@@ -192,7 +203,7 @@ async fn run_tail(
                         && records.first_position < records.next_position)
                     || (records.first_position == local_tail
                         && records.next_position == local_tail
-                        && engine.archive_holds_frame(
+                        && engine.holds_whole_segment(
                             records.segment_base,
                             Position(records.first_position),
                         ))
@@ -275,7 +286,19 @@ async fn run_tail(
                     (!truncate.prev_at_segment_start).then_some(truncate.prev_record_crc),
                 );
                 let before = engine.local_tail().0;
-                engine.truncate_to_matching(Position(truncate.position), expected_event)?;
+                // Checking the cut can read the last event before it from the
+                // archive.
+                {
+                    let engine = Arc::clone(&engine);
+                    let position = Position(truncate.position);
+                    tokio::task::spawn_blocking(move || {
+                        engine.truncate_to_matching(position, expected_event)
+                    })
+                    .await
+                    .map_err(|error| Error::Internal {
+                        message: format!("cutting the log back: {error}"),
+                    })??;
+                }
                 tracing::info!(
                     context = %config.context,
                     boundary = truncate.position,

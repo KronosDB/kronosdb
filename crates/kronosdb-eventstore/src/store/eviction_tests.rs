@@ -201,8 +201,10 @@ fn a_reopened_store_finds_its_evicted_segments() {
     assert_eq!(reads(&store).unwrap(), expected);
 }
 
+/// A store whose oldest segments are only in the archive does not open
+/// without it, rather than failing every read of them later.
 #[test]
-fn without_an_archive_evicted_segments_cannot_be_read() {
+fn a_store_with_evicted_segments_needs_its_archive_to_open() {
     let root = tempfile::tempdir().unwrap();
     let tier = tempfile::tempdir().unwrap();
     let dir = root.path().join("default");
@@ -212,11 +214,74 @@ fn without_an_archive_evicted_segments_cannot_be_read() {
     store.shutdown();
     drop(store);
 
-    let store = EventStoreEngine::open_with_store_options(&dir, &options(None)).unwrap();
-    let Err(error) = store.source(Position(0), &everything()) else {
-        panic!("read an evicted segment");
+    let Err(error) = EventStoreEngine::open_with_store_options(&dir, &options(None)) else {
+        panic!("opened without the archive its evicted segments are in");
     };
     assert!(matches!(error, Error::Rejected { .. }), "{error}");
+}
+
+/// Opening reads nothing from the archive while every evicted segment has
+/// its locator and is indexed here, its own key table or a merged one.
+#[cfg(unix)]
+#[test]
+fn a_store_with_its_index_opens_without_reaching_the_archive() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let store = filled_store(root.path(), tier.path());
+    let expected = reads(&store).unwrap();
+    archive(&store, tier.path());
+    evict(&store, 10);
+    let evicted = store.archivable_segments()[..10].to_vec();
+    assert!(
+        evicted
+            .iter()
+            .any(|segment| !segment.path.with_extension("keys").exists()),
+        "some evicted segment should be indexed by a merged table only"
+    );
+    store.shutdown();
+    drop(store);
+
+    // Key tables in the archive cannot be read now.
+    let index = tier.path().join("default").join("index");
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let opened = EventStoreEngine::open_with_store_options(&dir, &options(Some(tier.path())));
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(reads(&opened.unwrap()).unwrap(), expected);
+}
+
+/// A body that cannot be deleted stays a body: the evicted prefix does not
+/// move past it, and the store reopens as it was.
+#[cfg(unix)]
+#[test]
+fn a_body_that_cannot_be_deleted_is_not_evicted() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dir = root.path().join("default");
+    let store = filled_store(root.path(), tier.path());
+    let expected = reads(&store).unwrap();
+    archive(&store, tier.path());
+    evict(&store, 2);
+    let evicted_end = store.evicted_end();
+    let next = store.archivable_segments()[2].clone();
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let refused = store.evict_segment(next.base);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(refused.is_err());
+    assert!(next.path.exists());
+    assert_eq!(store.evicted_end(), evicted_end);
+    assert_eq!(reads(&store).unwrap(), expected);
+
+    store.evict_segment(next.base).unwrap();
+    store.shutdown();
+    drop(store);
+    let store =
+        EventStoreEngine::open_with_store_options(&dir, &options(Some(tier.path()))).unwrap();
+    assert_eq!(store.evicted_end(), next.end);
+    assert_eq!(reads(&store).unwrap(), expected);
 }
 
 #[test]
@@ -613,4 +678,33 @@ fn reads_from_evicted_positions_are_told_apart() {
         store.archivable_segments().last().unwrap().end
     );
     assert!(store.sealed_body_bytes() > 0);
+}
+
+/// On a node that evicts, the oldest segment that still has its body can be
+/// evicted while a read of it runs, so a read from there may wait on the
+/// archive too.
+#[test]
+fn reads_from_the_oldest_local_segment_may_reach_the_archive_on_a_capped_node() {
+    use crate::api::EventStore;
+    let root = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let store = EventStoreEngine::create_with_store_options(
+        &root.path().join("default"),
+        &StoreOptions {
+            archive: Some(
+                ArchiveStore::from_url(&archive_url(tier.path()), Some(1 << 30)).unwrap(),
+            ),
+            ..options(None)
+        },
+    )
+    .unwrap();
+    fill(&store);
+    let segments = store.archivable_segments();
+    assert!(store.reads_archive_from(Position(0)));
+    assert!(store.reads_archive_from(Position(segments[0].end - 1)));
+    assert!(!store.reads_archive_from(Position(segments[0].end)));
+    archive(&store, tier.path());
+    evict(&store, 2);
+    assert!(store.reads_archive_from(Position(segments[2].end - 1)));
+    assert!(!store.reads_archive_from(Position(segments[2].end)));
 }
