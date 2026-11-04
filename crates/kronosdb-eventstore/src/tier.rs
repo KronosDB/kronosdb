@@ -25,6 +25,16 @@
 //! bytes. A table inside another archived table's range is superseded and
 //! deleted after [`DELETE_GRACE`]; a bucket under object lock refuses, and
 //! the table stays.
+//!
+//! An object up to 8 MiB goes up in one request, a larger one in 8 MiB
+//! parts, at most four in flight. A multipart upload that fails, or whose
+//! pass is cancelled, is aborted, so the store drops the parts it holds. One
+//! cut short by a crash or a lost connection stays open, invisible to a
+//! listing, and the store bills its parts until they are removed. Give the
+//! bucket a lifecycle rule that does that: on S3, an
+//! `AbortIncompleteMultipartUpload` rule with `DaysAfterInitiation` of a day
+//! or so; on GCS, the `AbortIncompleteMultipartUpload` action with an `age`
+//! condition. Azure discards uncommitted blocks on its own after a week.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -34,17 +44,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, WriteMultipart};
+use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::Error;
 use crate::segment::merge::{parse_table_file_name, table_file_name};
 use crate::segment::sealed_index::SealedIndex;
 use crate::store::{ArchivableSegment, EventStoreEngine};
 
-/// Upload chunk size for multipart uploads.
-const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
+/// Size of each part of a multipart upload. A file up to this size goes up
+/// in one request.
+const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// Most parts of one upload in flight at once. Bounds what an upload holds
+/// in memory (these parts and the one being read), and keeps parts from
+/// sharing the uplink so thinly that each outlasts its request timeout.
+const PARTS_IN_FLIGHT: usize = 4;
 
 /// How long a superseded key table stays in the archive after the table
 /// that covers it was uploaded, so a node that listed the archive just
@@ -235,12 +251,16 @@ impl Archiver {
     /// environments.
     pub fn from_url(raw_url: &str) -> Result<Self, Error> {
         let (store, prefix) = crate::remote::open_store(raw_url)?;
-        Ok(Self {
+        Ok(Self::new(store, prefix))
+    }
+
+    fn new(store: Box<dyn ObjectStore>, prefix: ObjectPath) -> Self {
+        Self {
             store,
             prefix,
             grace: DELETE_GRACE,
             contexts: tokio::sync::Mutex::new(HashMap::new()),
-        })
+        }
     }
 
     /// Sets how long superseded tables stay before they are deleted.
@@ -681,21 +701,33 @@ impl Archiver {
                 ),
             });
         }
-        let mut data = file.take(len);
-        // One request for what fits in one part; parts, uploaded as they
-        // are read, for the rest.
-        if len <= UPLOAD_CHUNK as u64 {
-            let mut bytes = Vec::with_capacity(len as usize);
-            data.read_to_end(&mut bytes).await?;
-            if bytes.len() as u64 != len {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "{} ended at {} bytes while uploading its {len}",
-                        path.display(),
-                        bytes.len()
-                    ),
-                )));
+        self.upload(file, len, object, &path.display().to_string())
+            .await
+    }
+
+    /// Streams `len` bytes of `data`, named `name` in errors, to `object`,
+    /// verifies the stored size, and returns their blake3. What fits in one
+    /// part goes up in one request; the rest in parts of [`PART_SIZE`], at
+    /// most [`PARTS_IN_FLIGHT`] at a time, read as earlier ones finish. An
+    /// upload that fails, for any reason, is aborted.
+    async fn upload(
+        &self,
+        mut data: impl AsyncRead + Unpin,
+        len: u64,
+        object: &ObjectPath,
+        name: &str,
+    ) -> Result<String, Error> {
+        let ended = |at: u64| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{name} ended at {at} bytes while uploading its {len}"),
+            ))
+        };
+        if len <= PART_SIZE as u64 {
+            let mut bytes = vec![0u8; len as usize];
+            let read = read_full(&mut data, &mut bytes).await?;
+            if read as u64 != len {
+                return Err(ended(read as u64));
             }
             let blake3 = blake3::hash(&bytes).to_hex().to_string();
             self.store
@@ -704,32 +736,34 @@ impl Archiver {
                 .map_err(tier_err)?;
             return self.verify_size(object, len).await.map(|()| blake3);
         }
-        let upload = self.store.put_multipart(object).await.map_err(tier_err)?;
-        let mut writer = WriteMultipart::new(upload);
-        let mut hasher = blake3::Hasher::new();
-        let mut total: u64 = 0;
-        let mut chunk = vec![0u8; UPLOAD_CHUNK];
-        loop {
-            let read = data.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&chunk[..read]);
-            writer.write(&chunk[..read]);
-            total += read as u64;
-        }
-        writer.finish().await.map_err(tier_err)?;
-        if total != len {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "{} ended at {total} bytes while uploading its {len}",
-                    path.display()
-                ),
-            )));
-        }
 
-        self.verify_size(object, total).await?;
+        let mut parts = Parts::start(self.store.as_ref(), object).await?;
+        let sent = async {
+            let mut hasher = blake3::Hasher::new();
+            let mut total = 0u64;
+            while total < len {
+                let mut part = vec![0u8; (len - total).min(PART_SIZE as u64) as usize];
+                let read = read_full(&mut data, &mut part).await?;
+                if read < part.len() {
+                    // Completing it would store a short object.
+                    return Err(ended(total + read as u64));
+                }
+                hasher.update(&part);
+                total += read as u64;
+                parts.put(PutPayload::from(part)).await.map_err(tier_err)?;
+            }
+            Ok(hasher)
+        }
+        .await;
+        let hasher = match sent {
+            Ok(hasher) => hasher,
+            Err(error) => {
+                parts.abort().await;
+                return Err(error);
+            }
+        };
+        parts.complete().await.map_err(tier_err)?;
+        self.verify_size(object, len).await?;
         Ok(hasher.finalize().to_hex().to_string())
     }
 
@@ -749,6 +783,113 @@ impl Archiver {
     }
 }
 
+/// A multipart upload with at most [`PARTS_IN_FLIGHT`] parts in flight.
+/// Unless it completes, it is aborted: on a failure, and when dropped, as
+/// when the pass driving it is cancelled. So a failed attempt leaves no
+/// parts behind that the store goes on billing for; a crash still can (see
+/// the module doc).
+struct Parts {
+    /// `None` once completed or aborted.
+    upload: Option<Box<dyn MultipartUpload>>,
+    in_flight: tokio::task::JoinSet<object_store::Result<()>>,
+}
+
+impl Parts {
+    async fn start(store: &dyn ObjectStore, object: &ObjectPath) -> Result<Self, Error> {
+        let upload = store.put_multipart(object).await.map_err(tier_err)?;
+        Ok(Self {
+            upload: Some(upload),
+            in_flight: tokio::task::JoinSet::new(),
+        })
+    }
+
+    /// Starts uploading `part` once fewer than [`PARTS_IN_FLIGHT`] are in
+    /// flight.
+    async fn put(&mut self, part: PutPayload) -> object_store::Result<()> {
+        while self.in_flight.len() >= PARTS_IN_FLIGHT {
+            self.next_done().await?;
+        }
+        let upload = self.upload.as_mut().expect("an unfinished upload");
+        self.in_flight.spawn(upload.put_part(part));
+        Ok(())
+    }
+
+    async fn next_done(&mut self) -> object_store::Result<()> {
+        match self.in_flight.join_next().await {
+            None => Ok(()),
+            Some(Ok(result)) => result,
+            Some(Err(error)) => Err(object_store::Error::Generic {
+                store: "archive",
+                source: Box::new(error),
+            }),
+        }
+    }
+
+    /// Waits for the parts in flight, then completes the upload.
+    async fn complete(mut self) -> object_store::Result<()> {
+        let completed = async {
+            while !self.in_flight.is_empty() {
+                self.next_done().await?;
+            }
+            let upload = self.upload.as_mut().expect("an unfinished upload");
+            upload.complete().await
+        }
+        .await;
+        match completed {
+            Ok(_) => {
+                self.upload = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.abort().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn abort(&mut self) {
+        self.in_flight.shutdown().await;
+        if let Some(mut upload) = self.upload.take() {
+            abort_upload(upload.as_mut()).await;
+        }
+    }
+}
+
+impl Drop for Parts {
+    fn drop(&mut self) {
+        let Some(mut upload) = self.upload.take() else {
+            return;
+        };
+        self.in_flight.abort_all();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { abort_upload(upload.as_mut()).await });
+        }
+    }
+}
+
+async fn abort_upload(upload: &mut dyn MultipartUpload) {
+    if let Err(error) = upload.abort().await {
+        tracing::warn!(
+            %error,
+            "could not abort a failed multipart upload; the store keeps its parts until a \
+             lifecycle rule removes them"
+        );
+    }
+}
+
+/// Reads into `buf` until it is full or `data` ends. Returns how much it
+/// read.
+async fn read_full(data: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match data.read(&mut buf[filled..]).await? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
+}
+
 /// The summary this node's copy of `segment` would have; `None` while its
 /// seal is in flight, or once its body is evicted.
 async fn local_summary(segment: &ArchivableSegment) -> Result<Option<SegmentSummary>, Error> {
@@ -766,7 +907,7 @@ async fn local_summary(segment: &ArchivableSegment) -> Result<Option<SegmentSumm
     let mut data = file.take(data_len);
     let mut hasher = blake3::Hasher::new();
     let mut total = 0u64;
-    let mut chunk = vec![0u8; UPLOAD_CHUNK];
+    let mut chunk = vec![0u8; PART_SIZE];
     loop {
         let read = data.read(&mut chunk).await?;
         if read == 0 {
@@ -824,7 +965,11 @@ fn tier_err(error: object_store::Error) -> Error {
 }
 
 #[cfg(test)]
+mod faulty;
+
+#[cfg(test)]
 mod tests {
+    use super::faulty::{Faults, Faulty};
     use super::*;
     use crate::append::AppendRequest;
     use crate::event::{AppendEvent, Tag};
@@ -832,6 +977,134 @@ mod tests {
     use std::sync::Arc;
 
     const SEGMENT_SIZE: u64 = 16 * 1024;
+
+    /// An archiver over the directory `dir` through a [`Faulty`] store.
+    fn faulty_archiver(dir: &Path, faults: Faults) -> (Archiver, Faulty) {
+        let url = url::Url::from_directory_path(dir).unwrap();
+        let (store, prefix) = crate::remote::open_store(url.as_str()).unwrap();
+        let faulty = Faulty::over(store, faults);
+        (Archiver::new(Box::new(faulty.clone()), prefix), faulty)
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    async fn stored(archiver: &Archiver, object: &ObjectPath) -> Option<Vec<u8>> {
+        match archiver.store.get(object).await {
+            Ok(result) => Some(result.bytes().await.unwrap().to_vec()),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// A source that fails, as a disk does.
+    struct FailingRead;
+
+    impl AsyncRead for FailingRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("the disk failed")))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_upload_keeps_a_few_parts_of_its_size_in_flight() {
+        let tier = tempfile::tempdir().unwrap();
+        let (archiver, store) = faulty_archiver(
+            tier.path(),
+            Faults {
+                part_delay: Duration::from_millis(50),
+                ..Faults::default()
+            },
+        );
+        let len = 5 * PART_SIZE + 123;
+        let bytes = pattern(len);
+        let object = archiver.prefix.clone().join("large");
+        let blake3 = archiver
+            .upload(&bytes[..], len as u64, &object, "large")
+            .await
+            .unwrap();
+        assert_eq!(blake3, blake3::hash(&bytes).to_hex().to_string());
+        assert!(stored(&archiver, &object).await.unwrap() == bytes);
+        let seen = store.seen();
+        let mut sizes = vec![PART_SIZE; 5];
+        sizes.push(123);
+        assert_eq!(seen.part_sizes, sizes);
+        assert!(
+            (2..=PARTS_IN_FLIGHT).contains(&seen.most_in_flight),
+            "{} parts in flight",
+            seen.most_in_flight
+        );
+        assert_eq!(seen.aborts, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_upload_that_fails_is_aborted() {
+        let tier = tempfile::tempdir().unwrap();
+        let (archiver, store) = faulty_archiver(tier.path(), Faults::default());
+        let object = archiver.prefix.clone().join("failed");
+        let bytes = pattern(2 * PART_SIZE + 5);
+
+        // A source that ends early: completing would store a short object.
+        let error = archiver
+            .upload(&bytes[..], 3 * PART_SIZE as u64, &object, "short")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{error}"
+        );
+        assert_eq!(store.seen().aborts, 1);
+        assert!(stored(&archiver, &object).await.is_none());
+
+        // A source that fails partway.
+        let error = archiver
+            .upload(
+                (&bytes[..]).chain(FailingRead),
+                3 * PART_SIZE as u64,
+                &object,
+                "failing",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("the disk failed"), "{error}");
+        assert_eq!(store.seen().aborts, 2);
+        assert!(stored(&archiver, &object).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_upload_dropped_partway_is_aborted() {
+        let tier = tempfile::tempdir().unwrap();
+        let (archiver, store) = faulty_archiver(
+            tier.path(),
+            Faults {
+                stall_parts: true,
+                ..Faults::default()
+            },
+        );
+        let object = archiver.prefix.clone().join("dropped");
+        let len = (PARTS_IN_FLIGHT + 1) * PART_SIZE;
+        let bytes = pattern(len);
+        let upload = archiver.upload(&bytes[..], len as u64, &object, "dropped");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), upload)
+                .await
+                .is_err()
+        );
+        // Dropping it starts the abort on the runtime.
+        for _ in 0..200 {
+            if store.seen().aborts > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(store.seen().aborts, 1);
+        assert!(stored(&archiver, &object).await.is_none());
+    }
 
     fn make_event(log: &str, index: usize) -> AppendEvent {
         AppendEvent {
@@ -1204,7 +1477,7 @@ mod tests {
         let archiver = Archiver::from_url(&base).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large");
-        let len = 2 * UPLOAD_CHUNK + 12_345;
+        let len = 2 * PART_SIZE + 12_345;
         let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
         std::fs::write(&path, &bytes).unwrap();
         let object = archiver
