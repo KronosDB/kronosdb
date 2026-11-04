@@ -83,19 +83,32 @@ env:
   - name: KRONOSDB_ACK_MODE
     value: {{ $root.Values.config.ackMode | quote }}
   - name: KRONOSDB_DRAIN_DEADLINE
-    value: {{ $root.Values.config.drainDeadlineSecs | quote }}
+    value: {{ int64 $root.Values.config.drainDeadlineSecs | quote }}
   {{- if $root.Values.contexts }}
   - name: KRONOSDB_MANIFEST
     value: /etc/kronosdb/manifest.toml
   {{- end }}
-  {{- if $root.Values.archive.url }}
+  {{- /* Numbers go through int64: YAML numbers reach templates as
+         float64, and quote renders 500000000000 as "5e+11". */}}
+  {{- with $root.Values.archive }}
+  {{- if and .maxLocalBytes (not .url) }}
+  {{- fail "archive.maxLocalBytes is set but archive.url is empty: evicted segments are read back from the archive, so a cap needs one. Set archive.url, or unset archive.maxLocalBytes." }}
+  {{- end }}
+  {{- if .url }}
+  {{- if lt (int64 .intervalSecs) 1 }}
+  {{- fail "archive.intervalSecs must be at least 1." }}
+  {{- end }}
   - name: KRONOSDB_ARCHIVE_URL
-    value: {{ $root.Values.archive.url | quote }}
+    value: {{ .url | quote }}
   - name: KRONOSDB_ARCHIVE_INTERVAL_SECS
-    value: {{ $root.Values.archive.intervalSecs | quote }}
-  {{- if $root.Values.archive.maxLocalBytes }}
+    value: {{ int64 .intervalSecs | quote }}
+  {{- if .maxLocalBytes }}
+  {{- if lt (int64 .maxLocalBytes) 1 }}
+  {{- fail (printf "archive.maxLocalBytes must be a whole number of bytes above 0, not %v; leave it empty to keep every segment." .maxLocalBytes) }}
+  {{- end }}
   - name: KRONOSDB_ARCHIVE_MAX_LOCAL_BYTES
-    value: {{ $root.Values.archive.maxLocalBytes | quote }}
+    value: {{ int64 .maxLocalBytes | quote }}
+  {{- end }}
   {{- end }}
   {{- end }}
   {{- if or $root.Values.auth.accessToken $root.Values.auth.existingSecret }}
