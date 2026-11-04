@@ -54,14 +54,16 @@ use crate::segment::sealed_index::SealedIndex;
 /// Bytes of one cached block of an archived segment.
 pub const BLOCK: u64 = 256 * 1024;
 
-/// The most one request fetches.
+/// The most one request of a read fetches. Whole objects are downloaded in
+/// requests of [`CHUNK`] bytes.
 pub const MAX_GET: u64 = 4 * 1024 * 1024;
 
 /// Bytes of blocks a read plans and prefetches ahead of itself in evicted
 /// segments; it plans the next stretch halfway through this one.
 pub const READAHEAD: u64 = 32 * 1024 * 1024;
 
-/// Files downloaded at once when a node installs archived segments.
+/// Objects (summaries, locators, key tables) downloaded at once by one call;
+/// their bytes in flight are bounded by the node's in-flight budget.
 const DOWNLOADS_IN_FLIGHT: usize = 32;
 
 /// What [`RemoteSegments::listing`] finds.
@@ -283,7 +285,7 @@ impl Drop for Pending {
         let (context, base) = self.segment;
         let mut flights = lock(&self.archive.flights);
         for (block, flight) in blocks {
-            flights.remove(&(context, base, block));
+            forget(&mut flights, (context, base, block), &flight);
             flight.finish(Err(Failure::Unavailable(
                 "the download was abandoned".into(),
             )));
@@ -394,8 +396,8 @@ async fn get_range(
 /// a range past its end from a request the archive did not answer.
 const SIZE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// One block being fetched: the reader that fetches it fills it in, the
-/// others wait on it.
+/// One block being downloaded: its download task fills it in, and every
+/// reader that wants the block waits on it.
 #[derive(Default)]
 struct Flight {
     state: Mutex<Option<Result<Bytes, Failure>>>,
@@ -427,6 +429,18 @@ impl Flight {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
+    }
+}
+
+/// Takes `flight`, the download of block `key`, out of `flights` once it is
+/// answered or given up on, unless a later download of the block has taken
+/// its place: that one is still under way, and readers share it.
+fn forget(flights: &mut HashMap<BlockKey, Arc<Flight>>, key: BlockKey, flight: &Arc<Flight>) {
+    if flights
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, flight))
+    {
+        flights.remove(&key);
     }
 }
 
@@ -595,12 +609,12 @@ impl RemoteSegments {
     /// Bytes of segment `base`'s data, which is what its archived object
     /// holds.
     pub fn data_len(&self, base: u64) -> Result<u64, Error> {
-        if let Some(&len) = self.data_lens.lock().unwrap().get(&base) {
+        if let Some(&len) = lock(&self.data_lens).get(&base) {
             return Ok(len);
         }
         let idx = crate::segment::segment_path(&self.dir, base).with_extension("idx");
         let len = SealedIndex::open(&idx, base)?.data_len();
-        self.data_lens.lock().unwrap().insert(base, len);
+        lock(&self.data_lens).insert(base, len);
         Ok(len)
     }
 
@@ -624,14 +638,11 @@ impl RemoteSegments {
         for (block, flight) in waiting {
             let bytes = flight.wait(deadline).map_err(|failure| {
                 // A later read starts a download of its own.
-                let key = (self.id, base, block);
-                let mut flights = lock(&self.archive.flights);
-                if flights
-                    .get(&key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
-                {
-                    flights.remove(&key);
-                }
+                forget(
+                    &mut lock(&self.archive.flights),
+                    (self.id, base, block),
+                    &flight,
+                );
                 failure.into_error(&format!("segment {base}"))
             })?;
             have.insert(block, bytes);
@@ -809,7 +820,7 @@ impl RemoteSegments {
                         .zip(bytes.chunks(BLOCK as usize).map(Bytes::copy_from_slice))
                     {
                         cache.put((this.id, base, *block), bytes.clone());
-                        flights.remove(&(this.id, base, *block));
+                        forget(&mut flights, (this.id, base, *block), flight);
                         flight.finish(Ok(bytes));
                     }
                 }
@@ -817,7 +828,7 @@ impl RemoteSegments {
                     this.stats.failures.fetch_add(1, Ordering::Relaxed);
                     let mut flights = lock(&archive.flights);
                     for (block, flight) in &blocks {
-                        flights.remove(&(this.id, base, *block));
+                        forget(&mut flights, (this.id, base, *block), flight);
                         flight.finish(Err(failure.clone()));
                     }
                 }
@@ -849,6 +860,7 @@ impl RemoteSegments {
                 (base, object)
             })
             .collect();
+        let timeout = self.archive.limits.fetch_timeout;
         self.archive.block_on(async move {
             use futures_util::StreamExt;
             let results: Vec<Result<Option<crate::tier::SegmentSummary>, Error>> =
@@ -856,14 +868,18 @@ impl RemoteSegments {
                     .map(|(base, object)| {
                         let store = Arc::clone(&store);
                         async move {
-                            let bytes = match store.get(&object).await {
-                                Ok(result) => result.bytes().await.map(Some),
-                                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                                Err(error) => Err(error),
-                            }
-                            .map_err(|error| Error::Unavailable {
-                                message: format!("reading {object} from the archive: {error}"),
-                            })?;
+                            let get = async {
+                                match store.get(&object).await {
+                                    Ok(result) => result.bytes().await.map(Some),
+                                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                                    Err(error) => Err(error),
+                                }
+                            };
+                            let bytes = tokio::time::timeout(timeout, get)
+                                .await
+                                .map_err(|_| timed_out(timeout))
+                                .and_then(|got| got.map_err(Failure::of))
+                                .map_err(|failure| failure.into_error(object.as_ref()))?;
                             bytes
                                 .map(|bytes| {
                                     serde_json::from_slice(&bytes).map_err(|error| {
@@ -1207,7 +1223,8 @@ pub(crate) fn open_store_with<'a>(
 /// [`Error::Unavailable`], instead of the client's default three minutes.
 pub(crate) const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The longest one download of segment bytes may take before it fails as
+/// The longest one download of segment bytes may take, its wait for room
+/// in the in-flight budget included, before it fails as
 /// [`Error::Unavailable`]. A request is retried for [`RETRY_TIMEOUT`], and
 /// its last attempt may take as long again; this bounds it whatever the
 /// client does, so a reader never waits on a download for ever.
@@ -1640,15 +1657,16 @@ mod tests {
         // back (they fail by their deadline), then fails by its own.
         let error = read_one(&remote, 100, 0..100).unwrap_err();
         assert!(matches!(error, Error::Unavailable { .. }), "{error}");
+        // A download gives its share back as it fails, then answers its
+        // readers.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while archive.in_flight.available_permits() < 4 {
+        while archive.in_flight.available_permits() < 4 || !flights().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the budget never came back"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(flights().is_empty());
     }
 
     /// A store that answers every GET after `delay` and records how much
@@ -1858,5 +1876,45 @@ mod tests {
         assert_eq!(store.largest.load(Relaxed), super::CHUNK);
         let (_, most_bytes) = *store.most_at_once.lock().unwrap();
         assert!(most_bytes <= budget, "{most_bytes} bytes asked for at once");
+    }
+
+    /// A download that ends after its readers gave up on it (and a later
+    /// read started another for the same block) leaves the later one in
+    /// place, so readers still share it rather than start a third.
+    #[test]
+    fn a_download_given_up_on_leaves_its_successor_in_place() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        put_segment(memory.as_ref(), "default", 0, data(1000));
+        let hanging = Arc::new(ThrottledStore::new(
+            memory,
+            ThrottleConfig {
+                wait_get_per_call: std::time::Duration::from_secs(3600),
+                ..ThrottleConfig::default()
+            },
+        ));
+        let archive = super::ArchiveStore::over_store(hanging, "kb".into(), None).unwrap();
+        let remote = remote(&archive, "default", &[(0, 1000)]);
+        let key = (remote.id, 0, 0);
+
+        // The stale download, whose readers took it out of the map.
+        let stale = Arc::new(super::Flight::default());
+        let pending = super::Pending {
+            archive: Arc::clone(&archive),
+            segment: (remote.id, 0),
+            blocks: Some(vec![(0, Arc::clone(&stale))]),
+        };
+        let wanted: Vec<(u64, Vec<std::ops::Range<u64>>)> =
+            vec![(0, std::iter::once(0..100).collect())];
+        remote.prefetch(&wanted).unwrap();
+        let successor = Arc::clone(&archive.flights.lock().unwrap()[&key]);
+
+        drop(pending);
+        assert!(stale.wait(std::time::Instant::now()).is_err());
+        let current = archive.flights.lock().unwrap().get(&key).cloned();
+        assert!(current.is_some_and(|current| Arc::ptr_eq(&current, &successor)));
+        remote.prefetch(&wanted).unwrap();
+        let current = archive.flights.lock().unwrap().get(&key).cloned();
+        assert!(current.is_some_and(|current| Arc::ptr_eq(&current, &successor)));
     }
 }
