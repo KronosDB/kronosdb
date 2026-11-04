@@ -1397,6 +1397,12 @@ mod tests {
             follower.begin_replication_epoch(epoch, [0, 1, 2])?;
         }
         for slice in slices {
+            // What the Tail client does with the end of an evicted segment.
+            if slice.next_position == follower.local_tail().0
+                && follower.archive_holds_frame(slice.segment_base, Position(slice.first_position))
+            {
+                continue;
+            }
             if slice.first_position == slice.segment_base {
                 follower.rotate_replicated(epoch, Position(slice.segment_base))?;
             }
@@ -1864,6 +1870,16 @@ mod tests {
     /// segments up to the one `evict_before` names (an index), or all but
     /// the last.
     fn archived_leader_with(late: usize, evict_before: Option<usize>) -> Archived {
+        archived_leader_checkpointing(late, evict_before, false)
+    }
+
+    /// [`archived_leader_with`], with a watermark checkpoint after every late
+    /// event when `checkpoints` is set, so segments end in control records.
+    fn archived_leader_checkpointing(
+        late: usize,
+        evict_before: Option<usize>,
+        checkpoints: bool,
+    ) -> Archived {
         let tmp = tempfile::tempdir().unwrap();
         let tier = tmp.path().join("tier");
         std::fs::create_dir_all(&tier).unwrap();
@@ -1889,6 +1905,9 @@ mod tests {
                 .unwrap();
         for i in 0..late {
             append(&leader, &format!("late-{i}"), &big);
+            if checkpoints {
+                leader.persist_watermark_checkpoint().unwrap();
+            }
         }
         leader.wait_for_seals();
         // Merged tables replace the own tables of the segments they cover,
@@ -2358,6 +2377,54 @@ mod tests {
 
         let start = plan_tail_start(leader, &describe(&follower)).unwrap();
         follow(leader, &follower, &start).unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        follower.wait_for_seals();
+        assert_same_events(&everything(&follower), &everything(leader));
+    }
+
+    /// A node that joined without bodies has a watermark at the end of the
+    /// last segment it holds only in the archive. A new leader that still
+    /// holds that segment and cuts the node back to its end sends what
+    /// follows its last event there: control records the archive's copy
+    /// already holds.
+    #[test]
+    fn a_cut_at_the_end_of_an_evicted_segment_skips_what_the_archive_holds() {
+        let archived = archived_leader_checkpointing(700, Some(0), true);
+        let leader = &archived.leader;
+        assert_eq!(leader.evicted_end(), 0, "this leader holds every body");
+        let archivable = leader.archivable_segments();
+        let dir = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("joined")
+            .join("default");
+        let options = capped_options(&archived.tier, &[0, 1, 2], Some(SEGMENT_SIZE));
+        let follower = EventStoreEngine::create_with_store_options(&dir, &options).unwrap();
+        follower
+            .truncate_to_matching(Position(0), Some(None))
+            .unwrap();
+        follower
+            .apply_archived(archivable[archivable.len() / 2].base)
+            .unwrap();
+        let end = follower.local_tail().0;
+        assert_eq!(follower.evicted_end(), end, "the node should hold no body");
+
+        let prev = leader.replication_boundary_event(Position(end)).unwrap();
+        let (_, slices) = leader.replication_catchup_slices(Position(end)).unwrap();
+        assert!(
+            slices[0].segment_base < end,
+            "the fixture should leave control records after the last event before {end}"
+        );
+        follow(
+            leader,
+            &follower,
+            &TailStart::Truncate {
+                position: end,
+                prev,
+            },
+        )
+        .unwrap();
         follower.adopt_watermark(leader.replication_epoch(), leader.head());
         follower.wait_for_seals();
         assert_same_events(&everything(&follower), &everything(leader));

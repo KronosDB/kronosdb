@@ -2163,6 +2163,25 @@ impl EventStoreEngine {
         Ok((Position(local_tail), slices))
     }
 
+    /// Whether a Tail frame for `segment_base` starting at `first_position`
+    /// holds only what follows the last event of a segment this node has
+    /// evicted (ADR-0011). A node that joined without bodies has its
+    /// watermark at the end of such a segment; a leader that still holds the
+    /// segment and cuts the node back there sends the control records after
+    /// its last event. The segment is final, so the archive's copy already
+    /// holds them: the frame is acknowledged without being written.
+    pub fn archive_holds_frame(&self, segment_base: u64, first_position: Position) -> bool {
+        if !self.evicted.contains(segment_base) {
+            return false;
+        }
+        let list = self.segments.read();
+        list.bases
+            .binary_search(&segment_base)
+            .ok()
+            .and_then(|index| list.bases.get(index + 1))
+            == Some(&first_position.0)
+    }
+
     /// Applies raw Tail bytes to this follower's authoritative segment log.
     /// No DCB evaluation occurs: the claimed leader already serialized the
     /// write under the same epoch. The returned wave must be durable before a
