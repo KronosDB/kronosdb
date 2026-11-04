@@ -91,7 +91,9 @@ archive:
   # Most bytes of sealed segments each node keeps on disk. Past it, the
   # oldest archived segments are evicted and read back from the archive by
   # range, which is slower than a local read: set it only when the disk
-  # cannot hold the whole log. Empty keeps everything.
+  # cannot hold the whole log. Needs url, and at least two segments
+  # (256 MiB each by default). A whole number of bytes; empty keeps
+  # everything.
   maxLocalBytes: ""
   credentialsSecret: ""
 
