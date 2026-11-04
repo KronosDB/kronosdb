@@ -12,12 +12,20 @@
 //! ```
 //!
 //! Every object is written once and never replaced, so the archive can live
-//! in a bucket under object lock. A segment is archived once its summary
-//! exists. Summaries are written only if absent and segments are archived
-//! in log order, so the archived segments are always a prefix of the log. A
-//! writer that finds a summary already there compares it with its own:
-//! equal is two leaders racing, different means two logs share the prefix,
-//! and the pass fails without writing anything more.
+//! in a bucket under object lock: what an interrupted attempt left is
+//! checked against the local copy, not written again. A segment is archived
+//! once its summary exists. Summaries are written only if absent and
+//! segments are archived in log order, so the archived segments are always
+//! a prefix of the log. A writer that finds a summary already there
+//! compares it with its own: equal is two leaders racing, different means
+//! two logs share the prefix, and the pass fails without writing anything
+//! more.
+//!
+//! That needs a store that creates an object only if it is absent. A leader
+//! checks it before it archives: it creates [`CONDITIONAL_WRITE_CHECK`]
+//! under the URL, if absent, then asks to create it again, which must be
+//! refused. A store that accepts gets nothing archived. The object is never
+//! deleted: object lock may forbid it, and there is only ever the one.
 //!
 //! The key tables are a segment's own table while no merged table covers
 //! it, and the merged tables of ADR-0010, uploaded once the segments they
@@ -66,6 +74,20 @@ const PARTS_IN_FLIGHT: usize = 4;
 /// that covers it was uploaded, so a node that listed the archive just
 /// before can still download what it chose.
 pub const DELETE_GRACE: Duration = Duration::from_secs(600);
+
+/// The object a leader creates, under the archive's URL and outside every
+/// context, to check that the store creates an object only if it is
+/// absent. Never deleted, so there is only ever the one.
+pub const CONDITIONAL_WRITE_CHECK: &str = "conditional-write-check.txt";
+
+const CONDITIONAL_WRITE_CHECK_BODY: &[u8] = b"KronosDB creates this object, then asks the \
+store to create it again only if it is absent, which the store must refuse: committing an \
+archived segment by its summary relies on that. It is never deleted, as object lock may \
+forbid it.\n";
+
+/// Longest wait for the next archive pass of a context after its passes
+/// failed.
+pub const MAX_PASS_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct TierConfig {
@@ -237,11 +259,50 @@ enum Archived {
     SealInFlight,
 }
 
+/// What an archiver knows while its node leads.
+#[derive(Default)]
+struct Leading {
+    /// Whether the store was found to create objects only if absent.
+    checked: bool,
+    contexts: HashMap<String, ContextArchive>,
+}
+
 pub struct Archiver {
     store: Box<dyn ObjectStore>,
     prefix: ObjectPath,
     grace: Duration,
-    contexts: tokio::sync::Mutex<HashMap<String, ContextArchive>>,
+    leading: tokio::sync::Mutex<Leading>,
+}
+
+/// When the next archive pass of one context may run: at the next
+/// interval while passes succeed; after failures, two intervals later, then
+/// four, and so on up to [`MAX_PASS_BACKOFF`]. So a pass that keeps failing
+/// does not list the archive and hash segments again every interval.
+#[derive(Debug, Default)]
+pub struct PassBackoff {
+    failures: u32,
+    until: Option<std::time::Instant>,
+}
+
+impl PassBackoff {
+    pub fn ready(&self, now: std::time::Instant) -> bool {
+        self.until.is_none_or(|until| now >= until)
+    }
+
+    /// A pass failed at `now`. Returns how long the next waits.
+    pub fn failed(&mut self, now: std::time::Instant, interval: Duration) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let wait = interval
+            .saturating_mul(1 << self.failures.min(16))
+            .min(MAX_PASS_BACKOFF)
+            .max(interval);
+        self.until = Some(now + wait);
+        wait
+    }
+
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl Archiver {
@@ -259,7 +320,7 @@ impl Archiver {
             store,
             prefix,
             grace: DELETE_GRACE,
-            contexts: tokio::sync::Mutex::new(HashMap::new()),
+            leading: tokio::sync::Mutex::new(Leading::default()),
         }
     }
 
@@ -269,11 +330,55 @@ impl Archiver {
         self
     }
 
-    /// Drops what this archiver knows of every context, so the next pass
-    /// lists the archive again. Called when this node stops being leader:
-    /// another node may write in the meantime.
+    /// Drops what this archiver knows, so the next pass checks the store
+    /// and lists the archive again. Called when this node stops being
+    /// leader: another node may write in the meantime.
     pub async fn forget(&self) {
-        self.contexts.lock().await.clear();
+        *self.leading.lock().await = Leading::default();
+    }
+
+    /// Checks that the store creates an object only if it is absent, which
+    /// committing a segment by its summary relies on: a store that ignores
+    /// If-None-Match lets one leader's summary replace another's unseen.
+    /// Creates [`CONDITIONAL_WRITE_CHECK`] if it is absent, then creates it
+    /// again, which the store must refuse.
+    async fn check_conditional_writes(&self) -> Result<(), Error> {
+        let object = self.prefix.clone().join(CONDITIONAL_WRITE_CHECK);
+        let create = || {
+            self.store.put_opts(
+                &object,
+                PutPayload::from_static(CONDITIONAL_WRITE_CHECK_BODY),
+                PutMode::Create.into(),
+            )
+        };
+        let refuse = |why: String| {
+            let message = format!(
+                "not archiving: the archive {why}. Committing a segment by its summary needs \
+                 an object created only if it is absent (If-None-Match: * on S3)"
+            );
+            tracing::error!(%object, "{message}");
+            Error::Rejected { message }
+        };
+        match create().await {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(
+                error @ (object_store::Error::NotImplemented { .. }
+                | object_store::Error::NotSupported { .. }),
+            ) => {
+                return Err(refuse(format!(
+                    "cannot create an object only if it is absent ({error})"
+                )));
+            }
+            Err(error) => return Err(tier_err(error)),
+        }
+        match create().await {
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Ok(_) => Err(refuse(format!(
+                "replaced {object} when asked to create it only if absent: it ignores \
+                 conditional writes"
+            ))),
+            Err(error) => Err(tier_err(error)),
+        }
     }
 
     fn context_path(&self, context: &str, parts: &[&str]) -> ObjectPath {
@@ -323,12 +428,16 @@ impl Archiver {
         context: &str,
         engine: &EventStoreEngine,
     ) -> Result<ArchivePassReport, Error> {
-        let mut contexts = self.contexts.lock().await;
-        if !contexts.contains_key(context) {
-            let state = self.open_context(context, engine).await?;
-            contexts.insert(context.to_string(), state);
+        let mut leading = self.leading.lock().await;
+        if !leading.checked {
+            self.check_conditional_writes().await?;
+            leading.checked = true;
         }
-        let state = contexts.get_mut(context).expect("inserted above");
+        if !leading.contexts.contains_key(context) {
+            let state = self.open_context(context, engine).await?;
+            leading.contexts.insert(context.to_string(), state);
+        }
+        let state = leading.contexts.get_mut(context).expect("inserted above");
 
         let mut report = ArchivePassReport::default();
         for segment in engine.archivable_segments() {
@@ -1527,6 +1636,68 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::Corrupted { .. }), "{error}");
         assert!(!path.join(format!("{:020}.seg", next.base)).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_store_that_ignores_conditional_writes_gets_nothing_archived() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let engine = engine_in(data.path());
+        seal_segments(&engine, "a", 2).await;
+        let (archiver, _) = faulty_archiver(
+            tier.path(),
+            Faults {
+                ignore_create: true,
+                ..Faults::default()
+            },
+        );
+        let error = archiver
+            .run_archive_pass("default", &engine)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Rejected { .. }), "{error}");
+        assert!(!tier.path().join("default").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_leader_checks_conditional_writes_on_the_one_object() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let engine = engine_in(data.path());
+        seal_segments(&engine, "a", 1).await;
+        // Under a retention policy too: the check never replaces it.
+        for _ in 0..2 {
+            let (archiver, store) = faulty_archiver(
+                tier.path(),
+                Faults {
+                    write_once: true,
+                    ..Faults::default()
+                },
+            );
+            archiver.run_archive_pass("default", &engine).await.unwrap();
+            archiver.forget().await;
+            archiver.run_archive_pass("default", &engine).await.unwrap();
+            assert!(store.seen().writes_ending(CONDITIONAL_WRITE_CHECK) <= 1);
+        }
+        let probe = std::fs::read(tier.path().join(CONDITIONAL_WRITE_CHECK)).unwrap();
+        assert_eq!(probe, CONDITIONAL_WRITE_CHECK_BODY);
+    }
+
+    #[test]
+    fn failed_passes_back_off_up_to_a_cap() {
+        let interval = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut backoff = PassBackoff::default();
+        assert!(backoff.ready(start));
+        let waits: Vec<u64> = (0..6)
+            .map(|_| backoff.failed(start, interval).as_secs())
+            .collect();
+        assert_eq!(waits, [60, 120, 240, 300, 300, 300]);
+        assert!(!backoff.ready(start + Duration::from_secs(299)));
+        assert!(backoff.ready(start + Duration::from_secs(300)));
+        backoff.succeeded();
+        assert!(backoff.ready(start));
+        assert_eq!(backoff.failed(start, interval).as_secs(), 60);
     }
 
     /// An attempt that dies before its summary leaves the segment's other
