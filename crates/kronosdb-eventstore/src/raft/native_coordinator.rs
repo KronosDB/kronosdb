@@ -114,6 +114,7 @@ impl ClusterManager {
         archiver: crate::tier::Archiver,
         interval: Duration,
     ) {
+        let mut backoff: HashMap<String, crate::tier::PassBackoff> = HashMap::new();
         loop {
             tokio::time::sleep(interval).await;
             let leading = self.control.claim().is_some_and(|claim| {
@@ -124,31 +125,37 @@ impl ClusterManager {
                 // leads again.
                 archiver.forget().await;
                 self.archive_status.not_archiving();
+                backoff.clear();
                 continue;
             }
             for context in self.context_manager.list_contexts() {
+                let wait = backoff.entry(context.clone()).or_default();
+                if !wait.ready(std::time::Instant::now()) {
+                    continue;
+                }
                 let Ok(engine) = self.context_manager.get_context(&context) else {
                     continue;
                 };
                 let result = archiver.run_archive_pass(&context, &engine).await;
-                match &result {
-                    Ok(report) => self.archive_status.archived(&context, report.archived_end),
-                    Err(_) => self.archive_status.archive_failed(&context),
-                }
                 match result {
-                    Ok(report) if report.segments + report.tables + report.deleted > 0 => {
-                        tracing::info!(
-                            context,
-                            segments = report.segments,
-                            tables = report.tables,
-                            deleted = report.deleted,
-                            archived_end = report.archived_end,
-                            "archive pass"
-                        );
+                    Ok(report) => {
+                        wait.succeeded();
+                        self.archive_status.archived(&context, report.archived_end);
+                        if report.segments + report.tables + report.deleted > 0 {
+                            tracing::info!(
+                                context,
+                                segments = report.segments,
+                                tables = report.tables,
+                                deleted = report.deleted,
+                                archived_end = report.archived_end,
+                                "archive pass"
+                            );
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) => {
-                        tracing::warn!(%error, context, "archive pass failed; retrying next interval");
+                        self.archive_status.archive_failed(&context);
+                        let retry_in = wait.failed(std::time::Instant::now(), interval);
+                        tracing::warn!(%error, context, ?retry_in, "archive pass failed");
                     }
                 }
             }
