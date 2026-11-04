@@ -455,20 +455,26 @@ impl Archiver {
         // on past that (preallocated space a crash kept from being trimmed),
         // and those bytes are not part of the log.
         let data_len = SealedIndex::open(&idx_path, segment.base)?.data_len();
-        let blake3 = self
-            .upload_file(
-                &segment.path,
-                data_len,
-                &self.segment_object(context, segment.base, "seg"),
-            )
-            .await?;
-        self.store
-            .put(
-                &self.segment_object(context, segment.base, "idx"),
-                PutPayload::from(idx_bytes),
-            )
-            .await
-            .map_err(tier_err)?;
+        // An attempt that died before its summary leaves the other objects
+        // behind. They are checked, never written again: a bucket under a
+        // retention policy refuses the overwrite, and under S3 object lock
+        // it keeps another locked version.
+        let seg_object = self.segment_object(context, segment.base, "seg");
+        let blake3 = match self
+            .upload_file(&segment.path, data_len, &seg_object)
+            .await?
+        {
+            Upload::Written(blake3) => blake3,
+            Upload::Present(size) => {
+                self.check_archived_data(context, segment, data_len, &seg_object, size)
+                    .await?
+            }
+        };
+        self.put_once(
+            &self.segment_object(context, segment.base, "idx"),
+            idx_bytes,
+        )
+        .await?;
 
         // Its own key table, unless a merge has already replaced it with a
         // merged table, which goes up once the archive covers its range.
@@ -478,8 +484,8 @@ impl Archiver {
             && let Some(len) = file_len(&keys_path).await?
         {
             let object = self.table_object(context, segment.base, segment.end);
-            match self.upload_file(&keys_path, len, &object).await {
-                Ok(_) => {
+            match self.upload_table(&keys_path, len, &object).await {
+                Ok(()) => {
                     state.tables.insert(range, now_millis());
                 }
                 Err(error) if is_not_found(&error) => {}
@@ -534,8 +540,8 @@ impl Archiver {
                 continue;
             };
             let object = self.table_object(context, table.base, table.end);
-            match self.upload_file(&table.path, len, &object).await {
-                Ok(_) => {
+            match self.upload_table(&table.path, len, &object).await {
+                Ok(()) => {
                     state.tables.insert(range, now_millis());
                     uploaded += 1;
                 }
@@ -682,15 +688,84 @@ impl Archiver {
         Ok(report)
     }
 
-    /// Streams the first `len` bytes of `path` to `object`, verifies the
-    /// stored size, and returns their blake3. A file shorter than `len` is
-    /// `Error::Corrupted`: its index says it holds more.
+    /// Uploads a key table unless the archive holds it already. A table's
+    /// name fixes its bytes, so one already there of the same size is it.
+    async fn upload_table(&self, path: &Path, len: u64, object: &ObjectPath) -> Result<(), Error> {
+        match self.upload_file(path, len, object).await? {
+            Upload::Written(_) => Ok(()),
+            Upload::Present(size) => same_size(object, size, len),
+        }
+    }
+
+    /// The blake3 of the segment the archive holds at `object`, `size`
+    /// bytes, which must be this node's `data_len` bytes of `segment`: an
+    /// earlier attempt's upload, or another leader's. Anything else was
+    /// written by another log, and the pass fails before writing more.
+    async fn check_archived_data(
+        &self,
+        context: &str,
+        segment: &ArchivableSegment,
+        data_len: u64,
+        object: &ObjectPath,
+        size: u64,
+    ) -> Result<String, Error> {
+        let foreign = |what: String| Error::Corrupted {
+            message: format!(
+                "the archive of context {context} holds data for segment {} that {what}, and \
+                 no summary commits it. Does another cluster archive to the same prefix? \
+                 Nothing is overwritten: remove {object} if it is not this log's",
+                segment.base
+            ),
+        };
+        if size != data_len {
+            return Err(foreign(format!(
+                "is {size} bytes long, not the {data_len} of this node's"
+            )));
+        }
+        let local = hash_file(&segment.path, data_len).await?;
+        let mut archived = blake3::Hasher::new();
+        let mut stream = self
+            .store
+            .get(object)
+            .await
+            .map_err(tier_err)?
+            .into_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(tier_err)? {
+            archived.update(&chunk);
+        }
+        if archived.finalize().to_hex().as_str() != local {
+            return Err(foreign("differs from this node's".to_string()));
+        }
+        Ok(local)
+    }
+
+    /// Writes `bytes` to `object` unless an object is there already, which
+    /// must then be as long: names fix bytes, and nothing is overwritten.
+    async fn put_once(&self, object: &ObjectPath, bytes: Vec<u8>) -> Result<(), Error> {
+        let len = bytes.len() as u64;
+        match self
+            .store
+            .put_opts(object, PutPayload::from(bytes), PutMode::Create.into())
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {
+                self.verify_size(object, len).await
+            }
+            Err(error) => Err(tier_err(error)),
+        }
+    }
+
+    /// Streams the first `len` bytes of `path` to `object`, as [`upload`]
+    /// does. A file shorter than `len` is `Error::Corrupted`: its index says
+    /// it holds more.
+    ///
+    /// [`upload`]: Self::upload
     async fn upload_file(
         &self,
         path: &Path,
         len: u64,
         object: &ObjectPath,
-    ) -> Result<String, Error> {
+    ) -> Result<Upload, Error> {
         let file = tokio::fs::File::open(path).await?;
         let file_len = file.metadata().await?.len();
         if file_len < len {
@@ -705,23 +780,30 @@ impl Archiver {
             .await
     }
 
-    /// Streams `len` bytes of `data`, named `name` in errors, to `object`,
-    /// verifies the stored size, and returns their blake3. What fits in one
-    /// part goes up in one request; the rest in parts of [`PART_SIZE`], at
-    /// most [`PARTS_IN_FLIGHT`] at a time, read as earlier ones finish. An
-    /// upload that fails, for any reason, is aborted.
+    /// Streams `len` bytes of `data`, named `name` in errors, to `object`
+    /// unless an object is there already, and verifies the stored size.
+    /// What fits in one part goes up in one request, created only if absent;
+    /// the rest in parts of [`PART_SIZE`], at most [`PARTS_IN_FLIGHT`] at a
+    /// time, read as earlier ones finish. A multipart upload cannot be made
+    /// conditional, so the object is looked up first. An upload that fails,
+    /// for any reason, is aborted.
     async fn upload(
         &self,
         mut data: impl AsyncRead + Unpin,
         len: u64,
         object: &ObjectPath,
         name: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<Upload, Error> {
         let ended = |at: u64| {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("{name} ended at {at} bytes while uploading its {len}"),
             ))
+        };
+        let present = |head: object_store::Result<object_store::ObjectMeta>| match head {
+            Ok(meta) => Ok(Some(Upload::Present(meta.size))),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(tier_err(error)),
         };
         if len <= PART_SIZE as u64 {
             let mut bytes = vec![0u8; len as usize];
@@ -730,13 +812,26 @@ impl Archiver {
                 return Err(ended(read as u64));
             }
             let blake3 = blake3::hash(&bytes).to_hex().to_string();
-            self.store
-                .put(object, PutPayload::from(bytes))
+            match self
+                .store
+                .put_opts(object, PutPayload::from(bytes), PutMode::Create.into())
                 .await
-                .map_err(tier_err)?;
-            return self.verify_size(object, len).await.map(|()| blake3);
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    if let Some(present) = present(self.store.head(object).await)? {
+                        return Ok(present);
+                    }
+                }
+                Err(error) => return Err(tier_err(error)),
+            }
+            self.verify_size(object, len).await?;
+            return Ok(Upload::Written(blake3));
         }
 
+        if let Some(present) = present(self.store.head(object).await)? {
+            return Ok(present);
+        }
         let mut parts = Parts::start(self.store.as_ref(), object).await?;
         let sent = async {
             let mut hasher = blake3::Hasher::new();
@@ -764,23 +859,34 @@ impl Archiver {
         };
         parts.complete().await.map_err(tier_err)?;
         self.verify_size(object, len).await?;
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(Upload::Written(hasher.finalize().to_hex().to_string()))
     }
 
-    /// Checks the store holds `len` bytes at `object`, just uploaded.
+    /// Checks the store holds `len` bytes at `object`, just written.
     async fn verify_size(&self, object: &ObjectPath, len: u64) -> Result<(), Error> {
         let head = self.store.head(object).await.map_err(tier_err)?;
-        if head.size != len {
-            return Err(Error::Corrupted {
-                message: format!(
-                    "archive verification failed for {object}: uploaded {len} bytes, the \
-                     store reports {}",
-                    head.size
-                ),
-            });
-        }
-        Ok(())
+        same_size(object, head.size, len)
     }
+}
+
+/// What [`Archiver::upload`] did.
+#[derive(Debug)]
+enum Upload {
+    /// It wrote the object, whose bytes have this blake3.
+    Written(String),
+    /// An object of this size was there already, so it wrote nothing.
+    Present(u64),
+}
+
+fn same_size(object: &ObjectPath, size: u64, len: u64) -> Result<(), Error> {
+    if size != len {
+        return Err(Error::Corrupted {
+            message: format!(
+                "the archive holds {size} bytes at {object}, where this node has {len}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// A multipart upload with at most [`PARTS_IN_FLIGHT`] parts in flight.
@@ -898,13 +1004,24 @@ async fn local_summary(segment: &ArchivableSegment) -> Result<Option<SegmentSumm
         return Ok(None);
     }
     let data_len = SealedIndex::open(&idx_path, segment.base)?.data_len();
-    let file = match tokio::fs::File::open(&segment.path).await {
-        Ok(file) => file,
+    let blake3 = match hash_file(&segment.path, data_len).await {
+        Ok(blake3) => blake3,
         // Evicted: the archive is all there is to compare with.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
     };
-    let mut data = file.take(data_len);
+    Ok(Some(SegmentSummary {
+        base: segment.base,
+        end: segment.end,
+        data_len,
+        blake3,
+    }))
+}
+
+/// The blake3 of the first `len` bytes of `path`. A file shorter than that
+/// is `Error::Corrupted`: its index says it holds more.
+async fn hash_file(path: &Path, len: u64) -> Result<String, Error> {
+    let mut data = tokio::fs::File::open(path).await?.take(len);
     let mut hasher = blake3::Hasher::new();
     let mut total = 0u64;
     let mut chunk = vec![0u8; PART_SIZE];
@@ -916,20 +1033,15 @@ async fn local_summary(segment: &ArchivableSegment) -> Result<Option<SegmentSumm
         hasher.update(&chunk[..read]);
         total += read as u64;
     }
-    if total != data_len {
+    if total != len {
         return Err(Error::Corrupted {
             message: format!(
-                "{} is {total} bytes, but its index says its data runs to {data_len}",
-                segment.path.display()
+                "{} is {total} bytes, but its index says its data runs to {len}",
+                path.display()
             ),
         });
     }
-    Ok(Some(SegmentSummary {
-        base: segment.base,
-        end: segment.end,
-        data_len,
-        blake3: hasher.finalize().to_hex().to_string(),
-    }))
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn diverged(context: &str, local: &SegmentSummary, archived: &SegmentSummary) -> Error {
@@ -1024,10 +1136,13 @@ mod tests {
         let len = 5 * PART_SIZE + 123;
         let bytes = pattern(len);
         let object = archiver.prefix.clone().join("large");
-        let blake3 = archiver
+        let Upload::Written(blake3) = archiver
             .upload(&bytes[..], len as u64, &object, "large")
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("nothing was uploaded");
+        };
         assert_eq!(blake3, blake3::hash(&bytes).to_hex().to_string());
         assert!(stored(&archiver, &object).await.unwrap() == bytes);
         let seen = store.seen();
@@ -1414,6 +1529,65 @@ mod tests {
         assert!(!path.join(format!("{:020}.seg", next.base)).exists());
     }
 
+    /// An attempt that dies before its summary leaves the segment's other
+    /// objects behind. The next writes none of them again, so a bucket that
+    /// refuses every overwrite, as one under a retention policy does, does
+    /// not stop archiving there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retried_segment_writes_nothing_twice() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let engine = engine_in(data.path());
+        seal_segments(&engine, "a", 2).await;
+        let (archiver, store) = faulty_archiver(
+            tier.path(),
+            Faults {
+                write_once: true,
+                failing_puts: Some((".sum", 1)),
+                ..Faults::default()
+            },
+        );
+        archiver
+            .run_archive_pass("default", &engine)
+            .await
+            .unwrap_err();
+        assert_eq!(store.seen().writes_ending(".seg"), 1);
+        assert_eq!(store.seen().writes_ending(".sum"), 0);
+
+        let report = archiver.run_archive_pass("default", &engine).await.unwrap();
+        let segments = engine.archivable_segments();
+        assert_eq!(report.segments, segments.len());
+        let seen = store.seen();
+        assert_eq!(seen.writes_ending(".seg"), segments.len());
+        assert!(seen.writes.values().all(|&n| n == 1), "{:?}", seen.writes);
+    }
+
+    /// Data of another log under a segment's name, with no summary to
+    /// commit it, fails the pass and stays as it is, whatever its length.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn segment_data_of_another_log_is_refused_not_overwritten() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let engine = engine_in(data.path());
+        seal_segments(&engine, "a", 1).await;
+        let segment = engine.archivable_segments().remove(0);
+        let len = data_bytes(&segment).len();
+        let dir = tier.path().join("default").join("segments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{:020}.seg", segment.base));
+
+        for foreign in [vec![0u8; len], vec![0u8; len - 1]] {
+            std::fs::write(&path, &foreign).unwrap();
+            let error = archiver_for(tier.path(), DELETE_GRACE)
+                .run_archive_pass("default", &engine)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), foreign);
+            assert!(!dir.join(format!("{:020}.sum", segment.base)).exists());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn merged_tables_follow_their_segments_and_supersede_their_parts() {
         let data = tempfile::tempdir().unwrap();
@@ -1484,10 +1658,13 @@ mod tests {
             .prefix
             .clone()
             .join(format!("large-{}", now_millis()));
-        let blake3 = archiver
+        let Upload::Written(blake3) = archiver
             .upload_file(&path, len as u64, &object)
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("nothing was uploaded");
+        };
         assert_eq!(blake3, blake3::hash(&bytes).to_hex().to_string());
         let stored = archiver
             .store

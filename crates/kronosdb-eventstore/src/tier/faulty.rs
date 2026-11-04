@@ -52,6 +52,17 @@ pub struct Seen {
     pub deletes: usize,
 }
 
+impl Seen {
+    /// Writes of objects whose name ends with `suffix`.
+    pub fn writes_ending(&self, suffix: &str) -> usize {
+        self.writes
+            .iter()
+            .filter(|(name, _)| name.ends_with(suffix))
+            .map(|(_, count)| count)
+            .sum()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Faulty {
     inner: Arc<dyn ObjectStore>,
