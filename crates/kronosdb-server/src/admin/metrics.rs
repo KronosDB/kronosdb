@@ -23,6 +23,13 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str, samples: &[(Stri
     }
 }
 
+/// Whether a leader knows where `status`'s archive ends: once a pass over
+/// it has succeeded. A pass lists the archive before anything else, so a
+/// failed first pass knows nothing.
+fn archived_end_known(status: &kronosdb_eventstore::tier::ContextArchiveStatus) -> bool {
+    status.last_success_ms > 0
+}
+
 fn ctx_label(context: &str) -> String {
     format!("{{context=\"{}\"}}", context.replace('"', ""))
 }
@@ -254,16 +261,26 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
                     .map(|(name, status)| (ctx_label(name), value(status)))
                     .collect::<Vec<_>>()
             };
+        // Where the archive ends is known from a context's first successful
+        // pass; before it, after a restart or a failover, it reads 0, and
+        // the lag would be the whole log.
+        let known: Vec<_> = archiving
+            .iter()
+            .filter(|(_, status)| archived_end_known(status))
+            .collect();
         family(
             &mut out,
             "kronosdb_archive_archived_position",
             "gauge",
-            "End of the archived prefix; reported by the node that archives (the leader)",
-            &per_context(&|status| status.archived_end),
+            "End of the archived prefix; reported by the node that archives (the leader) from its first successful pass",
+            &known
+                .iter()
+                .map(|(name, status)| (ctx_label(name), status.archived_end))
+                .collect::<Vec<_>>(),
         );
         // Against the log as it is now: a pass that cannot reach the
         // archive leaves its last archived position, and the lag grows.
-        let lag: Vec<(String, u64)> = archiving
+        let lag: Vec<(String, u64)> = known
             .iter()
             .filter_map(|(name, status)| {
                 let engine = state.contexts.get_context(name).ok()?;
@@ -277,7 +294,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             &mut out,
             "kronosdb_archive_lag_events",
             "gauge",
-            "Events in final segments not archived yet; reported by the leader",
+            "Events in final segments not archived yet; reported by the leader from its first successful pass",
             &lag,
         );
         family(
@@ -564,4 +581,25 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     }
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kronosdb_eventstore::tier::ArchiveStatus;
+
+    #[test]
+    fn the_archive_end_is_unknown_until_a_pass_succeeds() {
+        let status = ArchiveStatus::default();
+        status.archive_failed("orders");
+        let contexts = status.contexts();
+        assert!(!archived_end_known(&contexts[0].1), "a failed first pass");
+
+        status.archived("orders", 0);
+        let contexts = status.contexts();
+        assert!(
+            archived_end_known(&contexts[0].1),
+            "nothing archived yet, known"
+        );
+    }
 }
