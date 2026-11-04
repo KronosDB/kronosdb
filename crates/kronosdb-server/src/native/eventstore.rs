@@ -54,9 +54,6 @@ fn finish_events_body(mut body: Vec<u8>, count: u32, marker: Option<u64>) -> Byt
     Bytes::from(body)
 }
 
-/// Sends `[from, up_to)` as Events frames; the last carries END and `marker`.
-/// The first page is read on the caller; later pages yield first, so a long
-/// read never holds the connection's reader.
 /// Runs `read` on `store`: inline, or on the blocking pool when it may wait
 /// on the archive (`archive`), so the connection and the runtime's workers
 /// go on serving everything else meanwhile.
@@ -110,6 +107,9 @@ async fn read_page(
     .await
 }
 
+/// Sends `[from, up_to)` as Events frames; the last carries END and `marker`.
+/// The first page is read on the caller; later pages yield first, so a long
+/// read never holds the connection's reader.
 async fn send_range(
     store: &Arc<dyn EventStore>,
     from: Position,
