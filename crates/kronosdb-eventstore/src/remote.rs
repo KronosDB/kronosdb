@@ -557,12 +557,10 @@ impl RemoteSegments {
                         }
                         this.fetched_bytes
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        let mut at = 0;
-                        while at < bytes.len() {
-                            let end = (at + BLOCK as usize).min(bytes.len());
-                            out.push(bytes.slice(at..end));
-                            at = end;
-                        }
+                        // Each block is copied out: a slice would share the
+                        // request's buffer, and one block left in the cache
+                        // would keep all of it alive.
+                        out.extend(bytes.chunks(BLOCK as usize).map(Bytes::copy_from_slice));
                     }
                     Ok(out)
                 });
@@ -964,5 +962,90 @@ mod tests {
             "failed after {took:?}, retry timeout {:?}",
             super::RETRY_TIMEOUT
         );
+    }
+
+    /// `len` bytes that differ from one offset to the next.
+    fn data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// An archive in memory, its objects under `kb`.
+    fn memory_archive() -> (
+        Arc<object_store::memory::InMemory>,
+        Arc<super::ArchiveStore>,
+    ) {
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        let archive = super::ArchiveStore::over_store(memory.clone(), "kb".into(), None).unwrap();
+        (memory, archive)
+    }
+
+    /// Puts `bytes` as archived segment `base` of `context`.
+    fn put_segment(
+        store: &dyn object_store::ObjectStore,
+        context: &str,
+        base: u64,
+        bytes: Vec<u8>,
+    ) {
+        use object_store::ObjectStoreExt;
+        let object =
+            object_store::path::Path::from(format!("kb/{context}/segments/{base:020}.seg"));
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(store.put(&object, bytes.into()))
+            .unwrap();
+    }
+
+    /// The cold reads of `context`, which hold segment `base` of `data_len`
+    /// bytes: what its locator would say.
+    fn remote(
+        archive: &Arc<super::ArchiveStore>,
+        context: &str,
+        segments: &[(u64, u64)],
+    ) -> Arc<super::RemoteSegments> {
+        let remote = archive
+            .segments(&std::path::Path::new("/nowhere").join(context))
+            .unwrap();
+        remote
+            .data_lens
+            .lock()
+            .unwrap()
+            .extend(segments.iter().copied());
+        Arc::new(remote)
+    }
+
+    /// Every block a request brings is cached in a buffer of its own: a
+    /// slice of the request's buffer would keep all of it alive for as long
+    /// as any one block stays cached, and the cache would hold many times
+    /// its budget.
+    #[test]
+    fn cached_blocks_do_not_keep_their_request_alive() {
+        let (memory, archive) = memory_archive();
+        let len = 3 * super::MAX_GET as usize / 2;
+        let bytes = data(len);
+        put_segment(memory.as_ref(), "default", 0, bytes.clone());
+        let remote = remote(&archive, "default", &[(0, len as u64)]);
+
+        let read = remote.read(0, &[0..len as u64]).unwrap();
+        assert_eq!(read[0], bytes);
+        drop(read);
+
+        // The download task lets go of its blocks once it has answered.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let shared = {
+                let cache = remote.blocks.lock().unwrap();
+                assert_eq!(cache.len(), len.div_ceil(super::BLOCK as usize));
+                cache.iter().filter(|(_, bytes)| !bytes.is_unique()).count()
+            };
+            if shared == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{shared} cached blocks share their buffer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
