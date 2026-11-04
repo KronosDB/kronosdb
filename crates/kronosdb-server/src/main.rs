@@ -90,11 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .map(|url| {
             kronosdb_eventstore::remote::ArchiveStore::from_url(url, config.archive_max_local_bytes)
+                .map_err(|error| without_archive_credentials(error, url))
         })
         .transpose()?;
-    if config.archive_max_local_bytes.is_some() && archive.is_none() {
-        return Err("archive max-local-bytes is set without an archive url".into());
-    }
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
         mapping_budget: kronosdb_eventstore::cache::MappingBudget::shared(),
@@ -464,13 +462,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     cluster.start_replication()?;
     if let Some(archive_url) = &config.archive_url {
-        cluster.start_archive(kronosdb_eventstore::tier::TierConfig {
-            url: archive_url.clone(),
-            interval: Duration::from_secs(config.archive_interval_secs),
-            max_local_bytes: config.archive_max_local_bytes,
-        })?;
+        cluster
+            .start_archive(kronosdb_eventstore::tier::TierConfig {
+                url: archive_url.clone(),
+                interval: Duration::from_secs(config.archive_interval_secs),
+                max_local_bytes: config.archive_max_local_bytes,
+            })
+            .map_err(|error| without_archive_credentials(error, archive_url))?;
         info!(
-            url = %archive_url,
+            url = %crate::config::redact_url(archive_url),
             interval_secs = config.archive_interval_secs,
             max_local_bytes = config.archive_max_local_bytes,
             "archive enabled"
@@ -484,6 +484,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("KronosDB shut down gracefully");
     Ok(())
+}
+
+/// An error opening the archive, with its URL redacted wherever the
+/// message quotes it: the message ends up in the logs.
+fn without_archive_credentials(error: impl std::fmt::Display, url: &str) -> String {
+    error
+        .to_string()
+        .replace(url, &crate::config::redact_url(url))
 }
 
 /// Accepts client and peer connections until `stop`, counting the ones
