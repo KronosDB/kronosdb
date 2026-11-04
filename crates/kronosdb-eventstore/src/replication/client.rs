@@ -190,8 +190,15 @@ async fn run_tail(
                 if records.next_position < local_tail
                     || (records.next_position == local_tail
                         && records.first_position < records.next_position)
+                    || (records.first_position == local_tail
+                        && records.next_position == local_tail
+                        && engine.archive_holds_frame(
+                            records.segment_base,
+                            Position(records.first_position),
+                        ))
                 {
-                    // Fully duplicated catch-up/live overlap. Bytes are
+                    // Fully duplicated catch-up/live overlap, or the end of a
+                    // segment this node holds in the archive. Bytes are
                     // already durable; acknowledge this session byte cursor.
                     last_ack_position = local_tail;
                     pending_tx.send_replace(Some(PendingAck {
