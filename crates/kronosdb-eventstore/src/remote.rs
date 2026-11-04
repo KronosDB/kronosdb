@@ -85,6 +85,8 @@ pub struct ArchiveStore {
     prefix: ObjectPath,
     io: IoRuntime,
     cache_bytes: usize,
+    /// How long one download of segment bytes may take: [`FETCH_TIMEOUT`].
+    fetch_timeout: std::time::Duration,
     /// The cap on sealed bytes this node keeps on disk, if any: a node
     /// catching up from the archive skips the bodies it would evict anyway.
     max_local_bytes: Option<u64>,
@@ -95,6 +97,7 @@ impl std::fmt::Debug for ArchiveStore {
         f.debug_struct("ArchiveStore")
             .field("prefix", &self.prefix)
             .field("cache_bytes", &self.cache_bytes)
+            .field("fetch_timeout", &self.fetch_timeout)
             .field("max_local_bytes", &self.max_local_bytes)
             .finish()
     }
@@ -111,6 +114,7 @@ impl ArchiveStore {
             prefix,
             io: IoRuntime::new()?,
             cache_bytes: DEFAULT_CACHE_BYTES,
+            fetch_timeout: FETCH_TIMEOUT,
             max_local_bytes,
         }))
     }
@@ -127,6 +131,7 @@ impl ArchiveStore {
             prefix,
             io: IoRuntime::new()?,
             cache_bytes: DEFAULT_CACHE_BYTES,
+            fetch_timeout: FETCH_TIMEOUT,
             max_local_bytes,
         }))
     }
@@ -327,16 +332,24 @@ impl Flight {
         self.done.notify_all();
     }
 
-    fn wait(&self) -> Result<Bytes, Failure> {
+    /// Its result, once the download has one, or a failure at `deadline`.
+    fn wait(&self, deadline: std::time::Instant) -> Result<Bytes, Failure> {
         let mut state = lock(&self.state);
         loop {
             if let Some(result) = state.as_ref() {
                 return result.clone();
             }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(Failure::Unavailable(
+                    "the download did not finish in time".into(),
+                ));
+            }
             state = self
                 .done
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
     }
 }
@@ -544,8 +557,21 @@ impl RemoteSegments {
             });
         }
         let (mut have, waiting) = self.reserve(base, data_len, blocks_of(ranges));
+        // Every download fails by its own deadline; this one is for a
+        // download that never answers at all.
+        let deadline = std::time::Instant::now() + self.archive.fetch_timeout + RETRY_TIMEOUT;
         for (block, flight) in waiting {
-            let bytes = flight.wait().map_err(|failure| failure.into_error(base))?;
+            let bytes = flight.wait(deadline).map_err(|failure| {
+                // A later read starts a download of its own.
+                let mut flights = lock(&self.flights);
+                if flights
+                    .get(&(base, block))
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                {
+                    flights.remove(&(base, block));
+                }
+                failure.into_error(base)
+            })?;
             have.insert(block, bytes);
         }
 
@@ -643,14 +669,24 @@ impl RemoteSegments {
             };
             self.archive.io.handle().spawn(async move {
                 this.requests.fetch_add(1, Ordering::Relaxed);
-                let fetched = get_range(
-                    this.archive.store.as_ref(),
-                    &object,
-                    run,
-                    data_len,
-                    "its locator",
+                let timeout = this.archive.fetch_timeout;
+                let fetched = tokio::time::timeout(
+                    timeout,
+                    get_range(
+                        this.archive.store.as_ref(),
+                        &object,
+                        run,
+                        data_len,
+                        "its locator",
+                    ),
                 )
-                .await;
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Failure::Unavailable(format!(
+                        "no answer within {}s",
+                        timeout.as_secs_f64()
+                    )))
+                });
                 let blocks = pending.blocks.take().expect("answered once");
                 match fetched {
                     Ok(bytes) => {
@@ -931,6 +967,13 @@ pub(crate) fn open_store_with<'a>(
 /// [`Error::Unavailable`], instead of the client's default three minutes.
 pub(crate) const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The longest one download of segment bytes may take before it fails as
+/// [`Error::Unavailable`]. A request is retried for [`RETRY_TIMEOUT`], and
+/// its last attempt may take as long again; this bounds it whatever the
+/// client does, so a reader never waits on a download for ever.
+pub(crate) const FETCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3 * RETRY_TIMEOUT.as_secs());
+
 /// S3 from the environment, uploading with a SHA-256 checksum unless the
 /// environment names another: a bucket under object lock (WORM) refuses
 /// uploads without one, and every upload is checked on arrival.
@@ -1207,5 +1250,52 @@ mod tests {
                 summary.data_len
             );
         }
+    }
+
+    /// A reader waiting on a download gives up at its deadline, whatever
+    /// the download does.
+    #[test]
+    fn a_waiter_gives_up_at_its_deadline() {
+        let flight = super::Flight::default();
+        let began = std::time::Instant::now();
+        let waited = flight.wait(began + std::time::Duration::from_millis(50));
+        assert!(matches!(waited, Err(super::Failure::Unavailable(_))));
+        assert!(began.elapsed() >= std::time::Duration::from_millis(50));
+    }
+
+    /// A download the archive never answers fails its readers by its
+    /// deadline, as unavailable, and a later read starts a download of its
+    /// own instead of joining the dead one.
+    #[test]
+    fn a_download_that_never_answers_fails_its_readers_in_bounded_time() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        put_segment(memory.as_ref(), "default", 0, data(1000));
+        let hanging = Arc::new(ThrottledStore::new(
+            memory,
+            ThrottleConfig {
+                wait_get_per_call: std::time::Duration::from_secs(3600),
+                ..ThrottleConfig::default()
+            },
+        ));
+        let mut archive = super::ArchiveStore::over_store(hanging, "kb".into(), None).unwrap();
+        Arc::get_mut(&mut archive).unwrap().fetch_timeout = std::time::Duration::from_millis(200);
+        let remote = remote(&archive, "default", &[(0, 1000)]);
+
+        for _ in 0..2 {
+            let reader = Arc::clone(&remote);
+            let (done, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(read_one(&reader, 0, 0..100));
+            });
+            let error = result
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the read waits on the download for ever")
+                .unwrap_err();
+            assert!(matches!(error, Error::Unavailable { .. }), "{error}");
+            assert!(remote.flights.lock().unwrap().is_empty());
+        }
+        assert_eq!(remote.requests(), 2);
+        assert_eq!(remote.failures(), 2);
     }
 }
