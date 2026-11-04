@@ -738,7 +738,7 @@ fn check_archive(
     max_local_bytes: Option<u64>,
     segment_size: u64,
 ) -> Result<Option<String>, String> {
-    if interval_secs == 0 {
+    if has_url && interval_secs == 0 {
         return Err("archive interval-secs must be at least 1".into());
     }
     let Some(cap) = max_local_bytes else {
@@ -752,33 +752,18 @@ fn check_archive(
     if !has_url {
         return Err("archive max-local-bytes is set without an archive url".into());
     }
-    // Eviction runs between seals: below two segments, a node keeps at
-    // most one sealed body, and almost every read of sealed data goes to
-    // the archive.
-    Ok((cap < segment_size.saturating_mul(2)).then(|| {
+    // The cap counts the active segment and the index files too: below
+    // three segments, a node keeps at most one sealed body, and almost every
+    // read of sealed data goes to the archive.
+    Ok((cap < segment_size.saturating_mul(3)).then(|| {
         format!(
-            "archive max-local-bytes ({cap}) is below twice the segment size ({segment_size}): \
-             almost every read of sealed segments will go to the archive"
+            "archive max-local-bytes ({cap}) is below three times the segment size \
+             ({segment_size}): almost every read of sealed segments will go to the archive"
         )
     }))
 }
 
-/// An object-store URL fit for logs: without credentials in its user info
-/// or its query (an Azure SAS token, a presigned signature).
-pub fn redact_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.split(['?', '#']).next().unwrap_or_default().to_string();
-    };
-    // User info cannot hold an unescaped '/', so the authority ends at the
-    // first one; a password with a '?' or '@' in it is still dropped whole.
-    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let location = format!("{host}{path}");
-    let location = location.split(['?', '#']).next().unwrap_or_default();
-    format!("{scheme}://{location}")
-}
+pub use kronosdb_eventstore::remote::redact_url;
 
 /// Resolves admin auth from CLI/env (priority) and the TOML file.
 fn resolve_admin_auth(
@@ -893,16 +878,21 @@ mod tests {
     fn archive_settings_that_cannot_work_are_refused() {
         const SEGMENT: u64 = 256 << 20;
         assert!(check_archive(true, 0, None, SEGMENT).is_err());
-        assert!(check_archive(false, 0, None, SEGMENT).is_err());
+        // No archive: its interval is never used.
+        assert_eq!(check_archive(false, 0, None, SEGMENT), Ok(None));
         assert!(check_archive(true, 30, Some(0), SEGMENT).is_err());
         assert!(check_archive(false, 30, Some(1 << 40), SEGMENT).is_err());
         assert_eq!(check_archive(false, 30, None, SEGMENT), Ok(None));
         assert_eq!(
-            check_archive(true, 30, Some(2 * SEGMENT), SEGMENT),
+            check_archive(true, 30, Some(3 * SEGMENT), SEGMENT),
             Ok(None)
         );
-        let warning = check_archive(true, 30, Some(2 * SEGMENT - 1), SEGMENT).unwrap();
-        assert!(warning.unwrap().contains("below twice the segment size"));
+        let warning = check_archive(true, 30, Some(3 * SEGMENT - 1), SEGMENT).unwrap();
+        assert!(
+            warning
+                .unwrap()
+                .contains("below three times the segment size")
+        );
     }
 
     #[test]

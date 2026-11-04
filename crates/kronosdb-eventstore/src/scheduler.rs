@@ -386,7 +386,7 @@ impl Schedules {
 pub fn tick(
     engine: &EventStoreEngine,
     projection: &Mutex<Projection>,
-    leading: bool,
+    leading: &dyn Fn() -> bool,
     context: &str,
 ) {
     let mut projection = match projection.try_lock() {
@@ -399,10 +399,12 @@ pub fn tick(
         tracing::warn!(%error, context, "schedule projection stalled; retrying");
         return;
     }
-    if !leading {
-        return;
-    }
+    // Asked again before every fire: the fold may have waited on the
+    // archive, and only the leader fires.
     for live in projection.due(now_ms()) {
+        if !leading() {
+            return;
+        }
         match fire(engine, &live) {
             Ok(()) => tracing::debug!(
                 context,
@@ -653,11 +655,11 @@ mod tests {
         let schedules = Schedules::default();
         let projection = schedules.projection("default");
 
-        tick(&engine, &projection, false, "default");
+        tick(&engine, &projection, &|| false, "default");
         assert_eq!(projection.lock().unwrap().len(), 1, "folded, not fired");
         assert_eq!(engine.head(), Position(1));
 
-        tick(&engine, &projection, true, "default");
+        tick(&engine, &projection, &|| true, "default");
         assert_eq!(engine.head(), Position(3), "target and fired appended");
         // Shared: what the loop folded is what ListSchedules sees.
         let listed = schedules.projection("default");
@@ -672,11 +674,11 @@ mod tests {
         let projection = Mutex::new(Projection::default());
 
         let busy = projection.lock().unwrap();
-        tick(&engine, &projection, true, "default");
+        tick(&engine, &projection, &|| true, "default");
         drop(busy);
         assert_eq!(engine.head(), Position(1), "nothing fired while busy");
 
-        tick(&engine, &projection, true, "default");
+        tick(&engine, &projection, &|| true, "default");
         assert_eq!(engine.head(), Position(3));
     }
 

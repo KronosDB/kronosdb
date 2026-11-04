@@ -135,7 +135,7 @@ pub struct ArchiveStore {
     in_flight_blocks: u32,
     /// Numbers each context's cold reads, which key their blocks.
     next_context: AtomicU64,
-    /// The cap on sealed bytes this node keeps on disk, if any: a node
+    /// The cap on the bytes this node keeps on disk for its logs, if any: a node
     /// catching up from the archive skips the bodies it would evict anyway.
     max_local_bytes: Option<u64>,
 }
@@ -152,7 +152,7 @@ impl std::fmt::Debug for ArchiveStore {
 
 impl ArchiveStore {
     /// The archive at `raw_url`, as for [`crate::tier::Archiver::from_url`],
-    /// for a node that keeps at most `max_local_bytes` of sealed segments on
+    /// for a node that keeps at most `max_local_bytes` of its logs' files on
     /// disk (`None`: all of them).
     pub fn from_url(raw_url: &str, max_local_bytes: Option<u64>) -> Result<Arc<Self>, Error> {
         let (store, prefix) = open_store(raw_url)?;
@@ -502,7 +502,7 @@ impl RemoteSegments {
             .join(format!("{base:020}.seg"))
     }
 
-    /// The cap on sealed bytes this node keeps on disk, if any.
+    /// The cap on the bytes this node keeps on disk for its logs, if any.
     pub fn max_local_bytes(&self) -> Option<u64> {
         self.archive.max_local_bytes
     }
@@ -1137,9 +1137,45 @@ pub(crate) fn open_store(raw_url: &str) -> Result<(Box<dyn ObjectStore>, ObjectP
     open_store_with(raw_url, std::iter::empty::<(&str, &str)>())
 }
 
+/// An object-store URL fit for logs: without credentials in its user info
+/// or its query (an Azure SAS token, a presigned signature).
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.split(['?', '#']).next().unwrap_or_default().to_string();
+    };
+    // User info cannot hold an unescaped '/', so the authority ends at the
+    // first one; a password with a '?' or '@' in it is still dropped whole.
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let location = format!("{host}{path}");
+    let location = location.split(['?', '#']).next().unwrap_or_default();
+    format!("{scheme}://{location}")
+}
+
 /// [`open_store`] with `options` (keys as the provider names them, such as
-/// `aws_endpoint`) over what the environment says.
+/// `aws_endpoint`) over what the environment says. Errors quote the URL
+/// redacted: they end up in logs.
 pub(crate) fn open_store_with<'a>(
+    raw_url: &str,
+    options: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(Box<dyn ObjectStore>, ObjectPath), Error> {
+    open_store_quoting_url(raw_url, options).map_err(|error| match error {
+        Error::Rejected { message } => {
+            let shown = redact_url(raw_url);
+            let mut message = message.replace(raw_url, &shown);
+            // The provider's builder may quote the URL as parsed.
+            if let Ok(parsed) = url::Url::parse(raw_url) {
+                message = message.replace(parsed.as_str(), &shown);
+            }
+            Error::Rejected { message }
+        }
+        other => other,
+    })
+}
+
+fn open_store_quoting_url<'a>(
     raw_url: &str,
     options: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<(Box<dyn ObjectStore>, ObjectPath), Error> {
@@ -1308,6 +1344,29 @@ mod tests {
             error.to_string().contains("only if it is absent"),
             "{error}"
         );
+    }
+
+    /// A URL an archive cannot be opened at is quoted without the
+    /// credentials it carries.
+    #[test]
+    fn a_refused_url_is_quoted_without_its_credentials() {
+        let mut refused = 0;
+        for url in [
+            "http://user:hunter2@example.com/archive?sig=s3cr3t",
+            "s3://bucket/prefix?X-Amz-Signature=s3cr3t&unknown=\u{0}",
+            "az://user:hunter2@container/prefix?sv=s3cr3t&bad",
+        ] {
+            let Err(error) = super::open_store_with(url, [("not_a_setting", "x")]) else {
+                continue;
+            };
+            refused += 1;
+            let message = error.to_string();
+            assert!(
+                !message.contains("hunter2") && !message.contains("s3cr3t"),
+                "{message}"
+            );
+        }
+        assert!(refused >= 2, "only {refused} of the URLs were refused");
     }
 
     /// An archive that takes connections and never answers fails a

@@ -21,11 +21,19 @@
 //! two logs share the prefix, and the pass fails without writing anything
 //! more.
 //!
-//! That needs a store that creates an object only if it is absent. A leader
-//! checks it before it archives: it creates [`CONDITIONAL_WRITE_CHECK`]
-//! under the URL, if absent, then asks to create it again, which must be
-//! refused. A store that accepts gets nothing archived. The object is never
-//! deleted: object lock may forbid it, and there is only ever the one.
+//! One case is not covered: an object too large for one request goes up in
+//! parts, and completing a multipart upload cannot be made conditional. Two
+//! leaders racing on the same segment (a deposed one finishing an upload as
+//! the new one starts it) can both complete it. The bytes are the same, so
+//! a plain bucket is unaffected; under object lock the second completion is
+//! a second retained version, or is refused and retried by the next pass.
+//!
+//! Committing by summary needs a store that creates an object only if it is
+//! absent. A leader checks it before it archives: it creates
+//! [`CONDITIONAL_WRITE_CHECK`] under the URL, if absent, then asks to create
+//! it again, which must be refused. A store that accepts gets nothing
+//! archived. The object is never deleted: object lock may forbid it, and
+//! there is only ever the one.
 //!
 //! The key tables are a segment's own table while no merged table covers
 //! it, and the merged tables of ADR-0010, uploaded once the segments they
@@ -102,7 +110,7 @@ pub struct TierConfig {
     /// Delay between archive passes on the claimed leader, and between
     /// eviction passes on every node.
     pub interval: Duration,
-    /// Most bytes of sealed segments this node keeps on disk; past it, the
+    /// Most bytes of its logs' files this node keeps on disk; past it, the
     /// oldest archived segments are evicted. `None` never evicts.
     pub max_local_bytes: Option<u64>,
 }
@@ -139,7 +147,7 @@ pub struct EvictionPassReport {
     pub evicted: usize,
     /// Bytes their files held.
     pub freed: u64,
-    /// Bytes of sealed segments still on disk.
+    /// Bytes of the logs' files still on disk, what the cap counts.
     pub local_bytes: u64,
     /// Contexts whose oldest local segment is not archived yet.
     pub waiting: Vec<String>,
@@ -178,7 +186,7 @@ pub struct ContextArchiveStatus {
 /// Eviction on this node.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvictionStatus {
-    /// The cap on sealed segment bytes; 0 for none.
+    /// The cap on the bytes of the logs' files; 0 for none.
     pub max_local_bytes: u64,
     /// Segments evicted since startup.
     pub evicted_segments: u64,
@@ -1183,6 +1191,11 @@ async fn local_bytes(engine: &Arc<EventStoreEngine>) -> Result<u64, Error> {
 
 /// The oldest final segment of `engine` with a body, if there is one.
 async fn oldest_body(engine: &Arc<EventStoreEngine>) -> Result<Option<OldestBody>, Error> {
+    // Bodies a catch-up is putting in place are the oldest: evicting one
+    // would undo it.
+    if engine.catching_up_from_archive() {
+        return Ok(None);
+    }
     let evicted_end = engine.evicted_end();
     let Some(segment) = engine
         .archivable_segments()
