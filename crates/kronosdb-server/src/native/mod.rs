@@ -19,15 +19,14 @@ mod session;
 pub mod tls;
 mod wire;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kronosdb_eventstore::api::EventStore;
 use kronosdb_eventstore::raft::cluster::ClusterManager;
 use kronosdb_eventstore::raft::transport::RaftNode;
 use kronosdb_eventstore::replication::PEER_MAX_FRAME;
 use kronosdb_eventstore::replication::service::SegmentReplicationService;
-use kronosdb_eventstore::scheduler::Projection;
+use kronosdb_eventstore::scheduler::Schedules;
 use kronosdb_protocol as p;
 use kronosdb_protocol::ErrorCode;
 use kronosdb_protocol::net::server::{Accepted, BoxFuture, PeerInfo, ServerStream, Service};
@@ -50,8 +49,9 @@ pub struct Deps {
     pub max_snapshot_size: u64,
     /// Commands, queries and the platform.
     pub hub: Arc<Hub>,
-    /// The scheduler's per-context view of live schedules, advanced lazily.
-    pub schedule_projections: Arc<Mutex<HashMap<String, Projection>>>,
+    /// Every context's live schedules, folded by the scheduler loop and
+    /// caught up by `ListSchedules`.
+    pub schedules: Arc<Schedules>,
 }
 
 /// What every handler gets: the server's dependencies and the connection.

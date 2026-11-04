@@ -129,10 +129,11 @@ pub async fn list_schedules(ctx: Ctx, stream: ServerStream) -> Result<(), Failur
         .context_manager()
         .get_context(&name)
         .map_err(convert::failure)?;
-    let projections = std::sync::Arc::clone(&ctx.deps.schedule_projections);
+    let projection = ctx.deps.schedules.projection(&name);
+    // On the blocking pool: catching up may read evicted segments, and
+    // waits while the scheduler loop folds the same projection.
     let schedules = tokio::task::spawn_blocking(move || {
-        let mut projections = projections.lock().expect("projection map poisoned");
-        let projection = projections.entry(name.to_string()).or_default();
+        let mut projection = projection.lock().unwrap_or_else(|e| e.into_inner());
         projection.advance(&engine).map(|()| projection.list())
     })
     .await
