@@ -91,18 +91,26 @@ impl ClusterManager {
                     "eviction pass"
                 );
             }
-            // A context that failed or diverged holds back only itself: the
-            // pass went on with the others.
+            // A context that failed or diverged is not evicted from; the pass
+            // went on with the others, though its bytes still count.
             for (context, error) in &report.failed {
                 tracing::warn!(%error, context, "eviction failed for this context; retrying next interval");
             }
             if report.local_bytes > max_local_bytes {
+                let reason = if !report.waiting.is_empty() {
+                    "over the local cap: the archive has not caught up"
+                } else if !report.diverged.is_empty() || !report.failed.is_empty() {
+                    "over the local cap: some contexts cannot be evicted from"
+                } else {
+                    "over the local cap with nothing left to evict: the cap is below what \
+                     the active segments and indexes need"
+                };
                 tracing::warn!(
                     local_bytes = report.local_bytes,
                     max_local_bytes,
                     waiting = ?report.waiting,
                     diverged = ?report.diverged,
-                    "over the local cap: the archive has not caught up"
+                    "{reason}"
                 );
             }
         }
@@ -212,19 +220,24 @@ impl ClusterManager {
         loop {
             tokio::time::sleep(tick).await;
 
-            let leading = self.is_writable_leader();
-
             for context in self.context_manager.list_contexts() {
                 let Ok(engine) = self.context_manager.get_context(&context) else {
                     continue;
                 };
                 let projection = schedules.projection(&context);
+                let this = Arc::clone(&self);
                 // Off the runtime: a fold may wait on the archive and a fire
                 // on the quorum. Not awaited, so one context waiting on the
                 // archive holds up no other; its next ticks skip it until it
-                // is done.
+                // is done. Leadership is asked before each fire, not here:
+                // the tick may start late.
                 tokio::task::spawn_blocking(move || {
-                    crate::scheduler::tick(&engine, &projection, leading, &context);
+                    crate::scheduler::tick(
+                        &engine,
+                        &projection,
+                        &|| this.is_writable_leader(),
+                        &context,
+                    );
                 });
             }
         }
@@ -491,6 +504,7 @@ impl ClusterManager {
                     // so: a follower that cannot catch up (the archive
                     // unreachable, say) must not spin, nor go unnoticed.
                     let mut failures = 0u32;
+                    let mut lasting = 0u32;
                     loop {
                         let current = control.claim();
                         if current
@@ -503,16 +517,28 @@ impl ClusterManager {
                         let outcome = run_tail_session(Arc::clone(&engine), config.clone()).await;
                         if started.elapsed() >= TAIL_SESSION_HEALTHY {
                             failures = 0;
+                            lasting = 0;
                         }
-                        if let Err(error) = outcome {
+                        if let Err(error) = &outcome {
                             failures = failures.saturating_add(1);
+                            // Corruption, or a catch-up the archive cannot
+                            // serve, does not clear by retrying soon, and a
+                            // retry may download a whole segment again.
+                            if matches!(
+                                error,
+                                Error::Corrupted { .. } | Error::Internal { .. } | Error::Rejected { .. }
+                            ) {
+                                lasting = lasting.saturating_add(1);
+                            } else {
+                                lasting = 0;
+                            }
                             if failures.is_multiple_of(TAIL_FAILURES_PER_WARNING) {
                                 tracing::warn!(%error, %context, leader_id, epoch, failures, "Tail sessions keep failing; this node is not catching up");
                             } else {
                                 tracing::debug!(%error, %context, leader_id, epoch, "Tail session reconnecting");
                             }
                         }
-                        tokio::time::sleep(tail_retry_delay(failures)).await;
+                        tokio::time::sleep(tail_retry_delay(failures, lasting)).await;
                     }
                 }))
             })
@@ -997,8 +1023,13 @@ const TAIL_SESSION_HEALTHY: Duration = Duration::from_secs(10);
 const TAIL_FAILURES_PER_WARNING: u32 = 20;
 
 /// How long to wait before the next Tail session after `failures` in a row:
-/// a quarter second at first, doubling to at most two seconds.
-fn tail_retry_delay(failures: u32) -> Duration {
+/// a quarter second at first, doubling to at most two seconds. Past three
+/// failures in a row that retrying does not clear (`lasting`), the wait
+/// keeps doubling, to at most two minutes.
+fn tail_retry_delay(failures: u32, lasting: u32) -> Duration {
+    if lasting > 3 {
+        return Duration::from_secs(2 << (lasting - 3).min(6)).min(Duration::from_secs(120));
+    }
     Duration::from_millis(250 << failures.saturating_sub(1).min(3))
 }
 

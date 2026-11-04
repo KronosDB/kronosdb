@@ -29,8 +29,22 @@ use crate::hub::{Hub, HubConfig};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// How long blocking work still running at exit may take to finish: a
+/// read waiting on an unreachable archive, or a scheduled fire waiting on a
+/// quorum that is gone, must not keep the process alive. Acked writes are
+/// already durable by then.
+const BLOCKING_SHUTDOWN: Duration = Duration::from_secs(10);
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(BLOCKING_SHUTDOWN);
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging. KRONOSDB_LOG_FORMAT=json switches to
     // newline-delimited JSON for log aggregation (Loki, CloudWatch, etc.).
     let env_filter = || {

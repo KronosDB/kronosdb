@@ -2321,8 +2321,14 @@ impl EventStoreEngine {
     /// the segments they fill become final here. Returns the segments
     /// applied.
     pub fn apply_archived(&self, up_to: u64) -> Result<usize, Error> {
+        self.apply_archived_in(up_to, self.archive_catchup_session())
+    }
+
+    /// [`apply_archived`](Self::apply_archived) for the Tail session numbered
+    /// `session`, read before the catch-up was handed to its thread: if a
+    /// newer session has started by the time it runs, it does nothing.
+    pub fn apply_archived_in(&self, up_to: u64, session: u64) -> Result<usize, Error> {
         let _running = self.evicted.catchup.lock();
-        let session = self.evicted.catchup_session.load(Ordering::Acquire);
         let go_on = || {
             if self.evicted.catchup_session.load(Ordering::Acquire) == session {
                 Ok(())
@@ -2406,6 +2412,18 @@ impl EventStoreEngine {
         }
     }
 
+    /// Whether this log is catching up from the archive now: its bodies are
+    /// being put in place, and an eviction pass leaves them alone.
+    pub fn catching_up_from_archive(&self) -> bool {
+        self.evicted.catchup.try_lock().is_none()
+    }
+
+    /// The current Tail session's number, for
+    /// [`apply_archived_in`](Self::apply_archived_in).
+    pub fn archive_catchup_session(&self) -> u64 {
+        self.evicted.catchup_session.load(Ordering::Acquire)
+    }
+
     /// Stops a catch-up from the archive that an earlier Tail session
     /// started, and waits until it has: a new session reads where the log
     /// ends, which that catch-up would otherwise go on moving.
@@ -2479,8 +2497,12 @@ impl EventStoreEngine {
             .map(|(&base, &len)| (base, len))
             .collect();
         let sent: u64 = listing.segments.range(end..).map(|(_, &len)| len).sum();
-        let room = cap.saturating_sub(sent);
         let installed_bytes: u64 = sizes.iter().map(|&(_, len)| len).sum();
+        // The cap counts every file the log keeps: what is here already (the
+        // active segment the Tail fills, for one), what the leader sends, and
+        // the locators and key tables installed, about a twentieth of their
+        // segments.
+        let room = cap.saturating_sub(sent + self.local_bytes()? + installed_bytes / 16);
         if installed_bytes <= room {
             return Ok(0);
         }
@@ -5423,6 +5445,12 @@ impl Evicted {
         })
     }
 
+    /// Downloads the own key table `[base, end)` of an evicted segment.
+    fn fetch_keys(&self, base: u64, end: u64, local: &Path) -> Result<bool, Error> {
+        self.archive(base)?
+            .download("index", &segment::merge::table_file_name(base, end), local)
+    }
+
     /// The bases of the evicted prefix, checked whole, followed by `rest`.
     ///
     /// The prefix is found by its locators, and segments follow one another
@@ -5432,12 +5460,6 @@ impl Evicted {
     /// that is gone, so both are downloaded from the archive. Key tables
     /// are the index's to fetch, and only when no merged table covers them
     /// (see [`fetch_keys`](Self::fetch_keys)).
-    /// Downloads the own key table `[base, end)` of an evicted segment.
-    fn fetch_keys(&self, base: u64, end: u64, local: &Path) -> Result<bool, Error> {
-        self.archive(base)?
-            .download("index", &segment::merge::table_file_name(base, end), local)
-    }
-
     fn complete_prefix(&self, dir: &Path, bases: &[u64]) -> Result<Vec<u64>, Error> {
         let end = self.end();
         let listed: std::collections::BTreeSet<u64> =

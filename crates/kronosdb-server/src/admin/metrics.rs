@@ -61,25 +61,28 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     }
 
     // One directory walk per context per scrape — a blocking recursive
-    // stat, so it runs on the blocking pool, not a runtime worker. The
-    // logs' files are counted against a cap only when there is one: without
-    // it the value is not reported.
+    // stat, so it runs on the blocking pool, not a runtime worker. The same
+    // walk is what a cap counts: their sum is reported with a cap, and only
+    // when every walk succeeded, so a failed one does not read as room.
     let capped = state.cluster.archive_status().eviction().max_local_bytes > 0;
-    let (data_bytes, local_bytes): (Vec<(String, u64)>, u64) =
+    let (data_bytes, local_bytes): (Vec<(String, u64)>, Option<u64>) =
         tokio::task::spawn_blocking(move || {
-            let local_bytes = if capped {
-                sized
-                    .iter()
-                    .map(|(_, engine)| engine.local_bytes().unwrap_or(0))
-                    .sum()
-            } else {
-                0
-            };
+            let mut local_bytes = Some(0u64);
             let data_bytes = sized
                 .into_iter()
-                .map(|(label, engine)| (label, engine.data_dir_bytes()))
+                .map(|(label, engine)| {
+                    let bytes = match engine.local_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            local_bytes = None;
+                            engine.data_dir_bytes()
+                        }
+                    };
+                    local_bytes = local_bytes.map(|sum| sum + bytes);
+                    (label, bytes)
+                })
                 .collect();
-            (data_bytes, local_bytes)
+            (data_bytes, local_bytes.filter(|_| capped))
         })
         .await
         .unwrap_or_default();
@@ -320,7 +323,7 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             "Cap on sealed segment bytes kept on disk; 0 without a cap",
             &[(String::new(), eviction.max_local_bytes)],
         );
-        if capped {
+        if let Some(local_bytes) = local_bytes {
             family(
                 &mut out,
                 "kronosdb_archive_local_bytes",

@@ -220,8 +220,8 @@ fn a_store_with_evicted_segments_needs_its_archive_to_open() {
     assert!(matches!(error, Error::Rejected { .. }), "{error}");
 }
 
-/// Opening reads nothing from the archive while every evicted segment has
-/// its locator and is indexed here, its own key table or a merged one.
+/// Opening fetches no key table from the archive while every evicted
+/// segment is indexed here, by its own key table or a merged one.
 #[cfg(unix)]
 #[test]
 fn a_store_with_its_index_opens_without_reaching_the_archive() {
@@ -246,6 +246,11 @@ fn a_store_with_its_index_opens_without_reaching_the_archive() {
     // Key tables in the archive cannot be read now.
     let index = tier.path().join("default").join("index");
     std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&index).is_ok() {
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: permissions do not bind this user");
+        return;
+    }
     let opened = EventStoreEngine::open_with_store_options(&dir, &options(Some(tier.path())));
     std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(reads(&opened.unwrap()).unwrap(), expected);
@@ -268,6 +273,12 @@ fn a_body_that_cannot_be_deleted_is_not_evicted() {
     let next = store.archivable_segments()[2].clone();
 
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(dir.join("probe"), b"").is_ok() {
+        std::fs::remove_file(dir.join("probe")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: permissions do not bind this user");
+        return;
+    }
     let refused = store.evict_segment(next.base);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(refused.is_err());
@@ -329,12 +340,9 @@ fn only_the_oldest_final_segment_with_a_body_is_evicted() {
     assert_eq!(store.evicted_end(), segments[1].end);
 }
 
+/// What the cap counts: every file the log keeps on disk.
 fn local_bytes(store: &EventStoreEngine) -> u64 {
-    store
-        .sealed_bodies()
-        .iter()
-        .map(|segment| std::fs::metadata(&segment.path).unwrap().len())
-        .sum()
+    store.local_bytes().unwrap()
 }
 
 fn evict_down_to(

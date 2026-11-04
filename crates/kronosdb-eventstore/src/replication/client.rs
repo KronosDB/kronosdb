@@ -338,7 +338,8 @@ async fn run_tail(
     let before = engine.local_tail().0;
     let applied = {
         let engine = Arc::clone(&engine);
-        tokio::task::spawn_blocking(move || engine.apply_archived(up_to))
+        let session = engine.archive_catchup_session();
+        tokio::task::spawn_blocking(move || engine.apply_archived_in(up_to, session))
             .await
             .map_err(|error| Error::Internal {
                 message: format!("catching up from the archive: {error}"),
