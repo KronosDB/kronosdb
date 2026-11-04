@@ -343,12 +343,12 @@ fn evict_down_to(
     max_local_bytes: u64,
 ) -> Result<crate::tier::EvictionPassReport, Error> {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
+    Ok(runtime.block_on(async {
         Archiver::from_url(&archive_url(tier))
             .unwrap()
             .run_eviction_pass(&[("default".to_string(), store)], max_local_bytes)
             .await
-    })
+    }))
 }
 
 #[test]
@@ -405,8 +405,8 @@ fn a_segment_unlike_its_archived_copy_is_kept() {
     archived.blake3 = "0".repeat(64);
     std::fs::write(&summary, serde_json::to_vec(&archived).unwrap()).unwrap();
 
-    let error = evict_down_to(Arc::clone(&store), tier.path(), 0).unwrap_err();
-    assert!(matches!(error, Error::Corrupted { .. }), "{error}");
+    let report = evict_down_to(Arc::clone(&store), tier.path(), 0).unwrap();
+    assert_eq!(report.diverged, vec!["default".to_string()]);
     assert_eq!(store.evicted_end(), 0);
     assert!(store.archivable_segments()[0].path.exists());
 }
