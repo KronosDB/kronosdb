@@ -93,12 +93,14 @@ archive:
   # archived segments are evicted, across contexts the oldest first, and
   # read back from the archive by range (about 100 ms a read, against a
   # millisecond locally): set it only when the disk cannot hold the whole
-  # log. Needs url, and at least two segments (256 MiB each by default).
+  # log. Needs url, and room for at least three segments (256 MiB each by
+  # default) plus their index files.
   # A whole number of bytes; empty keeps everything.
   #
-  # - Evicted events exist only in the bucket unless some node keeps
-  #   everything: keep one node without a cap (a learner kept for backup)
-  #   and turn on versioning or object lock for the bucket.
+  # - The cap applies to voters. Learners are kept for backup and keep
+  #   every segment: run at least one (learners.replicas), or the evicted
+  #   events exist only in the bucket. Turn on versioning or object lock
+  #   for the bucket either way.
   # - While the archive is unreachable nothing is evicted, and every capped
   #   node grows past the cap at the ingest rate: size the volume for the
   #   longest outage you want to ride out (ingest bytes per hour times its
