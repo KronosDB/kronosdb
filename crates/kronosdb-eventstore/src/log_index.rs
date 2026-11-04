@@ -69,11 +69,26 @@ fn rebuildable(error: Error, path: &Path) -> Result<(), Error> {
     }
 }
 
+/// Fetches the own key table `[base, end)` of an evicted segment into the
+/// given path (ADR-0011); `false` when the archive does not hold it.
+pub(crate) type FetchKeys<'a> = &'a dyn Fn(u64, u64, &Path) -> Result<bool, Error>;
+
 /// Opens the index of the log in `dir`, whose segments start at `bases`
 /// (the last one, `active_base`, being written). Reads headers and small
 /// sections only; a file is rebuilt from its segment only when it is
 /// missing or damaged.
-pub(crate) fn open(dir: &Path, bases: &[u64], active_base: u64) -> Result<OpenedIndex, Error> {
+///
+/// Segments below `evicted_end` have no body to rebuild from: the own key
+/// table of one that no merged table covers is fetched from the archive
+/// instead, and only then, so opening needs the archive only when a file
+/// is actually missing.
+pub(crate) fn open(
+    dir: &Path,
+    bases: &[u64],
+    active_base: u64,
+    evicted_end: u64,
+    fetch_keys: FetchKeys<'_>,
+) -> Result<OpenedIndex, Error> {
     let index_dir = dir.join(INDEX_DIR);
     std::fs::create_dir_all(&index_dir)?;
 
@@ -185,6 +200,20 @@ pub(crate) fn open(dir: &Path, bases: &[u64], active_base: u64) -> Result<Opened
         });
         let table = match own {
             Ok(table) => table,
+            Err(error) if base < evicted_end => {
+                rebuildable(error, &keys_path)?;
+                let end = locator_count(&locators) + base;
+                remove_if_exists(&keys_path)?;
+                if !fetch_keys(base, end, &keys_path)? {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "evicted segment {base} has no key table here, in a merged table, \
+                             or in the archive"
+                        ),
+                    });
+                }
+                KeyTableFile::open(&keys_path)?
+            }
             Err(error) => {
                 rebuildable(error, &keys_path)?;
                 build(&mut built)?;

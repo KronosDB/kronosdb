@@ -214,7 +214,8 @@ impl LogView {
         match index {
             IndexRef::Active(_) => self.active_segment_reader(base, seg_path),
             IndexRef::Sealed(_) => {
-                SegmentReader::from_shared_mmap(self.cache.get_mmap(seg_path, base)?)
+                let mmap = self.cache.get_mmap(seg_path, base)?;
+                SegmentReader::from_shared_mmap(still_held(&self.evicted, &self.cache, base, mmap)?)
             }
         }
     }
@@ -1792,7 +1793,13 @@ impl EventStoreEngine {
         // none covers. Only a missing or damaged file is rebuilt. The
         // locators' control summaries are what recovery reads below, so no
         // sealed segment's records are read at all.
-        let opened = crate::log_index::open(dir, &all_bases, active_base)?;
+        let opened = crate::log_index::open(
+            dir,
+            &all_bases,
+            active_base,
+            evicted.end(),
+            &|base, end, local| evicted.fetch_keys(base, end, local),
+        )?;
         let rebuilt_at_open = opened.rebuilt;
         let sealed = opened.locators;
 
@@ -1822,10 +1829,12 @@ impl EventStoreEngine {
             active_index.read().controls(),
             head_pos,
         );
+        // Evicted segments are final: committed, whatever the last checkpoint
+        // in the log says (one in an evicted segment is below its end).
         let recovered_watermark = if voters.len() == 1 {
             head_pos
         } else {
-            recovered.checkpoint
+            recovered.checkpoint.max(evicted.end())
         };
         let watermark = Arc::new(WatermarkState::new(
             recovered.epoch,
@@ -1992,6 +2001,9 @@ impl EventStoreEngine {
         byte_offset: u64,
         expected_crc: u32,
     ) -> Result<bool, Error> {
+        if self.evicted.contains(segment_base) {
+            return self.verify_archived_probe(segment_base, byte_offset, expected_crc);
+        }
         let path = segment::segment_path(&self.dir, segment_base);
         if !path.exists() || byte_offset < segment::SEGMENT_HEADER_SIZE as u64 {
             return Ok(false);
@@ -2008,6 +2020,71 @@ impl EventStoreEngine {
             return Ok(false);
         }
         Ok(record_crc_ending_at(&path, byte_offset)? == Some(expected_crc))
+    }
+
+    /// [`verify_replication_probe`](Self::verify_replication_probe) for an
+    /// evicted segment (ADR-0011): the records from the last event starting
+    /// before `byte_offset` up to it are read from the archive, so a follower
+    /// that is only behind is not mistaken for one that diverged.
+    fn verify_archived_probe(
+        &self,
+        base: u64,
+        byte_offset: u64,
+        expected_crc: u32,
+    ) -> Result<bool, Error> {
+        let header = segment::SEGMENT_HEADER_SIZE as u64;
+        if byte_offset <= header {
+            return Ok(byte_offset == header && expected_crc == 0);
+        }
+        let archive = Arc::clone(self.evicted.archive(base)?);
+        if byte_offset > archive.data_len(base)? {
+            return Ok(false);
+        }
+        let locator = self
+            .cache
+            .get_index(&segment::segment_path(&self.dir, base), base)?;
+        let offset = |index: u64| {
+            locator
+                .offset_of(base + index)?
+                .ok_or(Error::PositionNotFound {
+                    position: base + index,
+                })
+        };
+        // Events starting before the offset: the last of them is where whole
+        // records are known to start.
+        let (mut low, mut high) = (0, locator.event_count());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if offset(middle)? < byte_offset {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let start = match low {
+            0 => header,
+            events => offset(events - 1)?,
+        };
+        let bytes = archive
+            .read(base, std::slice::from_ref(&(start..byte_offset)))?
+            .pop()
+            .unwrap_or_default();
+        let mut at = 0;
+        let mut last_crc = None;
+        while at < bytes.len() {
+            let Some(record_header) = bytes
+                .get(at..at + segment::RECORD_HEADER_SIZE)
+                .and_then(|header| <&[u8; segment::RECORD_HEADER_SIZE]>::try_from(header).ok())
+            else {
+                return Ok(false);
+            };
+            let Some(record) = crate::segment::record::parse_header(record_header)? else {
+                return Ok(false);
+            };
+            at += record.total_len();
+            last_crc = Some(record.stored_crc);
+        }
+        Ok(at == bytes.len() && last_crc == Some(expected_crc))
     }
 
     pub fn replication_epoch(&self) -> u64 {
@@ -2164,22 +2241,18 @@ impl EventStoreEngine {
     }
 
     /// Whether a Tail frame for `segment_base` starting at `first_position`
-    /// holds only what follows the last event of a segment this node has
-    /// evicted (ADR-0011). A node that joined without bodies has its
-    /// watermark at the end of such a segment; a leader that still holds the
-    /// segment and cuts the node back there sends the control records after
-    /// its last event. The segment is final, so the archive's copy already
-    /// holds them: the frame is acknowledged without being written.
-    pub fn archive_holds_frame(&self, segment_base: u64, first_position: Position) -> bool {
-        if !self.evicted.contains(segment_base) {
-            return false;
-        }
+    /// holds only what follows the last event of a segment this node keeps
+    /// whole: evicted (ADR-0011) or covered by a merged table. A node that
+    /// joined from the archive has its watermark at the end of such a
+    /// segment; a leader that cuts the node back there sends the control
+    /// records after its last event. The segment is final, so this node's
+    /// copy, or the archive's, already holds them: the frame is acknowledged
+    /// without being written.
+    pub fn holds_whole_segment(&self, segment_base: u64, first_position: Position) -> bool {
         let list = self.segments.read();
-        list.bases
-            .binary_search(&segment_base)
-            .ok()
-            .and_then(|index| list.bases.get(index + 1))
-            == Some(&first_position.0)
+        list.bases.binary_search(&segment_base).is_ok_and(|index| {
+            list.bases.get(index + 1) == Some(&first_position.0) && self.is_whole(&list, index)
+        })
     }
 
     /// Applies raw Tail bytes to this follower's authoritative segment log.
@@ -2248,14 +2321,27 @@ impl EventStoreEngine {
     /// the segments they fill become final here. Returns the segments
     /// applied.
     pub fn apply_archived(&self, up_to: u64) -> Result<usize, Error> {
+        let _running = self.evicted.catchup.lock();
+        let session = self.evicted.catchup_session.load(Ordering::Acquire);
+        let go_on = || {
+            if self.evicted.catchup_session.load(Ordering::Acquire) == session {
+                Ok(())
+            } else {
+                Err(Error::Unavailable {
+                    message: "the catch-up from the archive was given up for a new Tail session"
+                        .into(),
+                })
+            }
+        };
         let archive = Arc::clone(self.evicted.archive(up_to).map_err(|_| Error::Rejected {
             message: format!(
                 "the leader keeps segments from {up_to} on and the earlier ones only in its \
                  archive, which this node has not configured"
             ),
         })?);
-        let mut applied = self.install_archived_prefix(&archive, up_to)?;
+        let mut applied = self.install_archived_prefix(&archive, up_to, &go_on)?;
         loop {
+            go_on()?;
             let cursor = self.replication_cursor()?;
             let base = cursor.segment_base;
             if base >= up_to {
@@ -2291,6 +2377,7 @@ impl EventStoreEngine {
             let mut last_write = None;
             let mut start = offset;
             while start < bytes.len() {
+                go_on()?;
                 let end = archived_chunk_end(&bytes, start)?;
                 let write = self.apply_replicated_records(
                     epoch,
@@ -2319,6 +2406,14 @@ impl EventStoreEngine {
         }
     }
 
+    /// Stops a catch-up from the archive that an earlier Tail session
+    /// started, and waits until it has: a new session reads where the log
+    /// ends, which that catch-up would otherwise go on moving.
+    pub fn end_archive_catchup(&self) {
+        self.evicted.catchup_session.fetch_add(1, Ordering::AcqRel);
+        drop(self.evicted.catchup.lock());
+    }
+
     /// The first step of [`apply_archived`](Self::apply_archived) on a node
     /// with a cap on local bytes whose log is empty past its evicted prefix
     /// (a node joining, typically): the archived segments are installed
@@ -2340,6 +2435,7 @@ impl EventStoreEngine {
         &self,
         archive: &crate::remote::RemoteSegments,
         up_to: u64,
+        go_on: &dyn Fn() -> Result<(), Error>,
     ) -> Result<usize, Error> {
         let Some(cap) = archive.max_local_bytes() else {
             return Ok(0);
@@ -2452,6 +2548,7 @@ impl EventStoreEngine {
                     .into(),
             });
         }
+        go_on()?;
         self.install_evicted(&installed, &merged)?;
 
         // Bodies back, newest first, so the evicted segments stay a prefix.
@@ -2462,6 +2559,7 @@ impl EventStoreEngine {
             if kept + len > room {
                 break;
             }
+            go_on()?;
             self.restore_evicted(archive, summary)?;
             kept += len;
             restored += 1;
@@ -2485,30 +2583,28 @@ impl EventStoreEngine {
         archive: &crate::remote::RemoteSegments,
         summary: &crate::tier::SegmentSummary,
     ) -> Result<(), Error> {
+        let not_newest = |evicted_end: u64| Error::Internal {
+            message: format!(
+                "segment {} is not the newest evicted: the evicted prefix ends at {evicted_end}",
+                summary.base
+            ),
+        };
         if self.evicted.end() != summary.end {
-            return Err(Error::Internal {
-                message: format!(
-                    "segment {} is not the newest evicted: the evicted prefix ends at {}",
-                    summary.base,
-                    self.evicted.end()
-                ),
-            });
+            return Err(not_newest(self.evicted.end()));
         }
-        archive.restore_body(summary, &segment::segment_path(&self.dir, summary.base))?;
-        self.evicted
-            .end
-            .compare_exchange(
-                summary.end,
-                summary.base,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|evicted_end| Error::Internal {
-                message: format!(
-                    "the evicted prefix moved to {evicted_end} while segment {} got its body back",
-                    summary.base
-                ),
-            })?;
+        // Downloaded beside the log, then put in place while no eviction
+        // runs: an eviction during the download may move the prefix on.
+        let path = segment::segment_path(&self.dir, summary.base);
+        let staged = path.with_extension("restore");
+        archive.restore_body(summary, &staged)?;
+        let _bodies = self.evicted.bodies.lock();
+        if self.evicted.end() != summary.end {
+            remove_if_exists(&staged)?;
+            return Err(not_newest(self.evicted.end()));
+        }
+        std::fs::rename(&staged, &path)?;
+        crate::segment::writer::sync_dir(&self.dir)?;
+        self.evicted.end.store(summary.base, Ordering::Release);
         Ok(())
     }
 
@@ -2735,6 +2831,17 @@ impl EventStoreEngine {
         if pos.0 == old_tail && expected_event.is_none() {
             return Ok(());
         }
+        // The anchor may be in an evicted segment, and reading it from the
+        // archive must not hold up appends and reads: it is found before the
+        // locks are taken, against a layout checked again under them.
+        let checked = match expected_event {
+            Some(_) => {
+                let bases = Arc::clone(&self.segments.read().bases);
+                let anchor = self.event_anchor(&bases, pos)?;
+                Some((bases, anchor))
+            }
+            None => None,
+        };
 
         let mut writer = self.writer.lock();
         let mut seg_list = self.segments.write();
@@ -2761,7 +2868,15 @@ impl EventStoreEngine {
             Some(expected) => {
                 // A node that installed archived segments without their
                 // bodies has its last event in the archive (ADR-0011).
-                let anchor = self.event_anchor(&seg_list.bases, pos)?;
+                let (bases, anchor) = checked.expect("found when expected");
+                if *bases != *seg_list.bases {
+                    return Err(Error::Unavailable {
+                        message: format!(
+                            "the segments changed while the cut at {} was checked",
+                            pos.0
+                        ),
+                    });
+                }
                 if expected != anchor.map(|anchor| anchor.crc) {
                     return Err(Error::Corrupted {
                         message: format!(
@@ -2772,14 +2887,15 @@ impl EventStoreEngine {
                     });
                 }
                 match anchor {
-                    // An evicted segment is final, byte for byte the same
-                    // everywhere: a cut can only come after all of it.
-                    Some(anchor) if self.evicted.contains(seg_list.bases[anchor.segment_index]) => {
+                    // An evicted segment, or one a merged table covers, is
+                    // final: byte for byte the same everywhere, and not
+                    // reopened. A cut can only come after all of it.
+                    Some(anchor) if self.is_whole(&seg_list, anchor.segment_index) => {
                         let next = anchor.segment_index + 1;
                         if seg_list.bases.get(next) != Some(&pos.0) {
                             return Err(Error::Corrupted {
                                 message: format!(
-                                    "the leader cuts at {} inside archived segment {}",
+                                    "the leader cuts at {} inside final segment {}",
                                     pos.0, seg_list.bases[anchor.segment_index]
                                 ),
                             });
@@ -2815,11 +2931,15 @@ impl EventStoreEngine {
                 .last()
                 .is_none_or(|t| t.end() <= target_base)
         );
-        for &base in &seg_list.bases[target_index + 1..] {
+        // Newest first, and a segment's companions before its body: a crash
+        // part way leaves bodies with nothing after them but bodies, never a
+        // locator without its body above one with a body, which would look
+        // like a segment lost (`discover_segments`).
+        for &base in seg_list.bases[target_index + 1..].iter().rev() {
             let path = segment::segment_path(&self.dir, base);
-            remove_if_exists(&path)?;
             remove_if_exists(&path.with_extension("idx"))?;
             remove_if_exists(&path.with_extension("keys"))?;
+            remove_if_exists(&path)?;
             self.cache.invalidate(base);
         }
         // The containing segment becomes active; its sealed index files no
@@ -2845,6 +2965,21 @@ impl EventStoreEngine {
         drop(seg_list);
         drop(writer);
         Ok(())
+    }
+
+    /// Whether sealed segment `index` of `list` is final and kept whole:
+    /// evicted (ADR-0011), or covered by a merged table (ADR-0010), which
+    /// only ever covers final segments. Such a segment is never reopened.
+    fn is_whole(&self, list: &SegmentList, index: usize) -> bool {
+        let Some(&end) = list.bases.get(index + 1) else {
+            return false;
+        };
+        let base = list.bases[index];
+        self.evicted.contains(base)
+            || list
+                .tables
+                .iter()
+                .any(|table| table.base() <= base && end <= table.end())
     }
 
     /// The leader's side of [`truncate_to_matching`](Self::truncate_to_matching):
@@ -2982,6 +3117,7 @@ impl EventStoreEngine {
     /// Readers holding a mapping or open file keep reading.
     pub fn evict_segment(&self, base: u64) -> Result<(), Error> {
         self.evicted.archive(base)?;
+        let _bodies = self.evicted.bodies.lock();
         let end = {
             let list = self.segments.read();
             let i = list
@@ -3010,7 +3146,12 @@ impl EventStoreEngine {
             })?;
         self.cache.drop_body(base);
         let path = segment::segment_path(&self.dir, base);
-        std::fs::remove_file(&path)?;
+        if let Err(error) = std::fs::remove_file(&path) {
+            // The body is still there: it is not evicted after all, or the
+            // next open would find a body after a segment without one.
+            self.evicted.end.store(base, Ordering::Release);
+            return Err(error.into());
+        }
         crate::segment::writer::sync_dir(&self.dir)?;
         Ok(())
     }
@@ -3860,6 +4001,16 @@ impl EventStoreEngine {
         seg_path: &Path,
         sealed: &Arc<dyn Locator>,
     ) -> Result<RecordReader, Error> {
+        let reader = self.local_reader_unchecked(base, seg_path, sealed)?;
+        still_held(&self.evicted, &self.cache, base, reader)
+    }
+
+    fn local_reader_unchecked(
+        &self,
+        base: u64,
+        seg_path: &Path,
+        sealed: &Arc<dyn Locator>,
+    ) -> Result<RecordReader, Error> {
         match self.read_mode {
             ReadMode::Blocks => Ok(RecordReader::Sealed(self.cache.sealed_reader(
                 seg_path,
@@ -3954,6 +4105,13 @@ impl EventStoreEngine {
     ///
     /// Scans segments from oldest to newest, reading events linearly within each segment.
     /// This is an infrequently-called operation so a linear scan is acceptable.
+    ///
+    /// A sealed segment whose last event is older than `timestamp_millis` is
+    /// skipped after reading only that event, so a lookup reads little of
+    /// an evicted segment (ADR-0011). Every node skips the same way, with
+    /// its segments local or evicted, so all answer alike. The answer is the
+    /// first such event while timestamps do not go backwards from one
+    /// segment to the next.
     pub fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
         let head = self.watermark.get();
         if head == 0 {
@@ -3972,17 +4130,45 @@ impl EventStoreEngine {
 
             let seg_path = segment::segment_path(&self.dir, base);
 
-            if seg_list.is_sealed(i) && self.evicted.contains(base) {
+            let archived = |this: &Self| {
                 let end = seg_list.bases[i + 1].min(head);
-                match self.archived_sequence_at(base, &seg_path, end, timestamp_millis)? {
+                this.archived_sequence_at(base, &seg_path, end, timestamp_millis)
+            };
+            if seg_list.is_sealed(i) {
+                let end = seg_list.bases[i + 1].min(head);
+                if self
+                    .newest_timestamp(base, &seg_path, end)?
+                    .is_none_or(|newest| newest < timestamp_millis)
+                {
+                    continue;
+                }
+            }
+            if seg_list.is_sealed(i) && self.evicted.contains(base) {
+                match archived(self)? {
                     Some(position) => return Ok(Some(position)),
                     None => continue,
                 }
             }
 
             let reader = if seg_list.is_sealed(i) {
-                let mmap = self.cache.get_mmap(&seg_path, base)?;
-                SegmentReader::from_shared_mmap(mmap)?
+                match self
+                    .cache
+                    .get_mmap(&seg_path, base)
+                    .and_then(|mmap| still_held(&self.evicted, &self.cache, base, mmap))
+                {
+                    Ok(mmap) => SegmentReader::from_shared_mmap(mmap)?,
+                    // Evicted between the check and the open.
+                    Err(Error::Io(error))
+                        if error.kind() == io::ErrorKind::NotFound
+                            && self.evicted.contains(base) =>
+                    {
+                        match archived(self)? {
+                            Some(position) => return Ok(Some(position)),
+                            None => continue,
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 self.active_segment_reader(base, &seg_path)?
             };
@@ -4003,11 +4189,22 @@ impl EventStoreEngine {
         Ok(None)
     }
 
+    /// The timestamp of sealed segment `base`'s last event before position
+    /// `end`, read from its body or the archive; `None` when it has none.
+    fn newest_timestamp(&self, base: u64, seg_path: &Path, end: u64) -> Result<Option<i64>, Error> {
+        let index = self.index_for(base, seg_path)?;
+        let last = (base + index.event_count()).min(end);
+        if last <= base {
+            return Ok(None);
+        }
+        let offset = index
+            .offset_of(last - 1)?
+            .ok_or(Error::PositionNotFound { position: last - 1 })?;
+        let mut reader = self.reader_for(&index, base, seg_path)?;
+        Ok(Some(reader.read_event_at(last - 1, offset)?.timestamp))
+    }
+
     /// `get_sequence_at` within evicted segment `base`, up to position `end`.
-    /// A segment whose last event is older than `timestamp_millis` is
-    /// skipped after reading only that event, so a lookup does not download
-    /// the archive; that is exact while timestamps do not go backwards
-    /// from one segment to the next. Otherwise the segment is walked.
     fn archived_sequence_at(
         &self,
         base: u64,
@@ -4021,17 +4218,6 @@ impl EventStoreEngine {
         let locator = self.cache.get_index(seg_path, base)?;
         let last = (base + locator.event_count()).min(end);
         if last == base {
-            return Ok(None);
-        }
-        let offset = locator
-            .offset_of(last - 1)?
-            .ok_or(Error::PositionNotFound { position: last - 1 })?;
-        let newest = RecordReader::Fetched(crate::fetch::FetchedRecords::archived(
-            Arc::clone(self.evicted.archive(base)?),
-            Arc::clone(&locator),
-        ))
-        .read_event_at(last - 1, offset)?;
-        if newest.timestamp < timestamp_millis {
             return Ok(None);
         }
 
@@ -4948,7 +5134,19 @@ impl EventStore for EventStoreEngine {
     }
 
     fn reads_archive_from(&self, from: Position) -> bool {
-        from.0 < self.evicted.end()
+        let end = self.evicted.end();
+        if from.0 < end {
+            return true;
+        }
+        if !self.evicted.evicts() {
+            return false;
+        }
+        // The oldest segment with a body can be evicted while the read runs.
+        let list = self.segments.read();
+        let oldest = list.bases.partition_point(|&base| base <= end);
+        list.bases
+            .get(oldest)
+            .is_some_and(|&oldest_end| from.0 < oldest_end)
     }
 
     fn get_sequence_at(&self, timestamp_millis: i64) -> Result<Option<Position>, Error> {
@@ -5105,6 +5303,11 @@ fn archived_chunk_end(bytes: &[u8], start: usize) -> Result<usize, Error> {
 /// header is missing or zero.
 fn holds_no_record(path: &Path) -> Result<bool, Error> {
     let file = std::fs::File::open(path)?;
+    // An install writes the segment header; a shorter file is damage of
+    // another kind, left to the reads that meet it.
+    if file.metadata()?.len() < segment::SEGMENT_HEADER_SIZE as u64 {
+        return Ok(false);
+    }
     let mut header = [0u8; segment::RECORD_HEADER_SIZE];
     match crate::segment::blocks::read_exact_at(
         &file,
@@ -5133,19 +5336,47 @@ enum SegmentWalk {
 pub(crate) struct Evicted {
     /// End of the evicted prefix: the base of the first segment with a body.
     end: AtomicU64,
+    /// Held while a body is removed or put back, so the prefix and the
+    /// files on disk change together.
+    bodies: parking_lot::Mutex<()>,
+    /// Held while the log catches up from the archive. A Tail session that
+    /// is given up does not stop the catch-up it started, which runs on a
+    /// blocking thread: the next session moves `catchup_session` on, which
+    /// stops it, and waits for it here before it reads where the log ends.
+    catchup: parking_lot::Mutex<()>,
+    catchup_session: AtomicU64,
     archive: Option<Arc<crate::remote::RemoteSegments>>,
 }
 
 impl Evicted {
     fn new(dir: &Path, opts: &StoreOptions, end: u64) -> Result<Self, Error> {
+        if end > 0 && opts.archive.is_none() {
+            return Err(Error::Rejected {
+                message: format!(
+                    "{}: the segments before position {end} are in the archive only, and no \
+                     archive is configured; configure the archive they were evicted to",
+                    dir.display()
+                ),
+            });
+        }
         Ok(Self {
             end: AtomicU64::new(end),
+            bodies: parking_lot::Mutex::new(()),
+            catchup: parking_lot::Mutex::new(()),
+            catchup_session: AtomicU64::new(0),
             archive: opts
                 .archive
                 .as_ref()
                 .map(|archive| archive.segments(dir).map(Arc::new))
                 .transpose()?,
         })
+    }
+
+    /// Whether this log evicts at all: an archive with a cap on local bytes.
+    pub(crate) fn evicts(&self) -> bool {
+        self.archive
+            .as_ref()
+            .is_some_and(|archive| archive.max_local_bytes().is_some())
     }
 
     /// End of the evicted prefix.
@@ -5172,9 +5403,15 @@ impl Evicted {
     /// without gaps from position 0: each ends where its locator's events
     /// end. A segment missing from the chain has lost its locator along with
     /// its body, and an unreadable locator cannot be rebuilt from a body
-    /// that is gone, so both are downloaded from the archive. So is the own
-    /// key table of an evicted segment that lost it; one the archive no
-    /// longer holds is covered by a merged table.
+    /// that is gone, so both are downloaded from the archive. Key tables
+    /// are the index's to fetch, and only when no merged table covers them
+    /// (see [`fetch_keys`](Self::fetch_keys)).
+    /// Downloads the own key table `[base, end)` of an evicted segment.
+    fn fetch_keys(&self, base: u64, end: u64, local: &Path) -> Result<bool, Error> {
+        self.archive(base)?
+            .download("index", &segment::merge::table_file_name(base, end), local)
+    }
+
     fn complete_prefix(&self, dir: &Path, bases: &[u64]) -> Result<Vec<u64>, Error> {
         let end = self.end();
         let listed: std::collections::BTreeSet<u64> =
@@ -5210,22 +5447,25 @@ impl Evicted {
                     ),
                 });
             }
-            let keys = path.with_extension("keys");
-            if !keys.exists()
-                && let Some(archive) = &self.archive
-            {
-                archive.download(
-                    "index",
-                    &segment::merge::table_file_name(next, segment_end),
-                    &keys,
-                )?;
-            }
             out.push(next);
             next = segment_end;
         }
         out.extend(bases.iter().copied().filter(|&base| base >= end));
         Ok(out)
     }
+}
+
+/// `opened`, a handle on sealed segment `base`'s body, unless the body was
+/// evicted while it was opened: then the cache lets go of it, so the deleted
+/// file's space is freed, and the caller is told it is gone. Eviction moves
+/// the prefix before it drops the cached handles, so a handle cached after
+/// that is caught here.
+fn still_held<T>(evicted: &Evicted, cache: &IndexCache, base: u64, opened: T) -> Result<T, Error> {
+    if evicted.contains(base) {
+        cache.drop_body(base);
+        return Err(Error::Io(io::ErrorKind::NotFound.into()));
+    }
+    Ok(opened)
 }
 
 /// The bases of a log's segments, ascending, and the end of its evicted
@@ -5238,15 +5478,29 @@ impl Evicted {
 /// with no record, not the newest, with a locator beside it. A sealed
 /// segment always holds a record, so that file is removed.
 fn discover_segments(dir: &Path, active_base: u64) -> Result<(Vec<u64>, u64), Error> {
+    // Downloads from the archive a crash interrupted.
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext == "download" || ext == "restore")
+        {
+            remove_if_exists(&path)?;
+        }
+    }
     let mut bodies = segment::list_segment_files(dir)?;
+    // An install starts where every segment before it is evicted, at the
+    // empty active segment it moves past: only the first body can be that
+    // file.
     let stale: Vec<u64> = bodies
-        .iter()
+        .first()
         .copied()
         .filter(|&base| base < active_base)
         .filter(|&base| {
             let path = segment::segment_path(dir, base);
             path.with_extension("idx").exists() && holds_no_record(&path).unwrap_or(false)
         })
+        .into_iter()
         .collect();
     for base in stale {
         tracing::warn!(
@@ -8064,9 +8318,15 @@ mod tests {
 
         let writer = SegmentWriter::open(dir.path(), 4 * 1024).unwrap();
         let bases = segment::list_segment_files(dir.path()).unwrap();
-        let sealed = crate::log_index::open(dir.path(), &bases, writer.active_base_position())
-            .unwrap()
-            .locators;
+        let sealed = crate::log_index::open(
+            dir.path(),
+            &bases,
+            writer.active_base_position(),
+            0,
+            &|_, _, _| unreachable!("nothing is evicted"),
+        )
+        .unwrap()
+        .locators;
         assert!(sealed.iter().any(|(_, index)| !index.controls().is_empty()));
         let active = writer.active_index_handle();
         let summarized = recover_native_control_state(

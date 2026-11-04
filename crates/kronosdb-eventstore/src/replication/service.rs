@@ -218,17 +218,23 @@ impl SegmentReplicationService {
         let recovery_source = open.recovery_source;
         let claim_updates = self.control.claim_updates();
         let epoch = engine.replication_epoch();
-        let start = plan_tail_start(
-            &engine,
-            &FollowerLog {
-                from_position: open.from_position,
-                segment_base: open.segment_base,
-                byte_offset: open.byte_offset,
-                last_record_crc: open.last_record_crc,
-                epoch_seen: open.epoch_seen,
-                watermark: open.watermark,
-            },
-        )?;
+        let follower = FollowerLog {
+            from_position: open.from_position,
+            segment_base: open.segment_base,
+            byte_offset: open.byte_offset,
+            last_record_crc: open.last_record_crc,
+            epoch_seen: open.epoch_seen,
+            watermark: open.watermark,
+        };
+        // Planning can read the follower's boundary from the archive.
+        let start = {
+            let engine = Arc::clone(&engine);
+            tokio::task::spawn_blocking(move || plan_tail_start(&engine, &follower))
+                .await
+                .map_err(|error| Error::Internal {
+                    message: format!("planning a Tail: {error}"),
+                })??
+        };
         let (catchup_from, initial_truncate, exact_cursor) = match start {
             TailStart::NeedSnapshot {
                 available_from,
@@ -236,6 +242,24 @@ impl SegmentReplicationService {
             } => {
                 return need_snapshot(&out, open.context, available_from, open.watermark, reason)
                     .await;
+            }
+            // The follower's log is a prefix of this one, but what follows
+            // its end is evicted here (ADR-0011): it reads that from the
+            // archive, and comes back.
+            TailStart::ExactCursor if open.segment_base < engine.evicted_end() => {
+                return need_archive(
+                    &out,
+                    open.context,
+                    NeedArchive {
+                        epoch,
+                        leader_id: self.node_id,
+                        announce_epoch: open.epoch_seen != epoch && !open.recovery_source,
+                        from_position: open.from_position,
+                        truncate: None,
+                        up_to: engine.evicted_end(),
+                    },
+                )
+                .await;
             }
             TailStart::ExactCursor => (open.from_position, None, true),
             // What follows the cut is evicted here (ADR-0011): the follower
@@ -251,7 +275,7 @@ impl SegmentReplicationService {
                         leader_id: self.node_id,
                         announce_epoch: open.epoch_seen != epoch && !open.recovery_source,
                         from_position: open.from_position,
-                        truncate: (position, prev),
+                        truncate: Some((position, prev)),
                         up_to: engine.evicted_end(),
                     },
                 )
@@ -514,8 +538,8 @@ struct NeedArchive {
     /// tells it before its first frame.
     announce_epoch: bool,
     from_position: u64,
-    /// The cut the follower's log needs before it continues.
-    truncate: (u64, Option<u32>),
+    /// The cut the follower's log needs before it continues, if any.
+    truncate: Option<(u64, Option<u32>)>,
     /// The first segment this node still holds.
     up_to: u64,
 }
@@ -535,21 +559,23 @@ async fn need_archive(out: &StreamSender, context: &str, need: NeedArchive) -> R
         )
         .await?;
     }
-    let (position, prev) = need.truncate;
-    send(
-        out,
-        Frame::TailTruncate(p::TailTruncate {
-            epoch: need.epoch,
-            position,
-            has_boundary: true,
-            prev_record_crc: prev.unwrap_or(0),
-            prev_at_segment_start: prev.is_none(),
-        }),
-    )
-    .await?;
+    if let Some((position, prev)) = need.truncate {
+        send(
+            out,
+            Frame::TailTruncate(p::TailTruncate {
+                epoch: need.epoch,
+                position,
+                has_boundary: true,
+                prev_record_crc: prev.unwrap_or(0),
+                prev_at_segment_start: prev.is_none(),
+            }),
+        )
+        .await?;
+    }
     tracing::info!(
         context,
-        cut = position,
+        cut = need.truncate.map(|(position, _)| position),
+        from = need.from_position,
         up_to = need.up_to,
         "follower needs evicted segments: sent to the archive"
     );
@@ -1399,7 +1425,7 @@ mod tests {
         for slice in slices {
             // What the Tail client does with the end of an evicted segment.
             if slice.next_position == follower.local_tail().0
-                && follower.archive_holds_frame(slice.segment_base, Position(slice.first_position))
+                && follower.holds_whole_segment(slice.segment_base, Position(slice.first_position))
             {
                 continue;
             }
@@ -1937,6 +1963,25 @@ mod tests {
         }
     }
 
+    /// What the leader's Tail does for a follower whose next bytes it has
+    /// evicted: the follower is only behind, its end checked against the
+    /// archive, or it is cut back first. Then it reads from the archive.
+    fn sent_to_the_archive(leader: &EventStoreEngine, follower: &EventStoreEngine) {
+        match plan_tail_start(leader, &describe(follower)).unwrap() {
+            TailStart::ExactCursor => assert!(
+                describe(follower).segment_base < leader.evicted_end(),
+                "the leader holds what follows the follower's end"
+            ),
+            TailStart::Truncate { position, prev } => {
+                assert!(position <= leader.evicted_end());
+                follower
+                    .truncate_to_matching(Position(position), Some(prev))
+                    .unwrap();
+            }
+            start => panic!("expected the archive, got {start:?}"),
+        }
+    }
+
     /// Every segment's valid bytes, an evicted one's from the archive.
     fn leader_bytes(archived: &Archived) -> Vec<(u64, Vec<u8>)> {
         let mut bytes = log_bytes(&archived.leader_dir);
@@ -1968,16 +2013,9 @@ mod tests {
         .unwrap();
         assert!(follower.local_tail().0 < evicted_end);
 
-        // The leader cannot serve what comes next: the follower makes the
-        // cut it is given, its boundary read from the archive, ...
-        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
-        let TailStart::Truncate { position, prev } = start else {
-            panic!("expected a cut, got {start:?}");
-        };
-        assert!(position <= evicted_end);
-        follower
-            .truncate_to_matching(Position(position), Some(prev))
-            .unwrap();
+        // The leader cannot serve what comes next: it checks the follower's
+        // end against the archive and sends it there, ...
+        sent_to_the_archive(leader, &follower);
 
         // ... reads the evicted segments from the archive, ...
         let applied = follower.apply_archived(evicted_end).unwrap();
@@ -2014,13 +2052,7 @@ mod tests {
             &archive_options(&archived.tier, &[0, 1, 2]),
         )
         .unwrap();
-        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
-        let TailStart::Truncate { position: 0, prev } = start else {
-            panic!("expected a cut at 0, got {start:?}");
-        };
-        follower
-            .truncate_to_matching(Position(0), Some(prev))
-            .unwrap();
+        sent_to_the_archive(leader, &follower);
         follower.apply_archived(leader.evicted_end()).unwrap();
         let start = plan_tail_start(leader, &describe(&follower)).unwrap();
         assert!(matches!(start, TailStart::ExactCursor), "{start:?}");
@@ -2140,13 +2172,7 @@ mod tests {
             &capped_options(&archived.tier, &[0, 1, 2], Some(cap)),
         )
         .unwrap();
-        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
-        let TailStart::Truncate { position: 0, prev } = start else {
-            panic!("expected a cut at 0, got {start:?}");
-        };
-        follower
-            .truncate_to_matching(Position(0), Some(prev))
-            .unwrap();
+        sent_to_the_archive(leader, &follower);
         follower.apply_archived(up_to).unwrap();
         assert!(follower.local_tail().0 >= up_to);
         assert!(
@@ -2324,8 +2350,8 @@ mod tests {
 
     /// The leader evicts past a joined node's tail before the node comes
     /// back for the rest. The node's last event is in a segment it installed
-    /// without its body, so the cut is checked against that event as the
-    /// archive holds it.
+    /// without its body: the leader reads the node's end from the archive,
+    /// and a cut there is checked against that event as the archive holds it.
     #[test]
     fn a_node_whose_last_event_is_evicted_continues_from_the_archive() {
         let archived = archived_leader_with(700, Some(11));
@@ -2360,11 +2386,15 @@ mod tests {
             "the leader should evict past the node"
         );
 
+        // The leader checks the node's end against the archive: it is only
+        // behind, so it needs no cut, only the archive.
         let start = plan_tail_start(leader, &describe(&follower)).unwrap();
-        let TailStart::Truncate { position, prev } = start else {
-            panic!("expected a cut at the node's tail, got {start:?}");
-        };
-        assert_eq!(position, tail);
+        assert!(matches!(start, TailStart::ExactCursor), "{start:?}");
+        assert!(describe(&follower).segment_base < leader.evicted_end());
+        // A cut there (after a leader change, say) is checked against that
+        // event as the archive holds it.
+        let position = tail;
+        let prev = leader.replication_boundary_event(Position(tail)).unwrap();
         let prev_crc = prev.expect("the leader has an event before the cut");
         assert!(matches!(
             follower.truncate_to_matching(Position(position), Some(Some(prev_crc ^ 1))),
@@ -2428,5 +2458,108 @@ mod tests {
         follower.adopt_watermark(leader.replication_epoch(), leader.head());
         follower.wait_for_seals();
         assert_same_events(&everything(&follower), &everything(leader));
+    }
+
+    /// A node that joined without bodies restarts. The last watermark
+    /// checkpoint in its log sits in a segment it holds only in the archive,
+    /// below that segment's end; evicted segments are final, so it recovers
+    /// at least to where they end, and a cut from the leader after it
+    /// evicts further lands where the node can make it.
+    #[test]
+    fn a_restarted_node_with_evicted_segments_takes_the_leaders_cut() {
+        // No checkpoint after the early events: the newest one the node
+        // installs is far below where its evicted segments end.
+        let archived = archived_leader_with(700, Some(11));
+        let leader = &archived.leader;
+        let dir = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("restarted")
+            .join("default");
+        let options = capped_options(&archived.tier, &[0, 1, 2], Some(SEGMENT_SIZE));
+        let follower = EventStoreEngine::create_with_store_options(&dir, &options).unwrap();
+        follower
+            .truncate_to_matching(Position(0), Some(None))
+            .unwrap();
+        follower.apply_archived(leader.evicted_end()).unwrap();
+        let evicted_end = follower.evicted_end();
+        assert!(evicted_end > 0);
+        follower.shutdown();
+        drop(follower);
+        let follower = EventStoreEngine::open_with_store_options(&dir, &options).unwrap();
+        assert_eq!(follower.evicted_end(), evicted_end);
+        assert!(
+            follower.head().0 >= evicted_end,
+            "recovered a watermark of {} inside the evicted prefix ending at {evicted_end}",
+            follower.head().0
+        );
+
+        let archivable = leader.archivable_segments();
+        for segment in &archivable[..archivable.len() - 1] {
+            if segment.base >= leader.evicted_end() {
+                leader.evict_segment(segment.base).unwrap();
+            }
+        }
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        if let TailStart::Truncate { position, prev } = start {
+            follower
+                .truncate_to_matching(Position(position), Some(prev))
+                .unwrap();
+        }
+        follower.apply_archived(leader.evicted_end()).unwrap();
+        let start = plan_tail_start(leader, &describe(&follower)).unwrap();
+        follow(leader, &follower, &start).unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        follower.wait_for_seals();
+        assert_same_events(&everything(&follower), &everything(leader));
+    }
+
+    /// A node that joined with room under its cap has the newest installed
+    /// segments' bodies back, under a merged table. A cut at its tail comes
+    /// after the last of them, which stays sealed: final segments are never
+    /// reopened.
+    #[test]
+    fn a_cut_after_a_restored_segment_keeps_it_sealed() {
+        let archived = archived_leader_checkpointing(700, Some(11), true);
+        let leader = &archived.leader;
+        let cap = archived_bytes(&archived) - 3 * SEGMENT_SIZE;
+        let dir = archived
+            .follower
+            .parent()
+            .unwrap()
+            .join("restored")
+            .join("default");
+        let options = capped_options(&archived.tier, &[0, 1, 2], Some(cap));
+        let follower = EventStoreEngine::create_with_store_options(&dir, &options).unwrap();
+        follower
+            .truncate_to_matching(Position(0), Some(None))
+            .unwrap();
+        follower.apply_archived(leader.evicted_end()).unwrap();
+        let tail = follower.local_tail().0;
+        assert!(
+            follower.evicted_end() < tail,
+            "the newest installed segment should have its body back"
+        );
+
+        let prev = leader.replication_boundary_event(Position(tail)).unwrap();
+        follow(
+            leader,
+            &follower,
+            &TailStart::Truncate {
+                position: tail,
+                prev,
+            },
+        )
+        .unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        follower.wait_for_seals();
+        let expected = everything(leader);
+        assert_same_events(&everything(&follower), &expected);
+        follower.shutdown();
+        drop(follower);
+        let follower = EventStoreEngine::open_with_store_options(&dir, &options).unwrap();
+        follower.adopt_watermark(leader.replication_epoch(), leader.head());
+        assert_same_events(&everything(&follower), &expected);
     }
 }
