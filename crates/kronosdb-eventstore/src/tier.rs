@@ -667,7 +667,11 @@ impl Archiver {
     }
 
     /// Uploads the live merged tables that lie inside the archived prefix
-    /// and are not archived yet. Returns how many it uploaded.
+    /// and are not archived yet. A table inside a wider archived one is
+    /// skipped: the archive superseded it already, on a leader whose merges
+    /// ran ahead of this node's, and uploading it again would only have it
+    /// deleted again, and under object lock leave another locked version.
+    /// Returns how many it uploaded.
     async fn archive_tables(
         &self,
         context: &str,
@@ -677,7 +681,10 @@ impl Archiver {
         let mut uploaded = 0;
         for table in engine.archivable_tables()? {
             let range = (table.base, table.end);
-            if table.end > state.archived_end || state.tables.contains_key(&range) {
+            if table.end > state.archived_end
+                || state.tables.contains_key(&range)
+                || superseded(&state.tables, range)
+            {
                 continue;
             }
             // A merge may supersede and delete it at any moment; its
@@ -1221,6 +1228,13 @@ async fn file_len(path: &Path) -> Result<Option<u64>, Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Whether an archived table other than `range` covers it.
+fn superseded<T>(tables: &BTreeMap<(u64, u64), T>, range: (u64, u64)) -> bool {
+    tables
+        .range(..=(range.0, u64::MAX))
+        .any(|(&(base, end), _)| (base, end) != range && base <= range.0 && end >= range.1)
 }
 
 /// Whether `error` is the store refusing a delete, which it will go on
@@ -1996,6 +2010,27 @@ mod tests {
         }
         assert_eq!(store.seen().deletes, superseded);
         assert_eq!(archived_tables(tier.path()), before);
+    }
+
+    /// A leader whose merges lag behind the archive's does not upload the
+    /// tables the archive has already superseded and deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_table_the_archive_superseded_is_not_uploaded_again() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let (engine, merged) = superseded_tables(data.path(), tier.path()).await;
+        // Another leader merged further: a wider table covers this node's.
+        let wider = (merged.0, merged.1 * 4);
+        let index = tier.path().join("default").join("index");
+        std::fs::write(index.join(table_file_name(wider.0, wider.1)), b"wider").unwrap();
+
+        let archiver = archiver_for(tier.path(), Duration::ZERO);
+        let report = archiver.run_archive_pass("default", &engine).await.unwrap();
+        assert!(report.deleted > 0);
+        assert!(!archived_tables(tier.path()).contains(&merged));
+        let report = archiver.run_archive_pass("default", &engine).await.unwrap();
+        assert_eq!((report.tables, report.deleted), (0, 0));
+        assert!(!archived_tables(tier.path()).contains(&merged));
     }
 
     /// A file larger than one part goes up in parts, on the object store at
