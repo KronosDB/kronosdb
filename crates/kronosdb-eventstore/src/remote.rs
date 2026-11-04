@@ -19,9 +19,14 @@
 //!
 //! Reads are synchronous to their callers, which are blocking read threads:
 //! requests run on a small runtime of the archive's own and the caller
-//! waits for them. Bytes are not checked here; every record is CRC-checked
-//! where it is read, as on the local paths. A failed request is
-//! `Error::Unavailable`.
+//! waits for them. Ranged bytes are not checked here; every record is
+//! CRC-checked where it is read, as on the local paths. Whole segments are
+//! checked against their summaries' blake3.
+//!
+//! A request the archive does not answer is `Error::Unavailable`. An object
+//! the archive should hold and does not is lost for good, `Error::Internal`;
+//! one of another length than its locator or summary says, or whose hash
+//! differs, is `Error::Corrupted`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -197,11 +202,7 @@ impl Drop for IoRuntime {
 struct Pending {
     segments: Arc<RemoteSegments>,
     base: u64,
-    blocks: Option<Vec<(u64, Arc<Flight>)>>,
-}
-
-fn blocks_len(pending: &Pending) -> usize {
-    pending.blocks.as_ref().map_or(0, Vec::len)
+    blocks: Option<Waiters>,
 }
 
 impl Drop for Pending {
@@ -209,47 +210,151 @@ impl Drop for Pending {
         let Some(blocks) = self.blocks.take() else {
             return;
         };
-        let mut flights = self
-            .segments
-            .flights
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut flights = lock(&self.segments.flights);
         for (block, flight) in blocks {
             flights.remove(&(self.base, block));
-            flight.finish(Err(format!(
-                "the download of segment {} was abandoned",
-                self.base
+            flight.finish(Err(Failure::Unavailable(
+                "the download was abandoned".into(),
             )));
         }
     }
 }
 
-/// One block being fetched: the reader that fetches it fills it in, the
-/// others wait on it.
-#[derive(Default)]
-struct Flight {
-    state: Mutex<Option<Result<Bytes, String>>>,
-    done: Condvar,
+/// Why a download from the archive failed, kept apart so every reader of
+/// a shared download reports it as what it is.
+#[derive(Clone, Debug)]
+enum Failure {
+    /// The object is not in the archive, though a summary or a locator says
+    /// it is. Asking again will not bring it.
+    Missing,
+    /// The object is not as long as its summary or locator says: an
+    /// integrity failure.
+    WrongSize {
+        size: u64,
+        expected: u64,
+        /// What says how long it should be.
+        by: &'static str,
+    },
+    /// The archive did not answer, or not in full. Asking again may work.
+    Unavailable(String),
 }
 
-impl Flight {
-    fn finish(&self, result: Result<Bytes, String>) {
-        *self.state.lock().unwrap() = Some(result);
-        self.done.notify_all();
+impl Failure {
+    fn of(error: object_store::Error) -> Self {
+        match error {
+            object_store::Error::NotFound { .. } => Self::Missing,
+            error => Self::Unavailable(error.to_string()),
+        }
     }
 
-    fn wait(&self) -> Result<Bytes, String> {
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if let Some(result) = state.as_ref() {
-                return result.clone();
-            }
-            state = self.done.wait(state).unwrap();
+    /// What a read of segment `base` reports.
+    fn into_error(self, base: u64) -> Error {
+        match self {
+            Self::Missing => Error::Internal {
+                message: format!("segment {base} is missing from the archive"),
+            },
+            Self::WrongSize { size, expected, by } => Error::Corrupted {
+                message: format!(
+                    "archived segment {base} is {size} bytes, where {by} says {expected}"
+                ),
+            },
+            Self::Unavailable(message) => Error::Unavailable {
+                message: format!("reading segment {base} from the archive: {message}"),
+            },
         }
     }
 }
 
+/// Bytes `range` of `object`, which `by` says is `len` bytes long. An
+/// object of another length is [`Failure::WrongSize`], also when the range
+/// starts past its end: the archive refuses such a request, and the size
+/// is then asked for, briefly, to tell that from a request that failed.
+async fn get_range(
+    store: &dyn ObjectStore,
+    object: &ObjectPath,
+    range: Range<u64>,
+    len: u64,
+    by: &'static str,
+) -> Result<Bytes, Failure> {
+    let wrong_size = |size: u64| Failure::WrongSize {
+        size,
+        expected: len,
+        by,
+    };
+    let options = object_store::GetOptions::new().with_range(Some(range.clone()));
+    let result = match store.get_opts(object, options).await {
+        Ok(result) => result,
+        Err(object_store::Error::NotFound { .. }) => return Err(Failure::Missing),
+        Err(error) => {
+            let head = tokio::time::timeout(SIZE_CHECK_TIMEOUT, store.head(object)).await;
+            return Err(match head {
+                Ok(Ok(meta)) if meta.size != len => wrong_size(meta.size),
+                Ok(Err(object_store::Error::NotFound { .. })) => Failure::Missing,
+                _ => Failure::Unavailable(error.to_string()),
+            });
+        }
+    };
+    if result.meta.size != len {
+        return Err(wrong_size(result.meta.size));
+    }
+    let bytes = result.bytes().await.map_err(Failure::of)?;
+    if bytes.len() as u64 != range.end - range.start {
+        return Err(Failure::Unavailable(format!(
+            "the archive returned {} bytes for {}..{}",
+            bytes.len(),
+            range.start,
+            range.end
+        )));
+    }
+    Ok(bytes)
+}
+
+/// How long a failed request waits to learn the object's size, which tells
+/// a range past its end from a request the archive did not answer.
+const SIZE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One block being fetched: the reader that fetches it fills it in, the
+/// others wait on it.
+#[derive(Default)]
+struct Flight {
+    state: Mutex<Option<Result<Bytes, Failure>>>,
+    done: Condvar,
+}
+
+impl Flight {
+    fn finish(&self, result: Result<Bytes, Failure>) {
+        *lock(&self.state) = Some(result);
+        self.done.notify_all();
+    }
+
+    fn wait(&self) -> Result<Bytes, Failure> {
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(result) = state.as_ref() {
+                return result.clone();
+            }
+            state = self
+                .done
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// Locks `mutex` whether or not a thread panicked holding it: what it
+/// guards (cached blocks, downloads in flight) stays consistent at every
+/// point a panic could leave it, and one panicking download must not fail
+/// every later read.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 type BlockKey = (u64, u64);
+
+/// Blocks of one segment, each with the download that brings it.
+type Waiters = Vec<(u64, Arc<Flight>)>;
 
 /// The archived segments of one context, read by range.
 pub struct RemoteSegments {
@@ -404,7 +509,7 @@ impl RemoteSegments {
         self.requests.load(Ordering::Relaxed)
     }
 
-    /// Reads of segment bytes from the archive that failed so far.
+    /// Requests for segment bytes that failed so far.
     pub fn failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
     }
@@ -440,9 +545,7 @@ impl RemoteSegments {
         }
         let (mut have, waiting) = self.reserve(base, data_len, blocks_of(ranges));
         for (block, flight) in waiting {
-            let bytes = flight.wait().map_err(|message| Error::Unavailable {
-                message: format!("reading segment {base} from the archive: {message}"),
-            })?;
+            let bytes = flight.wait().map_err(|failure| failure.into_error(base))?;
             have.insert(block, bytes);
         }
 
@@ -483,13 +586,12 @@ impl RemoteSegments {
     /// For each of `wanted` (blocks of segment `base`): its bytes when
     /// cached, or the download that brings them, which this call starts
     /// for the blocks nobody is fetching yet.
-    #[allow(clippy::type_complexity)]
     fn reserve(
         self: &Arc<Self>,
         base: u64,
         data_len: u64,
         wanted: BTreeSet<u64>,
-    ) -> (HashMap<u64, Bytes>, Vec<(u64, Arc<Flight>)>) {
+    ) -> (HashMap<u64, Bytes>, Waiters) {
         let mut have = HashMap::new();
         let mut waiting = Vec::new();
         let mut mine = Vec::new();
@@ -516,74 +618,69 @@ impl RemoteSegments {
     }
 
     /// Downloads `blocks` (ascending) of segment `base` on the archive's
-    /// runtime, neighbours in one request of up to [`MAX_GET`] bytes, all
-    /// requests at once; then caches them and lets their waiters go.
-    fn spawn_fetch(self: &Arc<Self>, base: u64, data_len: u64, blocks: Vec<(u64, Arc<Flight>)>) {
-        let mut runs: Vec<Range<u64>> = Vec::new();
-        for &(block, _) in &blocks {
+    /// runtime, neighbours in one request of up to [`MAX_GET`] bytes, each
+    /// request a task of its own; each caches its blocks and lets their
+    /// waiters go as soon as it has them.
+    fn spawn_fetch(self: &Arc<Self>, base: u64, data_len: u64, blocks: Waiters) {
+        let mut runs: Vec<(Range<u64>, Waiters)> = Vec::new();
+        for (block, flight) in blocks {
             let (start, end) = (block * BLOCK, ((block + 1) * BLOCK).min(data_len));
             match runs.last_mut() {
-                Some(run) if run.end == start && end - run.start <= MAX_GET => run.end = end,
-                _ => runs.push(start..end),
+                Some((run, blocks)) if run.end == start && end - run.start <= MAX_GET => {
+                    run.end = end;
+                    blocks.push((block, flight));
+                }
+                _ => runs.push((start..end, vec![(block, flight)])),
             }
         }
-        let this = Arc::clone(self);
-        let store = Arc::clone(&self.archive.store);
-        let object = self.segment_object(base);
-        let mut pending = Pending {
-            segments: Arc::clone(self),
-            base,
-            blocks: Some(blocks),
-        };
-        let count = blocks_len(&pending);
-        self.archive.io.handle().spawn(async move {
-            let gets = runs.iter().map(|run| store.get_range(&object, run.clone()));
-            let fetched = futures_util::future::try_join_all(gets)
-                .await
-                // The reader waiting on the flight says which segment.
-                .map_err(|error| error.to_string())
-                .and_then(|parts| {
-                    this.requests
-                        .fetch_add(runs.len() as u64, Ordering::Relaxed);
-                    let mut out = Vec::with_capacity(count);
-                    for (run, bytes) in runs.iter().zip(parts) {
-                        if bytes.len() as u64 != run.end - run.start {
-                            return Err(format!(
-                                "the archive returned {} bytes of segment {base} for {}..{}",
-                                bytes.len(),
-                                run.start,
-                                run.end
-                            ));
-                        }
+        for (run, blocks) in runs {
+            let this = Arc::clone(self);
+            let object = self.segment_object(base);
+            let mut pending = Pending {
+                segments: Arc::clone(self),
+                base,
+                blocks: Some(blocks),
+            };
+            self.archive.io.handle().spawn(async move {
+                this.requests.fetch_add(1, Ordering::Relaxed);
+                let fetched = get_range(
+                    this.archive.store.as_ref(),
+                    &object,
+                    run,
+                    data_len,
+                    "its locator",
+                )
+                .await;
+                let blocks = pending.blocks.take().expect("answered once");
+                match fetched {
+                    Ok(bytes) => {
                         this.fetched_bytes
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         // Each block is copied out: a slice would share the
                         // request's buffer, and one block left in the cache
                         // would keep all of it alive.
-                        out.extend(bytes.chunks(BLOCK as usize).map(Bytes::copy_from_slice));
+                        let mut cache = lock(&this.blocks);
+                        let mut flights = lock(&this.flights);
+                        for ((block, flight), bytes) in blocks
+                            .iter()
+                            .zip(bytes.chunks(BLOCK as usize).map(Bytes::copy_from_slice))
+                        {
+                            cache.put((base, *block), bytes.clone());
+                            flights.remove(&(base, *block));
+                            flight.finish(Ok(bytes));
+                        }
                     }
-                    Ok(out)
-                });
-            let mut cache = this.blocks.lock().unwrap();
-            let mut flights = this.flights.lock().unwrap();
-            let blocks = pending.blocks.take().expect("answered once");
-            match fetched {
-                Ok(fetched) => {
-                    for ((block, flight), bytes) in blocks.iter().zip(fetched) {
-                        cache.put((base, *block), bytes.clone());
-                        flights.remove(&(base, *block));
-                        flight.finish(Ok(bytes));
-                    }
-                }
-                Err(error) => {
-                    this.failures.fetch_add(1, Ordering::Relaxed);
-                    for (block, flight) in &blocks {
-                        flights.remove(&(base, *block));
-                        flight.finish(Err(error.clone()));
+                    Err(failure) => {
+                        this.failures.fetch_add(1, Ordering::Relaxed);
+                        let mut flights = lock(&this.flights);
+                        for (block, flight) in &blocks {
+                            flights.remove(&(base, *block));
+                            flight.finish(Err(failure.clone()));
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 
     /// The summary of archived segment `base`; `None` when the archive does
@@ -675,16 +772,15 @@ impl RemoteSegments {
             .collect();
         let store = Arc::clone(&self.archive.store);
         let object = self.segment_object(base);
+        let summary_len = summary.data_len;
         let parts = self
             .archive
             .block_on(async move {
-                futures_util::future::try_join_all(
-                    ranges
-                        .into_iter()
-                        .map(|range| store.get_range(&object, range)),
-                )
+                futures_util::future::try_join_all(ranges.into_iter().map(|range| {
+                    get_range(store.as_ref(), &object, range, summary_len, "its summary")
+                }))
                 .await
-                .map_err(|error| archive_error(base, error))
+                .map_err(|failure| failure.into_error(base))
             })
             .inspect_err(|_| {
                 self.failures.fetch_add(1, Ordering::Relaxed);
@@ -862,17 +958,6 @@ fn download_path(local: &Path) -> PathBuf {
     local.with_file_name(name)
 }
 
-fn archive_error(base: u64, error: object_store::Error) -> Error {
-    match error {
-        object_store::Error::NotFound { .. } => Error::Internal {
-            message: format!("evicted segment {base} is missing from the archive"),
-        },
-        error => Error::Unavailable {
-            message: format!("reading segment {base} from the archive: {error}"),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1014,6 +1099,15 @@ mod tests {
         Arc::new(remote)
     }
 
+    /// Bytes `range` of segment `base`.
+    fn read_one(
+        remote: &Arc<super::RemoteSegments>,
+        base: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(remote.read(base, std::slice::from_ref(&range))?.remove(0))
+    }
+
     /// Every block a request brings is cached in a buffer of its own: a
     /// slice of the request's buffer would keep all of it alive for as long
     /// as any one block stays cached, and the cache would hold many times
@@ -1026,8 +1120,8 @@ mod tests {
         put_segment(memory.as_ref(), "default", 0, bytes.clone());
         let remote = remote(&archive, "default", &[(0, len as u64)]);
 
-        let read = remote.read(0, &[0..len as u64]).unwrap();
-        assert_eq!(read[0], bytes);
+        let read = read_one(&remote, 0, 0..len as u64).unwrap();
+        assert_eq!(read, bytes);
         drop(read);
 
         // The download task lets go of its blocks once it has answered.
@@ -1046,6 +1140,72 @@ mod tests {
                 "{shared} cached blocks share their buffer"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The summary of `bytes` as archived segment `base`.
+    fn summary_of(base: u64, bytes: &[u8]) -> crate::tier::SegmentSummary {
+        crate::tier::SegmentSummary {
+            base,
+            end: base + 1,
+            data_len: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+        }
+    }
+
+    /// A segment the locator or the summary says is archived but the
+    /// archive does not hold is lost for good, on both read paths: asking
+    /// again will not bring it back.
+    #[test]
+    fn a_segment_missing_from_the_archive_is_an_internal_error_on_both_paths() {
+        let (_, archive) = memory_archive();
+        let remote = remote(&archive, "default", &[(0, 1000)]);
+        for error in [
+            read_one(&remote, 0, 0..100).unwrap_err(),
+            remote
+                .fetch_segment(&summary_of(0, &data(1000)))
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::Internal { .. }), "{error}");
+            assert!(
+                error.to_string().contains("missing from the archive"),
+                "{error}"
+            );
+        }
+    }
+
+    /// An archived segment of another length than its locator or summary
+    /// says failed an integrity check, wherever the read starts in it.
+    #[test]
+    fn an_archived_segment_of_the_wrong_length_is_corrupted() {
+        let (memory, archive) = memory_archive();
+        let bytes = data(2 * super::BLOCK as usize);
+        put_segment(memory.as_ref(), "default", 0, bytes.clone());
+
+        // Shorter than its locator says: a range in what it holds, and one
+        // past its end.
+        let len = 3 * super::BLOCK;
+        let shorter = remote(&archive, "default", &[(0, len)]);
+        for range in [0..100, len - 100..len] {
+            let error = read_one(&shorter, 0, range.clone()).unwrap_err();
+            assert!(
+                matches!(error, Error::Corrupted { .. }),
+                "{range:?}: {error}"
+            );
+        }
+
+        // Shorter and longer than its summary says, the summary's hash
+        // taken over what it says.
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&data(10 * super::MAX_GET as usize));
+        let whole = remote(&archive, "default", &[]);
+        for summary in [summary_of(0, &longer), summary_of(0, &bytes[..1000])] {
+            let error = whole.fetch_segment(&summary).unwrap_err();
+            assert!(
+                matches!(error, Error::Corrupted { .. }),
+                "{} bytes: {error}",
+                summary.data_len
+            );
         }
     }
 }
