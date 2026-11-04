@@ -54,13 +54,20 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     }
 
     // One directory walk per context per scrape — a blocking recursive
-    // stat, so it runs on the blocking pool, not a runtime worker.
+    // stat, so it runs on the blocking pool, not a runtime worker. The
+    // sealed bodies are stat'ed only for a cap, which they are counted
+    // against: without one the value is not reported.
+    let capped = state.cluster.archive_status().eviction().max_local_bytes > 0;
     let (data_bytes, local_bytes): (Vec<(String, u64)>, u64) =
         tokio::task::spawn_blocking(move || {
-            let local_bytes = sized
-                .iter()
-                .map(|(_, engine)| engine.sealed_body_bytes())
-                .sum();
+            let local_bytes = if capped {
+                sized
+                    .iter()
+                    .map(|(_, engine)| engine.sealed_body_bytes())
+                    .sum()
+            } else {
+                0
+            };
             let data_bytes = sized
                 .into_iter()
                 .map(|(label, engine)| (label, engine.data_dir_bytes()))
@@ -293,10 +300,10 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             &mut out,
             "kronosdb_archive_max_local_bytes",
             "gauge",
-            "Cap on sealed segment bytes kept on disk; 0 when nothing is evicted",
+            "Cap on sealed segment bytes kept on disk; 0 without a cap",
             &[(String::new(), eviction.max_local_bytes)],
         );
-        if eviction.max_local_bytes > 0 {
+        if capped {
             family(
                 &mut out,
                 "kronosdb_archive_local_bytes",
