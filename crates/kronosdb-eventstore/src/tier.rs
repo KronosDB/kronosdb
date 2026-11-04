@@ -59,7 +59,9 @@ use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutPay
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::criteria::{Criterion, SourcingCondition};
 use crate::error::Error;
+use crate::event::Position;
 use crate::segment::merge::{parse_table_file_name, table_file_name};
 use crate::segment::sealed_index::SealedIndex;
 use crate::store::{ArchivableSegment, EventStoreEngine};
@@ -1139,6 +1141,34 @@ enum Eviction {
     Diverged(Error),
 }
 
+/// The timestamp of the last event in `segment`, one record read from its
+/// local body.
+async fn last_event_timestamp(
+    engine: &Arc<EventStoreEngine>,
+    segment: &ArchivableSegment,
+) -> Option<i64> {
+    let last = segment
+        .end
+        .checked_sub(1)
+        .filter(|&last| last >= segment.base)?;
+    let engine = Arc::clone(engine);
+    let everything = SourcingCondition {
+        criteria: vec![Criterion {
+            names: vec![],
+            tags: vec![],
+        }],
+    };
+    let events =
+        tokio::task::spawn_blocking(move || engine.source_internal(Position(last), &everything, 1))
+            .await
+            .ok()?
+            .ok()?;
+    events
+        .first()
+        .filter(|event| event.position.0 == last)
+        .map(|event| event.timestamp)
+}
+
 /// Bytes of the sealed segment bodies `engine` holds on disk.
 async fn sealed_bytes(engine: &EventStoreEngine) -> Result<u64, Error> {
     let mut bytes = 0;
@@ -1149,7 +1179,7 @@ async fn sealed_bytes(engine: &EventStoreEngine) -> Result<u64, Error> {
 }
 
 /// The oldest final segment of `engine` with a body, if there is one.
-async fn oldest_body(engine: &EventStoreEngine) -> Result<Option<OldestBody>, Error> {
+async fn oldest_body(engine: &Arc<EventStoreEngine>) -> Result<Option<OldestBody>, Error> {
     let evicted_end = engine.evicted_end();
     let Some(segment) = engine
         .archivable_segments()
@@ -1163,14 +1193,20 @@ async fn oldest_body(engine: &EventStoreEngine) -> Result<Option<OldestBody>, Er
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    // When the file was last written: when the segment was sealed on the
-    // node that wrote it, but when it was downloaded on a node that caught
-    // up from the archive, so the order across contexts is only as good as
-    // that.
-    let age = meta
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as i64);
+    // The timestamp of its last event: when it was sealed, near enough,
+    // and the same on every node. The file's time is not: on a node that
+    // joined or caught up from the archive it is when the segment was
+    // downloaded. Timestamps are the writers', so a writer's clock skews
+    // only the order across contexts; each context still evicts its oldest
+    // first. A segment whose last event cannot be read falls back on its
+    // file's time.
+    let age = match last_event_timestamp(engine, &segment).await {
+        Some(timestamp) => timestamp,
+        None => meta
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as i64),
+    };
     Ok(Some(OldestBody {
         segment,
         bytes: meta.len(),
@@ -1566,6 +1602,16 @@ mod tests {
         log: &'static str,
         minimum_final: usize,
     ) {
+        seal_segments_at(engine, log, minimum_final, make_event(log, 0).timestamp).await;
+    }
+
+    /// [`seal_segments`] with events timestamped `timestamp`.
+    async fn seal_segments_at(
+        engine: &Arc<EventStoreEngine>,
+        log: &'static str,
+        minimum_final: usize,
+        timestamp: i64,
+    ) {
         let engine = Arc::clone(engine);
         tokio::task::spawn_blocking(move || {
             let mut index = engine.head().0 as usize;
@@ -1576,7 +1622,10 @@ mod tests {
                         events: (0..8)
                             .map(|_| {
                                 index += 1;
-                                make_event(log, index)
+                                AppendEvent {
+                                    timestamp,
+                                    ..make_event(log, index)
+                                }
                             })
                             .collect(),
                     })
@@ -2225,6 +2274,47 @@ mod tests {
         let eviction = status.eviction();
         assert_eq!((eviction.failures, eviction.diverged), (1, 1));
         assert_eq!(eviction.evicted_segments, segments.len() as u64);
+    }
+
+    /// Across contexts, the segment whose last event is oldest goes first,
+    /// whatever its file's time: on a node that caught up from the archive,
+    /// that is when the segment was downloaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_segment_with_the_oldest_events_is_evicted_first() {
+        let data = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let mut engines = Vec::new();
+        for (name, timestamp) in [("late", 2_000_000_000_000), ("early", 1_000_000_000_000)] {
+            let engine = evictable_engine_in(&data.path().join(name), tier.path());
+            seal_segments_at(&engine, "a", 2, timestamp).await;
+            archiver_for(tier.path(), DELETE_GRACE)
+                .run_archive_pass(name, &engine)
+                .await
+                .unwrap();
+            engines.push((name.to_string(), engine));
+        }
+        // The later context's files look older, as downloaded ones can.
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        let mut local = 0;
+        for (name, engine) in &engines {
+            for segment in engine.sealed_bodies() {
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(&segment.path)
+                    .unwrap();
+                if name == "late" {
+                    file.set_modified(hour_ago).unwrap();
+                }
+                local += file.metadata().unwrap().len();
+            }
+        }
+
+        let report = archiver_for(tier.path(), DELETE_GRACE)
+            .run_eviction_pass(&engines, local - 1)
+            .await;
+        assert_eq!(report.evicted, 1);
+        assert_eq!(engines[0].1.evicted_end(), 0);
+        assert!(engines[1].1.evicted_end() > 0);
     }
 
     /// A file larger than one part goes up in parts, on the object store at
