@@ -89,6 +89,19 @@ spec:
               pass and is logged as divergence: investigate that before
               anything else.
 
+        - alert: KronosDBArchiveDivergence
+          expr: sum by (pod) (increase(kronosdb_archive_divergences_total[15m])) > 0
+          labels: { severity: critical }
+          annotations:
+            summary: "Pod {{ printf "{{ $labels.pod }}" }} holds a segment unlike its archived copy"
+            description: >-
+              A final segment on this node differs from the copy in the
+              archive, so the context's segments are kept and not evicted.
+              Either this node's log or the archive is not the cluster's:
+              compare the segment named in the node's error log with the
+              leader's, and check that no other cluster writes to the same
+              archive prefix.
+
         - alert: KronosDBHistoryOnlyInArchive
           expr: min by (context) (kronosdb_archive_evicted_position) > 0
           for: 30m

@@ -353,6 +353,13 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
             "Eviction passes that failed",
             &[(String::new(), eviction.failures)],
         );
+        family(
+            &mut out,
+            "kronosdb_archive_divergences_total",
+            "counter",
+            "Contexts an eviction pass found with a segment unlike its archived copy, once per pass",
+            &[(String::new(), eviction.diverged)],
+        );
 
         let mut evicted = Vec::new();
         let mut requests = Vec::new();
