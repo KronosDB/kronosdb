@@ -181,10 +181,18 @@ serviceMonitor:
 alerts:
   # Prometheus-operator PrometheusRule with the production alert set:
   # poisoned engine, stalled writes, disk almost full, replication lag,
-  # ack degradation, DCB rejection spikes.
+  # ack degradation, DCB rejection spikes; with an archive, a stalled or
+  # lagging archive and failing eviction.
   enabled: false
   replicationLagEvents: 100000
   dcbRejectionsPerSecond: 10
+  # No successful archive pass for this long (at least three
+  # archive.intervalSecs).
+  archiveStalledSeconds: 900
+  # Events in final segments not archived yet, sustained for 30 minutes.
+  # A few segments' worth: lag rises by a segment at each seal and falls
+  # at each pass.
+  archiveLagEvents: 10000000
 
 # Matches the image's kronosdb user so the PVC is writable.
 podSecurityContext:
