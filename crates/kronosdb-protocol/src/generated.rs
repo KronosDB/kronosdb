@@ -8,7 +8,7 @@ use crate::codec::*;
 /// The protocol version this code speaks.
 pub const PROTOCOL_VERSION: u16 = 2;
 /// CRC32C of the schema source, for checking generated code is in sync.
-pub const SCHEMA_HASH: &str = "d1c0db3f";
+pub const SCHEMA_HASH: &str = "7cc1b9b4";
 
 /// Why a request failed. Unknown codes must be treated as `internal`.
 ///
@@ -41,6 +41,9 @@ impl ErrorCode {
     pub const RESOURCE_EXHAUSTED: Self = Self(11);
     /// The peer sent bytes that violate this protocol. The connection closes.
     pub const PROTOCOL_VIOLATION: Self = Self(12);
+    /// Nothing handles the command's or query's name: no handler for it is
+    /// connected to the cluster. A retry helps only once one subscribes.
+    pub const NO_HANDLER: Self = Self(13);
 
     /// The schema name of a known value.
     pub fn name(self) -> Option<&'static str> {
@@ -57,6 +60,7 @@ impl ErrorCode {
             10 => Some("cancelled"),
             11 => Some("resource_exhausted"),
             12 => Some("protocol_violation"),
+            13 => Some("no_handler"),
             _ => None,
         }
     }

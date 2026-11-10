@@ -174,7 +174,7 @@ async fn a_command_nobody_handles_is_a_fault() {
         .dispatch_command(&bus, command("c1", "Nobody"))
         .await
         .unwrap_err();
-    assert_eq!(fault.kind, FaultKind::Unavailable);
+    assert_eq!(fault.kind, FaultKind::NoHandler);
 }
 
 #[tokio::test]
@@ -244,7 +244,7 @@ async fn a_handler_stream_ending_fails_what_was_in_flight_to_it() {
         .dispatch_command(&bus, command("c2", "Slow"))
         .await
         .unwrap_err();
-    assert_eq!(fault.kind, FaultKind::Unavailable);
+    assert_eq!(fault.kind, FaultKind::NoHandler);
 }
 
 #[tokio::test]

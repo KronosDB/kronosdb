@@ -4,7 +4,7 @@
 /** The protocol version this code speaks. */
 export const PROTOCOL_VERSION = 2;
 /** CRC32C of the schema source, for checking generated code is in sync. */
-export const SCHEMA_HASH = "d1c0db3f";
+export const SCHEMA_HASH = "7cc1b9b4";
 
 /** The peer sent bytes that violate the protocol. */
 export class ProtocolError extends Error {}
@@ -336,6 +336,11 @@ export const ErrorCode = {
    * The peer sent bytes that violate this protocol. The connection closes.
    */
   protocol_violation: 12,
+  /**
+   * Nothing handles the command's or query's name: no handler for it is
+   * connected to the cluster. A retry helps only once one subscribes.
+   */
+  no_handler: 13,
 } as const;
 /** Open on decode: values this version does not know are kept. */
 export type ErrorCode = number;
@@ -352,6 +357,7 @@ export const ErrorCodeNames: Readonly<Record<number, string>> = {
   10: "cancelled",
   11: "resource_exhausted",
   12: "protocol_violation",
+  13: "no_handler",
 };
 
 /**

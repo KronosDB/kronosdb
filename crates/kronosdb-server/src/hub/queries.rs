@@ -23,6 +23,17 @@ pub(super) fn query_fault(error: QueryError) -> Fault {
     Fault::new(FaultKind::Unavailable, error.to_string())
 }
 
+/// Why the bus would not take a query for any of its type's handlers. No
+/// handler at all is its own fault: nothing handles the name.
+pub(super) fn any_handler_query_fault(error: QueryError) -> Fault {
+    match error {
+        QueryError::NoHandlerAvailable { .. } => {
+            Fault::new(FaultKind::NoHandler, error.to_string())
+        }
+        other => query_fault(other),
+    }
+}
+
 /// The results of a query as the handlers produce them. Ends when every
 /// handler is done, or at the deadline. Dropping it gives the query up:
 /// handlers still working on it are told to stop.
@@ -145,7 +156,7 @@ impl Hub {
                 Err(e) if has_remote => {
                     tracing::debug!(query = %name, error = %e, "local query dispatch skipped");
                 }
-                Err(e) => return Err(query_fault(e)),
+                Err(e) => return Err(any_handler_query_fault(e)),
             }
         }
         Ok(QueryStream {

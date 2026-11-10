@@ -14,8 +14,12 @@ use kronosdb_messaging::types::ErrorDetail;
 /// their wire reports failures with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultKind {
-    /// Not ready, no handler, nowhere to send it. Retrying may help.
+    /// Not ready, nowhere to send it, every handler busy, or the handler it
+    /// was routed to gone. Retrying may help.
     Unavailable,
+    /// Nothing handles the message's name: no handler for it is connected.
+    /// Retrying helps only once one subscribes.
+    NoHandler,
     /// The server's state forbids this otherwise valid request.
     Rejected,
     InvalidArgument,

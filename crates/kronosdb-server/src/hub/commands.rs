@@ -34,7 +34,9 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// Why the bus would not take a command, as a fault.
+/// Why the bus would not take a command for the handler it was routed to,
+/// as a fault. That handler no longer being there is `Unavailable`: a retry
+/// routes it again.
 pub(super) fn command_fault(error: CommandError) -> Fault {
     let kind = match &error {
         CommandError::NoHandlerAvailable { .. } | CommandError::NoPermitsAvailable { .. } => {
@@ -44,6 +46,17 @@ pub(super) fn command_fault(error: CommandError) -> Fault {
         CommandError::AtCapacity { .. } => FaultKind::ResourceExhausted,
     };
     Fault::new(kind, error.to_string())
+}
+
+/// Why the bus would not take a command for any of its type's handlers. No
+/// handler at all is its own fault: nothing handles the name.
+pub(super) fn any_handler_fault(error: CommandError) -> Fault {
+    match error {
+        CommandError::NoHandlerAvailable { .. } => {
+            Fault::new(FaultKind::NoHandler, error.to_string())
+        }
+        other => command_fault(other),
+    }
 }
 
 /// What a caller gets when the handler does not answer in time. The same
@@ -118,14 +131,16 @@ impl Hub {
         let dispatched = match route {
             // A keyed command whose ring owner is local goes to exactly that
             // handler: the global ring's decision, not a local re-selection.
-            CommandRoute::Local { client_id } => {
-                commands
-                    .dispatch_to_wait(command, &ClientId(client_id), timeout_left)
-                    .await
-            }
-            _ => commands.dispatch_wait(command, timeout_left).await,
+            CommandRoute::Local { client_id } => commands
+                .dispatch_to_wait(command, &ClientId(client_id), timeout_left)
+                .await
+                .map_err(command_fault),
+            _ => commands
+                .dispatch_wait(command, timeout_left)
+                .await
+                .map_err(any_handler_fault),
         };
-        let (pending, response_rx) = dispatched.map_err(command_fault)?;
+        let (pending, response_rx) = dispatched?;
         self.await_handler(bus, pending, response_rx, message_id, timeout, started)
             .await
     }
@@ -226,6 +241,23 @@ mod tests {
         assert_eq!(
             kind(CommandError::AtCapacity { capacity: 1 }),
             FaultKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn no_handler_for_the_name_is_its_own_fault_and_busy_handlers_are_not() {
+        let kind = |e| any_handler_fault(e).kind;
+        assert_eq!(
+            kind(CommandError::NoHandlerAvailable {
+                command_name: "x".into()
+            }),
+            FaultKind::NoHandler
+        );
+        assert_eq!(
+            kind(CommandError::NoPermitsAvailable {
+                command_name: "x".into()
+            }),
+            FaultKind::Unavailable
         );
     }
 

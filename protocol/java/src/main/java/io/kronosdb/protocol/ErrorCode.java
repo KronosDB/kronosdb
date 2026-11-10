@@ -69,6 +69,12 @@ public record ErrorCode(int value) {
      */
     public static final ErrorCode PROTOCOL_VIOLATION = new ErrorCode(12);
 
+    /**
+     * Nothing handles the command's or query's name: no handler for it is
+     * connected to the cluster. A retry helps only once one subscribes.
+     */
+    public static final ErrorCode NO_HANDLER = new ErrorCode(13);
+
     /** The value {@code value}: a constant if this version knows it. */
     public static ErrorCode of(int value) {
         return switch (value) {
@@ -84,6 +90,7 @@ public record ErrorCode(int value) {
             case 10 -> CANCELLED;
             case 11 -> RESOURCE_EXHAUSTED;
             case 12 -> PROTOCOL_VIOLATION;
+            case 13 -> NO_HANDLER;
             default -> new ErrorCode(value);
         };
     }
@@ -103,6 +110,7 @@ public record ErrorCode(int value) {
             case 10 -> "cancelled";
             case 11 -> "resource_exhausted";
             case 12 -> "protocol_violation";
+            case 13 -> "no_handler";
             default -> null;
         };
     }
@@ -122,6 +130,7 @@ public record ErrorCode(int value) {
             case "cancelled" -> 10;
             case "resource_exhausted" -> 11;
             case "protocol_violation" -> 12;
+            case "no_handler" -> 13;
             default -> -1;
         };
     }
