@@ -14,7 +14,7 @@ public final class Frames {
     public static final int PROTOCOL_VERSION = 2;
 
     /** CRC32C of the schema source, for checking generated code is in sync. */
-    public static final String SCHEMA_HASH = "d1c0db3f";
+    public static final String SCHEMA_HASH = "7cc1b9b4";
 
     /** Bytes every connection starts with, before the client's Hello. Do not modify. */
     public static final byte[] PREFACE = "KRONOSDB".getBytes(StandardCharsets.US_ASCII);

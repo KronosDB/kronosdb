@@ -70,6 +70,17 @@ fn subscription_fault(error: SubscriptionError) -> Fault {
     Fault::new(kind, error.to_string())
 }
 
+/// Why a subscription for any of its query's handlers could not open. No
+/// handler at all is its own fault: nothing handles the name.
+fn any_handler_subscription_fault(error: SubscriptionError) -> Fault {
+    match error {
+        SubscriptionError::NoHandlerAvailable { .. } => {
+            Fault::new(FaultKind::NoHandler, error.to_string())
+        }
+        other => subscription_fault(other),
+    }
+}
+
 /// What a subscriber receives, wherever its handler is. Dropping it
 /// cancels the subscription and tells the handler to stop.
 pub struct SubscriptionFeed {
@@ -208,10 +219,16 @@ impl Hub {
         let id = subscription.subscription_id.clone();
         let handler_view = Arc::new(subscription.clone());
         let opened = match &target {
-            Some(target) => bus.engine.subscribe_to(subscription, target),
-            None => bus.engine.subscribe(subscription),
+            Some(target) => bus
+                .engine
+                .subscribe_to(subscription, target)
+                .map_err(subscription_fault),
+            None => bus
+                .engine
+                .subscribe(subscription)
+                .map_err(any_handler_subscription_fault),
         };
-        let (pending, updates) = opened.map_err(subscription_fault)?;
+        let (pending, updates) = opened?;
         let handler = pending
             .target_handlers
             .first()

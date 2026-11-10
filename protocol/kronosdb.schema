@@ -55,6 +55,9 @@ enum ErrorCode: u16 {
   resource_exhausted = 11
   /// The peer sent bytes that violate this protocol. The connection closes.
   protocol_violation = 12
+  /// Nothing handles the command's or query's name: no handler for it is
+  /// connected to the cluster. A retry helps only once one subscribes.
+  no_handler = 13
 }
 
 /// How the client proves who it is.

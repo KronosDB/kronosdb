@@ -1883,6 +1883,7 @@ A `u16`. Why a request failed. Unknown codes must be treated as `internal`.
 | 10 | `cancelled` | The client cancelled the stream. |
 | 11 | `resource_exhausted` | A size or rate limit was exceeded. |
 | 12 | `protocol_violation` | The peer sent bytes that violate this protocol. The connection closes. |
+| 13 | `no_handler` | Nothing handles the command's or query's name: no handler for it is connected to the cluster. A retry helps only once one subscribes. |
 
 #### CredentialKind
 

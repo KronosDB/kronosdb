@@ -350,6 +350,7 @@ pub fn failure(fault: Fault) -> Failure {
         FaultKind::Rejected => ErrorCode::REJECTED,
         FaultKind::InvalidArgument => ErrorCode::INVALID_ARGUMENT,
         FaultKind::NotFound => ErrorCode::NOT_FOUND,
+        FaultKind::NoHandler => ErrorCode::NO_HANDLER,
         FaultKind::AlreadyExists => ErrorCode::ALREADY_EXISTS,
         FaultKind::ResourceExhausted => ErrorCode::RESOURCE_EXHAUSTED,
         FaultKind::Internal => ErrorCode::INTERNAL,
@@ -364,6 +365,7 @@ pub fn fault(failure: &Failure) -> Fault {
         ErrorCode::REJECTED => FaultKind::Rejected,
         ErrorCode::INVALID_ARGUMENT => FaultKind::InvalidArgument,
         ErrorCode::NOT_FOUND => FaultKind::NotFound,
+        ErrorCode::NO_HANDLER => FaultKind::NoHandler,
         ErrorCode::ALREADY_EXISTS => FaultKind::AlreadyExists,
         ErrorCode::RESOURCE_EXHAUSTED => FaultKind::ResourceExhausted,
         _ => FaultKind::Internal,
@@ -629,8 +631,11 @@ mod tests {
             ErrorCode::RESOURCE_EXHAUSTED
         );
         assert_eq!(code(FaultKind::AlreadyExists), ErrorCode::ALREADY_EXISTS);
+        assert_eq!(code(FaultKind::NoHandler), ErrorCode::NO_HANDLER);
         // And back, for what a peer reports.
         let back = fault(&Failure::new(ErrorCode::UNAVAILABLE, "down"));
         assert_eq!(back.kind, FaultKind::Unavailable);
+        let back = fault(&Failure::new(ErrorCode::NO_HANDLER, "nobody"));
+        assert_eq!(back.kind, FaultKind::NoHandler);
     }
 }

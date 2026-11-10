@@ -152,8 +152,9 @@ async fn dispatch_when_ready(client: &Client, cmd: &Command) -> Reply {
         match client.default_bus().dispatch_command(cmd).await {
             Ok(reply) => return reply,
             Err(e)
-                if e.failure()
-                    .is_some_and(|f| f.code == ErrorCode::UNAVAILABLE) =>
+                if e.failure().is_some_and(|f| {
+                    f.code == ErrorCode::UNAVAILABLE || f.code == ErrorCode::NO_HANDLER
+                }) =>
             {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -208,7 +209,43 @@ async fn a_command_goes_to_its_handler_and_the_answer_comes_back() {
         .dispatch_command(&command("c3", "Nobody", "x"))
         .await
         .unwrap_err();
-    assert_eq!(err.failure().unwrap().code, ErrorCode::UNAVAILABLE);
+    assert_eq!(err.failure().unwrap().code, ErrorCode::NO_HANDLER);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_or_subscription_nothing_handles_fails_with_no_handler() {
+    let node = spawn("no-handler", &[]);
+    let client = connect(&node).await;
+    let bus = client.default_bus();
+
+    let failure = match bus.dispatch_query(&query("q-nobody", "Nobody")).await {
+        Err(e) => e,
+        Ok(mut results) => results
+            .next()
+            .await
+            .expect_err("a query nothing handles fails"),
+    };
+    assert_eq!(
+        failure.failure().map(|f| f.code),
+        Some(ErrorCode::NO_HANDLER),
+        "{failure}"
+    );
+
+    let failure = match bus
+        .subscription_query("sub-nobody", &query("sub-nobody", "Nobody"), 8)
+        .await
+    {
+        Err(e) => e,
+        Ok(mut stream) => stream
+            .next()
+            .await
+            .expect_err("a subscription nothing handles fails"),
+    };
+    assert_eq!(
+        failure.failure().map(|f| f.code),
+        Some(ErrorCode::NO_HANDLER),
+        "{failure}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -296,7 +333,7 @@ async fn a_handler_that_disconnects_fails_its_commands_in_flight() {
         .dispatch_command(&command("slow-2", "Slow", "x"))
         .await
         .unwrap_err();
-    assert_eq!(err.failure().unwrap().code, ErrorCode::UNAVAILABLE);
+    assert_eq!(err.failure().unwrap().code, ErrorCode::NO_HANDLER);
 }
 
 /// A handler on a runtime of its own, so the whole connection can be cut
