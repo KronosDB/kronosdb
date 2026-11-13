@@ -2,7 +2,6 @@
 //! protocol: a real server process, the Rust client. Dispatchers and
 //! handlers use separate connections, as they do in real deployments.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::time::Duration;
@@ -14,6 +13,9 @@ use kronosdb_client::{
 };
 use tokio::task::JoinHandle;
 
+mod support;
+use support::free_port;
+
 struct Node {
     child: Child,
     native: String,
@@ -24,24 +26,6 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    // The kernel can hand a port it just released straight back, so ports this
-    // process already gave out are skipped: two nodes must never share one.
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut given = GIVEN.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !given.contains(&port) {
-            given.push(port);
-            return port;
-        }
     }
 }
 
@@ -81,7 +65,8 @@ fn spawn(name: &str, envs: &[(&str, &str)]) -> Node {
 /// A new connection, once the server is up. Generous: the suite starts a
 /// server per test, all at once.
 async fn connect(node: &Node) -> Client {
-    for _ in 0..600 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         if let Ok(client) = Client::connect(&node.native, &ConnectOptions::default()).await
             && client.default_context().head().await.is_ok()
         {
