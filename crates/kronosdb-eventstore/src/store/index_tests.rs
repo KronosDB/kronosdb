@@ -530,7 +530,10 @@ fn reads_racing_background_merges_stay_exact() {
             .unwrap();
         model.write().extend(logged);
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // The readers race the last seals and the merges they set off. A wave
+    // hands its seals over before it releases its appends, so this covers
+    // every segment the appends rotated away from.
+    engine.wait_for_seals();
     stop.store(true, Ordering::Relaxed);
     for reader in readers {
         assert!(reader.join().unwrap() > 0);
