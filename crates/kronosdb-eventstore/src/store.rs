@@ -6159,6 +6159,9 @@ mod tests {
         }
         let sealed = store.segments.read().sealed_count;
         assert!(sealed > 150, "only {sealed} sealed segments");
+        // Reads measure the settled store: a seal landing between two of
+        // them would move its segment from the pinned index to its files.
+        store.seals.wait_idle();
         store
     }
 
