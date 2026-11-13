@@ -1,6 +1,6 @@
 //! The native protocol end to end: a real server process, the Rust client.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -24,12 +24,8 @@ impl Drop for Node {
     }
 }
 
-fn work_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("native-e2e-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn work_dir(name: &str) -> support::WorkDir {
+    support::work_dir(&format!("native-e2e-{name}"))
 }
 
 fn spawn(dir: &Path) -> Node {
