@@ -47,6 +47,7 @@ fn spawn_node(node_id: u64, port: u16, admin_port: u16, peers: &[(u64, u16)]) ->
         .join(",");
 
     let mut cmd = ProcCommand::new(env!("CARGO_BIN_EXE_kronosdb-server"));
+    support::inherit_only_stdio(&mut cmd);
     // The client port is also the address the cluster advertises: peers
     // reach each other's handlers there.
     cmd.env("KRONOSDB_LISTEN", format!("127.0.0.1:{port}"))

@@ -42,6 +42,7 @@ fn spawn(name: &str, envs: &[(&str, &str)]) -> Node {
     let native = format!("127.0.0.1:{}", free_port());
     let admin = format!("127.0.0.1:{}", free_port());
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_kronosdb-server"));
+    support::inherit_only_stdio(&mut cmd);
     cmd.current_dir(&dir)
         .env("KRONOSDB_LISTEN", &native)
         .env("KRONOSDB_ADMIN_LISTEN", &admin)
