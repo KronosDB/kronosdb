@@ -55,6 +55,7 @@ fn work_dir(name: &str) -> PathBuf {
 fn spawn(data_dir: &Path, env: &[(&str, &str)]) -> Server {
     let admin = format!("127.0.0.1:{}", free_port());
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kronosdb-server"));
+    support::inherit_only_stdio(&mut cmd);
     cmd.current_dir(data_dir.parent().unwrap())
         // A stray kronosdb.toml or environment must not change the run.
         .env_remove("KRONOSDB_DEV")

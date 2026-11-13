@@ -40,6 +40,7 @@ fn work_dir(name: &str) -> PathBuf {
 /// Starts a node listening on `port`.
 fn spawn(dir: &Path, port: u16, envs: &[(&str, String)]) -> Node {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kronosdb-server"));
+    support::inherit_only_stdio(&mut cmd);
     cmd.current_dir(dir)
         .env("KRONOSDB_LISTEN", format!("127.0.0.1:{port}"))
         .env(

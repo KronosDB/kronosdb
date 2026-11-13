@@ -156,6 +156,40 @@ impl Drop for ServerHandle {
 mod ports;
 pub use ports::free_port;
 
+/// Starts `command`'s child with nothing open but stdin, stdout and stderr.
+///
+/// macOS creates a socket and only then marks it close-on-exec, so a child
+/// spawned from another thread in between inherits it. A server that
+/// inherited the listener [`free_port`] probes with kept that port bound,
+/// and the server meant for the port failed with "address in use"; one that
+/// inherited a client's connection keeps it open after the client closes it.
+/// Linux creates both close-on-exec at once, so there is nothing to undo.
+pub fn inherit_only_stdio(command: &mut std::process::Command) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        unsafe extern "C" {
+            fn getdtablesize() -> i32;
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_SETFD: i32 = 2;
+        const FD_CLOEXEC: i32 = 1;
+        // SAFETY: the hook runs in the child between fork and exec, where
+        // only async-signal-safe calls are allowed; these two are.
+        unsafe {
+            command.pre_exec(|| {
+                for fd in 3..getdtablesize() {
+                    fcntl(fd, F_SETFD, FD_CLOEXEC);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = command;
+}
+
 pub struct SpawnConfig {
     pub data_dir: PathBuf,
     pub listen_port: u16,
@@ -187,6 +221,7 @@ fn ensure_server_built() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap();
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    inherit_only_stdio(&mut cmd);
     cmd.current_dir(workspace_root)
         .arg("build")
         .arg("-p")
@@ -230,6 +265,7 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     let admin: SocketAddr = format!("127.0.0.1:{}", cfg.admin_port).parse().unwrap();
 
     let mut cmd = Command::new(bin);
+    inherit_only_stdio(&mut cmd);
     cmd.env("KRONOSDB_LISTEN", listen.to_string())
         .env("KRONOSDB_ADMIN_LISTEN", admin.to_string())
         .env("KRONOSDB_DATA_DIR", &cfg.data_dir)

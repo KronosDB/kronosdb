@@ -44,3 +44,37 @@ pub const STARTUP: Duration = Duration::from_secs(60);
 pub fn startup_deadline() -> Instant {
     Instant::now() + STARTUP
 }
+
+/// Starts `command`'s child with nothing open but stdin, stdout and stderr.
+///
+/// macOS creates a socket and only then marks it close-on-exec, so a child
+/// spawned from another thread in between inherits it. A server that
+/// inherited the listener [`free_port`] probes with kept that port bound,
+/// and the server meant for the port failed with "address in use"; one that
+/// inherited a client's connection keeps it open after the client closes it.
+/// Linux creates both close-on-exec at once, so there is nothing to undo.
+pub fn inherit_only_stdio(command: &mut std::process::Command) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        unsafe extern "C" {
+            fn getdtablesize() -> i32;
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_SETFD: i32 = 2;
+        const FD_CLOEXEC: i32 = 1;
+        // SAFETY: the hook runs in the child between fork and exec, where
+        // only async-signal-safe calls are allowed; these two are.
+        unsafe {
+            command.pre_exec(|| {
+                for fd in 3..getdtablesize() {
+                    fcntl(fd, F_SETFD, FD_CLOEXEC);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = command;
+}
