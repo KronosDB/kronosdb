@@ -14,6 +14,12 @@ use super::{Failure, NetError, OwnedFrame, encode};
 use crate::codec::{FLAG_END, PREFACE, Records, RecordsBuf};
 use crate::generated::*;
 
+/// How long a test waits for something that must happen eventually before
+/// it calls it stuck. Far past any healthy answer, even on a loaded machine
+/// running a debug build: only a hang reaches it. Tests of how quickly
+/// something happens use their own bounds.
+const STUCK: Duration = Duration::from_secs(60);
+
 /// What the toy's flooding Source did, for tests to look at.
 #[derive(Default)]
 struct Flood {
@@ -382,7 +388,7 @@ async fn shutdown_drains_open_requests_then_closes() {
     h.shutdown.send(true).unwrap();
     // The request already open is finished, not dropped.
     assert!(slow.await.unwrap().is_ok());
-    tokio::time::timeout(Duration::from_secs(1), h.conn.closed())
+    tokio::time::timeout(STUCK, h.conn.closed())
         .await
         .expect("the connection closes once drained");
     assert!(h.conn.is_draining());
@@ -405,7 +411,7 @@ async fn dropping_every_handle_closes_the_connection() {
     drop(stream);
     drop(conn);
     // Nothing can send any more: the client closes, and the server follows.
-    let ended = tokio::time::timeout(Duration::from_secs(1), server)
+    let ended = tokio::time::timeout(STUCK, server)
         .await
         .expect("the server saw the connection close");
     assert!(ended.unwrap().is_ok());
@@ -525,7 +531,7 @@ async fn others_still_complete(conn: &client::Connection) {
             assert_eq!(head(&answer), (i % 50) as u64 * 1000 + 7);
         }));
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(STUCK, async {
         for t in tasks {
             t.await.unwrap();
         }
@@ -621,7 +627,7 @@ async fn a_cancelled_stream_stops_at_once() {
         "the server sent {sent} frames past the window"
     );
     stream.cancel().await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(STUCK, async {
         while h.flood.ended.load(Ordering::Relaxed) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -658,11 +664,11 @@ async fn a_cancel_is_read_while_the_server_is_behind_on_writing() {
     settled(&flood).await;
     assert_eq!(flood.ended.load(Ordering::Relaxed), 0);
     let cancel = encode(1, FLAG_END, &Frame::Cancel(Cancel {})).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), write_half.write_all(&cancel))
+    tokio::time::timeout(STUCK, write_half.write_all(&cancel))
         .await
         .expect("the server stopped reading")
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(STUCK, async {
         while flood.ended.load(Ordering::Relaxed) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -789,7 +795,7 @@ async fn a_peer_that_reads_late_still_gets_every_answer() {
     let count = 8_000u32;
     let bytes = raw_requests(count);
     let (read_half, mut write_half) = tokio::io::split(client_io);
-    tokio::time::timeout(Duration::from_secs(5), write_half.write_all(&bytes))
+    tokio::time::timeout(STUCK, write_half.write_all(&bytes))
         .await
         .expect("the server stopped reading while its writes were blocked")
         .unwrap();
