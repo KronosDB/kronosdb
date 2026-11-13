@@ -752,6 +752,10 @@ struct SealQueue {
     /// Bases with a finalize in flight, and whether it was cancelled.
     in_flight: StdMutex<std::collections::BTreeMap<u64, bool>>,
     done: Condvar,
+    /// The seal threads not yet joined. A seal leaves `in_flight` before
+    /// its last file work, so only a joined thread is known to be done
+    /// with the directory.
+    threads: StdMutex<Vec<std::thread::JoinHandle<()>>>,
     dir: PathBuf,
     cache: Arc<IndexCache>,
     segments: Arc<RwLock<SegmentList>>,
@@ -768,6 +772,7 @@ impl SealQueue {
         Self {
             in_flight: StdMutex::new(std::collections::BTreeMap::new()),
             done: Condvar::new(),
+            threads: StdMutex::new(Vec::new()),
             dir: dir.to_path_buf(),
             cache: Arc::clone(cache),
             segments: Arc::clone(segments),
@@ -793,10 +798,17 @@ impl SealQueue {
                     queue.finish(seal);
                 }
             });
-        if let Err(error) = spawned {
-            tracing::error!(%error, "failed to spawn the seal thread; index files will be rebuilt at the next open");
-            self.in_flight.lock().unwrap().clear();
-            self.done.notify_all();
+        match spawned {
+            Ok(thread) => {
+                let mut threads = self.threads.lock().unwrap();
+                threads.retain(|thread| !thread.is_finished());
+                threads.push(thread);
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to spawn the seal thread; index files will be rebuilt at the next open");
+                self.in_flight.lock().unwrap().clear();
+                self.done.notify_all();
+            }
         }
     }
 
@@ -873,12 +885,20 @@ impl SealQueue {
         }
     }
 
-    /// Waits until no seal is in flight. Test and shutdown helper.
+    /// Waits until no seal is in flight. Test helper.
     #[cfg(test)]
     fn wait_idle(&self) {
         let mut in_flight = self.in_flight.lock().unwrap();
         while !in_flight.is_empty() {
             in_flight = self.done.wait(in_flight).unwrap();
+        }
+    }
+
+    /// Waits for every seal thread started so far to exit.
+    fn join_all(&self) {
+        let threads = std::mem::take(&mut *self.threads.lock().unwrap());
+        for thread in threads {
+            let _ = thread.join();
         }
     }
 }
@@ -896,7 +916,7 @@ fn spawn_sync_thread(
     feed: Arc<CommitFeed>,
     coalesce_window: Duration,
     seals: Arc<SealQueue>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("kronosdb-sync".into())
         .spawn(move || {
@@ -1049,7 +1069,7 @@ fn spawn_sync_thread(
                 }
             }
         })
-        .expect("spawn sync thread");
+        .expect("spawn sync thread")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1633,6 +1653,9 @@ pub struct EventStoreEngine {
     /// in the background when it runs.
     merge: Arc<MergeContext>,
     merger: StdMutex<Option<std::thread::JoinHandle<()>>>,
+    /// The group-commit thread, joined on drop so the seals its last wave
+    /// starts are known before the engine waits for them.
+    sync_thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
     /// Index files the last open had to rebuild from their segments.
     rebuilt_at_open: usize,
 }
@@ -1701,7 +1724,7 @@ impl EventStoreEngine {
         );
         let seals = Arc::new(SealQueue::new(dir, &cache, &segments, &merge));
 
-        spawn_sync_thread(
+        let sync_thread = spawn_sync_thread(
             dir.to_path_buf(),
             Arc::clone(&sync_state),
             Arc::clone(&writer),
@@ -1753,6 +1776,7 @@ impl EventStoreEngine {
             inline_breaker: InlineBreaker::new(),
             merge,
             merger: StdMutex::new(merger),
+            sync_thread: StdMutex::new(Some(sync_thread)),
             rebuilt_at_open: 0,
         })
     }
@@ -1868,7 +1892,7 @@ impl EventStoreEngine {
         );
         let seals = Arc::new(SealQueue::new(dir, &cache, &segments, &merge));
 
-        spawn_sync_thread(
+        let sync_thread = spawn_sync_thread(
             dir.to_path_buf(),
             Arc::clone(&sync_state),
             Arc::clone(&writer),
@@ -1920,6 +1944,7 @@ impl EventStoreEngine {
                     .then(|| crate::log_index::spawn(Arc::clone(&merge))),
             ),
             merge,
+            sync_thread: StdMutex::new(Some(sync_thread)),
             rebuilt_at_open,
         })
     }
@@ -1927,7 +1952,8 @@ impl EventStoreEngine {
     /// Returns a shared reference to this engine's metrics counters.
     /// Initiates engine shutdown: new appends are rejected, and the group
     /// commit sync thread performs one final fsync pass (releasing any
-    /// in-flight writers) before exiting. Idempotent.
+    /// in-flight writers) before exiting. Idempotent. It does not wait for
+    /// the background threads; dropping the engine does.
     pub fn shutdown(&self) {
         self.sync_state.begin_shutdown();
     }
@@ -5027,6 +5053,15 @@ impl Drop for EventStoreEngine {
         self.feed.close();
         // A merge stops at its next key and leaves no file behind.
         self.merge.stop();
+        // Nothing touches the directory once the engine is gone: the sync
+        // thread's last wave runs, then the seals it started write their
+        // index files. Otherwise a store opened on the same directory next
+        // would race them for the same `.idx.tmp`.
+        self.sync_state.begin_shutdown();
+        if let Some(sync) = self.sync_thread.lock().unwrap().take() {
+            let _ = sync.join();
+        }
+        self.seals.join_all();
         if let Some(merger) = self.merger.lock().unwrap().take() {
             let _ = merger.join();
         }
