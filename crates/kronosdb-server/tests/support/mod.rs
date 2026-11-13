@@ -78,3 +78,38 @@ pub fn inherit_only_stdio(command: &mut std::process::Command) {
     #[cfg(not(target_os = "macos"))]
     let _ = command;
 }
+
+/// A directory for one test's server, removed with everything in it when
+/// this is dropped. Keep it alive for as long as the server runs: a local
+/// declared before the server is dropped after it.
+pub struct WorkDir(tempfile::TempDir);
+
+impl std::ops::Deref for WorkDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<std::path::Path> for WorkDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+/// A fresh [`WorkDir`] under the target directory, its name starting with
+/// `name`.
+pub fn work_dir(name: &str) -> WorkDir {
+    work_dir_in(env!("CARGO_TARGET_TMPDIR"), name)
+}
+
+/// A fresh [`WorkDir`] under `parent`.
+pub fn work_dir_in(parent: impl AsRef<std::path::Path>, name: &str) -> WorkDir {
+    WorkDir(
+        tempfile::Builder::new()
+            .prefix(&format!("{name}-"))
+            .tempdir_in(parent)
+            .unwrap(),
+    )
+}

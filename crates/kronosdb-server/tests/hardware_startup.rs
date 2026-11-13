@@ -1,7 +1,7 @@
 //! Startup hardware checks, end to end: a real server process whose JSON logs
 //! are read back, and whose admin endpoints are queried.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,12 +43,8 @@ fn message(record: &Value) -> &str {
 
 /// A directory under the target dir, removed first and left for the next run
 /// to remove (the server's data dir must start empty).
-fn work_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("hardware-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn work_dir(name: &str) -> support::WorkDir {
+    support::work_dir(&format!("hardware-{name}"))
 }
 
 /// Starts the server with JSON logs and waits for its startup to finish.
@@ -112,7 +108,8 @@ async fn get(server: &Server, path: &str) -> String {
 
 #[tokio::test]
 async fn the_probe_runs_is_logged_and_reaches_the_admin_surfaces() {
-    let dir = work_dir("probe").join("data");
+    let work = work_dir("probe");
+    let dir = work.join("data");
     let server = spawn(&dir, &[]);
 
     // The probe line, with its measurements as structured fields.
@@ -188,7 +185,8 @@ async fn the_probe_runs_is_logged_and_reaches_the_admin_surfaces() {
 #[tokio::test]
 async fn explicit_ack_modes_are_not_decided_from_the_disk() {
     for mode in ["written", "durable"] {
-        let dir = work_dir(mode).join("data");
+        let work = work_dir(mode);
+        let dir = work.join("data");
         let server = spawn(&dir, &[("KRONOSDB_ACK_MODE", mode)]);
         let ack = server.record("ack mode:").expect("ack mode log line");
         assert_eq!(ack["fields"]["ack_mode"], mode);
@@ -201,18 +199,17 @@ async fn explicit_ack_modes_are_not_decided_from_the_disk() {
     }
 }
 
-/// A data dir that is guaranteed to trip a check on this platform, and the
-/// check: macOS always does; on Linux, tmpfs under /dev/shm.
-fn data_dir_that_trips_a_check(name: &str) -> Option<(PathBuf, &'static str)> {
+/// A work dir whose `data` directory is guaranteed to trip a check on this
+/// platform, and the check: macOS always does; on Linux, tmpfs under
+/// /dev/shm.
+fn work_dir_that_trips_a_check(name: &str) -> Option<(support::WorkDir, &'static str)> {
     if cfg!(target_os = "macos") {
-        return Some((work_dir(name).join("data"), "platform_macos"));
+        return Some((work_dir(name), "platform_macos"));
     }
     let shm = Path::new("/dev/shm");
     if cfg!(target_os = "linux") && shm.is_dir() {
-        let dir = shm.join(format!("kronosdb-hw-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        return Some((dir.join("data"), "memory_filesystem"));
+        let work = support::work_dir_in(shm, &format!("kronosdb-hw-{name}"));
+        return Some((work, "memory_filesystem"));
     }
     None
 }
@@ -231,9 +228,10 @@ fn finding_levels(server: &Server) -> Vec<(String, String)> {
 
 #[test]
 fn findings_are_loud_by_default() {
-    let Some((dir, check)) = data_dir_that_trips_a_check("loud") else {
+    let Some((work, check)) = work_dir_that_trips_a_check("loud") else {
         return;
     };
+    let dir = work.join("data");
     // An empty KRONOSDB_DEV (compose passthrough) means off, and boots.
     let server = spawn(&dir, &[("KRONOSDB_DEV", "")]);
     let expected = if check == "memory_filesystem" {
@@ -253,7 +251,6 @@ fn findings_are_loud_by_default() {
         .find(|r| message(r).contains("below the recommended production setup"))
         .expect("summary line");
     assert_eq!(summary["level"], "WARN");
-    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
 
 #[test]
@@ -262,9 +259,10 @@ fn dev_mode_logs_findings_quietly() {
         ("dev-env", ("KRONOSDB_DEV", "1")),
         ("dev-true", ("KRONOSDB_DEV", "true")),
     ] {
-        let Some((dir, check)) = data_dir_that_trips_a_check(name) else {
+        let Some((work, check)) = work_dir_that_trips_a_check(name) else {
             return;
         };
+        let dir = work.join("data");
         let server = spawn(&dir, &[env]);
         let levels = finding_levels(&server);
         assert!(
@@ -282,16 +280,16 @@ fn dev_mode_logs_findings_quietly() {
                 assert_eq!(record["level"], "INFO", "{text}");
             }
         }
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
 
 #[test]
 fn dev_mode_can_come_from_the_config_file() {
-    let Some((dir, check)) = data_dir_that_trips_a_check("dev-file") else {
+    let Some((work, check)) = work_dir_that_trips_a_check("dev-file") else {
         return;
     };
-    let config = dir.parent().unwrap().join("kronosdb.toml");
+    let dir = work.join("data");
+    let config = work.join("kronosdb.toml");
     std::fs::write(&config, "dev = true\n").unwrap();
     let server = spawn(&dir, &[("KRONOSDB_CONFIG", config.to_str().unwrap())]);
     let levels = finding_levels(&server);
@@ -303,5 +301,4 @@ fn dev_mode_can_come_from_the_config_file() {
         levels.iter().all(|(level, _)| level == "INFO"),
         "{levels:?}"
     );
-    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }

@@ -24,6 +24,8 @@ struct Node {
     child: Child,
     addr: String,
     admin: String,
+    /// Removed after `drop` has stopped the server.
+    _dir: support::WorkDir,
 }
 
 impl Drop for Node {
@@ -34,12 +36,7 @@ impl Drop for Node {
 }
 
 fn spawn_node(node_id: u64, port: u16, admin_port: u16, peers: &[(u64, u16)]) -> Node {
-    let data_dir = format!(
-        "{}/fabric-{}-node-{}",
-        env!("CARGO_TARGET_TMPDIR"),
-        std::process::id(),
-        node_id
-    );
+    let dir = support::work_dir(&format!("fabric-node-{node_id}"));
     let peer_str = peers
         .iter()
         .map(|(id, port)| format!("{id}=127.0.0.1:{port}"))
@@ -52,7 +49,7 @@ fn spawn_node(node_id: u64, port: u16, admin_port: u16, peers: &[(u64, u16)]) ->
     // reach each other's handlers there.
     cmd.env("KRONOSDB_LISTEN", format!("127.0.0.1:{port}"))
         .env("KRONOSDB_ADMIN_LISTEN", format!("127.0.0.1:{admin_port}"))
-        .env("KRONOSDB_DATA_DIR", &data_dir)
+        .env("KRONOSDB_DATA_DIR", &*dir)
         .env("KRONOSDB_NODE_NAME", format!("fabric-node-{node_id}"))
         .env("KRONOSDB_CLUSTER_NODE_ID", node_id.to_string())
         .env("KRONOSDB_CLUSTER_PEERS", &peer_str)
@@ -66,6 +63,7 @@ fn spawn_node(node_id: u64, port: u16, admin_port: u16, peers: &[(u64, u16)]) ->
         child: cmd.spawn().expect("spawn kronosdb-server"),
         addr: format!("127.0.0.1:{port}"),
         admin: format!("127.0.0.1:{admin_port}"),
+        _dir: dir,
     }
 }
 

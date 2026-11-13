@@ -2,7 +2,7 @@
 //! TLS handshakes. A native connection authenticates once, in its Hello, so
 //! a bad credential fails the connect and a good one is checked per request.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,12 +29,8 @@ impl Drop for Node {
     }
 }
 
-fn work_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("native-auth-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn work_dir(name: &str) -> support::WorkDir {
+    support::work_dir(&format!("native-auth-{name}"))
 }
 
 /// Starts a node listening on `port`.
@@ -390,17 +386,20 @@ contexts = ["billing"]
 async fn peers_authenticate_with_access_token() {
     let ports = [free_port(), free_port()];
     let peers = format!("1=127.0.0.1:{},2=127.0.0.1:{}", ports[0], ports[1]);
-    let _nodes: Vec<Node> = (0..2)
+    // Each node before its directory: stopped, then removed.
+    let _nodes: Vec<(Node, support::WorkDir)> = (0..2)
         .map(|i| {
-            spawn(
-                &work_dir(&format!("cluster-{i}")),
+            let dir = work_dir(&format!("cluster-{i}"));
+            let node = spawn(
+                &dir,
                 ports[i],
                 &[
                     ("KRONOSDB_CLUSTER_NODE_ID", (i + 1).to_string()),
                     ("KRONOSDB_CLUSTER_PEERS", peers.clone()),
                     ("KRONOSDB_ACCESS_TOKEN", "cluster-secret".into()),
                 ],
-            )
+            );
+            (node, dir)
         })
         .collect();
     let addr = format!("127.0.0.1:{}", ports[0]);
@@ -431,7 +430,8 @@ async fn peers_talk_over_tls() {
     let pki = Pki::new();
     let ports = [free_port(), free_port()];
     let peers = format!("1=127.0.0.1:{},2=127.0.0.1:{}", ports[0], ports[1]);
-    let _nodes: Vec<Node> = (0..2)
+    // Each node before its directory: stopped, then removed.
+    let _nodes: Vec<(Node, support::WorkDir)> = (0..2)
         .map(|i| {
             let dir = work_dir(&format!("tls-cluster-{i}"));
             let (cert, key) = pki.issue(&["localhost", "127.0.0.1"], None);
@@ -443,7 +443,7 @@ async fn peers_talk_over_tls() {
                 "[security]\ntls-cert = \"node.pem\"\ntls-key = \"node.key\"\ntls-ca = \"ca.pem\"\n",
             )
             .unwrap();
-            spawn(
+            let node = spawn(
                 &dir,
                 ports[i],
                 &[
@@ -451,7 +451,8 @@ async fn peers_talk_over_tls() {
                     ("KRONOSDB_CLUSTER_PEERS", peers.clone()),
                     ("KRONOSDB_ACCESS_TOKEN", "cluster-secret".into()),
                 ],
-            )
+            );
+            (node, dir)
         })
         .collect();
 

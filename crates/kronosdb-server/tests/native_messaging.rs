@@ -2,7 +2,6 @@
 //! protocol: a real server process, the Rust client. Dispatchers and
 //! handlers use separate connections, as they do in real deployments.
 
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::time::Duration;
 
@@ -20,6 +19,8 @@ struct Node {
     child: Child,
     native: String,
     admin: String,
+    /// Removed after `drop` has stopped the server.
+    _dir: support::WorkDir,
 }
 
 impl Drop for Node {
@@ -29,16 +30,8 @@ impl Drop for Node {
     }
 }
 
-fn work_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("native-messaging-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn spawn(name: &str, envs: &[(&str, &str)]) -> Node {
-    let dir = work_dir(name);
+    let dir = support::work_dir(&format!("native-messaging-{name}"));
     let native = format!("127.0.0.1:{}", free_port());
     let admin = format!("127.0.0.1:{}", free_port());
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_kronosdb-server"));
@@ -60,6 +53,7 @@ fn spawn(name: &str, envs: &[(&str, &str)]) -> Node {
         child: cmd.spawn().expect("spawn kronosdb-server"),
         native,
         admin,
+        _dir: dir,
     }
 }
 
