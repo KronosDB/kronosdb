@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Export the path where the `kronosdb-server` binary is expected to live so
@@ -9,17 +9,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // re-entrant through the eventstore → server → eventstore dependency edge.
     // Instead the crash harness (tests/crash_harness/mod.rs) ensures the binary is
     // built once at the start of each test run via `cargo build -p kronosdb-server`.
-    // `OUT_DIR` is `<target dir>/<profile>/build/<package>-<hash>/out`, so the
-    // profile directory holding the workspace's binaries is three levels up.
-    // Deriving it from there (rather than assuming `<workspace>/target`) keeps
-    // the harness working under `CARGO_TARGET_DIR`, a configured `target-dir`,
-    // or a shared target directory; assuming the default made every spawn fail
-    // with `NotFound` in those setups.
+    // `OUT_DIR` is `<target dir>/<profile>/build/<package>-<hash>/out` before
+    // Cargo 1.100 and `<target dir>/<profile>/build/<package>/<hash>/out` since,
+    // so the profile directory holding the workspace's binaries is the parent
+    // of the nearest `build`. Deriving it from there (rather than assuming
+    // `<workspace>/target`) keeps the harness working under `CARGO_TARGET_DIR`,
+    // a configured `target-dir`, or a shared target directory.
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let profile_dir = out_dir
         .ancestors()
-        .nth(3)
-        .expect("OUT_DIR is <target>/<profile>/build/<package>/out");
+        .find(|dir| dir.file_name() == Some("build".as_ref()))
+        .and_then(Path::parent)
+        .expect("OUT_DIR is under <target>/<profile>/build/");
     let bin_name = if cfg!(windows) {
         "kronosdb-server.exe"
     } else {
