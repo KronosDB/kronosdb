@@ -91,21 +91,12 @@ export const readBool = (r: Reader): boolean => readFlag(r, "bool");
 /** An `opt<T>` presence byte. */
 export const readPresent = (r: Reader): boolean => readFlag(r, "option");
 
+// Always TextDecoder, even for short ASCII: building a string with `+=` per
+// character leaves a rope that costs again on every Map lookup and in the GC.
 const readUtf8 = (r: Reader, len: number): string => {
   need(r, len);
   const start = r.pos;
   r.pos += len;
-  // Short ASCII strings (names, ids, tag keys) dominate events, and
-  // TextDecoder's fixed cost is large next to them.
-  if (len <= 64) {
-    let s = "";
-    for (let i = start; i < start + len; i++) {
-      const c = r.buf[i];
-      if (c >= 0x80) return utf8Decoder.decode(r.buf.subarray(start, start + len));
-      s += String.fromCharCode(c);
-    }
-    return s;
-  }
   return utf8Decoder.decode(r.buf.subarray(start, start + len));
 };
 
