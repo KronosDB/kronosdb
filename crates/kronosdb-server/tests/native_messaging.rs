@@ -63,13 +63,19 @@ fn spawn(name: &str, envs: &[(&str, &str)]) -> Node {
     }
 }
 
-/// A new connection, once the server is up. Generous: the suite starts a
-/// server per test, all at once.
+/// A new connection, once the server is up: its native port takes reads
+/// and its admin port answers. The admin server binds on its own task, so
+/// the native port answering says nothing about it. Generous: the suite
+/// starts a server per test, all at once.
 async fn connect(node: &Node) -> Client {
     let deadline = support::startup_deadline();
+    let health = format!("http://{}/health", node.admin);
     while std::time::Instant::now() < deadline {
         if let Ok(client) = Client::connect(&node.native, &ConnectOptions::default()).await
             && client.default_context().head().await.is_ok()
+            && reqwest::get(&health)
+                .await
+                .is_ok_and(|response| response.status().is_success())
         {
             return client;
         }
