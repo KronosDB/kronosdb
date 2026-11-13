@@ -16,7 +16,7 @@
 #![allow(dead_code)] // Not every helper is used by every test file.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -153,25 +153,8 @@ impl Drop for ServerHandle {
     }
 }
 
-/// A free localhost port: bound on 127.0.0.1:0 and dropped. Another process
-/// can still take it before the server binds; that window is accepted here.
-pub fn free_port() -> u16 {
-    // The kernel can hand a port it just released straight back, so ports this
-    // process already gave out are skipped: two nodes must never share one.
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut given = GIVEN.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !given.contains(&port) {
-            given.push(port);
-            return port;
-        }
-    }
-}
+mod ports;
+pub use ports::free_port;
 
 pub struct SpawnConfig {
     pub data_dir: PathBuf,

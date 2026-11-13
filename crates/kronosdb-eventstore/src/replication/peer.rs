@@ -260,10 +260,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_connection_is_dialed_again() {
-        let address = "127.0.0.1:0";
-        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
+        // The peer comes back on the same address, so it is one no outgoing
+        // connection can be handed while the peer is down.
+        let addr = format!("127.0.0.1:{}", crate::test_ports::free_port());
 
         let pool = PeerPool::new(PeerTransportConfig::default());
         let first = peer_at(&addr).await;

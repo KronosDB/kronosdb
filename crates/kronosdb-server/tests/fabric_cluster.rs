@@ -8,7 +8,6 @@
 //! relay, and node death is asserted to fail fast (retriable error), not
 //! hang.
 
-use std::net::TcpListener;
 use std::process::{Child, Command as ProcCommand, Stdio};
 use std::time::Duration;
 
@@ -17,6 +16,9 @@ use kronosdb_client::{
     Client, Command, ConnectOptions, ErrorCode, Payload, Query, QueryHandlerEvent, Reply,
     SubscriptionEvent,
 };
+
+mod support;
+use support::free_port;
 
 struct Node {
     child: Child,
@@ -28,24 +30,6 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    // The kernel can hand a port it just released straight back, so ports this
-    // process already gave out are skipped: two nodes must never share one.
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut given = GIVEN.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !given.contains(&port) {
-            given.push(port);
-            return port;
-        }
     }
 }
 
@@ -86,7 +70,8 @@ fn spawn_node(node_id: u64, port: u16, admin_port: u16, peers: &[(u64, u16)]) ->
 
 /// Waits until the node can serve: a leader claim is committed.
 async fn wait_ready(node: &Node) {
-    for _ in 0..300 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         if let Ok(response) = reqwest::get(format!("http://{}/ready", node.admin)).await
             && response.status().is_success()
         {
@@ -98,7 +83,8 @@ async fn wait_ready(node: &Node) {
 }
 
 async fn connect(node: &Node) -> Client {
-    for _ in 0..100 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         if let Ok(client) = Client::connect(&node.addr, &ConnectOptions::default()).await {
             return client;
         }

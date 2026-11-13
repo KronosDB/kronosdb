@@ -1,6 +1,5 @@
 //! The native protocol end to end: a real server process, the Rust client.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -9,6 +8,9 @@ use kronosdb_client::{
     Appended, Client, Condition, ConnectOptions, Criterion, DEFAULT_WINDOW, Delivery, ErrorCode,
     MIN_WINDOW, NewEvent, SubscribeOptions,
 };
+
+mod support;
+use support::free_port;
 
 struct Node {
     child: Child,
@@ -19,24 +21,6 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    // The kernel can hand a port it just released straight back, so ports this
-    // process already gave out are skipped: two nodes must never share one.
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut given = GIVEN.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !given.contains(&port) {
-            given.push(port);
-            return port;
-        }
     }
 }
 
@@ -77,7 +61,8 @@ fn spawn_with(dir: &Path, env: &[(&str, &str)]) -> Node {
 
 /// Connects once the server is up and its write path is ready.
 async fn connect(node: &Node) -> Client {
-    for _ in 0..200 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         if let Ok(client) = Client::connect(&node.native, &ConnectOptions::default()).await
             && client.default_context().head().await.is_ok()
         {
@@ -106,7 +91,8 @@ async fn append_ok(
     condition: Option<&Condition>,
 ) -> u64 {
     // Right after startup the write path may still be installing its epoch.
-    for _ in 0..100 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         match ctx.append(events, condition).await {
             Ok(Appended::Ok { marker, .. }) => return marker,
             Ok(Appended::Conflict { position }) => panic!("unexpected conflict at {position}"),

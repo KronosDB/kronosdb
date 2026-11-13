@@ -27,6 +27,10 @@ pub mod system;
 pub mod tier;
 pub mod wire;
 
+#[cfg(test)]
+#[path = "../tests/crash_harness/ports.rs"]
+mod test_ports;
+
 /// Append acknowledgement mode.
 ///
 /// `Written` releases appends once a quorum has *written* the events to its

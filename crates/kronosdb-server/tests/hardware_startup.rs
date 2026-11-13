@@ -1,13 +1,15 @@
 //! Startup hardware checks, end to end: a real server process whose JSON logs
 //! are read back, and whose admin endpoints are queried.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+mod support;
+use support::free_port;
 
 struct Server {
     child: Child,
@@ -37,24 +39,6 @@ impl Server {
 
 fn message(record: &Value) -> &str {
     record["fields"]["message"].as_str().unwrap_or("")
-}
-
-fn free_port() -> u16 {
-    // The kernel can hand a port it just released straight back, so ports this
-    // process already gave out are skipped: two nodes must never share one.
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut given = GIVEN.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !given.contains(&port) {
-            given.push(port);
-            return port;
-        }
-    }
 }
 
 /// A directory under the target dir, removed first and left for the next run
@@ -113,7 +97,8 @@ fn spawn(data_dir: &Path, env: &[(&str, &str)]) -> Server {
 
 async fn get(server: &Server, path: &str) -> String {
     let url = format!("http://{}{path}", server.admin);
-    for _ in 0..100 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         if let Ok(response) = reqwest::get(&url).await
             && response.status().is_success()
         {

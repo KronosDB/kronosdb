@@ -2,7 +2,6 @@
 //! TLS handshakes. A native connection authenticates once, in its Hello, so
 //! a bad credential fails the connect and a good one is checked per request.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -16,6 +15,9 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
+mod support;
+use support::free_port;
+
 struct Node {
     child: Child,
 }
@@ -24,24 +26,6 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    // The kernel can hand a port it just released straight back, so ports this
-    // process already gave out are skipped: two nodes must never share one.
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut given = GIVEN.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !given.contains(&port) {
-            given.push(port);
-            return port;
-        }
     }
 }
 
@@ -154,7 +138,8 @@ fn event() -> NewEvent {
 /// Connects, waiting for the server to come up. A refused credential is
 /// returned, not retried: it is the point.
 async fn connect(addr: &str, options: &ConnectOptions) -> Result<Client, kronosdb_client::Error> {
-    for _ in 0..150 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         match Client::connect(addr, options).await {
             Err(e) if e.failure().is_none() => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -186,7 +171,8 @@ fn code(e: &kronosdb_client::Error) -> ErrorCode {
 /// claim yet. Identity failures are never retried.
 async fn append_when_ready(client: &Client) -> Appended {
     let ctx = client.default_context();
-    for _ in 0..100 {
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
         match ctx.append(&[event()], None).await {
             Ok(appended) => return appended,
             Err(e) => {
