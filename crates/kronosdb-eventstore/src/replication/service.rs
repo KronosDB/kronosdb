@@ -1312,17 +1312,13 @@ mod tests {
         engine.shutdown();
     }
 
-    /// Copies a node's files, its index directory included. A rotated
-    /// segment's index files are written in the background as `*.tmp` and
-    /// renamed, which `shutdown` does not wait for: those are skipped, and a
-    /// copy without them rebuilds them at open.
+    /// Copies a node's files, its index directory included. The engine that
+    /// wrote them must be dropped first, which waits for its background
+    /// index writes.
     fn copy_log(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
-            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
-                continue;
-            }
             if entry.file_type().unwrap().is_dir() {
                 copy_log(&entry.path(), &to.join(entry.file_name()));
                 continue;
@@ -1447,38 +1443,35 @@ mod tests {
         Ok(())
     }
 
-    fn assert_converged(leader: &Path, follower: &Path) {
+    /// Drops both engines, which waits for their seals to write the sealed
+    /// segments' index files, then compares the two logs on disk.
+    fn assert_converged(leader: EventStoreEngine, follower: EventStoreEngine, logs: &Logs) {
+        drop(leader);
+        drop(follower);
         assert_eq!(
-            log_bytes(follower),
-            log_bytes(leader),
+            log_bytes(&logs.follower),
+            log_bytes(&logs.leader),
             "the follower is not byte-identical to the leader"
         );
-        assert_indexes_identical(leader, follower);
+        assert_indexes_identical(&logs.leader, &logs.follower);
     }
 
     /// The sealed segments' indexes are byte-identical too: the follower
     /// built its live index from replicated frames, the leader from its own
-    /// appends, and both wrote the same `.idx` and `.keys` at the seal. Seals land in
-    /// the background, so this waits for them.
+    /// appends, and both wrote the same `.idx` and `.keys` at the seal.
     fn assert_indexes_identical(leader: &Path, follower: &Path) {
         let mut bases = segment::list_segment_files(leader).unwrap();
         bases.pop(); // the active segment
         let read = |dir: &Path, base: u64| {
             std::fs::read(segment::segment_path(dir, base).with_extension("idx")).ok()
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         for base in bases {
-            let (ours, theirs) = loop {
-                match (read(leader, base), read(follower, base)) {
-                    (Some(ours), Some(theirs)) => break (ours, theirs),
-                    _ if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    other => panic!(
-                        "segment {base} sealed without an index: {:?}",
-                        (other.0.is_some(), other.1.is_some())
-                    ),
-                }
+            let (Some(ours), Some(theirs)) = (read(leader, base), read(follower, base)) else {
+                panic!(
+                    "segment {base} sealed without an index: leader {}, follower {}",
+                    read(leader, base).is_some(),
+                    read(follower, base).is_some()
+                );
             };
             assert!(
                 ours == theirs,
@@ -1529,7 +1522,7 @@ mod tests {
         assert_eq!(follower.local_tail().0, 6);
         assert_eq!(follower.log_epoch(), 2);
         assert_eq!(follower.epoch_extent(1), EpochExtent::EndsAt(5));
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// The same overlap with an event, not a checkpoint, last in the leader's
@@ -1547,7 +1540,7 @@ mod tests {
         let start = plan_tail_start(&leader, &describe(&follower)).unwrap();
         assert!(matches!(start, TailStart::Truncate { position: 5, .. }));
         follow(&leader, &follower, &start).unwrap();
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// The leader has been through several failovers while the node was away,
@@ -1574,7 +1567,7 @@ mod tests {
         follow(&leader, &follower, &start).unwrap();
         assert_eq!(follower.log_epoch(), 5);
         assert_eq!(follower.local_tail().0, 8);
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// A node that led an epoch whose `EpochChange` never reached the leader
@@ -1603,7 +1596,7 @@ mod tests {
         follow(&leader, &follower, &start).unwrap();
         assert_eq!(follower.epoch_extent(3), EpochExtent::Unknown);
         assert_eq!(follower.log_epoch(), 4);
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// With the same shape but a follower that cannot be cut to its watermark
@@ -1702,7 +1695,7 @@ mod tests {
         assert!(matches!(start, TailStart::Truncate { position: 5, .. }));
         follow(&leader, &follower, &start).unwrap();
         assert_eq!(follower.local_tail().0, 6);
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// The same gap inside one segment: the leader's checkpoint sits between
@@ -1731,7 +1724,7 @@ mod tests {
         assert!(matches!(start, TailStart::Truncate { position: 5, .. }));
         follow(&leader, &follower, &start).unwrap();
         assert_eq!(follower.local_tail().0, 7);
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// Both nodes wrote a checkpoint after event 4, but not the same one: the
@@ -1761,7 +1754,7 @@ mod tests {
         let start = plan_tail_start(&leader, &describe(&follower)).unwrap();
         assert!(matches!(start, TailStart::Truncate { position: 5, .. }));
         follow(&leader, &follower, &start).unwrap();
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// A checkpoint only the follower holds, at the end of the segment its
@@ -1786,7 +1779,7 @@ mod tests {
         assert!(matches!(start, TailStart::Truncate { position: 5, .. }));
         follow(&leader, &follower, &start).unwrap();
         assert_eq!(follower.local_tail().0, 6);
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// The gap must not hide a real difference: with the leader's extra
@@ -1834,7 +1827,7 @@ mod tests {
         let start = plan_tail_start(&leader, &describe(&follower)).unwrap();
         assert_eq!(start, TailStart::ExactCursor);
         follow(&leader, &follower, &start).unwrap();
-        assert_converged(&logs.leader, &logs.follower);
+        assert_converged(leader, follower, &logs);
     }
 
     /// Epoch alignment is for a leader's *past* epochs. A node in the
