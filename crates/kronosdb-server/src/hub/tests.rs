@@ -32,7 +32,7 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with(command_timeout: Duration) -> Fixture {
-    let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let contexts = Arc::new(ContextManager::new(dir.path(), 1 << 20).unwrap());
     let cluster = Arc::new(ClusterManager::new(
         contexts,
