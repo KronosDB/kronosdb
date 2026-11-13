@@ -752,9 +752,9 @@ struct SealQueue {
     /// Bases with a finalize in flight, and whether it was cancelled.
     in_flight: StdMutex<std::collections::BTreeMap<u64, bool>>,
     done: Condvar,
-    /// The seal threads not yet joined. A seal leaves `in_flight` before
-    /// its last file work, so only a joined thread is known to be done
-    /// with the directory.
+    /// The seal threads not yet joined. A seal leaves `in_flight` before it
+    /// installs its key table, unpins its index and finishes its file work,
+    /// so only a joined thread is known to be done with all of it.
     threads: StdMutex<Vec<std::thread::JoinHandle<()>>>,
     dir: PathBuf,
     cache: Arc<IndexCache>,
@@ -885,13 +885,10 @@ impl SealQueue {
         }
     }
 
-    /// Waits until no seal is in flight. Test helper.
+    /// Waits until every seal started so far is applied whole. Test helper.
     #[cfg(test)]
     fn wait_idle(&self) {
-        let mut in_flight = self.in_flight.lock().unwrap();
-        while !in_flight.is_empty() {
-            in_flight = self.done.wait(in_flight).unwrap();
-        }
+        self.join_all();
     }
 
     /// Waits for every seal thread started so far to exit.
