@@ -297,6 +297,7 @@ impl SegmentReplicationService {
         // the snapshot are buffered here; waves wholly covered by catch-up
         // are discarded by their next_position below.
         let live = engine.subscribe_replication();
+        let watermark_changes = engine.watch_watermark();
         let catchup = if exact_cursor {
             engine.replication_catchup_from_cursor(crate::store::ReplicationCursor {
                 position: Position(open.from_position),
@@ -339,7 +340,6 @@ impl SegmentReplicationService {
         // so the byte window can open while the stream is active.
         let consumer = AckConsumer {
             inbound,
-            out: out.clone(),
             window: Arc::clone(&window),
             engine: Arc::clone(&engine),
             control: Arc::clone(&self.control),
@@ -359,6 +359,7 @@ impl SegmentReplicationService {
             claim: session_claim,
             claim_updates,
             live,
+            watermark_changes,
             window,
             max_inflight: self.max_inflight_bytes,
             epoch,
@@ -637,7 +638,6 @@ impl Window {
 /// Reads a follower's TailAcks, advancing the window and the quorum watermark.
 struct AckConsumer {
     inbound: Inbound,
-    out: StreamSender,
     window: Arc<Window>,
     engine: Arc<EventStoreEngine>,
     control: Arc<ReplicationControl>,
@@ -715,20 +715,13 @@ impl AckConsumer {
         if !self.recovery_source {
             self.control
                 .record_progress(&self.context, ack.follower_id, ack.durable_position);
-            if let Some(watermark) = self.engine.acknowledge_replica(
+            // A bump reaches every session through the engine's watermark
+            // watch, this one's Sender included.
+            self.engine.acknowledge_replica(
                 ack.follower_id,
                 ack.epoch,
                 Position(ack.durable_position),
-            ) {
-                let _ = send(
-                    &self.out,
-                    Frame::TailWatermark(p::TailWatermark {
-                        epoch: ack.epoch,
-                        position: watermark.0,
-                    }),
-                )
-                .await;
-            }
+            );
         }
         window.ack_notify.notify_waiters();
         Ok(())
@@ -744,6 +737,9 @@ struct Sender {
     claim: ActiveClaim,
     claim_updates: watch::Receiver<Option<ActiveClaim>>,
     live: broadcast::Receiver<LiveFrame>,
+    /// Wakes when the quorum watermark moves, whichever session's
+    /// acknowledgement moved it.
+    watermark_changes: watch::Receiver<u64>,
     window: Arc<Window>,
     max_inflight: u64,
     epoch: u64,
@@ -844,14 +840,7 @@ impl Sender {
         }
 
         self.check_fence()?;
-        send(
-            &self.out,
-            Frame::TailWatermark(p::TailWatermark {
-                epoch,
-                position: self.engine.head().0,
-            }),
-        )
-        .await?;
+        let mut sent_watermark = self.send_watermark(epoch).await?;
 
         // Live handoff. Frames already covered by the catch-up snapshot
         // are duplicates and are dropped. Partial overlap indicates a
@@ -862,6 +851,22 @@ impl Sender {
                 changed = self.claim_updates.changed() => {
                     if changed.is_err() || !claim_matches(&self.control, self.claim) {
                         return Err(fence_changed());
+                    }
+                    continue;
+                }
+                changed = self.watermark_changes.changed() => {
+                    // The quorum moved, perhaps on another follower's
+                    // acknowledgement: this follower hears of it too.
+                    if changed.is_err() {
+                        return Err(follower_gone());
+                    }
+                    if self.engine.replication_epoch() != self.epoch {
+                        return Err(Error::Unavailable {
+                            message: "source context epoch changed".into(),
+                        });
+                    }
+                    if self.engine.head().0 > sent_watermark {
+                        sent_watermark = self.send_watermark(epoch).await?;
                     }
                     continue;
                 }
@@ -925,14 +930,7 @@ impl Sender {
                         sent_bytes += chunk.data.len() as u64;
                         self.send_records(epoch, chunk, sent_bytes).await?;
                     }
-                    send(
-                        &self.out,
-                        Frame::TailWatermark(p::TailWatermark {
-                            epoch,
-                            position: self.engine.head().0,
-                        }),
-                    )
-                    .await?;
+                    sent_watermark = self.send_watermark(epoch).await?;
                 }
                 Ok(LiveFrame::Reset { epoch: reset_epoch }) => {
                     return Err(Error::Unavailable {
@@ -950,6 +948,18 @@ impl Sender {
                 Err(broadcast::error::RecvError::Closed) => return Err(follower_gone()),
             }
         }
+    }
+
+    /// Tells the follower the watermark as this node has it now, and returns
+    /// what it told.
+    async fn send_watermark(&self, epoch: u64) -> Result<u64, Error> {
+        let position = self.engine.head().0;
+        send(
+            &self.out,
+            Frame::TailWatermark(p::TailWatermark { epoch, position }),
+        )
+        .await?;
+        Ok(position)
     }
 
     async fn wait_for_window(&self, sent: u64, next_len: u64) {
