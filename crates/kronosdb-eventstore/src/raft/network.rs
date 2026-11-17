@@ -5,7 +5,7 @@ use kronosdb_protocol as p;
 use kronosdb_protocol::Frame;
 use kronosdb_protocol::net::OwnedFrame;
 use openraft::BasicNode;
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -69,6 +69,17 @@ where
     RPCError::Network(NetworkError::new(error))
 }
 
+/// A peer that could not be connected to. openraft backs off from an
+/// unreachable peer (500 ms, until an RPC to it succeeds); a plain network
+/// error it does not, so a dead peer would be redialled at once, over and
+/// over, for as long as it stays down.
+fn unreachable<R>(error: &(impl StdError + 'static)) -> RPCError<NodeId, BasicNode, R>
+where
+    R: StdError,
+{
+    RPCError::Unreachable(Unreachable::new(error))
+}
+
 impl NetworkConnection {
     /// Serializes `rpc`, sends it in the frame `wrap` builds, and
     /// deserializes the answer `unwrap` extracts from the reply frame.
@@ -86,11 +97,15 @@ impl NetworkConnection {
         R: StdError,
     {
         let data = bincode::serialize(rpc).map_err(|e| network(&e))?;
-        let reply: OwnedFrame = self
+        let connection = self
             .pool
-            .request(&self.addr, &wrap(&data))
+            .connection(&self.addr)
             .await
-            .map_err(|e| network(&e))?;
+            .map_err(|e| unreachable(&e))?;
+        let reply: OwnedFrame = connection
+            .request(&wrap(&data))
+            .await
+            .map_err(|e| network(&crate::wire::net_error(e)))?;
         let frame = reply.decode().map_err(|e| network(&e))?;
         let data = unwrap(&frame).ok_or_else(|| {
             network(&p::net::NetError::Unexpected {
@@ -152,5 +167,28 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::Vote;
+
+    /// Nothing listens on the peer's address: the vote fails as unreachable,
+    /// which is what makes openraft back off instead of redialling at once.
+    #[tokio::test]
+    async fn a_peer_that_cannot_be_connected_to_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let mut factory = NetworkFactory::new(PeerTransportConfig::default());
+        let mut connection = factory.new_client(2, &BasicNode::new(addr)).await;
+        let request = VoteRequest::new(Vote::new(1, 1), None);
+        let error = connection
+            .vote(request, RPCOption::new(std::time::Duration::from_secs(1)))
+            .await
+            .expect_err("nothing listens there");
+        assert!(matches!(error, RPCError::Unreachable(_)), "{error:?}");
     }
 }
