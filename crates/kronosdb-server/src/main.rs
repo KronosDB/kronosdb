@@ -2,6 +2,7 @@ mod admin;
 mod auth;
 mod config;
 mod hub;
+mod learners;
 mod manifest;
 mod native;
 mod processor;
@@ -236,10 +237,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     cluster.bootstrap().await?;
 
-    for learner in &config.cluster_learners {
-        let _ = cluster.add_learner(learner.id, learner.addr.clone()).await;
-    }
-
     // Create the messaging manager (named buses, independent of event store
     // contexts — ADR-0006), the registries the admin console reads, and the
     // hub that runs commands, queries and the platform over them.
@@ -409,6 +406,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .expect("shared Raft node must be initialized");
 
     let (native_stop, native_stop_rx) = tokio::sync::watch::channel(false);
+    // Every node keeps trying to add the configured learners; only the
+    // leader's attempt can succeed (see `learners`).
+    learners::spawn(
+        Arc::clone(&cluster),
+        config
+            .cluster_learners
+            .iter()
+            .map(|p| PeerConfig {
+                id: p.id,
+                addr: p.addr.clone(),
+            })
+            .collect(),
+        native_stop_rx.clone(),
+    );
     let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let open_connections = Arc::clone(&connections);
     let shutdown_hub = Arc::clone(&hub);
