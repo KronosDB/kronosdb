@@ -75,7 +75,15 @@ async fn run_tail(
     // A connection of its own: a replication frame can be tens of megabytes
     // and must not hold up Raft heartbeats or forwarded appends behind it.
     let connection = config.peers.dedicated(&config.leader_addr).await?;
-    let cursor = engine.replication_cursor()?;
+    // Waits for the group-commit fsync and reads the last record from disk.
+    let cursor = {
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || engine.replication_cursor())
+            .await
+            .map_err(|error| Error::Internal {
+                message: format!("reading the replication cursor: {error}"),
+            })??
+    };
     // A follower says which epoch its log's bytes were written under, not the
     // one it has adopted: the leader aligns the cut of a diverged log to the
     // end of that epoch. A node adopts an epoch before the leader's bytes (and
@@ -152,6 +160,8 @@ async fn run_tail(
     // of the session has to agree on it.
     let mut session_epoch = (!recovery).then_some(config.epoch);
     let mut last_ack_position = 0u64;
+    // The latest bytes this session wrote, which may not be fsynced yet.
+    let mut last_write: Option<ReplicatedWrite> = None;
     let mut check_epoch = |actual: u64| -> Result<u64, Error> {
         let expected = *session_epoch.get_or_insert(actual);
         if actual != expected || actual > config.epoch {
@@ -214,15 +224,17 @@ async fn run_tail(
                         ))
                 {
                     // Fully duplicated catch-up/live overlap, or the end of a
-                    // segment this node holds in the archive. Bytes are
-                    // already durable; acknowledge this session byte cursor.
+                    // segment this node holds in the archive. Nothing is
+                    // written, but `local_tail` is where bytes were written,
+                    // not where they were fsynced: this session may have
+                    // applied some of them a moment ago.
                     last_ack_position = local_tail;
-                    pending_tx.send_replace(Some(PendingAck {
-                        write: None,
-                        epoch: frame_epoch,
-                        position: local_tail,
-                        bytes: records.stream_bytes_end,
-                    }));
+                    pending_tx.send_replace(Some(PendingAck::duplicate(
+                        last_write,
+                        frame_epoch,
+                        local_tail,
+                        records.stream_bytes_end,
+                    )));
                     continue;
                 }
                 if records.first_position != local_tail {
@@ -241,9 +253,10 @@ async fn run_tail(
                     records.data,
                 )?;
                 if write.durable_position.0 != records.next_position {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Internal {
                         message: format!(
-                            "Tail frame declared next position {}, decoded {}",
+                            "Tail frame declared next position {}, but its records decoded to {}; \
+                             the leader's frame is inconsistent, so report it with both nodes' logs",
                             records.next_position, write.durable_position.0
                         ),
                     });
@@ -260,6 +273,7 @@ async fn run_tail(
                     };
                 }
                 last_ack_position = write.durable_position.0;
+                last_write = Some(write);
                 engine.adopt_watermark(
                     apply_epoch(&engine, frame_epoch),
                     Position(leader_watermark.min(engine.local_tail().0)),
@@ -381,8 +395,9 @@ async fn wait_durable(engine: Arc<EventStoreEngine>, write: ReplicatedWrite) -> 
         .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
 }
 
-/// Latest-wins ack handed to the ack task. `write` is None when the acked
-/// range is already durable locally (duplicated catch-up/live overlap).
+/// Latest-wins ack handed to the ack task. `write` is the wave to wait for
+/// before acknowledging; it is None only when every acked byte was fsynced
+/// before this session started.
 #[derive(Clone, Copy)]
 struct PendingAck {
     write: Option<ReplicatedWrite>,
@@ -390,6 +405,27 @@ struct PendingAck {
     epoch: u64,
     position: u64,
     bytes: u64,
+}
+
+impl PendingAck {
+    /// The ack for a frame that needed no writing. It still replaces any
+    /// pending ack for this session's own writes (latest wins), so it carries
+    /// the session's latest write: waves complete in order, so waiting for it
+    /// covers every byte up to `local_tail`. A session that wrote nothing has
+    /// only bytes that were fsynced when it opened.
+    fn duplicate(
+        last_write: Option<ReplicatedWrite>,
+        epoch: u64,
+        local_tail: u64,
+        bytes: u64,
+    ) -> Self {
+        Self {
+            write: last_write,
+            epoch,
+            position: local_tail,
+            bytes,
+        }
+    }
 }
 
 /// Blocks a stopping Tail until the ack task has acknowledged `target`, so
@@ -407,5 +443,96 @@ async fn flush_acks(acked_rx: &mut watch::Receiver<u64>, target: u64) -> Result<
 fn stale_epoch(actual: u64, expected: u64) -> Error {
     Error::Unavailable {
         message: format!("stale Tail epoch {actual}; expected {expected}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::append::AppendRequest;
+    use crate::event::AppendEvent;
+    use crate::store::StoreOptions;
+
+    fn event(name: &str) -> AppendRequest {
+        AppendRequest {
+            condition: None,
+            events: vec![AppendEvent {
+                identifier: format!("id-{name}"),
+                name: name.into(),
+                version: "1.0".into(),
+                timestamp: 1_712_345_678_000,
+                payload: b"payload".to_vec(),
+                metadata: vec![],
+                tags: vec![],
+            }],
+        }
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_duplicate_ack_waits_for_the_write_this_session_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (leader_dir, follower_dir) = (tmp.path().join("leader"), tmp.path().join("follower"));
+        let options = StoreOptions {
+            max_segment_size: 64 * 1024,
+            voters: vec![0],
+            ..Default::default()
+        };
+        // Both nodes share the first event; the leader then writes one more.
+        let leader = EventStoreEngine::create_with_store_options(&leader_dir, &options).unwrap();
+        leader.append(event("first")).unwrap();
+        leader.shutdown();
+        drop(leader);
+        copy_dir(&leader_dir, &follower_dir);
+        let leader = EventStoreEngine::open_with_store_options(&leader_dir, &options).unwrap();
+        leader.append(event("second")).unwrap();
+        let follower = EventStoreEngine::open_with_store_options(&follower_dir, &options).unwrap();
+
+        let cursor = follower.replication_cursor().unwrap();
+        let slice = leader
+            .replication_catchup_from_cursor(cursor)
+            .unwrap()
+            .1
+            .into_iter()
+            .next()
+            .unwrap();
+        let bytes = std::fs::read(&slice.path).unwrap()
+            [slice.byte_start as usize..slice.byte_end as usize]
+            .to_vec();
+        let epoch = leader.replication_epoch();
+        if follower.replication_epoch() < epoch {
+            follower.begin_replication_epoch(epoch, [0]).unwrap();
+        }
+        let write = follower
+            .apply_replicated_records(
+                epoch,
+                slice.segment_base,
+                Position(slice.first_position),
+                &bytes,
+            )
+            .unwrap();
+
+        // The session applied a frame; a duplicate frame then replaces its
+        // pending ack. The new one must still wait for that write.
+        let ack = PendingAck::duplicate(Some(write), epoch, follower.local_tail().0, 7);
+        let waits_for = ack
+            .write
+            .expect("a duplicate ack must wait for the session's write");
+        assert_eq!(waits_for.wave, write.wave);
+        assert_eq!(ack.position, write.durable_position.0);
+
+        // A session that wrote nothing has nothing to wait for.
+        assert!(PendingAck::duplicate(None, epoch, 0, 0).write.is_none());
     }
 }

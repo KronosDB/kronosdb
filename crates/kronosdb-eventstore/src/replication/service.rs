@@ -64,7 +64,16 @@ impl SegmentReplicationService {
             let engine = self.contexts.get_context(name)?;
             let context_epoch = engine.replication_epoch();
             epoch = Some(epoch.map_or(context_epoch, |current| current.min(context_epoch)));
-            let physical = engine.replication_cursor()?;
+            // The cursor waits for the group-commit fsync and reads the last
+            // record from disk: not on a runtime worker.
+            let physical = {
+                let engine = Arc::clone(&engine);
+                tokio::task::spawn_blocking(move || engine.replication_cursor())
+                    .await
+                    .map_err(|error| Error::Internal {
+                        message: format!("reading the replication cursor: {error}"),
+                    })??
+            };
             cursors.push(p::ContextCursor {
                 context: name,
                 durable_position: physical.position.0,

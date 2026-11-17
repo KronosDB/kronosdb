@@ -125,8 +125,52 @@ impl ServerHandle {
     /// SIGSTOP the child: the process freezes mid-flight without dying. Its
     /// sockets stay bound but nothing answers — the closest a process-level
     /// harness gets to a "stale leader that doesn't know it was deposed".
+    ///
+    /// Returns once the whole process has stopped, not when the signal was
+    /// sent. On Linux, `kill` only queues SIGSTOP: one thread takes it and
+    /// stops the others, and until that thread gets a CPU the rest keep
+    /// running. On a loaded machine that is long enough for a "frozen"
+    /// follower to receive, write and acknowledge an append sent after
+    /// `pause` returned, so a leader cut off this way could still reach a
+    /// quorum. The parent is told only when every thread has stopped.
+    ///
+    /// Pausing a child that is already paused waits for a stop that was
+    /// already reported, and fails at the deadline.
     pub fn pause(&self) {
-        signal_child(self.child.id(), "STOP");
+        let pid = self.child.id() as libc::pid_t;
+        // SAFETY: plain syscalls on our own child's pid, which stays ours
+        // until it is reaped; `status` is a valid out-pointer.
+        unsafe {
+            assert_eq!(
+                libc::kill(pid, libc::SIGSTOP),
+                0,
+                "SIGSTOP {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut status = 0;
+            let reaped =
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            assert!(
+                reaped >= 0,
+                "waiting for {pid} to stop: {}",
+                std::io::Error::last_os_error()
+            );
+            if reaped == pid {
+                assert!(
+                    libc::WIFSTOPPED(status),
+                    "{pid} exited instead of stopping (wait status {status:#x})"
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{pid} has not stopped 10s after SIGSTOP"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// SIGCONT a paused child. It resumes exactly where it froze, with its

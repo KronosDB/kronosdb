@@ -584,14 +584,24 @@ impl ClusterManager {
 
         for context in &contexts {
             let engine = self.context_manager.get_context(context)?;
-            engine.drain_pending()?;
+            // Waits for the group-commit fsync: not on a runtime worker.
+            {
+                let engine = Arc::clone(&engine);
+                tokio::task::spawn_blocking(move || engine.drain_pending())
+                    .await
+                    .map_err(|error| Error::Internal {
+                        message: format!("draining pending writes before the claim: {error}"),
+                    })??;
+            }
             let engine_epoch = engine.replication_epoch();
             if engine_epoch < prior_epoch {
                 engine.begin_replication_epoch(prior_epoch, voter_ids.clone())?;
             } else if engine_epoch > resumed_epoch.unwrap_or(prior_epoch) {
-                return Err(Error::Corrupted {
+                return Err(Error::Unavailable {
                     message: format!(
-                        "context {context} recovered epoch {engine_epoch} beyond active claim {}",
+                        "context {context} recovered epoch {engine_epoch}, beyond this claim's \
+                         epoch {}; a newer leader has existed, so this node claims again once \
+                         it has caught up with the metadata group",
                         resumed_epoch.unwrap_or(prior_epoch)
                     ),
                 });
@@ -709,14 +719,27 @@ impl ClusterManager {
             let engine = self.context_manager.get_context(context)?;
             match engine.replication_epoch().cmp(&epoch) {
                 std::cmp::Ordering::Less => {
-                    engine.begin_replication_epoch(epoch, voter_ids.clone())?;
-                    engine.persist_epoch_change(epoch, self.cluster_config.node_id)?;
+                    // Persisting the EpochChange rotates the segment and waits
+                    // for the group-commit fsync: not on a runtime worker.
+                    let engine = Arc::clone(&engine);
+                    let voters = voter_ids.clone();
+                    let node_id = self.cluster_config.node_id;
+                    tokio::task::spawn_blocking(move || {
+                        engine.begin_replication_epoch(epoch, voters)?;
+                        engine.persist_epoch_change(epoch, node_id)
+                    })
+                    .await
+                    .map_err(|error| Error::Internal {
+                        message: format!("persisting the EpochChange record: {error}"),
+                    })??;
                 }
                 std::cmp::Ordering::Equal => {}
                 std::cmp::Ordering::Greater => {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Unavailable {
                         message: format!(
-                            "context {context} epoch {} exceeds active claim {epoch}",
+                            "context {context} is at epoch {}, beyond this claim's epoch \
+                             {epoch}; a newer leader has existed, so this node claims again \
+                             once it has caught up with the metadata group",
                             engine.replication_epoch()
                         ),
                     });
@@ -885,9 +908,11 @@ impl ClusterManager {
             return Ok(engine.durable_tail().0);
         }
         if engine.replication_epoch() != prior_epoch {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "context {context} is at epoch {}, expected {prior_epoch} or {claim_epoch}",
+                    "context {context} is at epoch {}, but reconciling this claim expects \
+                     {prior_epoch} (before) or {claim_epoch} (already adopted); the epoch \
+                     changed under the claim, so it is abandoned and retried",
                     engine.replication_epoch()
                 ),
             });

@@ -240,8 +240,10 @@ fn parse_flag(value: &str) -> Result<bool, String> {
     }
 }
 
-/// TOML config file structure.
+/// TOML config file structure. Every table refuses keys it does not know, so
+/// a misspelled or misplaced key stops the server instead of being ignored.
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     listen: Option<String>,
     #[serde(rename = "data-dir")]
@@ -274,6 +276,7 @@ struct ConfigFile {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct StorageConfig {
     #[serde(rename = "segment-size")]
     segment_size: Option<u64>,
@@ -294,6 +297,7 @@ struct StorageConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct ArchiveFileConfig {
     url: Option<String>,
     #[serde(rename = "interval-secs")]
@@ -303,6 +307,7 @@ struct ArchiveFileConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct TimeoutConfig {
     #[serde(rename = "command")]
     command_timeout: Option<u64>,
@@ -315,6 +320,7 @@ struct TimeoutConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct MessagingFileConfig {
     /// When a command's target handler is out of flow-control permits,
     /// wait (bounded by the command timeout) for a grant instead of
@@ -324,6 +330,7 @@ struct MessagingFileConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct AdminConfig {
     listen: Option<String>,
     #[serde(default)]
@@ -333,6 +340,7 @@ struct AdminConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct AdminAuthFile {
     /// "none" (default), "token", or "oidc".
     mode: Option<String>,
@@ -340,6 +348,7 @@ struct AdminAuthFile {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct OidcFile {
     issuer: Option<String>,
     #[serde(rename = "client-id")]
@@ -411,6 +420,7 @@ pub struct OidcConfig {
 }
 
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 struct SecurityConfig {
     #[serde(rename = "access-token")]
     access_token: Option<String>,
@@ -510,15 +520,13 @@ impl ServerConfig {
         let mut file_config = if let Some(ref path) = cli.config {
             let contents = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read config file '{}': {e}", path.display()))?;
-            toml::from_str::<ConfigFile>(&contents)
-                .map_err(|e| format!("failed to parse config file '{}': {e}", path.display()))?
+            parse_config_file(&contents, &path.display().to_string())?
         } else {
             // Try default location. A malformed file is an error, not a
             // silent fallback to defaults — a typo'd config must not boot
             // the server with settings the operator didn't choose.
             if let Ok(contents) = std::fs::read_to_string("kronosdb.toml") {
-                toml::from_str::<ConfigFile>(&contents)
-                    .map_err(|e| format!("failed to parse config file 'kronosdb.toml': {e}"))?
+                parse_config_file(&contents, "kronosdb.toml")?
             } else {
                 ConfigFile::default()
             }
@@ -764,6 +772,50 @@ fn check_archive(
 }
 
 pub use kronosdb_eventstore::remote::redact_url;
+
+/// Parses the TOML config file. An unknown key is reported with the table it
+/// sits in and its line, and says what to do about it; any other error keeps
+/// toml's own message, which carries the offending line.
+fn parse_config_file(contents: &str, name: &str) -> Result<ConfigFile, String> {
+    toml::from_str::<ConfigFile>(contents).map_err(|e| {
+        let message = e.message();
+        let Some(rest) = message.strip_prefix("unknown field `") else {
+            return format!("failed to parse config file '{name}': {e}");
+        };
+        let key = rest.split('`').next().unwrap_or(rest);
+        let (table, line) = match e.span() {
+            Some(span) => {
+                let before = &contents[..span.start.min(contents.len())];
+                let table = before
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| l.starts_with('['))
+                    .map(|l| {
+                        let header = l.split('#').next().unwrap_or(l).trim_end();
+                        format!("table {header}")
+                    })
+                    .unwrap_or_else(|| "the top level".to_string());
+                (table, Some(before.matches('\n').count() + 1))
+            }
+            None => ("the top level".to_string(), None),
+        };
+        let at = line.map(|l| format!(" (line {l})")).unwrap_or_default();
+        let expected = message
+            .split_once(", expected ")
+            .map(|(_, list)| {
+                format!(
+                    " Keys accepted there: {}.",
+                    list.trim_start_matches("one of ")
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "config file '{name}' has an unknown key `{key}` in {table}{at}. \
+             Fix its spelling or move it to the table it belongs to, or remove it.{expected}"
+        )
+    })
+}
 
 /// Resolves admin auth from CLI/env (priority) and the TOML file.
 fn resolve_admin_auth(
@@ -1045,5 +1097,155 @@ tls-ca = "/etc/kronosdb/ca.pem"
         let file: ConfigFile =
             toml::from_str("dev = false\n[storage]\nack-mode = \"auto\"").unwrap();
         assert_eq!(file.dev, Some(false));
+    }
+
+    const EXAMPLE_CONFIG: &str = r#"
+listen = "0.0.0.0:50051"
+data-dir = "data"
+node-name = "kronosdb-0"
+manifest = "kronosdb-manifest.toml"
+replication-inflight-bytes = 67108864
+dev = false
+
+[storage]
+segment-size = 268435456
+index-merge-rate = 67108864
+read-path = "blocks"
+block-cache-bytes = 1048576
+block-size = 65536
+readahead-blocks = 4
+ack-mode = "auto"
+max-snapshot-size = 4194304
+
+[archive]
+url = "file:///backups/kronosdb"
+interval-secs = 30
+max-local-bytes = 1073741824
+
+[timeouts]
+command = 30
+query = 30
+heartbeat-interval = 10
+heartbeat-timeout = 15
+
+[messaging]
+permit-wait = true
+
+[admin]
+listen = "127.0.0.1:9240"
+
+[admin.auth]
+mode = "token"
+token = "admin-secret"
+
+[admin.oidc]
+issuer = "https://idp.example.com/realms/admin"
+client-id = "kronosdb"
+client-secret = "s"
+redirect-url = "https://kronos.example.com/auth/callback"
+scopes = ["openid"]
+role-claim = "realm_access.roles"
+required-role = "admin"
+audience = "kronosdb"
+cookie-secret = "c"
+session-ttl-minutes = 60
+
+[security]
+access-token = "my-secret"
+tls-cert = "/path/to/cert.pem"
+tls-key = "/path/to/key.pem"
+tls-ca = "/path/to/ca.pem"
+tls-client-auth = "optional"
+
+[[security.tokens]]
+name = "ci"
+token-file = "/var/run/secrets/kronosdb/ci"
+roles = ["write"]
+contexts = ["orders-*"]
+
+[[security.issuers]]
+name = "gke"
+issuer = "https://container.googleapis.com/v1/projects/p/locations/l/clusters/c"
+audiences = ["kronosdb"]
+
+[[security.grants]]
+source = "gke"
+subject = "system:serviceaccount:prod:*"
+claims = {}
+roles = ["write"]
+"#;
+
+    #[test]
+    fn the_documented_example_config_loads() {
+        let config = parse_config_file(EXAMPLE_CONFIG, "kronosdb.toml").unwrap();
+        assert_eq!(config.storage.ack_mode.as_deref(), Some("auto"));
+        assert_eq!(config.archive.interval_secs, Some(30));
+        assert_eq!(config.security.tokens.len(), 1);
+        assert_eq!(config.security.issuers.len(), 1);
+        assert_eq!(config.security.grants.len(), 1);
+        assert_eq!(config.admin.oidc.session_ttl_minutes, Some(60));
+    }
+
+    #[test]
+    fn an_unknown_top_level_key_is_refused_by_name() {
+        // `ack-mode` belongs under [storage]; at the top level it did nothing.
+        let err = parse_config_file("ack-mode = \"durable\"\n", "my.toml").unwrap_err();
+        assert!(err.contains("`ack-mode`"), "{err}");
+        assert!(err.contains("my.toml"), "{err}");
+        assert!(err.contains("top level"), "{err}");
+        assert!(err.contains("remove it"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_nested_table_names_the_table() {
+        let err = parse_config_file("[storage]\nack_mode = \"durable\"\n", "my.toml").unwrap_err();
+        assert!(err.contains("`ack_mode`"), "{err}");
+        assert!(err.contains("[storage]"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+
+        let err = parse_config_file(
+            "[admin]\nlisten = \"x\"\n[admin.auth]\nmod = \"token\"\n",
+            "my.toml",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("`mod`") && err.contains("[admin.auth]"),
+            "{err}"
+        );
+
+        let err = parse_config_file(
+            "[[security.tokens]]\nname = \"a\"\nroles = []\ntoken_file = \"f\"\n",
+            "my.toml",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("`token_file`") && err.contains("[[security.tokens]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_file_table_refuses_unknown_keys() {
+        for table in [
+            "storage",
+            "archive",
+            "timeouts",
+            "messaging",
+            "admin",
+            "admin.auth",
+            "admin.oidc",
+            "security",
+        ] {
+            let err = parse_config_file(&format!("[{table}]\nbogus = 1\n"), "f").unwrap_err();
+            assert!(
+                err.contains("`bogus`") && err.contains(&format!("[{table}]")),
+                "{err}"
+            );
+        }
+        for table in ["tokens", "issuers", "grants"] {
+            let err =
+                parse_config_file(&format!("[[security.{table}]]\nbogus = 1\n"), "f").unwrap_err();
+            assert!(err.contains("`bogus`"), "{table}: {err}");
+        }
     }
 }

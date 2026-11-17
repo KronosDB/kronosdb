@@ -474,17 +474,20 @@ impl SegmentWriter {
         self.check_writable()?;
         self.flush_deferred()?;
         if first_position != self.next_position {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "replicated frame starts at position {}, local tail is {}",
+                    "replicated frame starts at position {}, but the local tail is {}; the \
+                     Tail session restarts and re-plans from the local tail",
                     first_position.0, self.next_position.0
                 ),
             });
         }
         if self.write_offset + bytes.len() as u64 > self.max_segment_size {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "replicated frame exceeds active segment {} without Rotate",
+                    "replicated frame would run past the end of active segment {} and no \
+                     Rotate came first; the Tail session restarts and re-plans from the \
+                     local tail",
                     self.active_base_position
                 ),
             });
@@ -614,9 +617,10 @@ impl SegmentWriter {
     /// segment is created. `new_base` must equal the follower's local tail.
     pub fn rotate_replicated(&mut self, new_base: Position) -> Result<(), Error> {
         if new_base != self.next_position {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "replicated Rotate base {}, local tail is {}",
+                    "replicated Rotate to base {}, but the local tail is {}; the Tail \
+                     session restarts and re-plans from the local tail",
                     new_base.0, self.next_position.0
                 ),
             });
