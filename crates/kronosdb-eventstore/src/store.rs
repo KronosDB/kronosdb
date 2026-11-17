@@ -615,6 +615,10 @@ struct SyncState {
     /// from what actually reached disk.
     failed: AtomicBool,
     failure_msg: StdMutex<Option<String>>,
+    /// Test fault point: the sync thread panics at the start of its next
+    /// wave when this is set.
+    #[cfg(test)]
+    panic_next_wave: AtomicBool,
 }
 
 impl SyncState {
@@ -629,6 +633,8 @@ impl SyncState {
             wake_cv: Condvar::new(),
             failed: AtomicBool::new(false),
             failure_msg: StdMutex::new(None),
+            #[cfg(test)]
+            panic_next_wave: AtomicBool::new(false),
         }
     }
 
@@ -707,14 +713,27 @@ impl SyncState {
         self.synced.notify_all();
     }
 
-    /// Poisons the engine after an fsync failure and wakes every waiter so
-    /// they observe the failure instead of blocking forever.
+    /// Poisons the engine after a group-commit failure (an fsync, or the
+    /// sync thread dying) and wakes every waiter so they observe the failure
+    /// instead of blocking forever.
     fn fail_sync(&self, err: &Error) {
-        *self.failure_msg.lock().unwrap() = Some(err.to_string());
+        self.fail_sync_with(err.to_string());
+    }
+
+    fn fail_sync_with(&self, message: String) {
+        // The thread may be unwinding from a panic that struck while it held
+        // one of these locks: poisoning must still go through.
+        *self
+            .failure_msg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
         self.failed.store(true, Ordering::Release);
         // Grab the completed lock so the store/notify pair cannot interleave
         // between a waiter's predicate check and its wait().
-        let _completed = self.completed.lock().unwrap();
+        let _completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.synced.notify_all();
     }
 
@@ -728,9 +747,9 @@ impl SyncState {
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| "unknown fsync failure".to_string());
+            .unwrap_or_else(|| "unknown group-commit failure".to_string());
         Error::Io(io::Error::other(format!(
-            "event store poisoned by fsync failure (writes are NOT durable): {msg}; restart required"
+            "event store poisoned by a group-commit failure (writes are NOT durable): {msg}; restart required"
         )))
     }
 
@@ -760,6 +779,9 @@ struct SealQueue {
     cache: Arc<IndexCache>,
     segments: Arc<RwLock<SegmentList>>,
     merge: Arc<MergeContext>,
+    /// Test fault point: the next seal finished panics.
+    #[cfg(test)]
+    panic_next_finish: AtomicBool,
 }
 
 impl SealQueue {
@@ -777,6 +799,8 @@ impl SealQueue {
             cache: Arc::clone(cache),
             segments: Arc::clone(segments),
             merge: Arc::clone(merge),
+            #[cfg(test)]
+            panic_next_finish: AtomicBool::new(false),
         }
     }
 
@@ -795,7 +819,27 @@ impl SealQueue {
             .name("kronosdb-seal".into())
             .spawn(move || {
                 for seal in seals {
-                    queue.finish(seal);
+                    let base = seal.base;
+                    // A panic must still release the seal's in-flight entry:
+                    // `cancel_from` (truncation, reopen) waits on it forever.
+                    // The segment stays readable through its pinned index and
+                    // the next open rebuilds the files, as for a write error.
+                    let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        queue.finish(seal)
+                    }));
+                    if finished.is_err() {
+                        tracing::error!(
+                            base,
+                            "the seal thread panicked while finishing a segment; \
+                             its index files will be rebuilt at the next open"
+                        );
+                        queue
+                            .in_flight
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&base);
+                        queue.done.notify_all();
+                    }
                 }
             });
         match spawned {
@@ -813,6 +857,10 @@ impl SealQueue {
     }
 
     fn finish(&self, seal: PendingSeal) {
+        #[cfg(test)]
+        if self.panic_next_finish.swap(false, Ordering::AcqRel) {
+            panic!("injected seal thread panic");
+        }
         let path = segment::segment_path(&self.dir, seal.base);
         let written = seal
             .index
@@ -917,6 +965,9 @@ fn spawn_sync_thread(
     std::thread::Builder::new()
         .name("kronosdb-sync".into())
         .spawn(move || {
+          // This thread alone completes commit waves: if it dies without
+          // poisoning, every waiter on a wave or the watermark blocks forever.
+          let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Cursor delimiting the start of the next wave's raw byte range.
             // Existing bytes on open are not live-republished; a Tail session
             // catches them up from its durable position before subscribing.
@@ -947,12 +998,16 @@ fn spawn_sync_thread(
                 // marked pending before shutdown still get their fsync (and
                 // their wakeup) instead of hanging on a dead thread.
                 let shutting_down = sync_state.shutdown.load(Ordering::Relaxed);
+                #[cfg(test)]
+                if sync_state.has_pending() && sync_state.panic_next_wave.swap(false, Ordering::AcqRel) {
+                    panic!("injected sync thread panic");
+                }
                 if sync_state.has_pending() {
                     // Barrier: take the writer lock only long enough to seal
                     // the wave, snapshot its raw byte ranges and covered tail,
                     // and clone the active file handle. Dispatch and fsync
                     // proceed independently after the lock is released.
-                    let sealed: Result<_, Error> = (|| {
+                    let sealed: Result<_, SyncFailure> = (|| {
                         let mut w = writer.lock();
                         let wave = sync_state.seal_wave();
                         let durable = local_tail.load(Ordering::Acquire);
@@ -976,7 +1031,8 @@ fn spawn_sync_thread(
                                 current_offset,
                                 durable,
                                 &taken_seals,
-                            )?
+                            )
+                            .map_err(|e| SyncFailure::new("reading segment metadata for the wave", e))?
                         } else {
                             WaveDescriptor {
                                 wave_id: wave,
@@ -995,7 +1051,9 @@ fn spawn_sync_thread(
                         wave_offset = current_offset;
                         wave_position = durable;
 
-                        let file = w.active_file_handle()?;
+                        let file = w
+                            .active_file_handle()
+                            .map_err(|e| SyncFailure::new("cloning the active segment's file handle", e))?;
                         Ok((wave, durable, descriptor, file, taken_seals))
                     })();
                     let result =
@@ -1023,12 +1081,15 @@ fn spawn_sync_thread(
                             // records and the new file's directory entry must
                             // be durable before the wave's writers are released.
                             for seal in &taken_seals {
-                                sync_file(&seal.file)?;
+                                sync_file(&seal.file)
+                                    .map_err(|e| SyncFailure::new("fdatasync of a rotated segment", e))?;
                             }
                             if !taken_seals.is_empty() {
-                                sync_dir(&dir)?;
+                                sync_dir(&dir)
+                                    .map_err(|e| SyncFailure::new("fsync of the data directory", Error::Io(e)))?;
                             }
-                            sync_file(&file)?;
+                            sync_file(&file)
+                                .map_err(|e| SyncFailure::new("fdatasync of the active segment", e))?;
                             Ok((wave, durable, taken_seals))
                         });
                     match result {
@@ -1049,14 +1110,21 @@ fn spawn_sync_thread(
                                 feed.committed();
                             }
                         }
-                        Err(e) => {
+                        Err(failure) => {
+                            // The wave is already sealed and its rotated
+                            // segments taken, so it can be neither retried
+                            // nor skipped: whatever failed, its writers can
+                            // never be told they are durable.
                             tracing::error!(
-                                error = %e,
-                                "group-commit fsync FAILED — poisoning event store; \
-                                 pending writes are not durable and new appends will be rejected"
+                                step = failure.step,
+                                error = %failure.error,
+                                "group-commit failed ({}) — poisoning event store; \
+                                 pending writes are not durable and new appends will be rejected",
+                                failure.step
                             );
-                            sync_state.fail_sync(&e);
-                            watermark.abort_all(&e.to_string());
+                            let message = failure.to_string();
+                            sync_state.fail_sync_with(message.clone());
+                            watermark.abort_all(&message);
                             return;
                         }
                     }
@@ -1065,8 +1133,43 @@ fn spawn_sync_thread(
                     return;
                 }
             }
+          }));
+          if let Err(payload) = outcome {
+              let panic = payload
+                  .downcast_ref::<&str>()
+                  .map(|m| (*m).to_string())
+                  .or_else(|| payload.downcast_ref::<String>().cloned())
+                  .unwrap_or_else(|| "non-string panic payload".to_string());
+              tracing::error!(
+                  %panic,
+                  "group-commit thread panicked — poisoning event store; \
+                   pending writes are not durable and new appends will be rejected"
+              );
+              let message = format!("the group-commit thread panicked: {panic}");
+              sync_state.fail_sync_with(message.clone());
+              watermark.abort_all(&message);
+          }
         })
         .expect("spawn sync thread")
+}
+
+/// A failure of one step of a group-commit wave, for the log and the poison
+/// message.
+struct SyncFailure {
+    step: &'static str,
+    error: Error,
+}
+
+impl SyncFailure {
+    fn new(step: &'static str, error: Error) -> Self {
+        Self { step, error }
+    }
+}
+
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: {}", self.step, self.error)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6778,11 +6881,92 @@ mod tests {
 
         let result = waiter.join().unwrap();
         let err = result.expect_err("waiter must NOT be told the write is durable");
-        assert!(err.to_string().contains("fsync failure"), "got: {err}");
+        assert!(
+            err.to_string().contains("group-commit failure"),
+            "got: {err}"
+        );
 
         // Poisoned: subsequent waits fail immediately too.
         assert!(state.is_failed());
         assert!(state.wait_for_sync(state.mark_pending()).is_err());
+    }
+
+    /// Runs `work` on a thread and fails the test if it has not finished in
+    /// time, so a regression that hangs is reported instead of stalling.
+    fn finishes_within<T: Send + 'static>(
+        what: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("{what} hung"))
+    }
+
+    /// A panic on the sync thread must poison the store like a failed fsync:
+    /// the append waiting on the dead thread's wave gets an error, later
+    /// appends fail fast, and dropping the engine still joins cleanly.
+    #[test]
+    fn sync_thread_panic_poisons_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(small_engine(dir.path()));
+        engine
+            .append(plain(vec![make_event("Ok", vec![])]))
+            .expect("a healthy store acks");
+
+        engine
+            .sync_state
+            .panic_next_wave
+            .store(true, Ordering::Release);
+        let doomed = Arc::clone(&engine);
+        let result = finishes_within("an append across a sync thread panic", move || {
+            doomed.append(plain(vec![make_event("Doomed", vec![])]))
+        });
+        let err = result
+            .err()
+            .expect("a write the dead thread never synced must not ack");
+        assert!(
+            err.to_string().contains("group-commit thread panicked"),
+            "got: {err}"
+        );
+
+        // Every other kind of waiter is released too, now and later.
+        assert!(engine.sync_state.is_failed());
+        assert!(engine.watermark.is_poisoned());
+        assert!(engine.sync_state.wait_for_sync(u64::MAX).is_err());
+        let late = Arc::clone(&engine);
+        let refused = finishes_within("an append after the panic", move || {
+            late.append(plain(vec![make_event("Late", vec![])]))
+        });
+        assert!(refused.is_err(), "a poisoned store must not ack");
+
+        // Shutdown and drop join the finished thread.
+        engine.shutdown();
+        finishes_within("dropping a poisoned engine", move || drop(engine));
+    }
+
+    /// A seal thread that panics must still release its in-flight entry, or
+    /// `cancel_from` (truncation, reopen) waits for it forever.
+    #[test]
+    fn seal_thread_panic_does_not_wedge_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = rotating_engine(dir.path());
+        engine
+            .seals
+            .panic_next_finish
+            .store(true, Ordering::Release);
+        for i in 0..40u8 {
+            let mut event = make_event("Fill", vec![]);
+            event.payload = vec![i; 300];
+            engine.append(plain(vec![event])).unwrap();
+        }
+        engine.seals.wait_idle();
+        let queue = Arc::clone(&engine);
+        finishes_within("cancelling seals after a seal thread panic", move || {
+            queue.seals.cancel_from(0)
+        });
     }
 
     /// The happy path is unchanged: complete_sync releases waiters with Ok.
