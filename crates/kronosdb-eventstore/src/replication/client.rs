@@ -75,7 +75,15 @@ async fn run_tail(
     // A connection of its own: a replication frame can be tens of megabytes
     // and must not hold up Raft heartbeats or forwarded appends behind it.
     let connection = config.peers.dedicated(&config.leader_addr).await?;
-    let cursor = engine.replication_cursor()?;
+    // Waits for the group-commit fsync and reads the last record from disk.
+    let cursor = {
+        let engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || engine.replication_cursor())
+            .await
+            .map_err(|error| Error::Internal {
+                message: format!("reading the replication cursor: {error}"),
+            })??
+    };
     // A follower says which epoch its log's bytes were written under, not the
     // one it has adopted: the leader aligns the cut of a diverged log to the
     // end of that epoch. A node adopts an epoch before the leader's bytes (and

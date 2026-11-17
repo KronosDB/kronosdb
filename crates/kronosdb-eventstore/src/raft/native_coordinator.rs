@@ -584,7 +584,15 @@ impl ClusterManager {
 
         for context in &contexts {
             let engine = self.context_manager.get_context(context)?;
-            engine.drain_pending()?;
+            // Waits for the group-commit fsync: not on a runtime worker.
+            {
+                let engine = Arc::clone(&engine);
+                tokio::task::spawn_blocking(move || engine.drain_pending())
+                    .await
+                    .map_err(|error| Error::Internal {
+                        message: format!("draining pending writes before the claim: {error}"),
+                    })??;
+            }
             let engine_epoch = engine.replication_epoch();
             if engine_epoch < prior_epoch {
                 engine.begin_replication_epoch(prior_epoch, voter_ids.clone())?;
@@ -711,8 +719,19 @@ impl ClusterManager {
             let engine = self.context_manager.get_context(context)?;
             match engine.replication_epoch().cmp(&epoch) {
                 std::cmp::Ordering::Less => {
-                    engine.begin_replication_epoch(epoch, voter_ids.clone())?;
-                    engine.persist_epoch_change(epoch, self.cluster_config.node_id)?;
+                    // Persisting the EpochChange rotates the segment and waits
+                    // for the group-commit fsync: not on a runtime worker.
+                    let engine = Arc::clone(&engine);
+                    let voters = voter_ids.clone();
+                    let node_id = self.cluster_config.node_id;
+                    tokio::task::spawn_blocking(move || {
+                        engine.begin_replication_epoch(epoch, voters)?;
+                        engine.persist_epoch_change(epoch, node_id)
+                    })
+                    .await
+                    .map_err(|error| Error::Internal {
+                        message: format!("persisting the EpochChange record: {error}"),
+                    })??;
                 }
                 std::cmp::Ordering::Equal => {}
                 std::cmp::Ordering::Greater => {
