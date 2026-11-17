@@ -589,9 +589,11 @@ impl ClusterManager {
             if engine_epoch < prior_epoch {
                 engine.begin_replication_epoch(prior_epoch, voter_ids.clone())?;
             } else if engine_epoch > resumed_epoch.unwrap_or(prior_epoch) {
-                return Err(Error::Corrupted {
+                return Err(Error::Unavailable {
                     message: format!(
-                        "context {context} recovered epoch {engine_epoch} beyond active claim {}",
+                        "context {context} recovered epoch {engine_epoch}, beyond this claim's \
+                         epoch {}; a newer leader has existed, so this node claims again once \
+                         it has caught up with the metadata group",
                         resumed_epoch.unwrap_or(prior_epoch)
                     ),
                 });
@@ -714,9 +716,11 @@ impl ClusterManager {
                 }
                 std::cmp::Ordering::Equal => {}
                 std::cmp::Ordering::Greater => {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Unavailable {
                         message: format!(
-                            "context {context} epoch {} exceeds active claim {epoch}",
+                            "context {context} is at epoch {}, beyond this claim's epoch \
+                             {epoch}; a newer leader has existed, so this node claims again \
+                             once it has caught up with the metadata group",
                             engine.replication_epoch()
                         ),
                     });
@@ -885,9 +889,11 @@ impl ClusterManager {
             return Ok(engine.durable_tail().0);
         }
         if engine.replication_epoch() != prior_epoch {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "context {context} is at epoch {}, expected {prior_epoch} or {claim_epoch}",
+                    "context {context} is at epoch {}, but reconciling this claim expects \
+                     {prior_epoch} (before) or {claim_epoch} (already adopted); the epoch \
+                     changed under the claim, so it is abandoned and retried",
                     engine.replication_epoch()
                 ),
             });

@@ -240,9 +240,10 @@ async fn run_tail(
                     records.data,
                 )?;
                 if write.durable_position.0 != records.next_position {
-                    return Err(Error::Corrupted {
+                    return Err(Error::Internal {
                         message: format!(
-                            "Tail frame declared next position {}, decoded {}",
+                            "Tail frame declared next position {}, but its records decoded to {}; \
+                             the leader's frame is inconsistent, so report it with both nodes' logs",
                             records.next_position, write.durable_position.0
                         ),
                     });

@@ -2241,9 +2241,11 @@ impl EventStoreEngine {
         let writer = self.writer.lock();
         let local_tail = self.local_tail.load(Ordering::Acquire);
         if cursor.position.0 > local_tail {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "replication cursor {} is beyond local tail {local_tail}",
+                    "replication cursor {} is beyond local tail {local_tail}; the follower's \
+                     position should have been planned (cut back or sent a snapshot) before \
+                     serving it",
                     cursor.position.0
                 ),
             });
@@ -2317,9 +2319,10 @@ impl EventStoreEngine {
         let writer = self.writer.lock();
         let local_tail = self.local_tail.load(Ordering::Acquire);
         if from.0 > local_tail {
-            return Err(Error::Corrupted {
+            return Err(Error::Internal {
                 message: format!(
-                    "replication cursor {} is beyond local tail {}",
+                    "replication cursor {} is beyond local tail {}; the follower's position \
+                     should have been planned (cut back or sent a snapshot) before serving it",
                     from.0, local_tail
                 ),
             });
@@ -2410,9 +2413,12 @@ impl EventStoreEngine {
         let (result, wave) = {
             let mut writer = self.writer.lock();
             if writer.active_base_position() != segment_base {
-                return Err(Error::Corrupted {
+                return Err(Error::Internal {
                     message: format!(
-                        "replication frame targets segment {segment_base}, active segment is {}",
+                        "replication frame targets segment {segment_base}, but the active \
+                         segment is {}; the leader sent records without the Rotate that moves \
+                         this node there, so the Tail session restarts and re-plans from this \
+                         node's tail",
                         writer.active_base_position()
                     ),
                 });
@@ -2930,8 +2936,8 @@ impl EventStoreEngine {
     }
 
     /// Truncates an uncommitted suffix during divergence repair. This is the
-    /// sole destructive entry point and will crash rather than cross the
-    /// watermark invariant.
+    /// sole destructive entry point and returns an error rather than cross
+    /// the watermark invariant.
     pub fn truncate_to(&self, pos: Position) -> Result<(), Error> {
         self.truncate_to_matching(pos, None)
     }
@@ -2964,16 +2970,26 @@ impl EventStoreEngine {
     ) -> Result<(), Error> {
         self.drain_pending()?;
         let watermark = self.watermark.get();
-        assert!(
-            pos.0 >= watermark,
-            "refusing to truncate committed data: target {} < watermark {}",
-            pos.0,
-            watermark
-        );
+        if pos.0 < watermark {
+            return Err(Error::Rejected {
+                message: format!(
+                    "refusing to truncate committed data: the cut at {} is below this node's \
+                     commit watermark {watermark}; the leader should have told it to restore \
+                     from a snapshot instead, so restore the node from a snapshot (or from \
+                     the leader's archive) rather than retrying",
+                    pos.0
+                ),
+            });
+        }
         let old_tail = self.local_tail.load(Ordering::Acquire);
         if pos.0 > old_tail {
-            return Err(Error::Corrupted {
-                message: format!("truncate target {} exceeds local tail {old_tail}", pos.0),
+            return Err(Error::Internal {
+                message: format!(
+                    "truncate target {} is beyond this node's local tail {old_tail}; the \
+                     leader planned the cut from a cursor this node no longer matches, so the \
+                     Tail session restarts and reports its cursor again",
+                    pos.0
+                ),
             });
         }
         if pos.0 == old_tail && expected_event.is_none() {
@@ -2998,8 +3014,12 @@ impl EventStoreEngine {
                 let target_index = match seg_list.bases.binary_search(&pos.0) {
                     Ok(index) => index,
                     Err(0) => {
-                        return Err(Error::Corrupted {
-                            message: format!("no segment contains truncate position {}", pos.0),
+                        return Err(Error::Internal {
+                            message: format!(
+                                "no segment contains truncate position {}; it is before the \
+                                 first segment this node holds",
+                                pos.0
+                            ),
                         });
                     }
                     Err(index) => index - 1,
@@ -5785,8 +5805,12 @@ fn locate_event_anchor(
     let start = match bases.binary_search(&pos.0) {
         Ok(index) => index,
         Err(0) => {
-            return Err(Error::Corrupted {
-                message: format!("no segment contains boundary position {}", pos.0),
+            return Err(Error::Internal {
+                message: format!(
+                    "no segment contains boundary position {}; it is before the first \
+                     segment this node holds",
+                    pos.0
+                ),
             });
         }
         Err(index) => index - 1,
@@ -5888,6 +5912,9 @@ mod index_tests;
 
 #[cfg(test)]
 mod eviction_tests;
+
+#[cfg(test)]
+mod truncate_tests;
 
 #[cfg(test)]
 mod tests {
