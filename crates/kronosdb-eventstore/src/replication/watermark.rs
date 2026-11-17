@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::error::Error;
 
@@ -87,6 +87,9 @@ pub struct WatermarkState {
     /// read paths and event streams; every write happens under `inner` so
     /// ledger drains can never miss a bump.
     watermark: Arc<AtomicU64>,
+    /// Carries the watermark's value on every bump, so a Tail session can
+    /// sleep until it moves. Sent under `inner`, like the store above.
+    changes: watch::Sender<u64>,
     /// Current voter-set size, updated atomically with epoch changes.
     /// Lock-free read for the per-append ack-mode decision (`auto`).
     voter_count: AtomicU64,
@@ -108,6 +111,7 @@ impl WatermarkState {
         let quorum = voters.len() / 2 + 1;
         Self {
             watermark: Arc::new(AtomicU64::new(initial)),
+            changes: watch::Sender::new(initial),
             voter_count: AtomicU64::new(voters.len() as u64),
             epoch: AtomicU64::new(epoch),
             poisoned: AtomicBool::new(false),
@@ -175,6 +179,11 @@ impl WatermarkState {
         Arc::clone(&self.watermark)
     }
 
+    /// A receiver that wakes whenever the watermark moves.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
     /// Records a current voter's durable cursor and recomputes the quorum
     /// commit point. Stale/future epochs and unknown node ids are ignored.
     pub fn advance(&self, node: NodeId, epoch: Epoch, pos: u64) -> Option<u64> {
@@ -221,6 +230,7 @@ impl WatermarkState {
             return None;
         }
         self.watermark.store(candidate, Ordering::Release);
+        self.changes.send_replace(candidate);
 
         // Release every waiter at a position the watermark now covers.
         // `split_off` keeps the strictly-greater suffix; the ledger key is

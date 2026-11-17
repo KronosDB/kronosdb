@@ -3333,6 +3333,12 @@ impl EventStoreEngine {
         Some(Position(watermark))
     }
 
+    /// A receiver that wakes whenever this node's watermark moves, so a Tail
+    /// session can tell its follower about a bump another session caused.
+    pub fn watch_watermark(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.watermark.subscribe()
+    }
+
     /// Follower-side adoption of the claimed leader's computed watermark.
     pub fn adopt_watermark(&self, epoch: u64, pos: Position) {
         if pos.0 > self.local_tail.load(Ordering::Acquire) {

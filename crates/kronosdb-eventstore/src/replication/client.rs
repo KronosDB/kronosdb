@@ -170,6 +170,11 @@ async fn run_tail(
         }
     };
 
+    // The highest watermark the leader has told this session. It can be ahead
+    // of what this node has applied (the frame travels beside the records, not
+    // behind them), so it is held and adopted up to the local tail as bytes
+    // arrive. Everything at or below it is committed cluster-wide.
+    let mut leader_watermark = 0u64;
     let mut archive_up_to = None;
     while let Some(frame) = stream.next().await.map_err(wire::net_error)? {
         match frame.decode().map_err(|error| Error::Internal {
@@ -255,6 +260,10 @@ async fn run_tail(
                     };
                 }
                 last_ack_position = write.durable_position.0;
+                engine.adopt_watermark(
+                    apply_epoch(&engine, frame_epoch),
+                    Position(leader_watermark.min(engine.local_tail().0)),
+                );
                 pending_tx.send_replace(Some(PendingAck {
                     write: Some(write),
                     epoch: frame_epoch,
@@ -264,9 +273,10 @@ async fn run_tail(
             }
             Frame::TailWatermark(watermark) => {
                 let frame_epoch = check_epoch(watermark.epoch)?;
+                leader_watermark = leader_watermark.max(watermark.position);
                 engine.adopt_watermark(
                     apply_epoch(&engine, frame_epoch),
-                    Position(watermark.position),
+                    Position(leader_watermark.min(engine.local_tail().0)),
                 );
                 // The leader sends this once the catch-up it computed is
                 // out, so a claimant that stops here has every byte of the
