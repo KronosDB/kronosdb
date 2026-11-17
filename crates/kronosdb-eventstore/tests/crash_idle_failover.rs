@@ -280,6 +280,16 @@ async fn run(scenario: Scenario) {
         .collect();
     let unreplicated =
         tokio::time::timeout(Duration::from_millis(1500), context.append(&suffix, None)).await;
+    if matches!(unreplicated, Ok(Ok(Appended::Ok { .. }))) {
+        // An ack needs a follower that holds the events: say which one did.
+        for (node, log) in logs_of(tmp.path()).iter().enumerate() {
+            evidence.note(format!(
+                "node{} holds {} events after the ack",
+                node + 1,
+                count_event_records(log)
+            ));
+        }
+    }
     assert!(
         !matches!(unreplicated, Ok(Ok(Appended::Ok { .. }))),
         "an isolated leader acknowledged an append: {unreplicated:?}"
