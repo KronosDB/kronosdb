@@ -2971,7 +2971,7 @@ impl EventStoreEngine {
         self.drain_pending()?;
         let watermark = self.watermark.get();
         if pos.0 < watermark {
-            return Err(Error::Rejected {
+            return Err(Error::Internal {
                 message: format!(
                     "refusing to truncate committed data: the cut at {} is below this node's \
                      commit watermark {watermark}; the leader should have told it to restore \
