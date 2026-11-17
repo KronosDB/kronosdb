@@ -40,7 +40,7 @@ fn a_cut_below_the_watermark_is_an_error_not_a_panic() {
     let error = store
         .truncate_to_matching(Position(0), None)
         .expect_err("cutting committed data must be refused");
-    assert!(matches!(error, Error::Rejected { .. }), "{error:?}");
+    assert!(matches!(error, Error::Internal { .. }), "{error:?}");
     let message = error.to_string();
     assert!(
         message.contains(&format!("watermark {watermark}")) && message.contains("cut at 0"),
