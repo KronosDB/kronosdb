@@ -538,8 +538,16 @@ impl ClusterManager {
             );
         }
 
-        // Initialize the node's shared Raft group.
+        // Initialize the node's shared Raft group, unless its log or vote
+        // says it already is (every restart): openraft logs an error for an
+        // initialize it refuses.
         if let Some(raft) = self.raft_node() {
+            let initialized = raft.is_initialized().await.map_err(|e| Error::Internal {
+                message: format!("failed to read the Raft group's state: {e}"),
+            })?;
+            if initialized {
+                return Ok(());
+            }
             match raft.initialize(members).await {
                 Ok(_) => {}
                 Err(e) => {
