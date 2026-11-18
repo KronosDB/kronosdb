@@ -717,33 +717,20 @@ impl ClusterManager {
         }
         for context in &contexts {
             let engine = self.context_manager.get_context(context)?;
-            match engine.replication_epoch().cmp(&epoch) {
-                std::cmp::Ordering::Less => {
-                    // Persisting the EpochChange rotates the segment and waits
-                    // for the group-commit fsync: not on a runtime worker.
-                    let engine = Arc::clone(&engine);
-                    let voters = voter_ids.clone();
-                    let node_id = self.cluster_config.node_id;
-                    tokio::task::spawn_blocking(move || {
-                        engine.begin_replication_epoch(epoch, voters)?;
-                        engine.persist_epoch_change(epoch, node_id)
-                    })
-                    .await
-                    .map_err(|error| Error::Internal {
-                        message: format!("persisting the EpochChange record: {error}"),
-                    })??;
-                }
-                std::cmp::Ordering::Equal => {}
-                std::cmp::Ordering::Greater => {
-                    return Err(Error::Unavailable {
-                        message: format!(
-                            "context {context} is at epoch {}, beyond this claim's epoch \
-                             {epoch}; a newer leader has existed, so this node claims again \
-                             once it has caught up with the metadata group",
-                            engine.replication_epoch()
-                        ),
-                    });
-                }
+            // Persisting the EpochChange rotates the segment and waits for the
+            // group-commit fsync: not on a runtime worker.
+            {
+                let engine = Arc::clone(&engine);
+                let voters = voter_ids.clone();
+                let node_id = self.cluster_config.node_id;
+                let context = context.clone();
+                tokio::task::spawn_blocking(move || {
+                    install_epoch(&engine, &context, epoch, voters, node_id)
+                })
+                .await
+                .map_err(|error| Error::Internal {
+                    message: format!("persisting the EpochChange record: {error}"),
+                })??;
             }
             engine.acknowledge_replica(self.cluster_config.node_id, epoch, engine.durable_tail());
         }
@@ -1058,6 +1045,38 @@ fn tail_retry_delay(failures: u32, lasting: u32) -> Duration {
     Duration::from_millis(250 << failures.saturating_sub(1).min(3))
 }
 
+/// Puts one context on the claimed epoch: adopts it, and writes its
+/// EpochChange unless the log already holds it. The two are separate checks
+/// because an earlier attempt can adopt the epoch and then fail (or crash)
+/// before the record is written. A context already beyond the claim means a
+/// newer leader has existed.
+fn install_epoch(
+    engine: &crate::store::EventStoreEngine,
+    context: &str,
+    epoch: u64,
+    voters: Vec<NodeId>,
+    node_id: NodeId,
+) -> Result<(), Error> {
+    match engine.replication_epoch().cmp(&epoch) {
+        std::cmp::Ordering::Less => {
+            engine.begin_replication_epoch(epoch, voters)?;
+            engine.persist_epoch_change(epoch, node_id)
+        }
+        std::cmp::Ordering::Equal if engine.log_epoch() < epoch => {
+            engine.persist_epoch_change(epoch, node_id)
+        }
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(Error::Unavailable {
+            message: format!(
+                "context {context} is at epoch {}, beyond this claim's epoch {epoch}; a newer \
+                 leader has existed, so this node claims again once it has caught up with the \
+                 metadata group",
+                engine.replication_epoch()
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,5 +1151,47 @@ mod tests {
             choose_claim_source(local, &[voter(2, 0, 0)]),
             ClaimSource::Local
         );
+    }
+
+    /// A claim that adopted the epoch but failed before its EpochChange was
+    /// written (or crashed in between) writes it on the next attempt: the log
+    /// must say which epoch its later records belong to.
+    #[test]
+    fn a_retried_claim_writes_the_epoch_change_an_earlier_attempt_did_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::store::EventStoreEngine::create(dir.path()).unwrap();
+        install_epoch(&engine, "default", 1, vec![0], 0).unwrap();
+        assert_eq!(engine.log_epoch(), 1);
+        engine
+            .append(crate::append::AppendRequest {
+                condition: None,
+                events: vec![crate::event::AppendEvent {
+                    identifier: "e-0".into(),
+                    name: "E".into(),
+                    version: "1.0".into(),
+                    timestamp: 0,
+                    payload: vec![],
+                    metadata: vec![],
+                    tags: vec![],
+                }],
+            })
+            .unwrap();
+
+        // The second claim adopts epoch 2, then fails before writing it.
+        engine.begin_replication_epoch(2, [0]).unwrap();
+        assert_eq!(engine.log_epoch(), 1);
+
+        install_epoch(&engine, "default", 2, vec![0], 0).unwrap();
+        assert_eq!(engine.replication_epoch(), 2);
+        assert_eq!(engine.log_epoch(), 2);
+
+        // Once written, a further attempt writes nothing more.
+        let before = engine.replication_cursor().unwrap().byte_offset;
+        install_epoch(&engine, "default", 2, vec![0], 0).unwrap();
+        assert_eq!(engine.replication_cursor().unwrap().byte_offset, before);
+
+        // A context beyond the claim is refused.
+        let refused = install_epoch(&engine, "default", 1, vec![0], 0).unwrap_err();
+        assert!(matches!(refused, Error::Unavailable { .. }), "{refused}");
     }
 }
