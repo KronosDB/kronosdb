@@ -65,7 +65,10 @@ certificate identifies the client instead, and Hello's credential kind is
 `none`. The
 principal the server resolves is fixed for the connection until a
 [Reauthenticate](#reauthenticate) replaces it, which a client sends before its
-token expires. Authorization happens per request, against that principal.
+token expires. A Reauthenticate that would turn a client connection into a
+peer connection, or a peer connection into a client one, is rejected, because
+the connection's frame size limit was set by Hello. Authorization happens per
+request, against that principal.
 
 Either side may close the connection at any time. A server about to shut down
 sends [GoAway](#goaway) first: it accepts no new streams after it, finishes
