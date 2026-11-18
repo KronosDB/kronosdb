@@ -3392,8 +3392,10 @@ impl EventStoreEngine {
     }
 
     /// Writes and durably commits the EpochChange record at a hard segment
-    /// boundary. Called only by the newly claimed leader before accepting
-    /// native writes.
+    /// boundary: a fresh segment at the head, or the active segment when it
+    /// holds no event and so already starts at the head (it may hold control
+    /// records, such as a previous take-over's EpochChange). Called only by
+    /// the newly claimed leader before accepting native writes.
     pub fn persist_epoch_change(&self, epoch: u64, leader_id: u64) -> Result<(), Error> {
         if epoch != self.watermark.epoch() || leader_id != self.node_id {
             return Err(Error::Io(io::Error::other(
@@ -3402,7 +3404,7 @@ impl EventStoreEngine {
         }
         let wave = {
             let mut writer = self.writer.lock();
-            if writer.has_records() {
+            if writer.head().0 > writer.active_base_position() {
                 let old_base = writer.active_base_position();
                 let new_base = writer.head();
                 writer.rotate_replicated(new_base)?;
@@ -8350,6 +8352,50 @@ mod tests {
         assert_eq!(slice.first_position, head.0);
         assert_eq!(slice.byte_start, segment::SEGMENT_HEADER_SIZE as u64);
         assert!(slice.byte_end > slice.byte_start);
+    }
+
+    /// A node that took over and has appended no event since takes over again
+    /// (a restart whose claim cannot be resumed, or a re-election on an idle
+    /// log). Its active segment holds only control records, so the head has
+    /// not moved and there is no new base to rotate to: the EpochChange goes
+    /// into the same segment, which already starts at the head.
+    #[test]
+    fn taking_over_again_with_no_event_since_writes_into_the_same_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = EventStoreEngine::create(dir.path()).unwrap();
+            store.begin_replication_epoch(1, [0]).unwrap();
+            store.persist_epoch_change(1, 0).unwrap();
+            store.begin_replication_epoch(2, [0]).unwrap();
+            store.persist_epoch_change(2, 0).unwrap();
+            assert_eq!(store.log_epoch(), 2);
+            store.shutdown();
+        }
+
+        // After a restart, the same: the log holds only control records.
+        let store = EventStoreEngine::open(dir.path()).unwrap();
+        assert_eq!(store.log_epoch(), 2);
+        store.begin_replication_epoch(3, [0]).unwrap();
+        store.persist_epoch_change(3, 0).unwrap();
+        assert_eq!(store.log_epoch(), 3);
+        assert_eq!(segment::list_segment_files(dir.path()).unwrap(), vec![0]);
+
+        // Events follow, and a later take-over still rotates at the head.
+        store
+            .append(AppendRequest {
+                condition: None,
+                events: vec![make_event("E0", vec![tag("k", "v")])],
+            })
+            .unwrap();
+        store.begin_replication_epoch(4, [0]).unwrap();
+        store.persist_epoch_change(4, 0).unwrap();
+        assert_eq!(segment::list_segment_files(dir.path()).unwrap(), vec![0, 1]);
+        store.shutdown();
+        drop(store);
+
+        let store = EventStoreEngine::open(dir.path()).unwrap();
+        assert_eq!(store.log_epoch(), 4);
+        assert_eq!(store.head(), Position(1));
     }
 
     /// A follower whose log ends somewhere that is not a record boundary of
