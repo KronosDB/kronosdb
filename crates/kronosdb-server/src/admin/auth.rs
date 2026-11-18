@@ -70,10 +70,24 @@ impl AuthRuntime {
     /// Builds the runtime. Performs NO network I/O — OIDC discovery is
     /// fetched lazily on first use so an unreachable IdP can't block boot.
     pub fn new(cfg: &AdminAuthConfig, identities: Arc<Authenticator>) -> Self {
-        let key = match cfg.oidc.as_ref().and_then(|o| o.cookie_secret.as_deref()) {
-            // Stretch the configured secret to the 64 bytes Key::from wants.
-            Some(secret) => Key::from(&Sha512::digest(secret.as_bytes())),
-            None => Key::generate(),
+        // The key that signs session cookies. A configured cookie secret, or
+        // in token mode the token itself, gives the same key on every restart
+        // and every node that shares it, so a session outlives a restart and
+        // works behind a load balancer; changing the token ends the sessions
+        // signed with the old one. Stretched to the 64 bytes Key::from wants.
+        let key = match (
+            cfg.oidc.as_ref().and_then(|o| o.cookie_secret.as_deref()),
+            &cfg.mode,
+            cfg.token.as_deref(),
+        ) {
+            (Some(secret), _, _) => Key::from(&Sha512::digest(secret.as_bytes())),
+            (None, AdminAuthMode::Token, Some(token)) => {
+                let mut hasher = Sha512::new();
+                hasher.update(b"kronosdb admin session key\0");
+                hasher.update(token.as_bytes());
+                Key::from(&hasher.finalize())
+            }
+            _ => Key::generate(),
         };
         let session_ttl = Duration::from_secs(
             cfg.oidc
@@ -915,6 +929,38 @@ mod tests {
         );
         let session = read_session(&auth, &headers).expect("session valid");
         assert_eq!(session.sub, "token-admin");
+    }
+
+    /// A token-mode session survives a restart and works on every node that
+    /// shares the token; changing the token ends it.
+    #[test]
+    fn a_token_session_is_valid_wherever_the_token_is() {
+        let resp = token_login_attempt(&token_auth(), "secret", Some("/"));
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session cookie set")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            set_cookie.split(';').next().unwrap().parse().unwrap(),
+        );
+
+        // A restarted node, or another node with the same token.
+        assert!(read_session(&token_auth(), &headers).is_some());
+
+        let rotated = AuthRuntime::new(
+            &AdminAuthConfig {
+                mode: AdminAuthMode::Token,
+                token: Some("rotated".into()),
+                oidc: None,
+            },
+            no_identities(),
+        );
+        assert!(read_session(&rotated, &headers).is_none());
     }
 
     #[test]
