@@ -30,8 +30,10 @@ use serde::Deserialize;
 
 use kronosdb_eventstore::context::ContextManager;
 
-/// Parsed manifest file.
+/// Parsed manifest file. Unknown keys are refused, so a misspelled table or
+/// key stops startup instead of declaring nothing.
 #[derive(Deserialize, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Event store contexts that must exist.
     #[serde(default)]
@@ -41,6 +43,7 @@ pub struct Manifest {
 /// A declared context. Only `name` today; a table (not a bare string) so
 /// per-context settings can be added without breaking existing manifests.
 #[derive(Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ContextSpec {
     pub name: String,
 }
@@ -122,6 +125,24 @@ name = "payments"
                 .collect::<Vec<_>>(),
             ["orders", "payments"]
         );
+    }
+
+    #[test]
+    fn unknown_keys_are_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.toml");
+
+        // `[[context]]` for `[[contexts]]` declared nothing at all.
+        std::fs::write(&path, "[[context]]\nname = \"orders\"\n").unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(err.contains("manifest.toml"), "{err}");
+        assert!(err.contains("`context`"), "{err}");
+        assert!(err.contains("`contexts`"), "{err}");
+
+        // A misspelled key inside an entry.
+        std::fs::write(&path, "[[contexts]]\nname = \"orders\"\nnmae = \"x\"\n").unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(err.contains("`nmae`"), "{err}");
     }
 
     #[test]
