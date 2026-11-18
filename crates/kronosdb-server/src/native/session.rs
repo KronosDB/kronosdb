@@ -124,10 +124,24 @@ impl Session {
     }
 
     /// Replaces the principal and recomputes every bound scope's rights.
-    pub fn reauthenticate(&self, principal: Arc<Principal>) {
+    ///
+    /// Refuses a principal that would change whether the connection is a
+    /// peer: Hello fixed the connection's frame size limit from that, so the
+    /// other kind of principal needs a connection of its own.
+    pub fn reauthenticate(&self, principal: Arc<Principal>) -> Result<(), Failure> {
+        let is_peer = |p: &Principal| p.allows(Access::Peer, Scope::Global, "");
+        if is_peer(&self.principal()) != is_peer(&principal) {
+            return Err(Failure::new(
+                ErrorCode::REJECTED,
+                "Reauthenticate cannot change whether this connection is a peer connection: \
+                 its frame size limit was set when it opened. Open a new connection with this \
+                 credential.",
+            ));
+        }
         self.contexts.write().recompute(&principal, Scope::Context);
         self.buses.write().recompute(&principal, Scope::Bus);
         *self.principal.write() = principal;
+        Ok(())
     }
 
     fn bindings(&self, scope: Scope) -> &RwLock<Bindings> {
@@ -259,11 +273,40 @@ mod tests {
         );
     }
 
+    /// The frame size limit is fixed in Hello by whether the principal is a
+    /// peer, so a credential that would change that is refused and the
+    /// connection keeps its principal.
+    #[test]
+    fn reauthentication_cannot_change_whether_the_connection_is_a_peer() {
+        let session = Session::new(principal(vec![Role::Write], None));
+        let refused = session
+            .reauthenticate(principal(vec![Role::Peer], None))
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::REJECTED);
+        assert!(
+            !session.principal().allows(Access::Peer, Scope::Global, ""),
+            "a client connection became a peer"
+        );
+
+        let session = Session::new(principal(vec![Role::Peer], None));
+        assert!(
+            session
+                .reauthenticate(principal(vec![Role::Write], None))
+                .is_err()
+        );
+        assert!(
+            session.principal().allows(Access::Peer, Scope::Global, ""),
+            "a peer connection became a client"
+        );
+    }
+
     #[test]
     fn reauthentication_recomputes_rights() {
         let session = Session::new(principal(vec![Role::Read], None));
         assert!(session.resolve(Scope::Context, 0, Access::Write).is_err());
-        session.reauthenticate(principal(vec![Role::Write], None));
+        session
+            .reauthenticate(principal(vec![Role::Write], None))
+            .unwrap();
         assert!(session.resolve(Scope::Context, 0, Access::Write).is_ok());
     }
 }

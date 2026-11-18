@@ -251,7 +251,7 @@ async fn reauthenticate(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
     // A certificate identity is the connection's and cannot be replaced.
     let principal = authenticate(&ctx.deps.auth, r.credential_kind, r.credential, None).await?;
     let shown = format!("{}:{}", principal.source, principal.subject);
-    ctx.session.reauthenticate(principal);
+    ctx.session.reauthenticate(principal)?;
     let _ = stream
         .out
         .finish(&p::Frame::Reauthenticated(p::Reauthenticated {
