@@ -773,9 +773,9 @@ fn check_archive(
 
 pub use kronosdb_eventstore::remote::redact_url;
 
-/// Parses the TOML config file. An unknown key is reported with the table it
-/// sits in and its line, and says what to do about it; any other error keeps
-/// toml's own message, which carries the offending line.
+/// Parses the TOML config file. An unknown key or table is reported with the
+/// table it sits in and its line, and says what to do about it; any other error
+/// keeps toml's own message, which carries the offending line.
 fn parse_config_file(contents: &str, name: &str) -> Result<ConfigFile, String> {
     toml::from_str::<ConfigFile>(contents).map_err(|e| {
         let message = e.message();
@@ -783,22 +783,43 @@ fn parse_config_file(contents: &str, name: &str) -> Result<ConfigFile, String> {
             return format!("failed to parse config file '{name}': {e}");
         };
         let key = rest.split('`').next().unwrap_or(rest);
-        let (table, line) = match e.span() {
+        let (unknown, location, line) = match e.span() {
             Some(span) => {
                 let before = &contents[..span.start.min(contents.len())];
-                let table = before
-                    .lines()
-                    .rev()
-                    .map(str::trim)
-                    .find(|l| l.starts_with('['))
-                    .map(|l| {
-                        let header = l.split('#').next().unwrap_or(l).trim_end();
-                        format!("table {header}")
-                    })
-                    .unwrap_or_else(|| "the top level".to_string());
-                (table, Some(before.matches('\n').count() + 1))
+                let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+                let on_line = before[line_start..].trim_start();
+                let (unknown, parent) = if on_line.starts_with('[') {
+                    // The unknown name is a table header: its parent is the
+                    // header path written before it, `[storage.` → [storage].
+                    let brackets = if on_line.starts_with("[[") { "[[" } else { "[" };
+                    let closing = if brackets == "[[" { "]]" } else { "]" };
+                    let parent = on_line.trim_start_matches('[').trim_end_matches('.').trim();
+                    let path = if parent.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{parent}.{key}")
+                    };
+                    (
+                        format!("table `{brackets}{path}{closing}`"),
+                        (!parent.is_empty()).then(|| format!("[{parent}]")),
+                    )
+                } else {
+                    // A key: it sits in the last table header above its line.
+                    let parent = before[..line_start]
+                        .lines()
+                        .rev()
+                        .map(str::trim)
+                        .find(|l| l.starts_with('['))
+                        .map(|l| l.split('#').next().unwrap_or(l).trim_end().to_string());
+                    (format!("key `{key}`"), parent)
+                };
+                let location = parent.map_or_else(
+                    || "at the top level".to_string(),
+                    |header| format!("in table {header}"),
+                );
+                (unknown, location, Some(before.matches('\n').count() + 1))
             }
-            None => ("the top level".to_string(), None),
+            None => (format!("key `{key}`"), "at the top level".to_string(), None),
         };
         let at = line.map(|l| format!(" (line {l})")).unwrap_or_default();
         let expected = message
@@ -811,7 +832,7 @@ fn parse_config_file(contents: &str, name: &str) -> Result<ConfigFile, String> {
             })
             .unwrap_or_default();
         format!(
-            "config file '{name}' has an unknown key `{key}` in {table}{at}. \
+            "config file '{name}' has an unknown {unknown} {location}{at}. \
              Fix its spelling or move it to the table it belongs to, or remove it.{expected}"
         )
     })
@@ -1220,6 +1241,44 @@ roles = ["write"]
         .unwrap_err();
         assert!(
             err.contains("`token_file`") && err.contains("[[security.tokens]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_table_is_named_with_the_table_it_sits_in() {
+        // `[backup]` was renamed to `[archive]`; an old config must say so plainly.
+        let err = parse_config_file(
+            "listen = \"0.0.0.0:50051\"\n\n[backup]\nurl = \"file:///b\"\n",
+            "my.toml",
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown table `[backup]`"), "{err}");
+        assert!(err.contains("at the top level (line 3)"), "{err}");
+        assert!(err.contains("`archive`"), "{err}");
+
+        // After another table, it is still a top-level table.
+        let err = parse_config_file(
+            "[storage]\nack-mode = \"durable\"\n[backup]\nurl = \"x\"\n",
+            "my.toml",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unknown table `[backup]` at the top level (line 3)"),
+            "{err}"
+        );
+
+        // A sub-table names its parent.
+        let err = parse_config_file("[storage.bogus]\nx = 1\n", "my.toml").unwrap_err();
+        assert!(
+            err.contains("unknown table `[storage.bogus]` in table [storage] (line 1)"),
+            "{err}"
+        );
+
+        // An array of tables too.
+        let err = parse_config_file("[[backups]]\nurl = \"x\"\n", "my.toml").unwrap_err();
+        assert!(
+            err.contains("unknown table `[[backups]]` at the top level (line 1)"),
             "{err}"
         );
     }
