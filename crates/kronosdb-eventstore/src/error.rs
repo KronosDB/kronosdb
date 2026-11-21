@@ -28,6 +28,13 @@ pub enum Error {
     /// doesn't allow. Retrying unchanged won't help.
     Rejected { message: String },
 
+    /// An append was written but not confirmed as committed: leadership
+    /// changed, the store failed, or the answer was lost on its way. It may or
+    /// may not be in the log. Unlike `Unavailable`, retrying it blindly can
+    /// write it twice; reading tells which, and a retry under the same
+    /// consistency condition is safe.
+    UnknownOutcome { message: String },
+
     /// The server broke one of its own invariants. Not the caller's fault.
     Internal { message: String },
 
@@ -73,6 +80,7 @@ impl std::fmt::Display for Error {
             Error::Corrupted { message } => write!(f, "data corrupted: {message}"),
             Error::Unavailable { message } => write!(f, "temporarily unavailable: {message}"),
             Error::Rejected { message } => write!(f, "rejected: {message}"),
+            Error::UnknownOutcome { message } => write!(f, "outcome unknown: {message}"),
             Error::Internal { message } => write!(f, "internal error: {message}"),
             Error::PositionNotFound { position } => {
                 write!(f, "no event at position {position}")

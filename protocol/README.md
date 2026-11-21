@@ -1884,7 +1884,7 @@ A `u16`. Why a request failed. Unknown codes must be treated as `internal`.
 
 | Value | Name | |
 |---|---|---|
-| 1 | `unavailable` | Not ready, failing over, or unreachable. Safe to retry. |
+| 1 | `unavailable` | Not ready, failing over, unreachable, or at a limit on what the server holds at once. Nothing was done: safe to retry. |
 | 2 | `rejected` | The server's state or configuration forbids this otherwise valid request. |
 | 3 | `invalid_argument` | The request is malformed or names something invalid. |
 | 4 | `not_found` | The named position, context, snapshot or schedule does not exist. |
@@ -1897,6 +1897,7 @@ A `u16`. Why a request failed. Unknown codes must be treated as `internal`.
 | 11 | `resource_exhausted` | A size or rate limit was exceeded. |
 | 12 | `protocol_violation` | The peer sent bytes that violate this protocol. The connection closes. |
 | 13 | `no_handler` | Nothing handles the command's or query's name: no handler for it is connected to the cluster. A retry helps only once one subscribes. |
+| 14 | `unknown_outcome` | The request may or may not have taken effect: an append was written but not confirmed as committed, because leadership changed, the store failed or the answer was lost. Read to find out; a retry under the same consistency condition is safe, a blind retry may write it twice. |
 
 #### CredentialKind
 

@@ -195,6 +195,7 @@ fn failure_error(failure: Failure) -> Error {
         | ErrorCode::PERMISSION_DENIED
         | ErrorCode::RESOURCE_EXHAUSTED => Error::Rejected { message },
         ErrorCode::CORRUPTED => Error::Corrupted { message },
+        ErrorCode::UNKNOWN_OUTCOME => Error::UnknownOutcome { message },
         _ => Error::Internal { message },
     }
 }
@@ -216,6 +217,9 @@ pub fn with_context(error: Error, what: impl std::fmt::Display) -> Error {
         Error::Internal { message } => Error::Internal {
             message: format!("{what}: {message}"),
         },
+        Error::UnknownOutcome { message } => Error::UnknownOutcome {
+            message: format!("{what}: {message}"),
+        },
         other => other,
     }
 }
@@ -234,6 +238,15 @@ mod tests {
             metadata: vec![("k".into(), "v".into())],
             tags: vec![Tag::from_str("orderId", "o-1")],
         }
+    }
+
+    #[test]
+    fn an_unknown_outcome_comes_back_from_the_wire_as_such() {
+        let error = net_error(NetError::Failed(Failure::new(
+            ErrorCode::UNKNOWN_OUTCOME,
+            "written, not confirmed",
+        )));
+        assert!(matches!(error, Error::UnknownOutcome { .. }), "{error}");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::codec::*;
 /// The protocol version this code speaks.
 pub const PROTOCOL_VERSION: u16 = 2;
 /// CRC32C of the schema source, for checking generated code is in sync.
-pub const SCHEMA_HASH: &str = "7cc1b9b4";
+pub const SCHEMA_HASH: &str = "6f7a0441";
 
 /// Why a request failed. Unknown codes must be treated as `internal`.
 ///
@@ -17,7 +17,8 @@ pub const SCHEMA_HASH: &str = "7cc1b9b4";
 pub struct ErrorCode(pub u16);
 
 impl ErrorCode {
-    /// Not ready, failing over, or unreachable. Safe to retry.
+    /// Not ready, failing over, unreachable, or at a limit on what the server
+    /// holds at once. Nothing was done: safe to retry.
     pub const UNAVAILABLE: Self = Self(1);
     /// The server's state or configuration forbids this otherwise valid request.
     pub const REJECTED: Self = Self(2);
@@ -44,6 +45,11 @@ impl ErrorCode {
     /// Nothing handles the command's or query's name: no handler for it is
     /// connected to the cluster. A retry helps only once one subscribes.
     pub const NO_HANDLER: Self = Self(13);
+    /// The request may or may not have taken effect: an append was written but
+    /// not confirmed as committed, because leadership changed, the store failed
+    /// or the answer was lost. Read to find out; a retry under the same
+    /// consistency condition is safe, a blind retry may write it twice.
+    pub const UNKNOWN_OUTCOME: Self = Self(14);
 
     /// The schema name of a known value.
     pub fn name(self) -> Option<&'static str> {
@@ -61,6 +67,7 @@ impl ErrorCode {
             11 => Some("resource_exhausted"),
             12 => Some("protocol_violation"),
             13 => Some("no_handler"),
+            14 => Some("unknown_outcome"),
             _ => None,
         }
     }

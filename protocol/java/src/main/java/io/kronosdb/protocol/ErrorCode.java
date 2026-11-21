@@ -10,7 +10,8 @@ package io.kronosdb.protocol;
 public record ErrorCode(int value) {
 
     /**
-     * Not ready, failing over, or unreachable. Safe to retry.
+     * Not ready, failing over, unreachable, or at a limit on what the server
+     * holds at once. Nothing was done: safe to retry.
      */
     public static final ErrorCode UNAVAILABLE = new ErrorCode(1);
 
@@ -75,6 +76,14 @@ public record ErrorCode(int value) {
      */
     public static final ErrorCode NO_HANDLER = new ErrorCode(13);
 
+    /**
+     * The request may or may not have taken effect: an append was written but
+     * not confirmed as committed, because leadership changed, the store failed
+     * or the answer was lost. Read to find out; a retry under the same
+     * consistency condition is safe, a blind retry may write it twice.
+     */
+    public static final ErrorCode UNKNOWN_OUTCOME = new ErrorCode(14);
+
     /** The value {@code value}: a constant if this version knows it. */
     public static ErrorCode of(int value) {
         return switch (value) {
@@ -91,6 +100,7 @@ public record ErrorCode(int value) {
             case 11 -> RESOURCE_EXHAUSTED;
             case 12 -> PROTOCOL_VIOLATION;
             case 13 -> NO_HANDLER;
+            case 14 -> UNKNOWN_OUTCOME;
             default -> new ErrorCode(value);
         };
     }
@@ -111,6 +121,7 @@ public record ErrorCode(int value) {
             case 11 -> "resource_exhausted";
             case 12 -> "protocol_violation";
             case 13 -> "no_handler";
+            case 14 -> "unknown_outcome";
             default -> null;
         };
     }
@@ -131,6 +142,7 @@ public record ErrorCode(int value) {
             case "resource_exhausted" -> 11;
             case "protocol_violation" -> 12;
             case "no_handler" -> 13;
+            case "unknown_outcome" -> 14;
             default -> -1;
         };
     }

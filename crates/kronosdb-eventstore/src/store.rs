@@ -686,14 +686,22 @@ impl SyncState {
         let mut completed = self.completed.lock().unwrap();
         while *completed < target_wave {
             if self.failed.load(Ordering::Acquire) {
-                return Err(self.failure_error());
+                return Err(self.failure_after_write());
             }
             completed = self.synced.wait(completed).unwrap();
         }
         if self.failed.load(Ordering::Acquire) {
-            return Err(self.failure_error());
+            return Err(self.failure_after_write());
         }
         Ok(())
+    }
+
+    /// The failure a write that was already made learns: it may or may not
+    /// survive a restart.
+    fn failure_after_write(&self) -> Error {
+        Error::UnknownOutcome {
+            message: self.failure_error().to_string(),
+        }
     }
 
     /// Barrier: called by the sync thread UNDER the writer lock. Seals the

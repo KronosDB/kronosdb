@@ -4,7 +4,7 @@
 /** The protocol version this code speaks. */
 export const PROTOCOL_VERSION = 2;
 /** CRC32C of the schema source, for checking generated code is in sync. */
-export const SCHEMA_HASH = "7cc1b9b4";
+export const SCHEMA_HASH = "6f7a0441";
 
 /** The peer sent bytes that violate the protocol. */
 export class ProtocolError extends Error {}
@@ -280,7 +280,8 @@ export const readFrameHeader = (buf: Uint8Array, offset = 0): FrameHeader | unde
  */
 export const ErrorCode = {
   /**
-   * Not ready, failing over, or unreachable. Safe to retry.
+   * Not ready, failing over, unreachable, or at a limit on what the server
+   * holds at once. Nothing was done: safe to retry.
    */
   unavailable: 1,
   /**
@@ -332,6 +333,13 @@ export const ErrorCode = {
    * connected to the cluster. A retry helps only once one subscribes.
    */
   no_handler: 13,
+  /**
+   * The request may or may not have taken effect: an append was written but
+   * not confirmed as committed, because leadership changed, the store failed
+   * or the answer was lost. Read to find out; a retry under the same
+   * consistency condition is safe, a blind retry may write it twice.
+   */
+  unknown_outcome: 14,
 } as const;
 /** Open on decode: values this version does not know are kept. */
 export type ErrorCode = number;
@@ -349,6 +357,7 @@ export const ErrorCodeNames: Readonly<Record<number, string>> = {
   11: "resource_exhausted",
   12: "protocol_violation",
   13: "no_handler",
+  14: "unknown_outcome",
 };
 
 /**

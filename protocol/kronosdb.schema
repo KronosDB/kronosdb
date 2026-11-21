@@ -31,7 +31,8 @@ protocol kronosdb 2
 
 /// Why a request failed. Unknown codes must be treated as `internal`.
 enum ErrorCode: u16 {
-  /// Not ready, failing over, or unreachable. Safe to retry.
+  /// Not ready, failing over, unreachable, or at a limit on what the server
+  /// holds at once. Nothing was done: safe to retry.
   unavailable = 1
   /// The server's state or configuration forbids this otherwise valid request.
   rejected = 2
@@ -58,6 +59,11 @@ enum ErrorCode: u16 {
   /// Nothing handles the command's or query's name: no handler for it is
   /// connected to the cluster. A retry helps only once one subscribes.
   no_handler = 13
+  /// The request may or may not have taken effect: an append was written but
+  /// not confirmed as committed, because leadership changed, the store failed
+  /// or the answer was lost. Read to find out; a retry under the same
+  /// consistency condition is safe, a blind retry may write it twice.
+  unknown_outcome = 14
 }
 
 /// How the client proves who it is.

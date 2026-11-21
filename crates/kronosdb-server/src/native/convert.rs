@@ -59,6 +59,13 @@ pub fn failure(e: Error) -> Failure {
             format!("temporarily unavailable: {message}"),
         ),
         Error::Rejected { message } => (ErrorCode::REJECTED, message),
+        Error::UnknownOutcome { message } => (
+            ErrorCode::UNKNOWN_OUTCOME,
+            format!(
+                "{message}. The append may or may not be in the log: read to find out, or retry \
+                 under the same consistency condition"
+            ),
+        ),
         Error::Internal { message } => (ErrorCode::INTERNAL, format!("internal error: {message}")),
         Error::PositionNotFound { position } => (
             ErrorCode::NOT_FOUND,
@@ -90,6 +97,20 @@ pub fn failure(e: Error) -> Failure {
 mod tests {
     use super::*;
     use kronosdb_eventstore::event::Tag;
+
+    /// An append whose outcome is unknown is not `unavailable`, which
+    /// promises a retry is safe, nor `internal`.
+    #[test]
+    fn an_unknown_outcome_has_its_own_code() {
+        let failure = failure(Error::UnknownOutcome {
+            message: "leadership was lost before the append was acknowledged".into(),
+        });
+        assert_eq!(failure.code, ErrorCode::UNKNOWN_OUTCOME);
+        assert!(
+            failure.message.contains("same consistency condition"),
+            "{failure}"
+        );
+    }
 
     #[test]
     fn empty_read_criteria_match_everything() {
