@@ -1176,3 +1176,68 @@ mod sockets {
         flood.await.unwrap();
     }
 }
+
+/// Before Hello is accepted the server knows nothing about the client, so it
+/// reads at most a small Hello; a bigger one is refused as a size limit.
+#[tokio::test]
+async fn a_hello_over_the_pre_authentication_limit_is_refused() {
+    let (mut client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(server::run(
+        server_io,
+        Arc::new(PeerInfo {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            certificates: vec![],
+        }),
+        Arc::new(Toy {
+            flood: Arc::default(),
+        }),
+        Arc::new(ServerConfig::default()),
+        shutdown_rx,
+    ));
+    let credential = "x".repeat(super::PRE_AUTH_MAX_FRAME as usize);
+    let hello = Frame::Hello(Hello {
+        version: PROTOCOL_VERSION,
+        features: 0,
+        record_format: server::RECORD_FORMAT,
+        client_name: "",
+        client_id: "",
+        credential_kind: CredentialKind::TOKEN,
+        credential: &credential,
+        window: DEFAULT_WINDOW,
+    });
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&encode(0, 0, &hello).unwrap());
+    let writer = tokio::spawn(async move {
+        let _ = client_io.write_all(&bytes).await;
+        let mut received = Vec::new();
+        let _ = client_io.read_to_end(&mut received).await;
+        received
+    });
+    let received = tokio::time::timeout(STUCK, writer).await.unwrap().unwrap();
+    assert!(server.await.unwrap().is_err());
+    let first = crate::codec::split_frame(&received).unwrap().unwrap();
+    let Some(Frame::RequestFailed(f)) = Frame::decode(first.header.kind, first.body).unwrap()
+    else {
+        panic!("expected RequestFailed");
+    };
+    assert_eq!(f.code, ErrorCode::RESOURCE_EXHAUSTED);
+    assert!(f.message.contains("before authentication"), "{}", f.message);
+}
+
+/// A frame's length header alone does not make the reader set aside the
+/// length it declares: memory follows the bytes that actually arrived.
+#[tokio::test]
+async fn a_length_header_alone_reserves_no_more_than_arrived() {
+    let declared: u32 = 15 * 1024 * 1024;
+    let mut bytes = declared.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[0u8; 100]);
+    let mut reader = super::FrameReader::new(&bytes[..], super::DEFAULT_MAX_FRAME);
+    assert!(reader.fill().await.unwrap());
+    assert!(reader.buffered().unwrap().is_none());
+    assert!(
+        reader.buf.capacity() < 1024 * 1024,
+        "reserved {} bytes for 104 that arrived",
+        reader.buf.capacity()
+    );
+}

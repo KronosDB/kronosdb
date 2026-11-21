@@ -198,6 +198,8 @@ where
         }
     };
     reader.set_max_frame(welcome.max_frame);
+    // The server is the one this client chose to connect to.
+    reader.reserve_declared_lengths();
 
     let (closed_tx, closed_rx) = watch::channel(false);
     let shared = Arc::new(Shared {
