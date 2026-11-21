@@ -228,6 +228,7 @@ mod tests {
                     principal: String::new(),
                     features: 0,
                     max_frame: None,
+                    peer: false,
                 })
             })
         }

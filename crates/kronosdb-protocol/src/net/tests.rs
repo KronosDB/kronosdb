@@ -62,6 +62,7 @@ impl Service for Toy {
                 principal,
                 features: 0,
                 max_frame: None,
+                peer: credential == "peer",
             })
         })
     }
@@ -434,6 +435,7 @@ async fn a_verified_peer_may_send_larger_frames() {
                     principal: String::new(),
                     features: 0,
                     max_frame: Some(1 << 20),
+                    peer: true,
                 })
             })
         }
@@ -941,6 +943,7 @@ mod sockets {
                     principal: String::new(),
                     features: 0,
                     max_frame: None,
+                    peer: false,
                 })
             })
         }
@@ -1240,4 +1243,171 @@ async fn a_length_header_alone_reserves_no_more_than_arrived() {
         "reserved {} bytes for 104 that arrived",
         reader.buf.capacity()
     );
+}
+
+/// A server config with its own limits.
+fn limited(handshakes: usize, connections: usize, streams: usize) -> Arc<ServerConfig> {
+    Arc::new(ServerConfig {
+        server_name: "toy".into(),
+        limits: Arc::new(server::Limits::new(handshakes, connections, streams)),
+        ..ServerConfig::default()
+    })
+}
+
+/// A connection over an in-memory pipe, served with `config`.
+async fn connect_with(
+    credential: &str,
+    config: Arc<ServerConfig>,
+) -> Result<(client::Connection, watch::Sender<bool>), NetError> {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    tokio::spawn(server::run(
+        server_io,
+        Arc::new(PeerInfo {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            certificates: vec![],
+        }),
+        Arc::new(Toy {
+            flood: Arc::default(),
+        }),
+        config,
+        shutdown_rx,
+    ));
+    let options = ConnectOptions {
+        client_name: "test".into(),
+        client_id: "test-1".into(),
+        credential: Credential::Token(credential.into()),
+        ..ConnectOptions::default()
+    };
+    let conn = client::handshake(client_io, &options).await?;
+    Ok((conn, shutdown))
+}
+
+async fn until(what: &str, check: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + STUCK;
+    while !check() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_request_past_the_stream_limit_is_refused_as_unavailable() {
+    let (conn, _shutdown) = connect_with("ci", limited(16, 16, 2)).await.unwrap();
+    let mut first = conn.open(&subscribe(0), true).await.unwrap();
+    let mut second = conn.open(&subscribe(0), true).await.unwrap();
+    first.next().await.unwrap().unwrap();
+    second.next().await.unwrap().unwrap();
+
+    let refused = conn
+        .request(&Frame::GetTail(GetTail { context: 0 }))
+        .await
+        .unwrap_err();
+    let failure = refused.failure().unwrap();
+    assert_eq!(failure.code, ErrorCode::UNAVAILABLE);
+    assert!(failure.message.contains("2 streams open"), "{failure}");
+
+    // Once a stream ends there is room again.
+    first.send_end(&Frame::Cancel(Cancel {})).await.unwrap();
+    while let Ok(Some(_)) = first.next().await {}
+    let mut answered = None;
+    let deadline = std::time::Instant::now() + STUCK;
+    while answered.is_none() {
+        match conn.request(&Frame::GetTail(GetTail { context: 0 })).await {
+            Ok(frame) => answered = Some(frame),
+            Err(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no room after a stream ended"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_peer_is_not_held_to_the_stream_limit() {
+    let (conn, _shutdown) = connect_with("peer", limited(16, 16, 1)).await.unwrap();
+    let mut first = conn.open(&subscribe(0), true).await.unwrap();
+    first.next().await.unwrap().unwrap();
+    conn.request(&Frame::GetTail(GetTail { context: 0 }))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_client_connection_past_the_connection_limit_is_refused_and_a_peer_is_not() {
+    let config = limited(16, 1, 16);
+    let (first, _first_shutdown) = connect_with("ci", Arc::clone(&config)).await.unwrap();
+
+    let Err(refused) = connect_with("ci", Arc::clone(&config)).await else {
+        panic!("a second client connection was accepted past the limit of one");
+    };
+    let failure = refused.failure().unwrap();
+    assert_eq!(failure.code, ErrorCode::UNAVAILABLE);
+    assert!(failure.message.contains("max-connections"), "{failure}");
+
+    let (_peer, _peer_shutdown) = connect_with("peer", Arc::clone(&config)).await.unwrap();
+
+    // Closing the first makes room.
+    drop(first);
+    until("the closed connection was never counted out", || {
+        config.limits.connections() == 0
+    })
+    .await;
+    connect_with("ci", Arc::clone(&config)).await.unwrap();
+    assert_eq!(config.limits.refused().1, 1);
+}
+
+#[tokio::test]
+async fn a_connection_past_the_handshake_limit_is_closed_at_once() {
+    let config = limited(1, 16, 16);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let served = Arc::clone(&config);
+    tokio::spawn(async move {
+        let service = Arc::new(Toy {
+            flood: Arc::default(),
+        });
+        loop {
+            let (tcp, peer) = listener.accept().await.unwrap();
+            tokio::spawn(server::connection(
+                tcp,
+                peer,
+                Arc::clone(&service),
+                Arc::clone(&served),
+                shutdown_rx.clone(),
+            ));
+        }
+    });
+
+    // One connection sits in its handshake, holding the only place.
+    let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    until("the idle connection never counted as a handshake", || {
+        config.limits.handshakes() == 1
+    })
+    .await;
+
+    let mut refused = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), refused.read(&mut byte))
+        .await
+        .expect("a connection past the handshake limit was left open");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert_eq!(config.limits.refused().0, 1);
+
+    // The one in its handshake still completes it.
+    let options = ConnectOptions {
+        client_name: "test".into(),
+        client_id: "test-1".into(),
+        credential: Credential::Token("ci".into()),
+        ..ConnectOptions::default()
+    };
+    client::handshake(idle, &options).await.unwrap();
+    until("a finished handshake was never counted out", || {
+        config.limits.handshakes() == 0
+    })
+    .await;
 }
