@@ -60,6 +60,14 @@ closes the connection. Until it has accepted Hello, a server reads frames of at
 most 64 KiB, and refuses a larger first frame with `resource_exhausted`; after
 that the frame limit is the one Welcome states.
 
+A server limits what it holds for clients at once: connections still in their
+handshake, client connections, and streams open on one connection. A
+connection past the handshake limit is closed as soon as it is accepted; one
+past the connection limit is refused with `unavailable` instead of Welcome; a
+request past the stream limit is refused with `unavailable` on its stream, and
+the connection lives on. Nothing was done in any of these, so a retry is safe
+and may find room. Verified peers are not counted.
+
 Hello carries the credentials. The server resolves `token` and `jwt` alike —
 a static token first, then a JWT from a trusted issuer — so a client that
 cannot tell which it holds sends `token`. With TLS client certificates the

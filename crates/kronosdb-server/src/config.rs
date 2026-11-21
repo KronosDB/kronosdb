@@ -269,6 +269,9 @@ struct ConfigFile {
     messaging: MessagingFileConfig,
 
     #[serde(default)]
+    limits: LimitsFileConfig,
+
+    #[serde(default)]
     admin: AdminConfig,
 
     #[serde(default)]
@@ -327,6 +330,18 @@ struct MessagingFileConfig {
     /// failing immediately. Default: true.
     #[serde(rename = "permit-wait")]
     permit_wait: Option<bool>,
+}
+
+/// What the server holds for clients at once. Verified peers are not counted.
+#[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
+struct LimitsFileConfig {
+    #[serde(rename = "max-handshakes")]
+    max_handshakes: Option<usize>,
+    #[serde(rename = "max-connections")]
+    max_connections: Option<usize>,
+    #[serde(rename = "max-streams-per-connection")]
+    max_streams_per_connection: Option<usize>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -481,6 +496,12 @@ pub struct ServerConfig {
     pub query_timeout_secs: u64,
     /// Bounded permit-wait on saturated command handlers (false = fail fast).
     pub messaging_permit_wait: bool,
+    /// Connections still in their TLS and Hello handshake at once.
+    pub max_handshakes: usize,
+    /// Client connections past their handshake at once.
+    pub max_connections: usize,
+    /// Streams open at once on one client connection.
+    pub max_streams_per_connection: usize,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_timeout_secs: u64,
     /// Max seconds to wait for connections to drain after SIGTERM.
@@ -545,6 +566,7 @@ impl ServerConfig {
         const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5;
         const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 15;
         const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = 4 * 1024 * 1024;
+        let default_limits = kronosdb_protocol::net::server::Limits::default();
 
         // CLI overrides file config. clap already handles env vars.
         // Every value resolves CLI/env > file > default.
@@ -686,6 +708,21 @@ impl ServerConfig {
                 .or(file_config.timeouts.query_timeout)
                 .unwrap_or(DEFAULT_QUERY_TIMEOUT),
             messaging_permit_wait: file_config.messaging.permit_wait.unwrap_or(true),
+            max_handshakes: positive(
+                "[limits] max-handshakes",
+                file_config.limits.max_handshakes,
+                default_limits.max_handshakes,
+            )?,
+            max_connections: positive(
+                "[limits] max-connections",
+                file_config.limits.max_connections,
+                default_limits.max_connections,
+            )?,
+            max_streams_per_connection: positive(
+                "[limits] max-streams-per-connection",
+                file_config.limits.max_streams_per_connection,
+                default_limits.max_streams,
+            )?,
             heartbeat_interval_secs: cli
                 .heartbeat_interval
                 .or(file_config.timeouts.heartbeat_interval)
@@ -734,6 +771,22 @@ impl ServerConfig {
             tracing::warn!("{warning}");
         }
         Ok(config)
+    }
+}
+
+/// A limit's value, or its default. Zero would refuse everything, so it is an
+/// error rather than a server that accepts nobody.
+fn positive(
+    name: &str,
+    value: Option<usize>,
+    default: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    match value {
+        Some(0) => {
+            Err(format!("{name} is 0, which would refuse every client; set at least 1").into())
+        }
+        Some(value) => Ok(value),
+        None => Ok(default),
     }
 }
 
@@ -948,6 +1001,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_limit_of_zero_is_refused() {
+        assert!(positive("[limits] max-connections", Some(0), 10).is_err());
+        assert_eq!(
+            positive("[limits] max-connections", Some(3), 10).unwrap(),
+            3
+        );
+        assert_eq!(positive("[limits] max-connections", None, 10).unwrap(), 10);
+    }
+
+    #[test]
     fn archive_settings_that_cannot_work_are_refused() {
         const SEGMENT: u64 = 256 << 20;
         assert!(check_archive(true, 0, None, SEGMENT).is_err());
@@ -1152,6 +1215,11 @@ heartbeat-timeout = 15
 [messaging]
 permit-wait = true
 
+[limits]
+max-handshakes = 1024
+max-connections = 10000
+max-streams-per-connection = 10000
+
 [admin]
 listen = "127.0.0.1:9240"
 
@@ -1205,6 +1273,7 @@ roles = ["write"]
         assert_eq!(config.security.issuers.len(), 1);
         assert_eq!(config.security.grants.len(), 1);
         assert_eq!(config.admin.oidc.session_ttl_minutes, Some(60));
+        assert_eq!(config.limits.max_connections, Some(10000));
     }
 
     #[test]
@@ -1290,6 +1359,7 @@ roles = ["write"]
             "archive",
             "timeouts",
             "messaging",
+            "limits",
             "admin",
             "admin.auth",
             "admin.oidc",

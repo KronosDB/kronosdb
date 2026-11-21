@@ -12,7 +12,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,131 @@ pub struct Accepted<S> {
     /// both directions. Peers replicating a log trade frames far larger than
     /// a client's, and only a verified peer should be allowed to.
     pub max_frame: Option<u32>,
+    /// A verified peer: not counted against the server's [`Limits`], which
+    /// are there for clients. A cluster whose nodes could not reach each other
+    /// because clients used up a limit would stop.
+    pub peer: bool,
+}
+
+/// What a server holds for clients at once, shared by all its connections.
+/// Verified peers are not counted. A connection or request past a limit is
+/// refused as `unavailable`: nothing was done, and a retry may find room.
+#[derive(Debug)]
+pub struct Limits {
+    /// Connections still in their handshake (TLS and Hello). One past it is
+    /// closed as soon as it is accepted.
+    pub max_handshakes: usize,
+    /// Client connections past their handshake.
+    pub max_connections: usize,
+    /// Streams open at once on one client connection.
+    pub max_streams: usize,
+    handshakes: AtomicUsize,
+    connections: AtomicUsize,
+    refused_handshakes: AtomicU64,
+    refused_connections: AtomicU64,
+    refused_streams: AtomicU64,
+}
+
+impl Limits {
+    pub fn new(max_handshakes: usize, max_connections: usize, max_streams: usize) -> Self {
+        Self {
+            max_handshakes,
+            max_connections,
+            max_streams,
+            handshakes: AtomicUsize::new(0),
+            connections: AtomicUsize::new(0),
+            refused_handshakes: AtomicU64::new(0),
+            refused_connections: AtomicU64::new(0),
+            refused_streams: AtomicU64::new(0),
+        }
+    }
+
+    /// Connections in their handshake now.
+    pub fn handshakes(&self) -> usize {
+        self.handshakes.load(Ordering::Relaxed)
+    }
+
+    /// Client connections past their handshake now.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
+    }
+
+    /// How many connections and requests each limit refused, since start:
+    /// handshakes, connections, streams.
+    pub fn refused(&self) -> (u64, u64, u64) {
+        (
+            self.refused_handshakes.load(Ordering::Relaxed),
+            self.refused_connections.load(Ordering::Relaxed),
+            self.refused_streams.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::new(1024, 10_000, 10_000)
+    }
+}
+
+/// Which counted limit a [`Slot`] holds a place in.
+#[derive(Clone, Copy)]
+enum Counted {
+    Handshake,
+    Connection,
+}
+
+impl Limits {
+    fn counter(&self, which: Counted) -> (&AtomicUsize, usize) {
+        match which {
+            Counted::Handshake => (&self.handshakes, self.max_handshakes),
+            Counted::Connection => (&self.connections, self.max_connections),
+        }
+    }
+
+    /// A place in `which`, unless it is full; a full limit counts a refusal.
+    fn take(self: &Arc<Self>, which: Counted) -> Option<Slot> {
+        let (count, max) = self.counter(which);
+        let mut current = count.load(Ordering::Relaxed);
+        loop {
+            if current >= max {
+                let refused = match which {
+                    Counted::Handshake => &self.refused_handshakes,
+                    Counted::Connection => &self.refused_connections,
+                };
+                refused.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(Slot {
+                        limits: Arc::clone(self),
+                        which,
+                    });
+                }
+                Err(now) => current = now,
+            }
+        }
+    }
+}
+
+/// A place taken in a limit, given back when dropped.
+struct Slot {
+    limits: Arc<Limits>,
+    which: Counted,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.limits
+            .counter(self.which)
+            .0
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Who is on the other end, as far as the transport knows.
@@ -84,6 +209,8 @@ pub struct ServerConfig {
     /// How long a client has to send its preface and Hello.
     pub handshake_timeout: Duration,
     pub tls: Option<TlsAcceptor>,
+    /// Shared by every connection served with this config.
+    pub limits: Arc<Limits>,
 }
 
 impl Default for ServerConfig {
@@ -94,6 +221,7 @@ impl Default for ServerConfig {
             heartbeat: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
             tls: None,
+            limits: Arc::default(),
         }
     }
 }
@@ -382,6 +510,11 @@ pub async fn connection<S: Service>(
     config: Arc<ServerConfig>,
     shutdown: watch::Receiver<bool>,
 ) {
+    // Counted from accept: the TLS handshake is the dear part of one.
+    let Some(handshake) = config.limits.take(Counted::Handshake) else {
+        tracing::debug!(%addr, limit = config.limits.max_handshakes, "too many handshakes; closing");
+        return;
+    };
     let result = match config.tls.clone() {
         Some(acceptor) => {
             match tokio::time::timeout(config.handshake_timeout, acceptor.accept(tcp)).await {
@@ -393,7 +526,8 @@ pub async fn connection<S: Service>(
                         .map(|chain| chain.iter().map(|c| c.clone().into_owned()).collect())
                         .unwrap_or_default();
                     let peer = Arc::new(PeerInfo { addr, certificates });
-                    run(tls, peer, service, config, shutdown).await
+                    let (r, w) = tokio::io::split(tls);
+                    run_halves(r, w, peer, service, config, shutdown, Some(handshake)).await
                 }
                 Ok(Err(e)) => Err(NetError::Tls(e.to_string())),
                 Err(_) => Err(NetError::Timeout),
@@ -406,7 +540,7 @@ pub async fn connection<S: Service>(
             });
             // Borrowed halves of the socket: no lock between them.
             let (r, w) = tcp.split();
-            run_halves(r, w, peer, service, config, shutdown).await
+            run_halves(r, w, peer, service, config, shutdown, Some(handshake)).await
         }
     };
     if let Err(error) = result {
@@ -469,7 +603,7 @@ where
     IO: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (r, w) = tokio::io::split(io);
-    run_halves(r, w, peer, service, config, shutdown).await
+    run_halves(r, w, peer, service, config, shutdown, None).await
 }
 
 /// The connection's task: it reads and routes frames, runs the handlers that
@@ -483,6 +617,7 @@ async fn run_halves<S, R, W>(
     service: Arc<S>,
     config: Arc<ServerConfig>,
     mut shutdown: watch::Receiver<bool>,
+    handshake_slot: Option<Slot>,
 ) -> Result<(), NetError>
 where
     S: Service,
@@ -496,16 +631,18 @@ where
     let mut reader = FrameReader::new(r, config.max_frame.min(PRE_AUTH_MAX_FRAME));
 
     let handshake = handshake(&mut reader, &outbox, &service, peer, &config);
-    let (session, window) = match tokio::time::timeout(config.handshake_timeout, handshake).await {
-        Ok(Ok((accepted, window))) => (accepted.session, window),
-        Ok(Err(e)) => {
-            // The refusal is queued: let it out before closing.
-            let farewell = farewell(&outbox, &mut wbuf, &mut taken, &mut w);
-            let _ = tokio::time::timeout(config.handshake_timeout, farewell).await;
-            return Err(e);
-        }
-        Err(_) => return Err(NetError::Timeout),
-    };
+    let (session, window, is_peer, _connection_slot) =
+        match tokio::time::timeout(config.handshake_timeout, handshake).await {
+            Ok(Ok((accepted, window, slot))) => (accepted.session, window, accepted.peer, slot),
+            Ok(Err(e)) => {
+                // The refusal is queued: let it out before closing.
+                let farewell = farewell(&outbox, &mut wbuf, &mut taken, &mut w);
+                let _ = tokio::time::timeout(config.handshake_timeout, farewell).await;
+                return Err(e);
+            }
+            Err(_) => return Err(NetError::Timeout),
+        };
+    drop(handshake_slot);
 
     let mut finished: Vec<u32> = Vec::new();
     let mut streams: HashMap<u32, Entry> = HashMap::new();
@@ -629,6 +766,28 @@ where
                         }
                     }
                     ServerRoute::Open => {
+                        if !is_peer && streams.len() >= config.limits.max_streams {
+                            config
+                                .limits
+                                .refused_streams
+                                .fetch_add(1, Ordering::Relaxed);
+                            let failure = Failure::new(
+                                ErrorCode::UNAVAILABLE,
+                                format!(
+                                    "this connection has {} streams open, the server's limit for \
+                                     one connection (max-streams-per-connection); retry once one \
+                                     ends",
+                                    streams.len()
+                                ),
+                            );
+                            control(
+                                &outbox,
+                                id,
+                                FLAG_END,
+                                &Frame::RequestFailed(failure.to_frame()),
+                            );
+                            continue;
+                        }
                         if draining {
                             let failure = Failure::new(
                                 ErrorCode::UNAVAILABLE,
@@ -876,7 +1035,7 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
     service: &Arc<S>,
     peer: Arc<PeerInfo>,
     config: &ServerConfig,
-) -> Result<(Accepted<S::Session>, u32), NetError> {
+) -> Result<(Accepted<S::Session>, u32, Option<Slot>), NetError> {
     let preface = reader.read_exact(PREFACE.len()).await?;
     if preface.as_ref() != PREFACE {
         return Err(NetError::Unexpected {
@@ -926,7 +1085,7 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
             FLAG_END,
             &Frame::RequestFailed(failure.to_frame()),
         );
-        Err::<(Accepted<S::Session>, u32), NetError>(NetError::Failed(failure))
+        Err::<(Accepted<S::Session>, u32, Option<Slot>), NetError>(NetError::Failed(failure))
     };
     // The version first, from its own two bytes: an older Hello may not
     // decode as this version's, and its client deserves to be told why.
@@ -968,11 +1127,29 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
         Ok(accepted) => accepted,
         Err(failure) => return refuse(failure),
     };
+    // A client connection takes a place for as long as it lives; a peer
+    // takes none.
+    let slot = if accepted.peer {
+        None
+    } else {
+        match config.limits.take(Counted::Connection) {
+            Some(slot) => Some(slot),
+            None => {
+                return refuse(Failure::new(
+                    ErrorCode::UNAVAILABLE,
+                    format!(
+                        "this server is at its limit of {} client connections \
+                         (max-connections); retry later, or connect to another node",
+                        config.limits.max_connections
+                    ),
+                ));
+            }
+        }
+    };
     let max_frame = accepted.max_frame.unwrap_or(config.max_frame);
     reader.set_max_frame(max_frame);
-    // A connection given its own frame limit is a verified peer, whose frame
-    // headers are trusted.
-    if accepted.max_frame.is_some() {
+    // A verified peer's frame headers are trusted.
+    if accepted.peer {
         reader.reserve_declared_lengths();
     }
     let welcome = Frame::Welcome(Welcome {
@@ -985,7 +1162,7 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
         heartbeat: u32::try_from(config.heartbeat.as_millis()).unwrap_or(u32::MAX),
     });
     outbox.push_now(Out::Frame(encode(0, 0, &welcome)?));
-    Ok((accepted, window))
+    Ok((accepted, window, slot))
 }
 
 /// The stored record layout this build reads and writes.

@@ -146,14 +146,13 @@ impl Service for Native {
             let cert = peer.certificates.first().map(|c| c.as_ref());
             let principal = authenticate(&deps.auth, h.credential_kind, h.credential, cert).await?;
             // Peers replicate frames of tens of megabytes; clients do not.
-            let max_frame = principal
-                .allows(Access::Peer, Scope::Global, "")
-                .then_some(PEER_MAX_FRAME);
+            let peer = principal.allows(Access::Peer, Scope::Global, "");
             Ok(Accepted {
                 principal: format!("{}:{}", principal.source, principal.subject),
                 session: Arc::new(Session::new(principal)),
                 features: 0,
-                max_frame,
+                max_frame: peer.then_some(PEER_MAX_FRAME),
+                peer,
             })
         })
     }

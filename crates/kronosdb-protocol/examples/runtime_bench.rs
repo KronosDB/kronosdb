@@ -26,6 +26,7 @@ impl Service for Empty {
                 principal: String::new(),
                 features: 0,
                 max_frame: None,
+                peer: false,
             })
         })
     }
