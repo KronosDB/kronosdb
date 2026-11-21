@@ -26,8 +26,8 @@ use tokio_rustls::rustls::pki_types::CertificateDer;
 use super::outbox::{OutTx, Outbox, WriteBuf};
 use super::rules::{self, LivenessCheck, ServerRoute};
 use super::{
-    DEFAULT_MAX_FRAME, Failure, FrameReader, NetError, Out, OwnedFrame, encode, encode_sized,
-    shared_header,
+    DEFAULT_MAX_FRAME, Failure, FrameReader, NetError, Out, OwnedFrame, PRE_AUTH_MAX_FRAME, encode,
+    encode_sized, shared_header,
 };
 use crate::codec::{FLAG_END, PREFACE};
 use crate::generated::{
@@ -492,7 +492,8 @@ where
     let outbox = Outbox::new();
     let mut wbuf = WriteBuf::new();
     let mut taken: VecDeque<Out> = VecDeque::new();
-    let mut reader = FrameReader::new(r, config.max_frame);
+    // Until Hello is accepted the client is unknown: read only a small Hello.
+    let mut reader = FrameReader::new(r, config.max_frame.min(PRE_AUTH_MAX_FRAME));
 
     let handshake = handshake(&mut reader, &outbox, &service, peer, &config);
     let (session, window) = match tokio::time::timeout(config.handshake_timeout, handshake).await {
@@ -883,7 +884,25 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
             context: "instead of the KRONOSDB preface",
         });
     }
-    let hello = reader.next().await?.ok_or(NetError::Closed)?;
+    let hello = match reader.next().await {
+        Err(NetError::FrameTooLarge { len, max }) => {
+            let failure = Failure::new(
+                ErrorCode::RESOURCE_EXHAUSTED,
+                format!(
+                    "the first frame is {len} bytes, more than the {max} bytes this server \
+                     reads before authentication; a Hello is far smaller"
+                ),
+            );
+            control(
+                outbox,
+                0,
+                FLAG_END,
+                &Frame::RequestFailed(failure.to_frame()),
+            );
+            return Err(NetError::Failed(failure));
+        }
+        read => read?.ok_or(NetError::Closed)?,
+    };
     if hello.kind() != Hello::KIND || hello.stream() != 0 {
         let failure = Failure::new(
             ErrorCode::PROTOCOL_VIOLATION,
@@ -951,6 +970,11 @@ async fn handshake<S: Service, R: AsyncRead + Unpin>(
     };
     let max_frame = accepted.max_frame.unwrap_or(config.max_frame);
     reader.set_max_frame(max_frame);
+    // A connection given its own frame limit is a verified peer, whose frame
+    // headers are trusted.
+    if accepted.max_frame.is_some() {
+        reader.reserve_declared_lengths();
+    }
     let welcome = Frame::Welcome(Welcome {
         version: PROTOCOL_VERSION,
         features: accepted.features,

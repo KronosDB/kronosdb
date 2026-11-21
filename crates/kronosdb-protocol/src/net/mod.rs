@@ -27,6 +27,11 @@ use crate::generated::{ErrorCode, Frame, RequestFailed};
 /// Frames larger than this are refused unless the connection agreed otherwise.
 pub const DEFAULT_MAX_FRAME: u32 = 16 * 1024 * 1024;
 
+/// The largest frame a server reads before Hello is accepted: the preface and
+/// Hello come from a client nobody has authenticated yet. A Hello carries a
+/// token or JWT, a few KiB at most.
+pub const PRE_AUTH_MAX_FRAME: u32 = 64 * 1024;
+
 /// A whole received frame, header included, sharing the read buffer.
 #[derive(Clone)]
 pub struct OwnedFrame {
@@ -334,6 +339,10 @@ pub(crate) struct FrameReader<R> {
     r: R,
     buf: BytesMut,
     max_frame: u32,
+    /// Whether to set aside a frame's declared length as soon as its header
+    /// arrives. Only for a connection whose other end is trusted (a verified
+    /// peer), where it saves copying large frames as the buffer grows.
+    reserve_declared: bool,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -342,11 +351,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             r,
             buf: BytesMut::with_capacity(64 * 1024),
             max_frame,
+            reserve_declared: false,
         }
     }
 
     pub(crate) fn set_max_frame(&mut self, max: u32) {
         self.max_frame = max;
+    }
+
+    /// Trust frame headers: reserve each frame's declared length at once.
+    pub(crate) fn reserve_declared_lengths(&mut self) {
+        self.reserve_declared = true;
     }
 
     /// Whether a whole frame is already buffered behind the current one.
@@ -374,7 +389,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             });
         }
         if self.buf.len() < len {
-            self.buf.reserve(len - self.buf.len());
+            // Room for what has arrived, doubled, up to what the frame still
+            // needs: a header alone, declaring megabytes, sets aside no more
+            // than the bytes that came with it, and a large frame still reads
+            // in a logarithmic number of growths.
+            let missing = len - self.buf.len();
+            if self.reserve_declared {
+                self.buf.reserve(missing);
+            } else {
+                self.buf
+                    .reserve(missing.min(self.buf.capacity().max(64 * 1024)));
+            }
             return Ok(None);
         }
         Ok(Some(OwnedFrame::from_bytes(
