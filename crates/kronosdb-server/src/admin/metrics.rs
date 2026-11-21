@@ -590,6 +590,38 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         );
     }
 
+    // The client port's limits: how close it is to each, and what each refused.
+    let limits = &state.limits;
+    family(
+        &mut out,
+        "kronosdb_native_handshakes",
+        "gauge",
+        "Client-port connections still in their TLS and Hello handshake",
+        &[(String::new(), limits.handshakes() as u64)],
+    );
+    family(
+        &mut out,
+        "kronosdb_native_client_connections",
+        "gauge",
+        "Client connections past their handshake (verified peers are not counted)",
+        &[(String::new(), limits.connections() as u64)],
+    );
+    let (handshakes, connections, streams) = limits.refused();
+    family(
+        &mut out,
+        "kronosdb_native_limit_refusals_total",
+        "counter",
+        "Connections and requests refused at a [limits] setting",
+        &[
+            ("{limit=\"max-handshakes\"}".to_string(), handshakes),
+            ("{limit=\"max-connections\"}".to_string(), connections),
+            (
+                "{limit=\"max-streams-per-connection\"}".to_string(),
+                streams,
+            ),
+        ],
+    );
+
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
 }
 

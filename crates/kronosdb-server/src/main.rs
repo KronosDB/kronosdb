@@ -323,6 +323,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.admin_auth,
         Arc::clone(&authenticator),
     ));
+    // The client port's limits, shared with the admin plane's metrics.
+    let limits = Arc::new(kronosdb_protocol::net::server::Limits::new(
+        config.max_handshakes,
+        config.max_connections,
+        config.max_streams_per_connection,
+    ));
     let admin_state = admin::AdminState {
         config: config.clone(),
         contexts: Arc::clone(&contexts),
@@ -336,6 +342,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         identities: Arc::clone(&authenticator),
         activity: Arc::new(admin::activity::ActivityTracker::new()),
         hardware,
+        limits: Arc::clone(&limits),
     };
     tokio::spawn(async move {
         if let Err(e) = admin::start_admin_server(admin_state).await {
@@ -474,6 +481,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let native_config = Arc::new(kronosdb_protocol::net::server::ServerConfig {
         server_name: config.node_name.clone(),
         tls,
+        limits,
         ..Default::default()
     });
     tokio::spawn(accept_loop(

@@ -45,6 +45,8 @@ pub struct AdminState {
     pub activity: Arc<activity::ActivityTracker>,
     /// What the startup hardware checks measured and found.
     pub hardware: Arc<kronosdb_eventstore::hardware::HardwareReport>,
+    /// The client port's limits, and what they refused.
+    pub limits: Arc<kronosdb_protocol::net::server::Limits>,
 }
 
 /// Starts the admin HTTP server on the configured address.
