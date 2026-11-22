@@ -483,6 +483,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )),
         max_snapshot_size: config.max_snapshot_size,
         appends: Arc::clone(&appends),
+        // A retried append is recognised only while the stores keep their
+        // newest events by identifier.
+        features: if config.retry_window_events > 0 {
+            kronosdb_protocol::net::feature::RETRY_SAFE_APPENDS
+        } else {
+            0
+        },
         hub: Arc::clone(&hub),
         schedules: Arc::clone(&schedules),
     }));

@@ -9,7 +9,7 @@ import java.util.List;
  * First frame of every connection, after the 8-byte preface {@code KRONOSDB}.
  *
  * @param version Highest protocol version the client speaks.
- * @param features Feature bits the client would like to use. None are defined in version 2.
+ * @param features Feature bits the client would like to use. Bit 0 ({@code 0x1}): appends that can be sent again.
  * @param recordFormat Stored record layout the client decodes. Version 2 knows layout 3.
  * @param clientName Application name, shown in the admin console.
  * @param clientId This instance, unique per process.

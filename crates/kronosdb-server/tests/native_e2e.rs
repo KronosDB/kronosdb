@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use kronosdb_client::{
     Appended, Client, Condition, ConnectOptions, Criterion, DEFAULT_WINDOW, Delivery, ErrorCode,
-    MIN_WINDOW, NewEvent, SubscribeOptions,
+    MIN_WINDOW, NewEvent, SubscribeOptions, feature,
 };
 
 mod support;
@@ -234,6 +234,44 @@ async fn event_store_over_the_native_protocol() {
     assert_eq!(missing.failure().unwrap().code, ErrorCode::NOT_FOUND);
     // The connection is fine afterwards.
     assert!(ctx.head().await.unwrap() > 0);
+}
+
+/// Connects asking for `features` and answers what Welcome granted.
+async fn granted(node: &Node, features: u64) -> u64 {
+    let options = ConnectOptions {
+        features,
+        ..ConnectOptions::default()
+    };
+    let deadline = support::startup_deadline();
+    while std::time::Instant::now() < deadline {
+        if let Ok(client) = Client::connect(&node.native, &options).await {
+            return client.connection().welcome().features;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the server never became ready on {}", node.native);
+}
+
+/// Welcome tells a client whether an append can be sent again: a server that
+/// recognises retries grants the feature to a client that asks for it, and
+/// one whose retry window is turned off grants nothing.
+#[tokio::test]
+async fn welcome_grants_retry_safe_appends_only_where_retries_are_recognised() {
+    let dir = work_dir("retry-feature");
+    let node = spawn(&dir);
+    assert_eq!(
+        granted(&node, feature::RETRY_SAFE_APPENDS).await,
+        feature::RETRY_SAFE_APPENDS
+    );
+    // Only what was asked for, and nothing the server does not know.
+    assert_eq!(granted(&node, 0).await, 0);
+    assert_eq!(granted(&node, u64::MAX).await, feature::RETRY_SAFE_APPENDS);
+
+    let off = work_dir("retry-feature-off");
+    let config = off.join("kronosdb.toml");
+    std::fs::write(&config, "[storage]\nretry-window-events = 0\n").unwrap();
+    let node = spawn_with(&off, &[("KRONOSDB_CONFIG", config.to_str().unwrap())]);
+    assert_eq!(granted(&node, feature::RETRY_SAFE_APPENDS).await, 0);
 }
 
 /// Records go from the client's frame into the segment as they are (the server

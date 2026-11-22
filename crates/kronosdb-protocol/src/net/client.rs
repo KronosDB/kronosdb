@@ -46,6 +46,9 @@ pub struct ConnectOptions {
     /// this far ahead, and no other. Bigger fills a link that is further
     /// away; the server never sends more than this on a stream nobody reads.
     pub window: u32,
+    /// The [`feature`](super::feature) bits to ask for. What the server
+    /// granted is in [`Welcomed::features`].
+    pub features: u64,
 }
 
 impl Default for ConnectOptions {
@@ -57,6 +60,7 @@ impl Default for ConnectOptions {
             tls: None,
             connect_timeout: Duration::from_secs(10),
             window: DEFAULT_WINDOW,
+            features: 0,
         }
     }
 }
@@ -170,7 +174,7 @@ where
         0,
         &Frame::Hello(Hello {
             version: PROTOCOL_VERSION,
-            features: 0,
+            features: options.features,
             record_format: RECORD_FORMAT,
             client_name: &options.client_name,
             client_id: &options.client_id,

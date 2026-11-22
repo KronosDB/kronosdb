@@ -32,6 +32,15 @@ pub const DEFAULT_MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// token or JWT, a few KiB at most.
 pub const PRE_AUTH_MAX_FRAME: u32 = 64 * 1024;
 
+/// The feature bits of Hello and Welcome. A client asks for the ones it would
+/// use, and the server grants those it provides.
+pub mod feature {
+    /// The server recognises an append sent again and answers with the
+    /// positions its events already have. A client granted this may send an
+    /// append again when it could not learn the outcome of the first.
+    pub const RETRY_SAFE_APPENDS: u64 = 1 << 0;
+}
+
 /// A whole received frame, header included, sharing the read buffer.
 #[derive(Clone)]
 pub struct OwnedFrame {
