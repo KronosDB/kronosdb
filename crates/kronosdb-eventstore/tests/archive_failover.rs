@@ -57,6 +57,7 @@ async fn run() {
                     max_local_bytes: None,
                 }),
                 max_snapshot_size: None,
+                append_timeout_secs: None,
             })
             .expect("spawn node"),
         );

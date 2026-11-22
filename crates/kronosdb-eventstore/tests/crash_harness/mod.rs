@@ -249,6 +249,9 @@ pub struct SpawnConfig {
     /// Snapshot state cap in bytes (`max-snapshot-size`). `None` keeps the
     /// 4 MB default.
     pub max_snapshot_size: Option<u64>,
+    /// Seconds an append may wait to be committed (`[timeouts] append`).
+    /// `None` keeps the default.
+    pub append_timeout_secs: Option<u64>,
 }
 
 /// Ensures the kronosdb-server binary is built once before any crash test runs it.
@@ -360,6 +363,9 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     }
     if let Some(bytes) = cfg.max_snapshot_size {
         cmd.env("KRONOSDB_MAX_SNAPSHOT_SIZE", bytes.to_string());
+    }
+    if let Some(secs) = cfg.append_timeout_secs {
+        cmd.env("KRONOSDB_APPEND_TIMEOUT", secs.to_string());
     }
 
     let child = cmd.spawn()?;
