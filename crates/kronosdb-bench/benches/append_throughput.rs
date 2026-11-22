@@ -5,15 +5,18 @@
 //! - Batch size (1-500 events per append call)
 //! - Segment rotation overhead (small segments force frequent rotation)
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use kronosdb_eventstore::append::AppendRequest;
 use kronosdb_eventstore::event::{AppendEvent, Tag};
 use kronosdb_eventstore::store::{EventStoreEngine, StoreOptions};
 use std::hint::black_box;
 use tempfile::tempdir;
 
-fn make_order_events(count: usize) -> Vec<AppendEvent> {
-    (0..count)
+/// `count` events, numbered from `first`. Every append gets events of its
+/// own: the same events again, identifiers included, are a retry of the
+/// first append and are not written.
+fn make_order_events(first: usize, count: usize) -> Vec<AppendEvent> {
+    (first..first + count)
         .map(|i| AppendEvent {
             identifier: format!("evt-{i}"),
             name: "OrderPlaced".into(),
@@ -44,18 +47,25 @@ fn batch_size_throughput(c: &mut Criterion) {
             |b, &batch_size| {
                 let dir = tempdir().unwrap();
                 let store = EventStoreEngine::create(dir.path()).unwrap();
-                let events = make_order_events(batch_size);
+                let mut next = 0;
 
-                b.iter(|| {
-                    black_box(
-                        store
-                            .append(AppendRequest {
-                                condition: None,
-                                events: events.clone(),
-                            })
-                            .unwrap(),
-                    );
-                });
+                b.iter_batched(
+                    || {
+                        next += batch_size;
+                        make_order_events(next, batch_size)
+                    },
+                    |events| {
+                        black_box(
+                            store
+                                .append(AppendRequest {
+                                    condition: None,
+                                    events,
+                                })
+                                .unwrap(),
+                        );
+                    },
+                    BatchSize::SmallInput,
+                );
             },
         );
     }
@@ -80,35 +90,49 @@ fn sustained_with_rotation(c: &mut Criterion) {
             ..Default::default()
         };
         let store = EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap();
-        let events = make_order_events(batch_size);
+        let mut next = 0;
 
-        b.iter(|| {
-            black_box(
-                store
-                    .append(AppendRequest {
-                        condition: None,
-                        events: events.clone(),
-                    })
-                    .unwrap(),
-            );
-        });
+        b.iter_batched(
+            || {
+                next += batch_size;
+                make_order_events(next, batch_size)
+            },
+            |events| {
+                black_box(
+                    store
+                        .append(AppendRequest {
+                            condition: None,
+                            events,
+                        })
+                        .unwrap(),
+                );
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.bench_function("no_rotation", |b| {
         let dir = tempdir().unwrap();
         let store = EventStoreEngine::create(dir.path()).unwrap(); // 256MB default
-        let events = make_order_events(batch_size);
+        let mut next = 0;
 
-        b.iter(|| {
-            black_box(
-                store
-                    .append(AppendRequest {
-                        condition: None,
-                        events: events.clone(),
-                    })
-                    .unwrap(),
-            );
-        });
+        b.iter_batched(
+            || {
+                next += batch_size;
+                make_order_events(next, batch_size)
+            },
+            |events| {
+                black_box(
+                    store
+                        .append(AppendRequest {
+                            condition: None,
+                            events,
+                        })
+                        .unwrap(),
+                );
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
