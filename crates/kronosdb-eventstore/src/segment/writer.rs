@@ -9,6 +9,7 @@ use crate::append::RecordBatch;
 use crate::cache::IndexCache;
 use crate::error::Error;
 use crate::event::{AppendEvent, Position};
+use crate::recent::{Fingerprint, RecentEvents};
 
 use crate::replication::epochs::EpochStart;
 use crate::segment::format::EventIndexFields;
@@ -48,6 +49,10 @@ pub struct RawAppendResult {
 /// This is NOT thread-safe — it's designed to be owned by a single writer thread.
 /// Readers access segments independently via mmap or file I/O.
 pub struct SegmentWriter {
+    /// The events at the end of the log, by identifier: every event this
+    /// writer writes, a client's or one replicated from the leader, is noted
+    /// here. Off until the engine asks for a window (`track_recent`).
+    recent: RecentEvents,
     /// Directory where segment files are stored.
     dir: PathBuf,
     /// Maximum size of a segment file in bytes.
@@ -124,6 +129,7 @@ impl SegmentWriter {
         sync_dir(dir)?;
 
         Ok(Self {
+            recent: RecentEvents::new(0),
             dir: dir.to_path_buf(),
             max_segment_size,
             active_file: file,
@@ -199,6 +205,7 @@ impl SegmentWriter {
         let active_index = SegmentIndex::build_from_segment(&path)?;
 
         Ok(Self {
+            recent: RecentEvents::new(0),
             dir: dir.to_path_buf(),
             max_segment_size,
             active_file: file,
@@ -405,6 +412,9 @@ impl SegmentWriter {
                     let scan = format::scan(&records[at + 5..at + wire_len])
                         .expect("the batch's records were checked when it was built");
                     index.insert_scanned(indexed_position, record_offset, &scan);
+                    let nth = (indexed_position - first_position.0) as usize;
+                    self.recent
+                        .note(indexed_position, batch.fingerprints()[nth]);
                     record_offset += 4 + wire_len as u64;
                     indexed_position += 1;
                     at += wire_len;
@@ -499,6 +509,7 @@ impl SegmentWriter {
         let mut cursor = 0usize;
         let mut expected = first_position;
         let mut events: Vec<(usize, EventIndexFields)> = Vec::new();
+        let mut fingerprints: Vec<Option<Fingerprint>> = Vec::new();
         // Control records, each with how many of the frame's events precede
         // it, so the index records them where they sit.
         let mut controls: Vec<(usize, format::ControlRecord)> = Vec::new();
@@ -555,6 +566,7 @@ impl SegmentWriter {
                     });
                 }
                 expected = expected.next();
+                fingerprints.push(Fingerprint::of(payload));
                 events.push((record_start, fields));
             } else if flags::is_control(flags_byte) {
                 let control = format::deserialize_control(flags_byte, payload)?;
@@ -593,6 +605,7 @@ impl SegmentWriter {
                     &fields.name,
                     &fields.tags,
                 );
+                self.recent.note(fields.position.0, fingerprints[i]);
             }
             for (_, control) in controls {
                 index.insert_control(*control);
@@ -713,6 +726,8 @@ impl SegmentWriter {
         self.active_base_position = base;
         self.write_offset = write_offset;
         self.next_position = next_position;
+        // What was cut is no longer in the log, so it is no longer a retry.
+        self.recent.truncate_from(next_position.0);
         Ok(())
     }
 
@@ -779,6 +794,20 @@ impl SegmentWriter {
     /// exists.
     pub fn attach_index_cache(&mut self, cache: Arc<IndexCache>) {
         self.index_cache = Some(cache);
+    }
+
+    /// Keeps the last `events` events by identifier, starting empty.
+    pub fn track_recent(&mut self, events: usize) {
+        self.recent = RecentEvents::new(events);
+    }
+
+    /// The events at the end of the log, by identifier.
+    pub fn recent(&self) -> &RecentEvents {
+        &self.recent
+    }
+
+    pub fn recent_mut(&mut self) -> &mut RecentEvents {
+        &mut self.recent
     }
 
     /// Rotates to a new segment file.
