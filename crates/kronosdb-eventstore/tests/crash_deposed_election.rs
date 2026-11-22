@@ -44,6 +44,7 @@ fn spawn_config(
         segment_size: None,
         archive: None,
         max_snapshot_size: None,
+        append_timeout_secs: None,
     }
 }
 

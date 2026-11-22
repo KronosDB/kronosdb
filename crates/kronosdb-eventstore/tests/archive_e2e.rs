@@ -43,6 +43,7 @@ async fn run() {
             max_local_bytes: Some(2 * SEGMENT_SIZE),
         }),
         max_snapshot_size: None,
+        append_timeout_secs: None,
     })
     .expect("spawn server");
     wait_until_ready(srv.listen, srv.admin, READY_TIMEOUT)

@@ -68,6 +68,12 @@ request past the stream limit is refused with `unavailable` on its stream, and
 the connection lives on. Nothing was done in any of these, so a retry is safe
 and may find room. Verified peers are not counted.
 
+Appends are limited too, per node. One that would take the bytes of appends
+waiting to be committed past the node's limit is refused with `unavailable`
+before anything is written. One that is not confirmed as committed within the
+node's append deadline is answered with `unavailable` as well: it was written,
+and may still end up in the log.
+
 An append can be sent again safely. A client that gets `unavailable` for one,
 or loses the connection before the answer, does not know whether it was
 written; it sends the same append again: the same events, with the same

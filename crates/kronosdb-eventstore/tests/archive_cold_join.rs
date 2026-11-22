@@ -52,6 +52,7 @@ async fn run() {
             max_local_bytes: Some(2 * SEGMENT_SIZE),
         }),
         max_snapshot_size: None,
+        append_timeout_secs: None,
     })
     .expect("spawn node 1");
     wait_until_ready(srv1.listen, srv1.admin, READY_TIMEOUT)
@@ -99,6 +100,7 @@ async fn run() {
             max_local_bytes: Some(2 * SEGMENT_SIZE),
         }),
         max_snapshot_size: None,
+        append_timeout_secs: None,
     })
     .expect("spawn node 2");
     wait_for_tcp(srv2.listen, READY_TIMEOUT).await;
