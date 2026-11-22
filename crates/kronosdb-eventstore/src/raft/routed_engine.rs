@@ -75,7 +75,7 @@ impl NativeEngine {
         });
         let reply = self
             .pool
-            .request(&leader.addr, &forward)
+            .write_request(&leader.addr, &forward)
             .await
             .map_err(|error| {
                 wire::with_context(error, format!("forward native append to node {leader_id}"))
@@ -84,7 +84,7 @@ impl NativeEngine {
         match reply.decode() {
             Ok(p::Frame::ForwardAppended(appended)) => {
                 if appended.epoch != epoch {
-                    return Err(Error::Unavailable {
+                    return Err(Error::UnknownOutcome {
                         message: format!(
                             "claimed leader changed epoch during append: sent {epoch}, received {}",
                             appended.epoch
@@ -155,11 +155,8 @@ impl NativeEngine {
                 }
             };
             if !self.control.is_local_writable(claim.epoch, claim.leader_id) {
-                return Err(Error::Unavailable {
-                    message: "leadership was lost before the append was acknowledged, so its \
-                              outcome is unknown; retry with a consistency condition to \
-                              stay idempotent"
-                        .into(),
+                return Err(Error::UnknownOutcome {
+                    message: "leadership was lost before the append was acknowledged".into(),
                 });
             }
             result
