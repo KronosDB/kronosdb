@@ -24,10 +24,12 @@ pub async fn tail(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
         .map_err(convert::failure)
 }
 
+/// A follower's append, held to this node's append limits like a client's.
 pub async fn forward_append(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
+    let bytes = stream.request.bytes().len() as u64;
     ctx.deps
-        .replication
-        .forward_append(stream)
+        .appends
+        .run(bytes, ctx.deps.replication.forward_append(stream))
         .await
         .map_err(convert::failure)
 }

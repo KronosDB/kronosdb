@@ -47,6 +47,8 @@ pub struct AdminState {
     pub hardware: Arc<kronosdb_eventstore::hardware::HardwareReport>,
     /// The client port's limits, and what they refused.
     pub limits: Arc<kronosdb_protocol::net::server::Limits>,
+    /// The append limits, and what they refused or timed out.
+    pub appends: Arc<crate::native::appends::AppendBudget>,
 }
 
 /// Starts the admin HTTP server on the configured address.
