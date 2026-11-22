@@ -169,6 +169,19 @@ fn a_retried_conditional_append_succeeds_again_after_its_segment_was_sealed() {
         .unwrap();
     assert_eq!(retried.first_position, first.first_position);
     assert_eq!(store.head(), Position(102), "nothing was written");
+    assert_eq!(
+        store.metrics_snapshot().dcb_violations,
+        0,
+        "a retry is not a refused append"
+    );
+
+    // An append that really conflicts with the sealed event is still counted.
+    let other = store.append(unless_ordered_after(read_up_to, vec![event("c", "three")]));
+    assert!(matches!(
+        other,
+        Err(Error::ConsistencyConditionViolated { .. })
+    ));
+    assert_eq!(store.metrics_snapshot().dcb_violations, 1);
 }
 
 #[test]

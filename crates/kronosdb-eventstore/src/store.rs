@@ -3689,11 +3689,7 @@ impl EventStoreEngine {
             // A retry whose first attempt has been sealed since conflicts
             // with its own events here, before `append_locked` can tell.
             Pre::Conflict(conflicting_position) => (
-                retried(&self.writer.lock(), &prepared).ok_or(
-                    Error::ConsistencyConditionViolated {
-                        conflicting_position,
-                    },
-                ),
+                self.conflict_unless_retried(&self.writer.lock(), &prepared, conflicting_position),
                 false,
             ),
             Pre::Checked(sealed_checked) => {
@@ -3709,6 +3705,23 @@ impl EventStoreEngine {
         let staged = StagedAppend { outcome, timer };
         self.release_written(staged.wait_pos());
         Ok(staged)
+    }
+
+    /// What a conflict found in the sealed segments, before the lock, comes
+    /// to: the answer to a retry whose own events it found, or the conflict,
+    /// counted here because nothing was counted when it was found.
+    fn conflict_unless_retried(
+        &self,
+        writer: &SegmentWriter,
+        request: &Prepared,
+        conflicting_position: Position,
+    ) -> Result<AppendResponse, Error> {
+        retried(writer, request).ok_or_else(|| {
+            self.metrics.record_dcb_violation();
+            Error::ConsistencyConditionViolated {
+                conflicting_position,
+            }
+        })
     }
 
     /// Fail fast once poisoned or shutting down.
@@ -3935,9 +3948,7 @@ impl EventStoreEngine {
                     return Staging::NeedsPool(prepared);
                 };
                 (
-                    retried(&writer, &prepared).ok_or(Error::ConsistencyConditionViolated {
-                        conflicting_position,
-                    }),
+                    self.conflict_unless_retried(&writer, &prepared, conflicting_position),
                     false,
                 )
             }
@@ -3990,10 +4001,10 @@ impl EventStoreEngine {
                 Some(Err(error)) => Some(Staging::Done(Err(error))),
                 Some(Ok(Pre::Conflict(conflicting_position))) => {
                     Some(Staging::Done(Ok(StagedAppend {
-                        outcome: retried(&self.writer.lock(), &prepared).ok_or(
-                            Error::ConsistencyConditionViolated {
-                                conflicting_position,
-                            },
+                        outcome: self.conflict_unless_retried(
+                            &self.writer.lock(),
+                            &prepared,
+                            conflicting_position,
                         ),
                         timer,
                     })))
@@ -4162,7 +4173,6 @@ impl EventStoreEngine {
             match found {
                 None => return Ok((SealedScan::NeedsDisk, sealed_count)),
                 Some(Some(position)) => {
-                    self.metrics.record_dcb_violation();
                     return Ok((SealedScan::Conflict(Position(position)), sealed_count));
                 }
                 Some(None) => {}
@@ -4182,6 +4192,7 @@ impl EventStoreEngine {
         if let (SealedScan::Conflict(position), _) =
             self.scan_sealed(condition, sealed_checked, true)?
         {
+            self.metrics.record_dcb_violation();
             return Ok(Some(position));
         }
         let conflict = self
