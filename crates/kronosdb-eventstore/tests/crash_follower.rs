@@ -62,6 +62,7 @@ async fn run_one_iteration(iter: usize) {
                 segment_size: None,
                 archive: None,
                 max_snapshot_size: None,
+                append_timeout_secs: None,
             })
             .expect("spawn node"),
         );
@@ -143,6 +144,7 @@ async fn run_one_iteration(iter: usize) {
         segment_size: None,
         archive: None,
         max_snapshot_size: None,
+        append_timeout_secs: None,
     })
     .expect("respawn follower");
     wait_until_ready(

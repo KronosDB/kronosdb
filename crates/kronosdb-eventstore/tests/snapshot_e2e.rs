@@ -26,6 +26,7 @@ fn single_node_config(data_dir: std::path::PathBuf) -> SpawnConfig {
         segment_size: None,
         archive: None,
         max_snapshot_size: None,
+        append_timeout_secs: None,
     }
 }
 

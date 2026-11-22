@@ -116,6 +116,11 @@ struct Cli {
     #[arg(long, env = "KRONOSDB_QUERY_TIMEOUT")]
     query_timeout: Option<u64>,
 
+    /// Seconds an append may wait to be confirmed as committed before it is
+    /// answered as unavailable, to be sent again.
+    #[arg(long, env = "KRONOSDB_APPEND_TIMEOUT")]
+    append_timeout: Option<u64>,
+
     /// Heartbeat interval in seconds.
     #[arg(long, env = "KRONOSDB_HEARTBEAT_INTERVAL")]
     heartbeat_interval: Option<u64>,
@@ -320,6 +325,8 @@ struct TimeoutConfig {
     command_timeout: Option<u64>,
     #[serde(rename = "query")]
     query_timeout: Option<u64>,
+    #[serde(rename = "append")]
+    append_timeout: Option<u64>,
     #[serde(rename = "heartbeat-interval")]
     heartbeat_interval: Option<u64>,
     #[serde(rename = "heartbeat-timeout")]
@@ -346,6 +353,8 @@ struct LimitsFileConfig {
     max_connections: Option<usize>,
     #[serde(rename = "max-streams-per-connection")]
     max_streams_per_connection: Option<usize>,
+    #[serde(rename = "max-pending-append-bytes")]
+    max_pending_append_bytes: Option<u64>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -501,6 +510,8 @@ pub struct ServerConfig {
     pub archive_max_local_bytes: Option<u64>,
     pub command_timeout_secs: u64,
     pub query_timeout_secs: u64,
+    /// Seconds an append may wait to be confirmed as committed.
+    pub append_timeout_secs: u64,
     /// Bounded permit-wait on saturated command handlers (false = fail fast).
     pub messaging_permit_wait: bool,
     /// Connections still in their TLS and Hello handshake at once.
@@ -509,6 +520,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// Streams open at once on one client connection.
     pub max_streams_per_connection: usize,
+    /// Bytes of appends this node holds at once, waiting to be committed.
+    pub max_pending_append_bytes: u64,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_timeout_secs: u64,
     /// Max seconds to wait for connections to drain after SIGTERM.
@@ -570,6 +583,9 @@ impl ServerConfig {
         const DEFAULT_ARCHIVE_INTERVAL_SECS: u64 = 30;
         const DEFAULT_COMMAND_TIMEOUT: u64 = 30;
         const DEFAULT_QUERY_TIMEOUT: u64 = 30;
+        // Below the usual 30 s caller deadline, so a caller hears why.
+        const DEFAULT_APPEND_TIMEOUT: u64 = 20;
+        const DEFAULT_MAX_PENDING_APPEND_BYTES: u64 = 256 * 1024 * 1024;
         const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5;
         const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 15;
         const DEFAULT_MAX_SNAPSHOT_SIZE: u64 = 4 * 1024 * 1024;
@@ -718,6 +734,13 @@ impl ServerConfig {
                 .query_timeout
                 .or(file_config.timeouts.query_timeout)
                 .unwrap_or(DEFAULT_QUERY_TIMEOUT),
+            append_timeout_secs: positive(
+                "[timeouts] append",
+                cli.append_timeout
+                    .or(file_config.timeouts.append_timeout)
+                    .map(|secs| secs as usize),
+                DEFAULT_APPEND_TIMEOUT as usize,
+            )? as u64,
             messaging_permit_wait: file_config.messaging.permit_wait.unwrap_or(true),
             max_handshakes: positive(
                 "[limits] max-handshakes",
@@ -734,6 +757,14 @@ impl ServerConfig {
                 file_config.limits.max_streams_per_connection,
                 default_limits.max_streams,
             )?,
+            max_pending_append_bytes: positive(
+                "[limits] max-pending-append-bytes",
+                file_config
+                    .limits
+                    .max_pending_append_bytes
+                    .map(|bytes| bytes as usize),
+                DEFAULT_MAX_PENDING_APPEND_BYTES as usize,
+            )? as u64,
             heartbeat_interval_secs: cli
                 .heartbeat_interval
                 .or(file_config.timeouts.heartbeat_interval)
@@ -1221,6 +1252,7 @@ max-local-bytes = 1073741824
 [timeouts]
 command = 30
 query = 30
+append = 20
 heartbeat-interval = 10
 heartbeat-timeout = 15
 
@@ -1231,6 +1263,7 @@ permit-wait = true
 max-handshakes = 1024
 max-connections = 10000
 max-streams-per-connection = 10000
+max-pending-append-bytes = 268435456
 
 [admin]
 listen = "127.0.0.1:9240"

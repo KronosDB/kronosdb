@@ -7,6 +7,7 @@
 //! stream. Authorization is decided here and in the session, so handlers only
 //! do their work.
 
+pub mod appends;
 mod convert;
 mod eventstore;
 mod fabric;
@@ -47,6 +48,8 @@ pub struct Deps {
     /// forwarded appends and cursor queries.
     pub replication: Arc<SegmentReplicationService>,
     pub max_snapshot_size: u64,
+    /// What this node holds for appends at once, and how long one may wait.
+    pub appends: Arc<appends::AppendBudget>,
     /// Commands, queries and the platform.
     pub hub: Arc<Hub>,
     /// Every context's live schedules, folded by the scheduler loop and
