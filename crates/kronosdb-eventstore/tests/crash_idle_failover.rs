@@ -205,6 +205,43 @@ async fn deposed_leader_with_a_different_history_below_the_cut_stays_loud() {
     .await;
 }
 
+/// The longest a follower with a committed vote waits for its leader before it
+/// campaigns, under the cluster's Raft settings: the leader lease (the election
+/// timeout's maximum), the election timeout itself (at most its maximum), and,
+/// once it has seen a peer with a longer log, the smaller-log delay (twice the
+/// maximum). openraft clears that last one only when the node itself
+/// campaigns, so a survivor that lost the previous election to a node with a
+/// longer log keeps it: four times the maximum, 12 s with the defaults.
+fn longest_election_wait() -> Duration {
+    let config = kronosdb_eventstore::raft::types::default_raft_config();
+    Duration::from_millis(4 * config.election_timeout_max)
+}
+
+/// Each node as its metrics and log show it: whether it leads, its Raft term,
+/// its native epoch and how many segments its log has.
+async fn view(srvs: &[ServerHandle], tmp: &std::path::Path) -> String {
+    let logs = logs_of(tmp);
+    let mut out = Vec::new();
+    for (index, server) in srvs.iter().enumerate() {
+        let read = |name: &'static str| async move {
+            tokio::time::timeout(Duration::from_millis(500), metric(server.admin, name))
+                .await
+                .ok()
+                .flatten()
+        };
+        let show = |value: Option<u64>| value.map_or("?".to_string(), |v| v.to_string());
+        out.push(format!(
+            "node{} leader={} term={} epoch={} segments={}",
+            index + 1,
+            show(read("kronosdb_raft_is_leader").await),
+            show(read("kronosdb_raft_current_term").await),
+            show(read("kronosdb_native_epoch").await),
+            logs[index].len()
+        ));
+    }
+    out.join(", ")
+}
+
 /// The last record of a valid log is a WatermarkCheckpoint.
 fn ends_in_checkpoint(log: &[(String, Vec<u8>)]) -> bool {
     let Some((_, bytes)) = log.last() else {
@@ -355,21 +392,36 @@ async fn run(scenario: Scenario) {
             // times out and campaigns. The node that wins the higher term
             // claims one more epoch (a fresh segment on both nodes).
             // Restarting the leader would not do: it resumes its own term and
-            // epoch.
+            // epoch. The freeze outlasts the longest a follower can wait
+            // before it campaigns (see `longest_election_wait`).
             let segments_before = logs_of(tmp.path())[followers[0]].len();
             // Whether the frozen leader loses its term is up to Raft's timers,
             // so freeze it again if the first time changed nothing.
             let mut failed_over = false;
-            for _attempt in 0..4 {
+            for attempt in 0..4 {
                 let leader_now = wait_for_raft_leader(&srvs, READY_TIMEOUT)
                     .await
                     .expect("leader before another failover");
+                evidence.note(format!(
+                    "round {round} attempt {attempt}: freezing node{} (segments before {segments_before}); {}",
+                    leader_now + 1,
+                    view(&srvs, tmp.path()).await
+                ));
                 srvs[leader_now].pause();
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(longest_election_wait() + Duration::from_secs(3)).await;
+                evidence.note(format!(
+                    "round {round} attempt {attempt}: before resume; {}",
+                    view(&srvs, tmp.path()).await
+                ));
                 srvs[leader_now].resume();
-                wait_for_raft_leader(&srvs, READY_TIMEOUT)
+                let after = wait_for_raft_leader(&srvs, READY_TIMEOUT)
                     .await
                     .expect("election after another failover");
+                evidence.note(format!(
+                    "round {round} attempt {attempt}: resumed, leader node{}; {}",
+                    after + 1,
+                    view(&srvs, tmp.path()).await
+                ));
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(12) {
                     let logs = logs_of(tmp.path());
@@ -380,6 +432,10 @@ async fn run(scenario: Scenario) {
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                evidence.note(format!(
+                    "round {round} attempt {attempt}: converged={failed_over}; {}",
+                    view(&srvs, tmp.path()).await
+                ));
                 if failed_over {
                     break;
                 }
