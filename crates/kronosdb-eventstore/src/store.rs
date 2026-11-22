@@ -1293,7 +1293,11 @@ fn finalize_append(
     wait?;
     match staged.outcome {
         Ok(response) => {
-            metrics.record_append(response.count, staged.timer.elapsed_us());
+            if response.retried {
+                metrics.record_retried_append();
+            } else {
+                metrics.record_append(response.count, staged.timer.elapsed_us());
+            }
             Ok(response)
         }
         Err(error) => Err(error),
@@ -1328,6 +1332,10 @@ enum Staging {
 struct Prepared {
     condition: Option<AppendCondition>,
     batch: RecordBatch,
+    /// A client's append: answered with the positions it already has when
+    /// its events are at the end of the log (a retry). The server's own
+    /// appends are written every time.
+    client: bool,
 }
 
 /// The pre-lock half's verdict.
@@ -1433,6 +1441,26 @@ fn prepare_client_records(request: RecordAppend) -> Result<Prepared, Error> {
     Ok(Prepared {
         condition: request.condition,
         batch: request.events,
+        client: true,
+    })
+}
+
+/// The answer for a client's append whose events are already at the end of
+/// the log, in the same order and with the same content: the positions they
+/// have. The client did not hear the first attempt's answer and sent it again
+/// (see [`crate::recent`]). Whoever waits on it waits for those positions to
+/// be committed, like the first attempt did.
+fn retried(writer: &SegmentWriter, request: &Prepared) -> Option<AppendResponse> {
+    if !request.client {
+        return None;
+    }
+    let first = writer.recent().position_of(request.batch.fingerprints())?;
+    let count = request.batch.len();
+    Some(AppendResponse {
+        first_position: Position(first),
+        count,
+        consistency_marker: Position(first + u64::from(count)),
+        retried: true,
     })
 }
 
@@ -1478,13 +1506,22 @@ fn prepare_system_append(mut request: AppendRequest) -> Result<Prepared, Error> 
     Ok(Prepared {
         batch: RecordBatch::from_events(&request.events),
         condition: request.condition,
+        client: false,
     })
 }
+
+/// The newest events a store keeps by identifier, by default: a retried
+/// append is recognised while fewer than this many events have been written
+/// since the first attempt. At 40,000 events a second that is 30 seconds.
+pub const DEFAULT_RECENT_EVENTS: usize = 1_200_000;
 
 /// Configuration options for an event store engine.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
     pub max_segment_size: u64,
+    /// How many of the newest events are kept by identifier, to recognise a
+    /// retried append ([`crate::recent`]). 0 turns that off.
+    pub recent_events: usize,
     /// Mappings of sealed segments and their indexes this store may keep,
     /// shared with every other store holding the same budget: by default
     /// the process's, sized from the kernel's limit (`MappingBudget::shared`).
@@ -1527,6 +1564,7 @@ impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             max_segment_size: DEFAULT_SEGMENT_SIZE,
+            recent_events: DEFAULT_RECENT_EVENTS,
             mapping_budget: crate::cache::MappingBudget::shared(),
             file_budget: crate::cache::FileBudget::shared(),
             read_mode: crate::segment::blocks::ReadMode::default(),
@@ -1780,7 +1818,8 @@ impl EventStoreEngine {
     /// Creates a new event store with full options.
     pub fn create_with_store_options(dir: &Path, opts: &StoreOptions) -> Result<Self, Error> {
         std::fs::create_dir_all(dir)?;
-        let seg_writer = SegmentWriter::new(dir, Position(0), opts.max_segment_size)?;
+        let mut seg_writer = SegmentWriter::new(dir, Position(0), opts.max_segment_size)?;
+        seg_writer.track_recent(opts.recent_events);
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
         let evicted = Arc::new(Evicted::new(dir, opts, 0)?);
@@ -1899,7 +1938,8 @@ impl EventStoreEngine {
 
     /// Opens an existing event store with full options.
     pub fn open_with_store_options(dir: &Path, opts: &StoreOptions) -> Result<Self, Error> {
-        let seg_writer = SegmentWriter::open(dir, opts.max_segment_size)?;
+        let mut seg_writer = SegmentWriter::open(dir, opts.max_segment_size)?;
+        seg_writer.track_recent(opts.recent_events);
         let head = seg_writer.head();
         let active_base = seg_writer.active_base_position();
         let active_index = seg_writer.active_index_handle();
@@ -2017,7 +2057,7 @@ impl EventStoreEngine {
             watermark: watermark.handle(),
         };
 
-        Ok(Self {
+        let engine = Self {
             dir: dir.to_path_buf(),
             writer,
             sync_state,
@@ -2046,10 +2086,60 @@ impl EventStoreEngine {
             merge,
             sync_thread: StdMutex::new(Some(sync_thread)),
             rebuilt_at_open,
-        })
+        };
+        engine.rebuild_recent();
+        Ok(engine)
     }
 
     /// Returns a shared reference to this engine's metrics counters.
+    /// Fills the index of recent events from the open segment as it was
+    /// found, so a node that restarts recognises a retry of what it wrote
+    /// just before. Every event there counts, committed or not: a retry is
+    /// about what is in the log.
+    ///
+    /// Only the open segment: opening a log reads no sealed segment's body,
+    /// and an append still unanswered when the node stopped is at the very
+    /// end of the log. One whose segment was sealed between its write and
+    /// the restart is not recognised, and a retry of it is written again.
+    ///
+    /// A record that cannot be read leaves the index empty: reads report
+    /// damage, opening does not start to.
+    fn rebuild_recent(&self) {
+        let (window, open_from) = {
+            let writer = self.writer.lock();
+            (
+                writer.recent().capacity() as u64,
+                writer.active_base_position(),
+            )
+        };
+        let tail = self.local_tail.load(Ordering::Acquire);
+        let from = tail.saturating_sub(window).max(open_from);
+        if window == 0 || from >= tail {
+            return;
+        }
+        let everything = SourcingCondition {
+            criteria: vec![crate::criteria::Criterion {
+                names: vec![],
+                tags: vec![],
+            }],
+        };
+        let mut found: Vec<(u64, Option<crate::recent::Fingerprint>)> = Vec::new();
+        let read = self.walk_matching_below(Position(from), &everything, tail, |_, record| {
+            let position = u64::from_le_bytes(record.body[..8].try_into().unwrap());
+            found.push((position, crate::recent::Fingerprint::of(record.body)));
+            Ok(Walk::Next)
+        });
+        if let Err(error) = read {
+            tracing::warn!(%error, "the open segment could not be read for retried appends; \
+                 none before this start will be recognised");
+            return;
+        }
+        let mut writer = self.writer.lock();
+        for (position, fingerprint) in found {
+            writer.recent_mut().note(position, fingerprint);
+        }
+    }
+
     /// Initiates engine shutdown: new appends are rejected, and the group
     /// commit sync thread performs one final fsync pass (releasing any
     /// in-flight writers) before exiting. Idempotent. It does not wait for
@@ -3588,10 +3678,14 @@ impl EventStoreEngine {
         // half that can wait on the disk, and sealed segments cannot change
         // under it. What seals in between is re-checked under the lock.
         let (outcome, owes_wake) = match self.stage_pre(&prepared)? {
+            // A retry whose first attempt has been sealed since conflicts
+            // with its own events here, before `append_locked` can tell.
             Pre::Conflict(conflicting_position) => (
-                Err(Error::ConsistencyConditionViolated {
-                    conflicting_position,
-                }),
+                retried(&self.writer.lock(), &prepared).ok_or(
+                    Error::ConsistencyConditionViolated {
+                        conflicting_position,
+                    },
+                ),
                 false,
             ),
             Pre::Checked(sealed_checked) => {
@@ -3828,12 +3922,17 @@ impl EventStoreEngine {
             Some(Ok(pre)) => pre,
         };
         let (outcome, owes_wake) = match pre {
-            Pre::Conflict(conflicting_position) => (
-                Err(Error::ConsistencyConditionViolated {
-                    conflicting_position,
-                }),
-                false,
-            ),
+            Pre::Conflict(conflicting_position) => {
+                let Some(writer) = self.writer.try_lock() else {
+                    return Staging::NeedsPool(prepared);
+                };
+                (
+                    retried(&writer, &prepared).ok_or(Error::ConsistencyConditionViolated {
+                        conflicting_position,
+                    }),
+                    false,
+                )
+            }
             Pre::Checked(sealed_checked) => {
                 let Some(mut writer) = self.writer.try_lock() else {
                     return Staging::NeedsPool(prepared);
@@ -3883,9 +3982,11 @@ impl EventStoreEngine {
                 Some(Err(error)) => Some(Staging::Done(Err(error))),
                 Some(Ok(Pre::Conflict(conflicting_position))) => {
                     Some(Staging::Done(Ok(StagedAppend {
-                        outcome: Err(Error::ConsistencyConditionViolated {
-                            conflicting_position,
-                        }),
+                        outcome: retried(&self.writer.lock(), &prepared).ok_or(
+                            Error::ConsistencyConditionViolated {
+                                conflicting_position,
+                            },
+                        ),
                         timer,
                     })))
                 }
@@ -4096,6 +4197,13 @@ impl EventStoreEngine {
         defer: bool,
     ) -> Result<AppendResponse, Error> {
         {
+            // Step 0: a retry of an append already in the log is answered
+            // with the positions it has. Before the condition: its own
+            // events would otherwise be what the condition trips over.
+            if let Some(response) = retried(writer, request) {
+                return Ok(response);
+            }
+
             // Step 1: Check DCB condition (the sealed half ran pre-lock).
             if let Some(condition) = &request.condition
                 && let Some(conflicting_pos) = self.check_dcb_locked(condition, sealed_checked)?
@@ -4117,6 +4225,7 @@ impl EventStoreEngine {
                     } else {
                         Position(self.local_tail.load(Ordering::Acquire))
                     },
+                    retried: false,
                 });
             }
 
@@ -4147,6 +4256,7 @@ impl EventStoreEngine {
                 first_position,
                 count,
                 consistency_marker: Position(new_head),
+                retried: false,
             })
         }
     }
@@ -4791,12 +4901,24 @@ impl EventStoreEngine {
         from: Position,
         condition: &SourcingCondition,
         up_to: Option<Position>,
-        mut visit: impl FnMut(u64, crate::segment::reader::StoredRecord<'_>) -> Result<Walk, Error>,
+        visit: impl FnMut(u64, crate::segment::reader::StoredRecord<'_>) -> Result<Walk, Error>,
     ) -> Result<(), Error> {
         let head = match up_to {
             Some(bound) => self.watermark.get().min(bound.0),
             None => self.watermark.get(),
         };
+        self.walk_matching_below(from, condition, head, visit)
+    }
+
+    /// [`walk_matching`](Self::walk_matching) with the bound given: every
+    /// matching record with position in `[from, head)`, committed or not.
+    fn walk_matching_below(
+        &self,
+        from: Position,
+        condition: &SourcingCondition,
+        head: u64,
+        mut visit: impl FnMut(u64, crate::segment::reader::StoredRecord<'_>) -> Result<Walk, Error>,
+    ) -> Result<(), Error> {
         let list = self.segments.read().clone();
         if list.bases.is_empty() || head == 0 {
             return Ok(());
@@ -5925,6 +6047,9 @@ mod eviction_tests;
 mod truncate_tests;
 
 #[cfg(test)]
+mod retry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::append::AppendCondition;
@@ -5946,6 +6071,13 @@ mod tests {
             metadata: vec![],
             tags,
         }
+    }
+
+    /// `event` under an identifier of its own, as another append would send
+    /// it: with the same identifier it would be a retry of the first.
+    fn another(mut event: AppendEvent, n: u64) -> AppendEvent {
+        event.identifier = format!("{}-{n}", event.identifier);
+        event
     }
 
     /// The dispatcher's read of the log: names and tags in place, from the
@@ -6156,7 +6288,10 @@ mod tests {
         // A real user event after the marker still conflicts as ever.
         let stale = store.append(AppendRequest {
             condition: Some(guard),
-            events: vec![make_event("PaymentReceived", vec![tag("orderId", "A")])],
+            events: vec![another(
+                make_event("PaymentReceived", vec![tag("orderId", "A")]),
+                2,
+            )],
         });
         assert!(matches!(
             stale,
@@ -7171,7 +7306,10 @@ mod tests {
                     }],
                 },
             }),
-            events: vec![make_event("OrderPlaced", vec![tag("orderId", "A")])],
+            events: vec![another(
+                make_event("OrderPlaced", vec![tag("orderId", "A")]),
+                2,
+            )],
         });
 
         assert!(matches!(
@@ -7782,11 +7920,11 @@ mod tests {
         };
         let engine =
             Arc::new(EventStoreEngine::create_with_store_options(dir.path(), &opts).unwrap());
-        let event = || make_event("OrderPlaced", vec![tag("orderId", "A")]);
+        let event = |n| another(make_event("OrderPlaced", vec![tag("orderId", "A")]), n);
         let mut inline = 0;
         let mut pooled = 0;
         for i in 0..20u64 {
-            let staging = engine.stage_inline(client(plain(vec![event()])));
+            let staging = engine.stage_inline(client(plain(vec![event(i)])));
             match &staging {
                 Staging::Done(_) => inline += 1,
                 Staging::NeedsPool(_) => pooled += 1,

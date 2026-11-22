@@ -19,6 +19,8 @@ pub struct StoreMetrics {
     // ── Writes ──
     /// Total append() calls (successful).
     pub appends: AtomicU64,
+    /// Appends recognised as a retry of one already in the log.
+    pub retried_appends: AtomicU64,
     /// Total events appended (across all append calls).
     pub events_appended: AtomicU64,
     /// Total append() calls that failed due to DCB condition violation.
@@ -77,6 +79,7 @@ impl StoreMetrics {
     pub fn new() -> Self {
         Self {
             appends: AtomicU64::new(0),
+            retried_appends: AtomicU64::new(0),
             events_appended: AtomicU64::new(0),
             dcb_violations: AtomicU64::new(0),
             ack_degradations: AtomicU64::new(0),
@@ -102,6 +105,7 @@ impl StoreMetrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             appends: self.appends.load(ORD),
+            retried_appends: self.retried_appends.load(ORD),
             events_appended: self.events_appended.load(ORD),
             dcb_violations: self.dcb_violations.load(ORD),
             append_duration_us: self.append_duration_us.load(ORD),
@@ -129,6 +133,12 @@ impl StoreMetrics {
         self.appends.fetch_add(1, ORD);
         self.events_appended.fetch_add(event_count as u64, ORD);
         self.append_duration_us.fetch_add(duration_us, ORD);
+    }
+
+    /// An append recognised as a retry: answered, nothing written.
+    #[inline]
+    pub fn record_retried_append(&self) {
+        self.retried_appends.fetch_add(1, ORD);
     }
 
     #[inline]
@@ -182,6 +192,7 @@ impl StoreMetrics {
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     pub appends: u64,
+    pub retried_appends: u64,
     pub events_appended: u64,
     pub dcb_violations: u64,
     pub ack_degradations: u64,

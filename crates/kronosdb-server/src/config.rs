@@ -297,6 +297,10 @@ struct StorageConfig {
     ack_mode: Option<String>,
     #[serde(rename = "max-snapshot-size")]
     max_snapshot_size: Option<u64>,
+    /// How many of a context's newest events are kept by identifier, to
+    /// recognise a retried append. 0 turns that off.
+    #[serde(rename = "retry-window-events")]
+    retry_window_events: Option<usize>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -486,6 +490,9 @@ pub struct ServerConfig {
     pub index_merge_rate: u64,
     /// Maximum snapshot state size in bytes; larger appends are rejected.
     pub max_snapshot_size: u64,
+    /// Newest events per context kept by identifier, to recognise a retried
+    /// append; 0 turns that off.
+    pub retry_window_events: usize,
     pub group_commit_ms: u64,
     /// Object-store URL of the archive tier; None = no archive.
     pub archive_url: Option<String>,
@@ -678,6 +685,10 @@ impl ServerConfig {
                 .index_merge_rate
                 .or(file_config.storage.index_merge_rate)
                 .unwrap_or(kronosdb_eventstore::store::DEFAULT_INDEX_MERGE_RATE),
+            retry_window_events: file_config
+                .storage
+                .retry_window_events
+                .unwrap_or(kronosdb_eventstore::store::DEFAULT_RECENT_EVENTS),
             max_snapshot_size: cli
                 .max_snapshot_size
                 .or(file_config.storage.max_snapshot_size)
@@ -1200,6 +1211,7 @@ block-size = 65536
 readahead-blocks = 4
 ack-mode = "auto"
 max-snapshot-size = 4194304
+retry-window-events = 1200000
 
 [archive]
 url = "file:///backups/kronosdb"

@@ -14,9 +14,12 @@ use kronosdb_eventstore::store::{EventStoreEngine, PageBounds};
 use kronosdb_eventstore::stream::EventStream;
 use tokio::time::timeout;
 
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 fn event(name: &str, tags: &[(&str, &str)]) -> AppendEvent {
     AppendEvent {
-        identifier: format!("id-{name}"),
+        // Its own identifier every time: the same one would be a retry.
+        identifier: format!("id-{name}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
         name: name.into(),
         version: "1".into(),
         timestamp: 0,

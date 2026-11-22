@@ -95,6 +95,9 @@ impl NativeEngine {
                     first_position: Position(appended.first_position),
                     count: appended.count,
                     consistency_marker: Position(appended.marker),
+                    // The leader's answer does not say; its positions are
+                    // right either way.
+                    retried: false,
                 })
             }
             Ok(p::Frame::ForwardAppendConflict(conflict)) => {
