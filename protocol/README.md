@@ -68,6 +68,19 @@ request past the stream limit is refused with `unavailable` on its stream, and
 the connection lives on. Nothing was done in any of these, so a retry is safe
 and may find room. Verified peers are not counted.
 
+An append can be sent again safely. A client that gets `unavailable` for one,
+or loses the connection before the answer, does not know whether it was
+written; it sends the same append again: the same events, with the same
+identifiers, in the same order. A node that holds those events at the end of
+its log answers with the positions they already have, and writes nothing. The
+check comes before the append's condition, so a conditional append that was
+committed is not refused by its own events. A node recognises a retry among
+the newest events of a context (1,200,000 by default); an older one is written
+again. An event without an identifier is never recognised, and the same
+identifier with other content is another event. To be recognised, a retry must
+send the events as they were: a client keeps them, rather than building them
+again.
+
 Hello carries the credentials. The server resolves `token` and `jwt` alike —
 a static token first, then a JWT from a trusted issuer — so a client that
 cannot tell which it holds sends `token`. With TLS client certificates the

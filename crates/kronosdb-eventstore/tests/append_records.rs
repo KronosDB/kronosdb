@@ -598,23 +598,35 @@ async fn reserved_namespace_records_are_refused_with_the_same_errors() {
     let engine = small(dir.path());
     let mut refused = 0;
     for (what, events) in cases {
+        // The same events under identifiers of their own on each route: the
+        // same identifiers would be a retry of the first.
+        let on = |route: &str| -> Vec<AppendEvent> {
+            events
+                .iter()
+                .cloned()
+                .map(|mut event| {
+                    event.identifier = format!("{}-{route}", event.identifier);
+                    event
+                })
+                .collect()
+        };
         let old = engine
             .append(AppendRequest {
                 condition: None,
-                events: events.clone(),
+                events: on("events"),
             })
             .map(|_| ());
         let new = engine
             .append_records_async(RecordAppend {
                 condition: None,
-                events: batch_of(&events, 0),
+                events: batch_of(&on("records"), 0),
             })
             .await
             .map(|_| ());
         let blocking = engine
             .append_records(RecordAppend {
                 condition: None,
-                events: batch_of(&events, 0),
+                events: batch_of(&on("blocking"), 0),
             })
             .map(|_| ());
         match (&old, &new, &blocking) {

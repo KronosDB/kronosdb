@@ -167,6 +167,12 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         events_appended
     );
     engine_family!(
+        "kronosdb_retried_appends_total",
+        "counter",
+        "Appends recognised as a retry of one already in the log: answered, nothing written",
+        retried_appends
+    );
+    engine_family!(
         "kronosdb_dcb_violations_total",
         "counter",
         "Appends rejected by a DCB consistency condition",

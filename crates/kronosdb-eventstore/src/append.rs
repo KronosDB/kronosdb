@@ -3,6 +3,7 @@ use bytes::Bytes;
 use crate::criteria::SourcingCondition;
 use crate::error::Error;
 use crate::event::{AppendEvent, Position};
+use crate::recent::Fingerprint;
 use crate::segment::format;
 
 /// The DCB consistency condition for an append.
@@ -52,6 +53,10 @@ pub struct RecordAppend {
 pub struct RecordBatch {
     count: u32,
     bytes: Bytes,
+    /// What identifies each event to the index of recent events
+    /// ([`crate::recent`]), in order. Worked out once, when the batch is
+    /// built, so nobody hashes under the writer lock.
+    fingerprints: std::sync::Arc<[Option<Fingerprint>]>,
     /// Some event has a `$` event type or a tag key starting with `$`: a
     /// client may not append it. Decided once, when the batch is built.
     reserved: bool,
@@ -62,9 +67,17 @@ impl RecordBatch {
     /// `flags` 0, [`format::check_event`] on every body, and `reserved`
     /// from what that returned.
     pub(crate) fn from_checked(count: u32, bytes: Bytes, reserved: bool) -> Self {
+        let mut fingerprints = Vec::with_capacity(count as usize);
+        let mut cursor = 0;
+        while cursor + 5 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            fingerprints.push(Fingerprint::of(&bytes[cursor + 5..cursor + 4 + len]));
+            cursor += 4 + len;
+        }
         Self {
             count,
             bytes,
+            fingerprints: fingerprints.into(),
             reserved,
         }
     }
@@ -89,11 +102,12 @@ impl RecordBatch {
             reserved |= crate::system::is_system_name(&event.name)
                 || event.tags.iter().any(crate::system::is_system_tag);
         }
-        Self {
-            count: events.len() as u32,
-            bytes: Bytes::from(bytes),
-            reserved,
-        }
+        Self::from_checked(events.len() as u32, Bytes::from(bytes), reserved)
+    }
+
+    /// Each event's fingerprint, in order.
+    pub(crate) fn fingerprints(&self) -> &[Option<Fingerprint>] {
+        &self.fingerprints
     }
 
     /// Number of events.
@@ -164,4 +178,7 @@ pub struct AppendResponse {
     /// The new consistency marker (position of the last event appended).
     /// Can be used as `consistency_marker` in a subsequent append.
     pub consistency_marker: Position,
+    /// The append was recognised as a retry of one already in the log:
+    /// nothing was written, and the positions are the first attempt's.
+    pub retried: bool,
 }
