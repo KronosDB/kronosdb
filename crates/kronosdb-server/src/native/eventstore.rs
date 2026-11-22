@@ -141,7 +141,13 @@ pub async fn append(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
         condition: req.condition.as_ref().map(convert::append_condition),
         events: convert::record_batch(&req.events, frame.bytes())?,
     };
-    match store.append_records(request).await {
+    let bytes = frame.bytes().len() as u64;
+    match ctx
+        .deps
+        .appends
+        .run(bytes, store.append_records(request))
+        .await
+    {
         Ok(r) => {
             finish(
                 &stream.out,
@@ -420,8 +426,14 @@ pub async fn append_snapshot(ctx: Ctx, stream: ServerStream) -> Result<(), Failu
         )));
     }
     let store = ctx.store(req.context, Access::Write)?;
-    let position = store
-        .append_snapshot(req.key.to_vec(), req.state.to_vec(), Position(req.position))
+    let bytes = frame.bytes().len() as u64;
+    let position = ctx
+        .deps
+        .appends
+        .run(
+            bytes,
+            store.append_snapshot(req.key.to_vec(), req.state.to_vec(), Position(req.position)),
+        )
         .await
         .map_err(convert::failure)?;
     finish(

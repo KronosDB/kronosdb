@@ -51,6 +51,7 @@ async fn run() {
             segment_size: None,
             archive: None,
             max_snapshot_size: None,
+            append_timeout_secs: None,
         };
         srvs.push(spawn_server(&cfg).expect("spawn node"));
     }
