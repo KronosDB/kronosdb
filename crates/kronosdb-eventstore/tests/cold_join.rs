@@ -202,6 +202,23 @@ async fn run() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    // --- The writer leaves the append it was waiting on behind when it is
+    // told to stop. Node 1 may hold it written while it is still on its way to
+    // node 2, with both heads already equal: wait for the logs themselves.
+    let start = Instant::now();
+    loop {
+        let log1 = read_valid_event_log(&data1, "default").expect("read node1 log");
+        let log2 = read_valid_event_log(&data2, "default").expect("read node2 log");
+        if log1 == log2 {
+            break;
+        }
+        // Past the timeout the comparison below says how they differ.
+        if start.elapsed() >= CONVERGENCE_TIMEOUT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     // --- Verify: torn-free scans, byte-identical segment files, and every
     // acknowledged event present with its original payload on the new node.
     for (name, dir) in [("node1", &data1), ("node2", &data2)] {
