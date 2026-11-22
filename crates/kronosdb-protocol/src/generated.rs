@@ -8,7 +8,7 @@ use crate::codec::*;
 /// The protocol version this code speaks.
 pub const PROTOCOL_VERSION: u16 = 2;
 /// CRC32C of the schema source, for checking generated code is in sync.
-pub const SCHEMA_HASH: &str = "7cc1b9b4";
+pub const SCHEMA_HASH: &str = "5dcacfb3";
 
 /// Why a request failed. Unknown codes must be treated as `internal`.
 ///
@@ -680,7 +680,8 @@ impl<'a> Schedule<'a> {
 pub struct Hello<'a> {
     /// Highest protocol version the client speaks.
     pub version: u16,
-    /// Feature bits the client would like to use. None are defined in version 2.
+    /// Feature bits the client would like to use. Bit 0 (`0x1`): appends that
+    /// can be sent again.
     pub features: u64,
     /// Stored record layout the client decodes. Version 2 knows layout 3.
     pub record_format: u8,

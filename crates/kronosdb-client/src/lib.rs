@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 pub use kronosdb_protocol::net::Failure;
 pub use kronosdb_protocol::net::client::{ConnectOptions, Credential, DEFAULT_WINDOW};
+pub use kronosdb_protocol::net::feature;
 pub use kronosdb_protocol::net::rules::MIN_WINDOW;
 pub use kronosdb_protocol::{ErrorCode, EventRecord};
 pub use messaging::*;

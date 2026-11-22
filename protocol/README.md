@@ -87,6 +87,12 @@ identifier with other content is another event. To be recognised, a retry must
 send the events as they were: a client keeps them, rather than building them
 again.
 
+A client that sends appends again asks for feature bit 0 (`0x1`) in Hello. A
+server that recognises retries grants it in Welcome. One that does not, because
+it is older or its retry window is turned off, grants nothing, and a client
+that was not granted the bit reports the failure instead of sending the append
+again, because that server would write the events a second time.
+
 Hello carries the credentials. The server resolves `token` and `jwt` alike —
 a static token first, then a JWT from a trusted issuer — so a client that
 cannot tell which it holds sends `token`. With TLS client certificates the
@@ -462,7 +468,7 @@ First frame of every connection, after the 8-byte preface `KRONOSDB`.
 | Field | Type | |
 |---|---|---|
 | `version` | u16 | Highest protocol version the client speaks. |
-| `features` | u64 | Feature bits the client would like to use. None are defined in version 2. |
+| `features` | u64 | Feature bits the client would like to use. Bit 0 (`0x1`): appends that can be sent again. |
 | `record_format` | u8 | Stored record layout the client decodes. Version 2 knows layout 3. |
 | `client_name` | str16 | Application name, shown in the admin console. |
 | `client_id` | str16 | This instance, unique per process. |

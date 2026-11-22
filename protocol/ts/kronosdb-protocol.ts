@@ -4,7 +4,7 @@
 /** The protocol version this code speaks. */
 export const PROTOCOL_VERSION = 2;
 /** CRC32C of the schema source, for checking generated code is in sync. */
-export const SCHEMA_HASH = "7cc1b9b4";
+export const SCHEMA_HASH = "5dcacfb3";
 
 /** The peer sent bytes that violate the protocol. */
 export class ProtocolError extends Error {}
@@ -711,7 +711,8 @@ export type Hello = {
    */
   version: number;
   /**
-   * Feature bits the client would like to use. None are defined in version 2.
+   * Feature bits the client would like to use. Bit 0 (`0x1`): appends that
+   * can be sent again.
    */
   features: bigint;
   /**

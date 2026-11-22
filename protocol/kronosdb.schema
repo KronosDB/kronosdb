@@ -141,7 +141,8 @@ struct Schedule {
 frame Hello = 0x0001 {
   /// Highest protocol version the client speaks.
   version: u16
-  /// Feature bits the client would like to use. None are defined in version 2.
+  /// Feature bits the client would like to use. Bit 0 (`0x1`): appends that
+  /// can be sent again.
   features: u64
   /// Stored record layout the client decodes. Version 2 knows layout 3.
   record_format: u8
