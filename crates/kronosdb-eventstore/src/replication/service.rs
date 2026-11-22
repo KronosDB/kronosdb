@@ -138,11 +138,15 @@ impl SegmentReplicationService {
                 .append_records_async(RecordAppend { condition, events })
                 .await
         };
+        // Written by now: past this point a failure leaves its outcome
+        // unknown, and the follower must not be told to retry it blindly.
         if !self
             .control
             .is_local_writable(request_epoch, request_leader)
         {
-            return retry(out, "leader fence changed before append acknowledgement").await;
+            return Err(Error::UnknownOutcome {
+                message: "leadership was lost before the append was acknowledged".into(),
+            });
         }
 
         let _ = match result {
@@ -163,6 +167,7 @@ impl SegmentReplicationService {
                 }))
                 .await
             }
+            Err(error @ Error::UnknownOutcome { .. }) => return Err(error),
             Err(error) => {
                 out.finish(&Frame::ForwardAppendRetry(p::ForwardAppendRetry {
                     reason: &error.to_string(),
