@@ -355,16 +355,41 @@ fn abort_locked(inner: &mut Inner, reason: &str) {
     }
 }
 
+/// What a waiter learns when its wait is cut short: its append was written,
+/// and whether it ends up committed is not known here.
 fn poison_error(msg: &str) -> Error {
-    Error::Io(io::Error::other(format!(
-        "append not committed (watermark aborted): {msg}"
-    )))
+    Error::UnknownOutcome {
+        message: format!("the append was written but not confirmed as committed: {msg}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// An append waiting for its quorum when the epoch moves on was already
+    /// written: whether it ends up committed is not known here.
+    #[test]
+    fn a_waiter_aborted_by_a_new_epoch_has_an_unknown_outcome() {
+        let wm = Arc::new(WatermarkState::new(1, [0, 1, 2], 0));
+        let waiting = Arc::clone(&wm);
+        let waiter = std::thread::spawn(move || waiting.wait_for(10));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while wm.inner.lock().unwrap().ledger.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never registered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        wm.begin_epoch(2, [0, 1, 2]).unwrap();
+        let outcome = waiter.join().unwrap();
+        assert!(
+            matches!(outcome, Err(Error::UnknownOutcome { .. })),
+            "{outcome:?}"
+        );
+    }
 
     #[test]
     fn quorum_of_one_advances_on_own_cursor() {

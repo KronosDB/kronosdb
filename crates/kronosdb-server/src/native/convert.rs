@@ -59,6 +59,15 @@ pub fn failure(e: Error) -> Failure {
             format!("temporarily unavailable: {message}"),
         ),
         Error::Rejected { message } => (ErrorCode::REJECTED, message),
+        // Retrying is safe because the store recognises the same append
+        // sent again (`kronosdb_eventstore::recent`).
+        Error::UnknownOutcome { message } => (
+            ErrorCode::UNAVAILABLE,
+            format!(
+                "{message}. It may have been written: send the same append again, it is not \
+                 written twice"
+            ),
+        ),
         Error::Internal { message } => (ErrorCode::INTERNAL, format!("internal error: {message}")),
         Error::PositionNotFound { position } => (
             ErrorCode::NOT_FOUND,
@@ -90,6 +99,20 @@ pub fn failure(e: Error) -> Failure {
 mod tests {
     use super::*;
     use kronosdb_eventstore::event::Tag;
+
+    /// An append whose outcome is unknown is answered as retryable, and says
+    /// that the retry must be the same append.
+    #[test]
+    fn an_unknown_outcome_is_unavailable_and_says_to_send_the_same_append() {
+        let failure = failure(Error::UnknownOutcome {
+            message: "leadership was lost before the append was acknowledged".into(),
+        });
+        assert_eq!(failure.code, ErrorCode::UNAVAILABLE);
+        assert!(
+            failure.message.contains("send the same append again"),
+            "{failure}"
+        );
+    }
 
     #[test]
     fn empty_read_criteria_match_everything() {
