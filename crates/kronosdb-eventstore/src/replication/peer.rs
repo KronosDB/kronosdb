@@ -148,6 +148,34 @@ impl PeerPool {
             .await
             .map_err(wire::net_error)
     }
+
+    /// A request that changes state on the peer, answered by one frame. A
+    /// failure before it was sent (no connection, or one already closed) is
+    /// `Unavailable`; one after it was sent, without an answer, is
+    /// `UnknownOutcome`, because the peer may have done it.
+    pub async fn write_request(
+        &self,
+        address: &str,
+        frame: &Frame<'_>,
+    ) -> Result<OwnedFrame, Error> {
+        let mut answer = self
+            .connection(address)
+            .await?
+            .open(frame, true)
+            .await
+            .map_err(wire::net_error)?;
+        match answer.next().await {
+            Ok(Some(reply)) => Ok(reply),
+            // The peer answered with a failure: its code says what happened.
+            Err(error) if error.failure().is_some() => Err(wire::net_error(error)),
+            Ok(None) => Err(Error::UnknownOutcome {
+                message: "the request was sent and its stream ended without an answer".into(),
+            }),
+            Err(error) => Err(Error::UnknownOutcome {
+                message: format!("the request was sent and then the connection failed ({error})"),
+            }),
+        }
+    }
 }
 
 fn describe(error: &NetError) -> String {
@@ -284,6 +312,67 @@ mod tests {
         let _second = peer_at(&addr).await;
         assert!(answered(&pool.request(&addr, &get_cursors).await.unwrap()));
         assert!(!pool.connection(&addr).await.unwrap().is_closed());
+    }
+
+    /// Reads one frame and returns its kind.
+    async fn read_frame(tcp: &mut tokio::net::TcpStream) -> u16 {
+        use tokio::io::AsyncReadExt;
+        let mut len = [0u8; 4];
+        tcp.read_exact(&mut len).await.unwrap();
+        let mut rest = vec![0u8; u32::from_le_bytes(len) as usize];
+        tcp.read_exact(&mut rest).await.unwrap();
+        u16::from_le_bytes([rest[0], rest[1]])
+    }
+
+    /// A peer that completes the handshake, reads one request, and hangs up
+    /// without answering it.
+    async fn peer_that_hangs_up() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut preface = [0u8; 8];
+            tcp.read_exact(&mut preface).await.unwrap();
+            read_frame(&mut tcp).await;
+            let welcome = kronosdb_protocol::net::encode(
+                0,
+                0,
+                &Frame::Welcome(kronosdb_protocol::Welcome {
+                    version: kronosdb_protocol::PROTOCOL_VERSION,
+                    features: 0,
+                    record_format: server::RECORD_FORMAT,
+                    server_name: "",
+                    principal: "",
+                    max_frame: 16 << 20,
+                    heartbeat: 10_000,
+                }),
+            )
+            .unwrap();
+            tcp.write_all(&welcome).await.unwrap();
+            // Pings and window grants may come first; hang up on the request.
+            while read_frame(&mut tcp).await != kronosdb_protocol::GetCursors::KIND {}
+            drop(tcp);
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_write_request_lost_after_it_was_sent_has_an_unknown_outcome() {
+        let pool = PeerPool::new(PeerTransportConfig::default());
+        let addr = peer_that_hangs_up().await;
+        let get_cursors = Frame::GetCursors(kronosdb_protocol::GetCursors {});
+        let lost = pool.write_request(&addr, &get_cursors).await.unwrap_err();
+        assert!(matches!(lost, Error::UnknownOutcome { .. }), "{lost}");
+    }
+
+    #[tokio::test]
+    async fn a_write_request_that_was_never_sent_is_unavailable() {
+        let pool = PeerPool::new(PeerTransportConfig::default());
+        let addr = format!("127.0.0.1:{}", crate::test_ports::free_port());
+        let get_cursors = Frame::GetCursors(kronosdb_protocol::GetCursors {});
+        let down = pool.write_request(&addr, &get_cursors).await.unwrap_err();
+        assert!(matches!(down, Error::Unavailable { .. }), "{down}");
     }
 
     #[test]

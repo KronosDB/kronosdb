@@ -216,6 +216,9 @@ pub fn with_context(error: Error, what: impl std::fmt::Display) -> Error {
         Error::Internal { message } => Error::Internal {
             message: format!("{what}: {message}"),
         },
+        Error::UnknownOutcome { message } => Error::UnknownOutcome {
+            message: format!("{what}: {message}"),
+        },
         other => other,
     }
 }
