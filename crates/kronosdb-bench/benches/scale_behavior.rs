@@ -201,29 +201,39 @@ fn append_at_scale(c: &mut Criterion) {
                     events_per_segment,
                 );
 
-                let new_event = kronosdb_eventstore::event::AppendEvent {
-                    identifier: "bench-evt".into(),
-                    name: "OrderPlaced".into(),
-                    version: "1.0".into(),
-                    timestamp: 9999999999999,
-                    payload: vec![0u8; 300],
-                    metadata: vec![],
-                    tags: vec![
-                        kronosdb_eventstore::event::Tag::from_str("orderId", "order-new"),
-                        kronosdb_eventstore::event::Tag::from_str("customerId", "cust-new"),
-                    ],
+                // Every append gets an event of its own: the same event again,
+                // identifier included, is a retry and is not written.
+                let mut next = 0u64;
+                let mut new_event = || {
+                    next += 1;
+                    kronosdb_eventstore::event::AppendEvent {
+                        identifier: format!("bench-evt-{next}"),
+                        name: "OrderPlaced".into(),
+                        version: "1.0".into(),
+                        timestamp: 9999999999999,
+                        payload: vec![0u8; 300],
+                        metadata: vec![],
+                        tags: vec![
+                            kronosdb_eventstore::event::Tag::from_str("orderId", "order-new"),
+                            kronosdb_eventstore::event::Tag::from_str("customerId", "cust-new"),
+                        ],
+                    }
                 };
 
-                b.iter(|| {
-                    black_box(
-                        store
-                            .append(kronosdb_eventstore::append::AppendRequest {
-                                condition: None,
-                                events: vec![new_event.clone()],
-                            })
-                            .unwrap(),
-                    );
-                });
+                b.iter_batched(
+                    &mut new_event,
+                    |event| {
+                        black_box(
+                            store
+                                .append(kronosdb_eventstore::append::AppendRequest {
+                                    condition: None,
+                                    events: vec![event],
+                                })
+                                .unwrap(),
+                        );
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             },
         );
     }
