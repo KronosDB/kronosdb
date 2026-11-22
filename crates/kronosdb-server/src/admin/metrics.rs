@@ -625,7 +625,25 @@ pub async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
                 "{limit=\"max-streams-per-connection\"}".to_string(),
                 streams,
             ),
+            (
+                "{limit=\"max-pending-append-bytes\"}".to_string(),
+                state.appends.refused(),
+            ),
         ],
+    );
+    family(
+        &mut out,
+        "kronosdb_pending_append_bytes",
+        "gauge",
+        "Bytes of appends this node holds, waiting to be made durable or acknowledged by a quorum",
+        &[(String::new(), state.appends.pending_bytes())],
+    );
+    family(
+        &mut out,
+        "kronosdb_append_deadline_exceeded_total",
+        "counter",
+        "Appends not confirmed by the [timeouts] append deadline: answered unavailable, to be sent again",
+        &[(String::new(), state.appends.timed_out())],
     );
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)

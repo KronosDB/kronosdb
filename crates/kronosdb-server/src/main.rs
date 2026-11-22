@@ -324,6 +324,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.admin_auth,
         Arc::clone(&authenticator),
     ));
+    // What this node holds for appends at once, and how long one may wait.
+    let appends = Arc::new(native::appends::AppendBudget::new(
+        config.max_pending_append_bytes,
+        Duration::from_secs(config.append_timeout_secs),
+    ));
     // The client port's limits, shared with the admin plane's metrics.
     let limits = Arc::new(kronosdb_protocol::net::server::Limits::new(
         config.max_handshakes,
@@ -344,6 +349,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         activity: Arc::new(admin::activity::ActivityTracker::new()),
         hardware,
         limits: Arc::clone(&limits),
+        appends: Arc::clone(&appends),
     };
     tokio::spawn(async move {
         if let Err(e) = admin::start_admin_server(admin_state).await {
@@ -476,6 +482,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.replication_inflight_bytes,
         )),
         max_snapshot_size: config.max_snapshot_size,
+        appends: Arc::clone(&appends),
         hub: Arc::clone(&hub),
         schedules: Arc::clone(&schedules),
     }));
