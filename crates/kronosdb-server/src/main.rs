@@ -110,6 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     let store_options = StoreOptions {
         max_segment_size: config.segment_size,
+        recent_events: config.retry_window_events,
         mapping_budget: kronosdb_eventstore::cache::MappingBudget::shared(),
         file_budget: kronosdb_eventstore::cache::FileBudget::shared(),
         read_mode: config.read_mode,
