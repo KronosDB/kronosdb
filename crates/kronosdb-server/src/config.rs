@@ -303,7 +303,8 @@ struct StorageConfig {
     #[serde(rename = "max-snapshot-size")]
     max_snapshot_size: Option<u64>,
     /// How many of a context's newest events are kept by identifier, to
-    /// recognise a retried append. 0 turns that off.
+    /// recognise a retried append. 0 turns that off. About 58 bytes an event
+    /// once full: 66 MiB a context at the default.
     #[serde(rename = "retry-window-events")]
     retry_window_events: Option<usize>,
 }
