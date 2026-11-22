@@ -1521,6 +1521,7 @@ fn prepare_system_append(mut request: AppendRequest) -> Result<Prepared, Error> 
 /// The newest events a store keeps by identifier, by default: a retried
 /// append is recognised while fewer than this many events have been written
 /// since the first attempt. At 40,000 events a second that is 30 seconds.
+/// Full, the index takes about 66 MiB.
 pub const DEFAULT_RECENT_EVENTS: usize = 1_200_000;
 
 /// Configuration options for an event store engine.

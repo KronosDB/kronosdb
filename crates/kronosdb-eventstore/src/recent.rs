@@ -17,17 +17,15 @@
 //! not writes it, correctly, as new.
 //!
 //! The window is a number of events, not a time. A retry that arrives after
-//! that many newer events is written again. After a restart the window
+//! that many newer events is written again. A full window takes about 58
+//! bytes an event (66 MiB for 1,200,000); it grows as events are written, so
+//! a quiet context holds little. After a restart the window
 //! starts as the open segment's events: a first attempt whose segment was
 //! sealed before the node stopped is not recognised.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState};
 use std::sync::OnceLock;
-
-/// Bytes one indexed event takes, for sizing the window from a memory budget:
-/// a map entry with its load-factor slack, and a queue slot.
-pub const BYTES_PER_EVENT: usize = 48;
 
 /// What identifies one event to the index: a keyed hash of its identifier,
 /// and a check value over everything else it holds (its position excluded).
