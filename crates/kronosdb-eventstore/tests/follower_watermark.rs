@@ -12,7 +12,7 @@ use crash_harness::*;
 
 use std::time::{Duration, Instant};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 /// Well under the 5 s watermark-checkpoint tick, which would otherwise mask a
 /// follower that was never told.
 const FOLLOWER_BUDGET: Duration = Duration::from_millis(1500);

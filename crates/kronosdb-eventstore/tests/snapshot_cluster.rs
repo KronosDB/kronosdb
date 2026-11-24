@@ -10,7 +10,7 @@ use crash_harness::*;
 
 use std::time::{Duration, Instant};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const LEADER_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_TIMEOUT: Duration = Duration::from_secs(15);
 

@@ -20,7 +20,7 @@ use tokio::sync::watch;
 const SEGMENT_SIZE: u64 = 128 * 1024; // small segments => many seals quickly
 const MIN_SEALED_SEGMENTS: usize = 6;
 const EVENTS_PER_APPEND: usize = 32;
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const CATCHUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 

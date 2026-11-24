@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crash_harness::*;
 use kronosdb_protocol::net::NetError;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const DEADLINE_SECS: u64 = 2;
 
 fn new_event(sequence: usize) -> NewEvent {

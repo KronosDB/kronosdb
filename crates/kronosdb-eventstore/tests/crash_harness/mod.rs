@@ -300,6 +300,30 @@ fn server_log_file(cfg: &SpawnConfig) -> Option<std::fs::File> {
         .ok()
 }
 
+/// How long a server just spawned gets to accept connections and report its
+/// write path ready. A healthy one needs well under a second; this bounds a
+/// slow machine under load, not the normal case.
+pub const STARTUP: Duration = Duration::from_secs(60);
+
+/// Spawns `cmd`, waiting for its binary if it is missing for a moment.
+///
+/// Every test binary runs `cargo build` for the server before its first
+/// spawn, and a build that has nothing to compile still puts the binary in
+/// place again: the old file goes and a new one comes. A test binary of
+/// another `cargo test` running in the same target directory can spawn in
+/// between.
+fn spawn_once_present(cmd: &mut Command) -> std::io::Result<Child> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            spawned => return spawned,
+        }
+    }
+}
+
 /// Spawn kronosdb-server as a child. Returns immediately after spawn — caller must
 /// call `wait_until_ready`.
 pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
@@ -368,7 +392,7 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
         cmd.env("KRONOSDB_APPEND_TIMEOUT", secs.to_string());
     }
 
-    let child = cmd.spawn()?;
+    let child = spawn_once_present(&mut cmd)?;
     Ok(ServerHandle {
         child,
         listen,
