@@ -2,7 +2,9 @@
 //! node. The engine decides who handles a message and holds the permits;
 //! the links are how a message reaches them.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use kronosdb_messaging::engine::MessagingEngine;
@@ -10,9 +12,10 @@ use kronosdb_messaging::query::QueryResult;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::types::{Fault, ToCommandHandler, ToQueryHandler};
+use super::types::{Fault, FaultKind, ToCommandHandler, ToQueryHandler};
 
 /// The way to one handler stream. `stream` tells a stream's own link from
 /// the one that replaced it when a client reconnects.
@@ -20,8 +23,26 @@ pub(super) struct Link<M> {
     pub(super) stream: u64,
     pub(super) tx: mpsc::Sender<M>,
     /// Cancelled when something else ends the stream: a newer stream of the
-    /// same client taking over, or the client's platform stream dying.
+    /// same client taking over, or the client going silent.
     pub(super) cancel: CancellationToken,
+    /// When the stream opened.
+    pub(super) opened: Instant,
+    /// What the stream has subscribed, by message type, with the load
+    /// factor it asked for. This is what the client has on this bus: the
+    /// engine's subscriptions and the table's rows follow it.
+    pub(super) subscribed: HashMap<String, i32>,
+}
+
+impl<M> Link<M> {
+    pub(super) fn new(stream: u64, tx: mpsc::Sender<M>, cancel: CancellationToken) -> Self {
+        Self {
+            stream,
+            tx,
+            cancel,
+            opened: Instant::now(),
+            subscribed: HashMap::new(),
+        }
+    }
 }
 
 /// Where a query's results gather: the sender is the dispatcher's stream,
@@ -30,6 +51,14 @@ pub(super) struct Collector {
     pub(super) results: mpsc::Sender<Result<QueryResult, Fault>>,
     /// The handlers that have not sent QueryDone yet.
     pub(super) outstanding: Mutex<Vec<String>>,
+    /// Whether any handler has sent a result yet.
+    pub(super) answered: AtomicBool,
+    /// Whether these handlers are the only ones the query went to, so that
+    /// none of them answering is the whole answer.
+    pub(super) alone: bool,
+    /// The handlers whose streams have not taken the query yet. One that
+    /// ends first never saw it.
+    pub(super) unsent: Mutex<Vec<String>>,
 }
 
 pub struct Bus {
@@ -96,6 +125,13 @@ impl Bus {
         }
     }
 
+    /// The handler's stream took the query.
+    pub(super) fn query_taken(&self, client_id: &str, request_id: &str) {
+        if let Some(collector) = self.collectors.get(request_id) {
+            collector.unsent.lock().retain(|h| h != client_id);
+        }
+    }
+
     /// A handler is gone: the queries waiting on it will never hear from it.
     pub(super) fn handler_gone(&self, client_id: &str) {
         let waiting: Vec<String> = self
@@ -105,8 +141,26 @@ impl Bus {
             .map(|c| c.key().clone())
             .collect();
         for request_id in waiting {
-            self.handler_done(client_id, &request_id);
+            self.handler_gone_for(client_id, &request_id);
         }
+    }
+
+    /// A handler is gone. A query that it never took, and that no one else
+    /// is answering, ends with a fault that says no handler took it, which
+    /// the caller can try again; any other waits no more.
+    pub(super) fn handler_gone_for(&self, client_id: &str, request_id: &str) {
+        let Some(collector) = self.collectors.get(request_id).map(|c| Arc::clone(&c)) else {
+            return;
+        };
+        let never_took = collector.unsent.lock().iter().any(|h| h == client_id);
+        let others = collector.outstanding.lock().iter().any(|h| h != client_id);
+        if never_took && !others && collector.alone && !collector.answered.load(Ordering::Acquire) {
+            let _ = collector.results.try_send(Err(Fault::new(
+                FaultKind::NoHandler,
+                "no handler available: the handler's stream ended before it was sent the query",
+            )));
+        }
+        self.handler_done(client_id, request_id);
     }
 }
 
@@ -144,11 +198,7 @@ mod tests {
     }
 
     fn link(tx: mpsc::Sender<ToQueryHandler>, stream: u64) -> Link<ToQueryHandler> {
-        Link {
-            stream,
-            tx,
-            cancel: CancellationToken::new(),
-        }
+        Link::new(stream, tx, CancellationToken::new())
     }
 
     #[tokio::test]
@@ -195,6 +245,9 @@ mod tests {
             Arc::new(Collector {
                 results,
                 outstanding: Mutex::new(handlers.iter().map(|h| h.to_string()).collect()),
+                answered: AtomicBool::new(false),
+                alone: true,
+                unsent: Mutex::new(Vec::new()),
             }),
             rx,
         )

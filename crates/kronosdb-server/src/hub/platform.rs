@@ -4,11 +4,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kronosdb_messaging::api::MessagingPlatform;
 use kronosdb_messaging::types::{ClientId, ComponentName};
 use tokio::sync::mpsc;
 
 use super::Hub;
+use super::handlers::Which;
 use super::types::{ClientIdentity, Fault, NodeInfo, ProcessorReport, ToClient};
 
 /// How many messages may queue for one platform stream.
@@ -66,6 +66,7 @@ impl Hub {
                 hub: Arc::clone(self),
                 client,
                 stream,
+                expired: false,
             },
             rx,
         ))
@@ -87,28 +88,41 @@ impl Hub {
         })
     }
 
-    /// Takes a client off every bus and out of the replicated table.
-    fn forget_client(&self, client: &ClientId) {
+    /// A client gone for want of liveness: its handler streams that opened
+    /// before it went silent end (each takes its subscriptions and rows with
+    /// it), and so do the subscription queries it opened. A stream opened
+    /// since is the client alive again, and stays.
+    pub(super) fn forget_client(self: &Arc<Self>, client: &ClientId) {
+        let silent_since = tokio::time::Instant::now().checked_sub(self.config.heartbeat_timeout);
         for bus in self.all_buses() {
-            bus.engine.remove_client(client);
-            bus.handler_gone(&client.0);
+            if let Some(since) = silent_since {
+                self.end_command_stream(&bus, &client.0, Which::OpenedBefore(since));
+                self.end_query_stream(&bus, &client.0, Which::OpenedBefore(since));
+            }
+            bus.engine.remove_subscriber(client);
         }
-        self.retract_client(&client.0);
     }
 }
 
-/// A client's platform stream. Dropping it, however the stream ended, is the
-/// client leaving: its handler streams end, and everything it registered
-/// goes.
+/// A client's platform stream. Dropping it, however the stream ended, takes
+/// the client off the platform. Its handler streams are the connection's
+/// own and end with it, unless the stream gave up on the client for want of
+/// a heartbeat ([`expire`](PlatformSession::expire)): then they end now.
 pub struct PlatformSession {
     hub: Arc<Hub>,
     client: ClientId,
     stream: u64,
+    expired: bool,
 }
 
 impl PlatformSession {
     pub fn client(&self) -> &ClientId {
         &self.client
+    }
+
+    /// The client's platform stream gave up on it: silent past the timeout.
+    pub fn expire(&mut self) {
+        self.expired = true;
     }
 
     /// The client is alive.
@@ -124,8 +138,7 @@ impl PlatformSession {
 
 impl Drop for PlatformSession {
     fn drop(&mut self) {
-        // A newer platform stream of this client owns it now: its
-        // registrations are the new ones, not ours to remove.
+        // A newer platform stream of this client owns it now.
         if !self
             .hub
             .clients
@@ -133,16 +146,14 @@ impl Drop for PlatformSession {
         {
             return;
         }
-        // Handler streams end with it: they are cancelled, and this does
-        // their cleanup, so a stale stream cannot clean up registrations the
-        // client makes after it reconnects.
-        self.hub.clients.close_handler_streams(&self.client.0);
         self.hub.processors.remove_client(&self.client.0);
         self.hub
             .client_registry
             .set_stream_active(&self.client, false);
         self.hub.client_registry.unregister(&self.client);
-        self.hub.forget_client(&self.client);
+        if self.expired {
+            self.hub.forget_client(&self.client);
+        }
         tracing::info!(client_id = %self.client.0, "platform stream ended: client removed");
     }
 }

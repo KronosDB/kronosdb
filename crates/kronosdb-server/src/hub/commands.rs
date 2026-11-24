@@ -177,6 +177,7 @@ impl Hub {
         timeout: Duration,
         started: Instant,
     ) -> Result<CommandResult, Fault> {
+        let name = pending.command.name.clone();
         let mut in_flight = InFlight {
             engine: &bus.engine,
             message_id: Some(message_id),
@@ -187,15 +188,28 @@ impl Hub {
             .await
             .is_err()
         {
-            return Err(Fault::unavailable(format!(
-                "handler '{}' has no stream on this node",
-                handler.0
-            )));
+            // The handler left between being picked and being sent the
+            // command: nothing saw it.
+            return Err(Fault::new(
+                FaultKind::NoHandler,
+                format!(
+                    "no handler available for command '{name}': handler '{}' has no stream on this node",
+                    handler.0
+                ),
+            ));
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         match tokio::time::timeout(remaining, response_rx).await {
             Ok(Ok(result)) => {
                 in_flight.settled();
+                if result.error_code.as_deref() == Some(error_codes::COMMAND_NOT_DELIVERED) {
+                    return Err(Fault::new(
+                        FaultKind::NoHandler,
+                        format!(
+                            "no handler available for command '{name}': its handler's stream ended before the command was sent"
+                        ),
+                    ));
+                }
                 Ok(result)
             }
             // The bus dropped the sender without an answer: the entry was

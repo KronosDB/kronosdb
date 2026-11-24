@@ -251,9 +251,10 @@ impl Hub {
             .to_query_handler(&handler, ToQueryHandler::Subscription(handler_view))
             .await;
         if delivered.is_err() {
-            return Err(Fault::unavailable(format!(
-                "handler '{handler}' has no stream on this node"
-            )));
+            return Err(Fault::new(
+                FaultKind::NoHandler,
+                format!("no handler available: handler '{handler}' has no stream on this node"),
+            ));
         }
         Ok(feed)
     }

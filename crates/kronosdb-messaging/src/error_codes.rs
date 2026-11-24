@@ -8,3 +8,7 @@ pub const COMMAND_TIMEOUT: &str = "KRONOSDB-4005";
 
 /// The handler the command was routed to disconnected before responding.
 pub const CONNECTION_TO_HANDLER_LOST: &str = "KRONOSDB-4006";
+
+/// The handler the command was routed to ended its stream before the command
+/// was sent to it: the handler never saw the command.
+pub const COMMAND_NOT_DELIVERED: &str = "KRONOSDB-4007";

@@ -80,7 +80,7 @@ pub async fn open_platform(ctx: Ctx, stream: ServerStream) -> Result<(), Failure
         return Err(invalid("malformed OpenPlatform"));
     };
     let hub = &ctx.deps.hub;
-    let (session, mut queue) = hub
+    let (mut session, mut queue) = hub
         .open_platform(identity(&open.client))
         .map_err(wire::failure)?;
     let client_id = session.client().0.clone();
@@ -140,6 +140,7 @@ pub async fn open_platform(ctx: Ctx, stream: ServerStream) -> Result<(), Failure
                     timeout_secs = ?timeout,
                     "platform stream: heartbeat timeout; removing the client"
                 );
+                session.expire();
                 return Err(Failure::new(
                     ErrorCode::UNAVAILABLE,
                     "no heartbeat within the timeout; reconnect",

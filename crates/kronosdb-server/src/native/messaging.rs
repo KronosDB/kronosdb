@@ -35,8 +35,8 @@ async fn ack(out: &StreamSender, instruction_id: &str) {
 }
 
 /// Why a handler stream the server ended says it ended.
-const ENDED_BY_SERVER: &str = "this handler stream ended because its client's platform stream \
-     did, or a newer handler stream of the same client replaced it";
+const ENDED_BY_SERVER: &str = "this handler stream ended because its client went silent, \
+     or a newer handler stream of the same client replaced it";
 
 fn load_factor(wire: u32) -> i32 {
     wire.min(i32::MAX as u32) as i32
@@ -96,6 +96,12 @@ pub async fn open_command_handlers(ctx: Ctx, stream: ServerStream) -> Result<(),
             }
             message = queue.recv() => match message {
                 Some(ToCommandHandler::Command(command)) => {
+                    // A client done with the stream takes nothing: the
+                    // command stays unsent, and its caller is told so.
+                    if inbound.has_ended() {
+                        return Ok(());
+                    }
+                    handlers.taken(&command.message_id);
                     let frame = p::Frame::HandleCommand(p::HandleCommand {
                         command: wire::wire_command(&command),
                     });
@@ -217,8 +223,12 @@ pub async fn open_query_handlers(ctx: Ctx, stream: ServerStream) -> Result<(), F
                 let Some(message) = message else {
                     return Err(Failure::new(ErrorCode::UNAVAILABLE, ENDED_BY_SERVER));
                 };
+                if inbound.has_ended() {
+                    return Ok(());
+                }
                 let sent = match &message {
                     ToQueryHandler::Query(query) => {
+                        handlers.taken(&query.message_id);
                         out.send(&p::Frame::HandleQuery(p::HandleQuery {
                             query: wire::wire_query(query),
                         }))

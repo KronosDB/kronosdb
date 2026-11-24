@@ -365,15 +365,21 @@ impl SubscriptionRegistry {
     /// Removes all subscriptions for a disconnected client
     /// (both as subscriber and as handler).
     pub fn remove_client(&self, client_id: &ClientId) {
-        // Remove as subscriber — the subscriber is gone, nothing to notify.
-        self.active
-            .write()
-            .retain(|_, sub| &sub.client_id != client_id);
+        self.remove_subscriber(client_id);
 
         // Remove as handler.
         self.fail_handler_subscriptions(client_id);
         let mut handlers = self.handlers.write();
         handlers.remove_client(client_id);
+    }
+
+    /// Removes the subscriptions `client_id` opened as a subscriber. The
+    /// subscriber is gone, so nothing is told. Subscriptions it serves as a
+    /// handler are left alone.
+    pub fn remove_subscriber(&self, client_id: &ClientId) {
+        self.active
+            .write()
+            .retain(|_, sub| &sub.client_id != client_id);
     }
 
     /// Ends the subscriptions `handler` serves, telling each subscriber the

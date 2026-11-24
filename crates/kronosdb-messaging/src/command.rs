@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -146,6 +146,9 @@ struct InFlightEntry {
     /// The sweep uses this instead of its default when present, so a client
     /// asking for a longer deadline isn't killed by the global sweep.
     timeout_override: Option<Duration>,
+    /// Whether the handler's stream took the command. Until it does, the
+    /// handler cannot have seen it.
+    sent: AtomicBool,
 }
 
 /// The command bus. Routes commands to registered handlers.
@@ -239,6 +242,17 @@ impl CommandBus {
             handlers.remove_client(client_id);
         }
         self.cancel_for_handler(client_id)
+    }
+
+    /// Like [`remove_client`](CommandBus::remove_client), telling the commands
+    /// the handler never took apart, as
+    /// [`cancel_for_handler_as`](CommandBus::cancel_for_handler_as) does.
+    pub fn remove_client_as(&self, client_id: &ClientId) -> (Vec<String>, Vec<String>) {
+        {
+            let mut handlers = self.handlers.write();
+            handlers.remove_client(client_id);
+        }
+        self.cancel_for_handler_as(client_id)
     }
 
     /// Grants flow control permits to a client.
@@ -458,6 +472,7 @@ impl CommandBus {
                 dispatched_at: now,
                 command_name: command_name.clone(),
                 timeout_override: extract_timeout(&command.processing_instructions),
+                sent: AtomicBool::new(false),
             },
         );
 
@@ -602,6 +617,7 @@ impl CommandBus {
                 dispatched_at: now,
                 command_name: command_name.clone(),
                 timeout_override: extract_timeout(&command.processing_instructions),
+                sent: AtomicBool::new(false),
             },
         );
 
@@ -691,6 +707,52 @@ impl CommandBus {
             }
         }
         cancelled
+    }
+
+    /// Like [`cancel_for_handler`](CommandBus::cancel_for_handler), and tells
+    /// the commands the handler's stream never took apart: those fail with
+    /// [`error_codes::COMMAND_NOT_DELIVERED`], since the handler never saw
+    /// them. Returns the ids of those the handler had been sent, and of the
+    /// rest.
+    pub fn cancel_for_handler_as(&self, handler_id: &ClientId) -> (Vec<String>, Vec<String>) {
+        let to_cancel: Vec<String> = self
+            .in_flight
+            .iter()
+            .filter(|e| &e.value().target_handler == handler_id)
+            .map(|e| e.key().clone())
+            .collect();
+
+        let (mut lost, mut not_sent) = (Vec::new(), Vec::new());
+        for msg_id in to_cancel {
+            if let Some((_, entry)) = self.in_flight.remove(&msg_id) {
+                if entry.sent.load(Ordering::Acquire) {
+                    self.fail_entry(
+                        entry,
+                        error_codes::CONNECTION_TO_HANDLER_LOST,
+                        "handler disconnected before responding",
+                        &msg_id,
+                    );
+                    lost.push(msg_id);
+                } else {
+                    self.fail_entry(
+                        entry,
+                        error_codes::COMMAND_NOT_DELIVERED,
+                        "handler's stream ended before the command was sent to it",
+                        &msg_id,
+                    );
+                    not_sent.push(msg_id);
+                }
+            }
+        }
+        (lost, not_sent)
+    }
+
+    /// The handler's stream took the command: from here the handler may
+    /// have seen it, and losing the handler fails it as such.
+    pub fn mark_sent(&self, message_id: &str) {
+        if let Some(entry) = self.in_flight.get(message_id) {
+            entry.sent.store(true, Ordering::Release);
+        }
     }
 
     /// Removes in-flight entries older than `timeout`. Each swept entry
@@ -1200,6 +1262,38 @@ mod tests {
 
         let cancelled = bus.remove_client(&client("node-1"));
         assert_eq!(cancelled.len(), 1);
+        assert_eq!(bus.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn a_handler_lost_fails_unsent_commands_apart_from_sent_ones() {
+        let bus = CommandBus::new();
+        bus.subscribe(
+            "CreateOrder".into(),
+            client("node-1"),
+            component("order-service"),
+            100,
+        );
+        bus.grant_permits(&client("node-1"), 10);
+        let mut sent = make_command("CreateOrder");
+        sent.message_id = "sent".into();
+        let (_pending, mut sent_rx) = bus.dispatch(sent).unwrap();
+        let mut queued = make_command("CreateOrder");
+        queued.message_id = "queued".into();
+        let (_pending, mut queued_rx) = bus.dispatch(queued).unwrap();
+        bus.mark_sent("sent");
+
+        let (lost, not_sent) = bus.remove_client_as(&client("node-1"));
+        assert_eq!(lost, vec!["sent".to_string()]);
+        assert_eq!(not_sent, vec!["queued".to_string()]);
+        assert_eq!(
+            sent_rx.try_recv().unwrap().error_code.as_deref(),
+            Some(error_codes::CONNECTION_TO_HANDLER_LOST)
+        );
+        assert_eq!(
+            queued_rx.try_recv().unwrap().error_code.as_deref(),
+            Some(error_codes::COMMAND_NOT_DELIVERED)
+        );
         assert_eq!(bus.in_flight_count(), 0);
     }
 
