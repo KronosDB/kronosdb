@@ -27,7 +27,7 @@ const PAUSE_DELAY_MIN_MS: u64 = 50;
 const PAUSE_DELAY_MAX_MS: u64 = 500;
 /// Acks that must land in the new epoch while the old leader is frozen.
 const REQUIRED_ACKS_WHILE_FROZEN: usize = 25;
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

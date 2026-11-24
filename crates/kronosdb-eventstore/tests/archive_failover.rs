@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const SEGMENT_SIZE: u64 = 64 * 1024;
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

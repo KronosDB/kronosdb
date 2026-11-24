@@ -25,7 +25,7 @@ use crash_harness::*;
 
 use std::time::{Duration, Instant};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACKED_EVENTS: usize = 5;
 /// Well under the 5s watermark-checkpoint tick, which would otherwise mask a

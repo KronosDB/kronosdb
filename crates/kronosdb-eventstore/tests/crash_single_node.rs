@@ -20,7 +20,7 @@ const AGGREGATES: usize = 8;
 const WRITER_TASKS: usize = 4;
 const KILL_DELAY_MIN_MS: u64 = 50;
 const KILL_DELAY_MAX_MS: u64 = 500;
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 const WORKLOAD_STARTUP_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

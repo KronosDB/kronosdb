@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use kronosdb_client::Snapshot;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const READY_TIMEOUT: Duration = crash_harness::STARTUP;
 
 fn single_node_config(data_dir: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
