@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use kronosdb_eventstore::context::ContextManager;
 use kronosdb_eventstore::raft::cluster::{ClusterConfig, ClusterManager, NodeType, PeerConfig};
+use kronosdb_eventstore::raft::handler_registry::{HandlerKind, HandlerRegistration};
 use kronosdb_eventstore::raft::types::default_raft_config;
 use kronosdb_eventstore::replication::peer::PeerTransportConfig;
 use kronosdb_messaging::client::ClientRegistry;
@@ -24,6 +25,8 @@ use crate::processor::ProcessorRegistry;
 
 struct Fixture {
     hub: Arc<Hub>,
+    /// The routing table the hub's writes land in.
+    table: Arc<FakeTable>,
     _dir: tempfile::TempDir,
 }
 
@@ -49,7 +52,8 @@ fn fixture_with(command_timeout: Duration) -> Fixture {
             peer_transport: PeerTransportConfig::default(),
         },
     ));
-    let hub = Hub::new(
+    let table = Arc::new(FakeTable::default());
+    let hub = Hub::with_writes(
         HubConfig {
             node_name: "test-node".into(),
             command_timeout,
@@ -62,11 +66,16 @@ fn fixture_with(command_timeout: Duration) -> Fixture {
             client_registry: Arc::new(ClientRegistry::new()),
             processors: Arc::new(ProcessorRegistry::new()),
         },
-        cluster,
+        &cluster,
+        table.clone(),
         Arc::new(peers::NoPeers),
         Arc::new(|| vec!["default".to_string()]),
     );
-    Fixture { hub, _dir: dir }
+    Fixture {
+        hub,
+        table,
+        _dir: dir,
+    }
 }
 
 fn payload(text: &'static str) -> Payload {
@@ -233,7 +242,8 @@ async fn a_handler_stream_ending_fails_what_was_in_flight_to_it() {
         let bus = Arc::clone(&bus);
         tokio::spawn(async move { hub.dispatch_command(&bus, command("c1", "Slow")).await })
     };
-    let _ = recv(&mut queue).await;
+    let ToCommandHandler::Command(sent) = recv(&mut queue).await;
+    handlers.taken(&sent.message_id);
     drop(handlers);
 
     let result = dispatch.await.unwrap().unwrap();
@@ -284,7 +294,8 @@ async fn a_takeover_fails_the_commands_still_in_flight_to_the_older_stream() {
         let bus = Arc::clone(&bus);
         tokio::spawn(async move { hub.dispatch_command(&bus, command("c1", "Slow")).await })
     };
-    let _ = recv(&mut old_queue).await;
+    let ToCommandHandler::Command(sent) = recv(&mut old_queue).await;
+    old.taken(&sent.message_id);
 
     // The client reconnects; the older stream can no longer answer c1.
     let (_new, _new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
@@ -381,7 +392,10 @@ async fn a_handler_that_goes_away_does_not_hold_a_query_open() {
         .dispatch_query(&bus, query("q1", "Slow", -1))
         .await
         .unwrap();
-    let _ = recv(&mut q1).await;
+    let ToQueryHandler::Query(sent) = recv(&mut q1).await else {
+        panic!("the query");
+    };
+    h1.taken(&sent.message_id);
     drop(h1);
     let ended = tokio::time::timeout(Duration::from_secs(1), results.next()).await;
     assert!(
@@ -483,7 +497,7 @@ async fn a_subscriber_that_leaves_tells_the_handler_and_credits_reach_it() {
     assert!(bus.initials.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_handler_that_dies_ends_its_subscriptions_with_the_loss_code() {
     let f = fixture();
     let bus = f.hub.bus("default");
@@ -496,8 +510,9 @@ async fn a_handler_that_dies_ends_its_subscriptions_with_the_loss_code() {
         .await
         .unwrap();
     let _ = recv(&mut queue).await;
-    // The platform stream dying is what removes a client from the buses.
-    let (session, _client_queue) = f
+    // A client gone silent is what removes it from the buses.
+    tokio::time::advance(Duration::from_secs(16)).await;
+    let (mut session, _client_queue) = f
         .hub
         .open_platform(ClientIdentity {
             client_id: "h1".into(),
@@ -505,6 +520,7 @@ async fn a_handler_that_dies_ends_its_subscriptions_with_the_loss_code() {
             version: "1".into(),
         })
         .unwrap();
+    session.expire();
     drop(session);
     match feed.next().await {
         Some(Ok(SubscriptionEvent::Failed { error_code, .. })) => {
@@ -663,4 +679,547 @@ async fn a_takeover_ends_the_subscriptions_the_older_stream_served() {
         other => panic!("expected the loss, got {other:?}"),
     }
     assert!(bus.engine.subscription_stats().is_empty());
+}
+
+// ── A client that reopens its streams keeps its handlers ───────────────
+
+type Row = (String, HandlerKind, String, String);
+
+/// The replicated routing table as a test can see it, with writes that can
+/// be held so a test decides which one lands last.
+#[derive(Default)]
+struct FakeTable {
+    state: parking_lot::Mutex<FakeState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct FakeState {
+    rows: std::collections::BTreeSet<Row>,
+    /// Removals wait while this is set.
+    hold: bool,
+    /// How many removals have arrived at the hold.
+    held: usize,
+    /// Registrations that fail as the control plane not being there yet.
+    failing_registrations: usize,
+}
+
+impl FakeTable {
+    fn rows(&self) -> std::collections::BTreeSet<Row> {
+        self.state.lock().rows.clone()
+    }
+
+    fn hold_removals(&self) {
+        self.state.lock().hold = true;
+    }
+
+    fn release_removals(&self) {
+        self.state.lock().hold = false;
+        self.changed.notify_waiters();
+    }
+
+    /// Resolves once `count` removals are waiting at the hold.
+    async fn removals_held(&self, count: usize) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.state.lock().held >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn gate(&self) {
+        self.state.lock().held += 1;
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.state.lock().hold {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl RoutingWrites for FakeTable {
+    fn node_id(&self) -> u64 {
+        1
+    }
+
+    fn register(
+        &self,
+        registration: HandlerRegistration,
+    ) -> peers::BoxFuture<'_, Result<(), kronosdb_eventstore::error::Error>> {
+        Box::pin(async move {
+            let mut state = self.state.lock();
+            if state.failing_registrations > 0 {
+                state.failing_registrations -= 1;
+                return Err(kronosdb_eventstore::error::Error::Unavailable {
+                    message: "no control-plane leader available".into(),
+                });
+            }
+            state.rows.insert((
+                registration.bus,
+                registration.kind,
+                registration.message_type,
+                registration.client_id,
+            ));
+            Ok(())
+        })
+    }
+
+    fn deregister<'a>(
+        &'a self,
+        bus: &'a str,
+        kind: HandlerKind,
+        message_type: &'a str,
+        client_id: &'a str,
+    ) -> peers::BoxFuture<'a, Result<(), kronosdb_eventstore::error::Error>> {
+        Box::pin(async move {
+            self.gate().await;
+            self.state.lock().rows.remove(&(
+                bus.to_string(),
+                kind,
+                message_type.to_string(),
+                client_id.to_string(),
+            ));
+            Ok(())
+        })
+    }
+}
+
+/// Waits for a handler stream the hub ended.
+async fn ended(cancelled: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(Duration::from_secs(5), cancelled)
+        .await
+        .expect("the stream was ended");
+}
+
+fn row(bus: &str, kind: HandlerKind, message_type: &str, client: &str) -> Row {
+    (bus.into(), kind, message_type.into(), client.into())
+}
+
+/// Waits for the replicated table to hold exactly `expected`, and to go on
+/// holding it while the writes still in flight land.
+async fn table_settles_to(table: &FakeTable, expected: &[Row]) {
+    let expected: std::collections::BTreeSet<Row> = expected.iter().cloned().collect();
+    for _ in 0..400 {
+        if table.rows() == expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(table.rows(), expected, "the routing table did not settle");
+}
+
+/// What a bus's engine holds for handlers: (kind, message type, client).
+fn local_rows(bus: &Bus) -> std::collections::BTreeSet<(HandlerKind, String, String)> {
+    let mut rows = std::collections::BTreeSet::new();
+    for (kind, details) in [
+        (HandlerKind::Command, bus.engine.command_details()),
+        (HandlerKind::Query, bus.engine.query_details()),
+    ] {
+        for detail in details {
+            for handler in detail.handlers {
+                rows.insert((kind, detail.name.clone(), handler.client_id));
+            }
+        }
+    }
+    rows
+}
+
+fn local(kind: HandlerKind, message_type: &str, client: &str) -> (HandlerKind, String, String) {
+    (kind, message_type.into(), client.into())
+}
+
+fn identity(client: &str) -> ClientIdentity {
+    ClientIdentity {
+        client_id: client.into(),
+        component_name: "svc".into(),
+        version: "1".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_platform_stream_the_client_closed_leaves_its_handler_streams_alone() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (session, _platform) = f.hub.open_platform(identity("h1")).unwrap();
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    old.subscribe("Echo", 100);
+    // The client reopens its handler stream, then its old platform stream
+    // is finally processed as closed.
+    let (mut new, mut new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    new.subscribe("Echo", 100);
+    new.grant(10);
+    drop(session);
+    drop(old);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), new.cancelled())
+            .await
+            .is_err(),
+        "the new stream is not ended by the old platform stream"
+    );
+    assert_eq!(
+        local_rows(&bus),
+        [local(HandlerKind::Command, "Echo", "h1")].into()
+    );
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Echo", "h1")],
+    )
+    .await;
+    let dispatch = {
+        let hub = Arc::clone(&f.hub);
+        let bus = Arc::clone(&bus);
+        tokio::spawn(async move { hub.dispatch_command(&bus, command("c1", "Echo")).await })
+    };
+    let ToCommandHandler::Command(delivered) = recv(&mut new_queue).await;
+    new.complete(ok_result(&delivered.message_id));
+    assert!(dispatch.await.unwrap().unwrap().error_code.is_none());
+}
+
+#[tokio::test]
+async fn a_platform_stream_ending_before_the_new_streams_open_ends_nothing() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (session, _platform) = f.hub.open_platform(identity("h1")).unwrap();
+    let (mut handlers, _queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    handlers.subscribe("Echo", 100);
+    let (mut queries, _query_queue) = f.hub.open_query_handlers(Arc::clone(&bus), who("h1"));
+    queries.subscribe("Ask");
+    drop(session);
+
+    // Whatever the client did to its platform stream, its handler streams
+    // are its own connection's: they end when that connection does.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), handlers.cancelled())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), queries.cancelled())
+            .await
+            .is_err()
+    );
+    table_settles_to(
+        &f.table,
+        &[
+            row("default", HandlerKind::Command, "Echo", "h1"),
+            row("default", HandlerKind::Query, "Ask", "h1"),
+        ],
+    )
+    .await;
+    drop(handlers);
+    drop(queries);
+    table_settles_to(&f.table, &[]).await;
+    assert!(local_rows(&bus).is_empty());
+}
+
+#[tokio::test]
+async fn an_older_stream_ending_after_the_newer_one_subscribed_keeps_its_rows() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    old.subscribe("Echo", 100);
+    old.subscribe("Gone", 100);
+    let (mut new, _new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    new.subscribe("Echo", 100);
+    drop(old);
+
+    // What the replaced stream held and the new one does not is gone; what
+    // the new one subscribed stays.
+    assert_eq!(
+        local_rows(&bus),
+        [local(HandlerKind::Command, "Echo", "h1")].into()
+    );
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Echo", "h1")],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stream_ending_late_does_not_remove_what_a_new_stream_on_the_same_bus_registered() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    old.subscribe("Echo", 100);
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Echo", "h1")],
+    )
+    .await;
+
+    // The old stream's end writes its removal, which is slow to land.
+    f.table.hold_removals();
+    drop(old);
+    f.table.removals_held(1).await;
+    let (mut new, _new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    new.subscribe("Echo", 100);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.table.release_removals();
+
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Echo", "h1")],
+    )
+    .await;
+    assert_eq!(
+        local_rows(&bus),
+        [local(HandlerKind::Command, "Echo", "h1")].into()
+    );
+}
+
+#[tokio::test]
+async fn a_stream_ending_late_does_not_remove_what_a_new_stream_on_another_bus_registered() {
+    let f = fixture();
+    let (a, b) = (f.hub.bus("a"), f.hub.bus("b"));
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&a), who("h1"));
+    old.subscribe("Echo", 100);
+    table_settles_to(&f.table, &[row("a", HandlerKind::Command, "Echo", "h1")]).await;
+
+    f.table.hold_removals();
+    drop(old);
+    f.table.removals_held(1).await;
+    let (mut new, _new_queue) = f.hub.open_query_handlers(Arc::clone(&b), who("h1"));
+    new.subscribe("Ask");
+    // Whatever the hub writes meanwhile, the removal lands last.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.table.release_removals();
+
+    table_settles_to(&f.table, &[row("b", HandlerKind::Query, "Ask", "h1")]).await;
+    assert!(local_rows(&a).is_empty());
+    assert_eq!(
+        local_rows(&b),
+        [local(HandlerKind::Query, "Ask", "h1")].into()
+    );
+}
+
+#[tokio::test]
+async fn a_replaced_stream_cannot_subscribe_anything() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    let (_new, _new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    // A frame of the old stream the server had not read yet.
+    old.subscribe("Late", 100);
+    old.grant(5);
+    drop(old);
+
+    assert!(local_rows(&bus).is_empty());
+    table_settles_to(&f.table, &[]).await;
+}
+
+#[tokio::test]
+async fn a_takeover_starts_the_new_stream_with_nothing_subscribed() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    old.subscribe("Echo", 100);
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Echo", "h1")],
+    )
+    .await;
+
+    let (_new, _new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    assert!(local_rows(&bus).is_empty());
+    table_settles_to(&f.table, &[]).await;
+    let fault = f
+        .hub
+        .dispatch_command(&bus, command("c1", "Echo"))
+        .await
+        .unwrap_err();
+    assert_eq!(fault.kind, FaultKind::NoHandler);
+}
+
+#[tokio::test]
+async fn a_takeover_does_not_leave_a_query_waiting_on_the_older_stream() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut old, mut old_queue) = f.hub.open_query_handlers(Arc::clone(&bus), who("h1"));
+    old.subscribe("Ask");
+    old.grant(10);
+    let mut results = f
+        .hub
+        .dispatch_query(&bus, query("q1", "Ask", 1))
+        .await
+        .unwrap();
+    let ToQueryHandler::Query(sent) = recv(&mut old_queue).await else {
+        panic!("the query");
+    };
+    old.taken(&sent.message_id);
+
+    let (_new, _new_queue) = f.hub.open_query_handlers(Arc::clone(&bus), who("h1"));
+    let ended = tokio::time::timeout(Duration::from_secs(1), results.next())
+        .await
+        .expect("the query is not left to wait out its deadline");
+    assert!(ended.is_none() || matches!(ended, Some(Err(_))));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_gone_silent_loses_its_streams_and_every_row() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut session, _platform) = f.hub.open_platform(identity("h1")).unwrap();
+    let (mut commands, _commands_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    commands.subscribe("Echo", 100);
+    let (mut queries, _queries_queue) = f.hub.open_query_handlers(Arc::clone(&bus), who("h1"));
+    queries.subscribe("Ask");
+    table_settles_to(
+        &f.table,
+        &[
+            row("default", HandlerKind::Command, "Echo", "h1"),
+            row("default", HandlerKind::Query, "Ask", "h1"),
+        ],
+    )
+    .await;
+
+    // Silent for longer than the timeout; its platform stream gives up.
+    tokio::time::advance(Duration::from_secs(16)).await;
+    // A stream opened since is proof of life, and stays.
+    let other = f.hub.bus("other");
+    let (mut fresh, _fresh_queue) = f.hub.open_command_handlers(Arc::clone(&other), who("h1"));
+    fresh.subscribe("Fresh", 100);
+    session.expire();
+    drop(session);
+
+    ended(commands.cancelled()).await;
+    ended(queries.cancelled()).await;
+    assert!(local_rows(&bus).is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), fresh.cancelled())
+            .await
+            .is_err()
+    );
+    table_settles_to(
+        &f.table,
+        &[row("other", HandlerKind::Command, "Fresh", "h1")],
+    )
+    .await;
+    drop(commands);
+    drop(queries);
+    drop(fresh);
+    table_settles_to(&f.table, &[]).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_reaper_ends_the_handler_streams_of_a_client_that_went_silent() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut commands, _queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    commands.subscribe("Echo", 100);
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Echo", "h1")],
+    )
+    .await;
+    tokio::time::advance(Duration::from_secs(16)).await;
+
+    f.hub.forget_client(&ClientId("h1".into()));
+
+    ended(commands.cancelled()).await;
+    assert!(local_rows(&bus).is_empty());
+    table_settles_to(&f.table, &[]).await;
+}
+
+#[tokio::test]
+async fn a_command_its_handlers_stream_ended_before_taking_is_not_a_lost_handler() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut handlers, _queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    handlers.subscribe("Echo", 100);
+    handlers.grant(10);
+    let dispatch = {
+        let hub = Arc::clone(&f.hub);
+        let bus = Arc::clone(&bus);
+        tokio::spawn(async move { hub.dispatch_command(&bus, command("c1", "Echo")).await })
+    };
+    // The command is in the stream's queue; the stream ends without taking it.
+    while bus.engine.command_bus().in_flight_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    drop(handlers);
+
+    // Nothing saw it: the caller is told there is no handler, which it can
+    // try again, not that a handler disconnected while answering.
+    let fault = dispatch.await.unwrap().unwrap_err();
+    assert_eq!(fault.kind, FaultKind::NoHandler);
+}
+
+#[tokio::test]
+async fn a_command_a_replaced_stream_never_took_is_not_a_lost_handler() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut old, _old_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    old.subscribe("Echo", 100);
+    old.grant(10);
+    let dispatch = {
+        let hub = Arc::clone(&f.hub);
+        let bus = Arc::clone(&bus);
+        tokio::spawn(async move { hub.dispatch_command(&bus, command("c1", "Echo")).await })
+    };
+    while bus.engine.command_bus().in_flight_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    let (_new, _new_queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+
+    let fault = dispatch.await.unwrap().unwrap_err();
+    assert_eq!(fault.kind, FaultKind::NoHandler);
+}
+
+#[tokio::test]
+async fn a_query_its_handlers_stream_ended_before_taking_is_not_an_empty_answer() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    let (mut handlers, _queue) = f.hub.open_query_handlers(Arc::clone(&bus), who("h1"));
+    handlers.subscribe("Ask");
+    handlers.grant(10);
+    let mut results = f
+        .hub
+        .dispatch_query(&bus, query("q1", "Ask", 1))
+        .await
+        .unwrap();
+    drop(handlers);
+
+    match tokio::time::timeout(Duration::from_secs(1), results.next()).await {
+        Ok(Some(Err(fault))) => assert_eq!(fault.kind, FaultKind::NoHandler),
+        other => panic!("expected no handler, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_registration_the_control_plane_cannot_take_yet_is_written_when_it_can() {
+    let f = fixture();
+    let bus = f.hub.bus("default");
+    f.table.state.lock().failing_registrations = 2;
+    let (mut handlers, _queue) = f.hub.open_command_handlers(Arc::clone(&bus), who("h1"));
+    handlers.subscribe("Echo", 100);
+    handlers.subscribe("Other", 100);
+
+    table_settles_to(
+        &f.table,
+        &[
+            row("default", HandlerKind::Command, "Echo", "h1"),
+            row("default", HandlerKind::Command, "Other", "h1"),
+        ],
+    )
+    .await;
+    handlers.unsubscribe("Echo");
+    table_settles_to(
+        &f.table,
+        &[row("default", HandlerKind::Command, "Other", "h1")],
+    )
+    .await;
 }

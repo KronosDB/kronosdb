@@ -1,6 +1,7 @@
 //! Dispatching a query to its handlers and gathering what they answer.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use kronosdb_messaging::query::{PendingQuery, Query, QueryError, QueryResult};
@@ -150,7 +151,8 @@ impl Hub {
             let name = query.name.clone();
             match bus.engine.query_bus().dispatch_wait(query, wait).await {
                 Ok(pending) => {
-                    self.deliver_query(bus, pending, results.clone()).await;
+                    self.deliver_query(bus, pending, results.clone(), !has_remote)
+                        .await;
                     local_active = true;
                 }
                 Err(e) if has_remote => {
@@ -188,7 +190,7 @@ impl Hub {
             .await
             .map_err(query_fault)?;
         let (results, rx) = mpsc::channel(RESULT_QUEUE);
-        self.deliver_query(bus, pending, results).await;
+        self.deliver_query(bus, pending, results, false).await;
         Ok(QueryStream {
             results: rx,
             deadline: Instant::now() + budget,
@@ -209,6 +211,7 @@ impl Hub {
         bus: &Bus,
         pending: PendingQuery,
         results: mpsc::Sender<Result<QueryResult, Fault>>,
+        alone: bool,
     ) {
         let request_id = pending.query.message_id.clone();
         let targets: Vec<String> = pending.target_handlers.into_iter().map(|h| h.0).collect();
@@ -217,6 +220,9 @@ impl Hub {
             Arc::new(Collector {
                 results,
                 outstanding: Mutex::new(targets.clone()),
+                answered: AtomicBool::new(false),
+                alone,
+                unsent: Mutex::new(targets.clone()),
             }),
         );
         let query = Arc::new(pending.query);
@@ -226,7 +232,7 @@ impl Hub {
                 .await;
             // A handler with no stream here will never answer.
             if sent.is_err() {
-                bus.handler_done(&target, &request_id);
+                bus.handler_gone_for(&target, &request_id);
             }
         }
     }

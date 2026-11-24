@@ -233,6 +233,21 @@ impl SubscriptionQueryDispatcher for MessagingEngine {
     }
 }
 
+impl MessagingEngine {
+    /// Like [`remove_command_client`](CommandDispatcher::remove_command_client),
+    /// telling the commands the handler's stream never took apart: the ids of
+    /// those it had been sent, and of the rest.
+    pub fn remove_command_client_as(&self, client_id: &ClientId) -> (Vec<String>, Vec<String>) {
+        self.command_bus.remove_client_as(client_id)
+    }
+
+    /// Removes the subscription queries `client_id` opened as a subscriber,
+    /// leaving every handler registration it holds as it is.
+    pub fn remove_subscriber(&self, client_id: &ClientId) {
+        self.subscriptions.remove_subscriber(client_id);
+    }
+}
+
 impl MessagingPlatform for MessagingEngine {
     fn remove_client(&self, client_id: &ClientId) -> Vec<String> {
         let cancelled = self.command_bus.remove_client(client_id);

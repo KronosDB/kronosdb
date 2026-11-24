@@ -21,6 +21,7 @@ mod platform;
 mod queries;
 mod routing;
 mod subscriptions;
+mod table;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -43,6 +44,7 @@ pub use peers::{BoxFuture, Peers, QueryLeg, RemoteFeed};
 pub use queries::QueryStream;
 pub use routing::{expected_results, routing_key_of};
 pub use subscriptions::SubscriptionFeed;
+pub use table::RoutingWrites;
 pub use types::*;
 
 #[derive(Debug, Clone)]
@@ -73,7 +75,9 @@ pub struct Hub {
     pub client_registry: Arc<ClientRegistry>,
     pub processors: Arc<ProcessorRegistry>,
     router: routing::Router,
-    cluster: Arc<ClusterManager>,
+    writes: Arc<dyn RoutingWrites>,
+    /// What this node has written to the routing table, per client.
+    routing: table::Rows,
     peers: Arc<dyn Peers>,
     contexts: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     streams: AtomicU64,
@@ -85,6 +89,20 @@ impl Hub {
         config: HubConfig,
         shared: Shared,
         cluster: Arc<ClusterManager>,
+        peers: Arc<dyn Peers>,
+        contexts: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Arc<Self> {
+        let writes = Arc::new(table::ClusterWrites(Arc::clone(&cluster)));
+        Self::with_writes(config, shared, &cluster, writes, peers, contexts)
+    }
+
+    /// Like [`Hub::new`], with the routing table's writes made through
+    /// `writes`.
+    pub(crate) fn with_writes(
+        config: HubConfig,
+        shared: Shared,
+        cluster: &ClusterManager,
+        writes: Arc<dyn RoutingWrites>,
         peers: Arc<dyn Peers>,
         contexts: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Arc<Self> {
@@ -101,7 +119,8 @@ impl Hub {
             client_registry,
             processors,
             router: routing::Router::new(cluster.handler_routing(), cluster.local_node_id()),
-            cluster,
+            writes,
+            routing: table::Rows::default(),
             peers,
             contexts,
             streams: AtomicU64::new(0),

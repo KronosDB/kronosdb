@@ -1,12 +1,8 @@
 //! The clients connected to this node: the way to each one's platform
-//! stream, and the handler streams that must end with it.
-
-use std::collections::HashMap;
+//! stream.
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use super::types::{ProcessorInstruction, ToClient, TopologyChange};
 
@@ -18,9 +14,6 @@ struct PlatformLink {
 #[derive(Default)]
 pub struct ClientDirectory {
     platform: DashMap<String, PlatformLink>,
-    /// A client's handler streams, by stream id. A client whose platform
-    /// stream dies is gone, whatever its handler streams still say.
-    handler_streams: Mutex<HashMap<String, Vec<(u64, CancellationToken)>>>,
 }
 
 impl ClientDirectory {
@@ -46,45 +39,6 @@ impl ClientDirectory {
         self.platform
             .remove_if(client_id, |_, link| link.stream == stream)
             .is_some()
-    }
-
-    pub(super) fn track_handler_stream(
-        &self,
-        client_id: &str,
-        stream: u64,
-        token: CancellationToken,
-    ) {
-        self.handler_streams
-            .lock()
-            .entry(client_id.to_string())
-            .or_default()
-            .push((stream, token));
-    }
-
-    pub(super) fn forget_handler_stream(&self, client_id: &str, stream: u64) {
-        let mut streams = self.handler_streams.lock();
-        if let Some(list) = streams.get_mut(client_id) {
-            list.retain(|(s, _)| *s != stream);
-            if list.is_empty() {
-                streams.remove(client_id);
-            }
-        }
-    }
-
-    /// Whether the client still has a handler stream other than `stream`.
-    pub(super) fn has_other_handler_streams(&self, client_id: &str, stream: u64) -> bool {
-        self.handler_streams
-            .lock()
-            .get(client_id)
-            .is_some_and(|list| list.iter().any(|(s, _)| *s != stream))
-    }
-
-    /// Ends every handler stream of a client whose platform stream died.
-    pub(super) fn close_handler_streams(&self, client_id: &str) {
-        let closing = self.handler_streams.lock().remove(client_id);
-        for (_, token) in closing.into_iter().flatten() {
-            token.cancel();
-        }
     }
 
     #[cfg(test)]
@@ -206,22 +160,5 @@ mod tests {
         assert!(fast_rx.recv().await.is_some() && fast_rx.recv().await.is_some());
         assert!(slow_rx.recv().await.is_some());
         assert!(slow_rx.recv().await.is_some());
-    }
-
-    #[test]
-    fn handler_streams_end_with_their_platform_stream() {
-        let clients = ClientDirectory::new();
-        let (a, b) = (CancellationToken::new(), CancellationToken::new());
-        clients.track_handler_stream("c", 10, a.clone());
-        clients.track_handler_stream("c", 11, b.clone());
-        assert!(clients.has_other_handler_streams("c", 10));
-        clients.forget_handler_stream("c", 11);
-        assert!(!clients.has_other_handler_streams("c", 10));
-        clients.close_handler_streams("c");
-        assert!(a.is_cancelled());
-        assert!(
-            !b.is_cancelled(),
-            "a stream that already ended is left alone"
-        );
     }
 }

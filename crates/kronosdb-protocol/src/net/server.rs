@@ -373,6 +373,13 @@ impl Inbound {
     pub fn is_cancelled(&self) -> bool {
         *self.cancel.borrow() || self.cancel.has_changed().is_err()
     }
+
+    /// Whether the client is done with the stream: it sent its last frame,
+    /// cancelled, or is gone. Frames it sent before may still be waiting to
+    /// be read; nothing sent to it now is read.
+    pub fn has_ended(&self) -> bool {
+        self.is_cancelled() || self.rx.as_ref().is_some_and(|rx| rx.is_closed())
+    }
 }
 
 /// Resolves once `shutdown` turns true (or its sender is gone).
@@ -1171,6 +1178,32 @@ pub const RECORD_FORMAT: u8 = 3;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_the_client_ended_or_cancelled_has_ended() {
+        let inbound = |rx| {
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            (
+                Inbound {
+                    rx: Some(rx),
+                    cancel: cancel_rx,
+                },
+                cancel_tx,
+            )
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let (open, _cancel) = inbound(rx);
+        assert!(!open.has_ended());
+        // The client's last frame: the connection lets go of its sender.
+        drop(tx);
+        assert!(open.has_ended());
+
+        let (_tx, rx) = mpsc::channel(1);
+        let (cancelled, cancel) = inbound(rx);
+        assert!(!cancelled.has_ended());
+        cancel.send(true).unwrap();
+        assert!(cancelled.has_ended());
+    }
 
     #[test]
     fn requests_are_cheap_until_they_are_seen_to_be_dear() {
