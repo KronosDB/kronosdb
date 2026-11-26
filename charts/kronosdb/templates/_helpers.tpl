@@ -212,6 +212,9 @@ checksum/manifest: {{ include (print $.Template.BasePath "/configmap-manifest.ya
 {{- if include "kronosdb.identityEnabled" . }}
 checksum/config: {{ include (print $.Template.BasePath "/configmap-config.yaml") . | sha256sum }}
 {{- end }}
+{{- range $key, $value := .Values.podAnnotations }}
+{{ $key }}: {{ $value | toString | quote }}
+{{- end }}
 {{- end -}}
 
 {{/* Pod volumes, shared by the voter and learner StatefulSets. */}}

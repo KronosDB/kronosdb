@@ -22,9 +22,10 @@ keeps a near-real-time copy beyond that.
 {{- end }}
 {{- if not .Values.persistence.storageClassName }}
 
-persistence.storageClassName is unset (cluster default). Prefer local
-NVMe: acked writes are already quorum-replicated, so replicated network
-volumes pay for replication twice. See docs/OPERATIONS.md.
+persistence.storageClassName is unset, so the cluster's default class is
+used. It should give volumes that outlive the node: a voter that comes back
+with an empty volume copies the whole log again and does not count as a voter
+until it has.
 {{- end }}
 
 Scaling the cluster
@@ -33,5 +34,7 @@ Scaling the cluster
     grow:   add the node via the admin console/API (add-voter), THEN
             `helm upgrade --set replicas=N` so the peer list matches.
     shrink: remove-voter first, then lower replicas.
-  Rolling updates and pod rescheduling need no special handling — node
-  IDs and DNS names are stable, and the PDB protects quorum.
+  Rolling updates and node drains wait for each voter to be ready, which
+  means it has caught up with the leader, and the PDB protects quorum.
+  Keep a voter's volume claim when it is rescheduled: without it the voter
+  starts empty and has to catch up before it counts again.
