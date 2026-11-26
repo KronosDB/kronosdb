@@ -613,6 +613,21 @@ impl ClusterManager {
         self.raft.read().clone()
     }
 
+    /// Resolves when the Raft core has stopped, with the reason. Never
+    /// resolves before `init_raft()` has run.
+    ///
+    /// The core is a single task that nothing restarts. Without it this node
+    /// neither votes nor follows a leader nor changes membership, while its
+    /// listeners stay up and its last leader claim stays in place: it looks
+    /// alive and answers nothing. The caller is expected to end the process.
+    /// A clean [`Raft::shutdown`] resolves this too ("raft stopped").
+    pub async fn raft_core_stopped(&self) -> String {
+        match self.raft_node() {
+            Some(raft) => core_stopped(raft.metrics()).await,
+            None => std::future::pending().await,
+        }
+    }
+
     /// Returns the cluster config.
     pub fn cluster_config(&self) -> &ClusterConfig {
         &self.cluster_config
@@ -948,6 +963,61 @@ impl ClusterManager {
         self.control.set_voters(voter_ids);
 
         Ok(())
+    }
+}
+
+/// Waits for the Raft core behind `metrics` to stop. An error it returns
+/// (storage, or a clean stop) is in its last metrics; a panic leaves no
+/// metrics, and shows as the channel closing when the task's state is dropped.
+async fn core_stopped(
+    mut metrics: tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>>,
+) -> String {
+    loop {
+        if let Err(fatal) = &metrics.borrow_and_update().running_state {
+            return fatal.to_string();
+        }
+        if metrics.changed().await.is_err() {
+            return "its task ended without reporting an error, which is what a panic does \
+                    (the panic message is earlier in this log)"
+                .to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod core_stopped_tests {
+    use super::*;
+    use openraft::RaftMetrics;
+    use openraft::error::Fatal;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn a_running_core_does_not_resolve() {
+        let (tx, rx) = watch::channel(RaftMetrics::<NodeId, BasicNode>::new_initial(1));
+        let mut running = tx.borrow().clone();
+        running.current_term = 7;
+        tx.send(running).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_millis(50), core_stopped(rx)).await;
+        assert!(stopped.is_err(), "metrics of a running core ended the wait");
+    }
+
+    #[tokio::test]
+    async fn a_reported_fatal_error_resolves_with_it() {
+        let (tx, rx) = watch::channel(RaftMetrics::<NodeId, BasicNode>::new_initial(1));
+        let waiting = tokio::spawn(core_stopped(rx));
+        let mut failed = tx.borrow().clone();
+        failed.running_state = Err(Fatal::Panicked);
+        tx.send(failed).unwrap();
+        assert_eq!(waiting.await.unwrap(), "panicked");
+    }
+
+    #[tokio::test]
+    async fn a_core_that_vanishes_resolves_as_a_panic() {
+        let (tx, rx) = watch::channel(RaftMetrics::<NodeId, BasicNode>::new_initial(1));
+        let waiting = tokio::spawn(core_stopped(rx));
+        drop(tx);
+        assert!(waiting.await.unwrap().contains("panic"));
     }
 }
 

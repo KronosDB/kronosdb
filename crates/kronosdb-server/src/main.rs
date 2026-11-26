@@ -440,8 +440,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let raft_for_shutdown = Arc::clone(&raft_node);
     let contexts_for_shutdown = Arc::clone(&contexts);
     let drain_deadline = Duration::from_secs(config.drain_deadline_secs);
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let draining_for_shutdown = Arc::clone(&draining);
     let shutdown = async move {
         shutdown_signal().await;
+        draining_for_shutdown.store(true, std::sync::atomic::Ordering::Release);
         info!(
             deadline_secs = drain_deadline.as_secs(),
             "shutdown signal received: draining"
@@ -529,7 +532,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref manifest_path) = config.manifest {
         spawn_manifest_watch(Arc::clone(&cluster), manifest_path.clone());
     }
-    shutdown.await;
+    // The Raft core stopping on its own (a storage error, a panic) leaves a
+    // process that keeps its ports open and answers nothing. Nothing in here
+    // can start the core again, so the node ends itself loudly and leaves the
+    // restart to whatever supervises it.
+    let raft_core_failed = async {
+        let reason = cluster.raft_core_stopped().await;
+        if draining.load(std::sync::atomic::Ordering::Acquire) {
+            // Stopped by the shutdown below: not a failure.
+            std::future::pending::<()>().await;
+        }
+        reason
+    };
+    tokio::select! {
+        () = shutdown => {}
+        reason = raft_core_failed => {
+            error!(
+                %reason,
+                "the Raft core stopped: this node can no longer vote, follow a leader or \
+                 change membership, and nothing in the process restarts it. Exiting so the \
+                 node is started again; if it stops the same way after the restart, report \
+                 it with this log"
+            );
+            // A last fsync pass, as on a normal shutdown.
+            contexts.shutdown_all();
+            return Err(format!("the Raft core stopped: {reason}").into());
+        }
+    }
 
     info!("KronosDB shut down gracefully");
     Ok(())
