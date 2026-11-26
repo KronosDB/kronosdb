@@ -193,7 +193,7 @@ livenessProbe:
 readinessProbe:
   httpGet: { path: /ready, port: admin }
 startupProbe:
-  httpGet: { path: /ready, port: admin }
+  httpGet: { path: /health, port: admin }
   failureThreshold: {{ $root.Values.startupProbe.failureThreshold }}
   periodSeconds: {{ $root.Values.startupProbe.periodSeconds }}
 {{- end -}}
@@ -211,6 +211,9 @@ checksum/manifest: {{ include (print $.Template.BasePath "/configmap-manifest.ya
 {{- end }}
 {{- if include "kronosdb.identityEnabled" . }}
 checksum/config: {{ include (print $.Template.BasePath "/configmap-config.yaml") . | sha256sum }}
+{{- end }}
+{{- range $key, $value := .Values.podAnnotations }}
+{{ $key }}: {{ $value | toString | quote }}
 {{- end }}
 {{- end -}}
 

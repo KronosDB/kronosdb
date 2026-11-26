@@ -1,9 +1,9 @@
 # KronosDB Helm chart values.
 #
 # The defaults produce a production-shaped 3-voter Raft cluster. The two
-# decisions you cannot skip: storage (use local NVMe — replicated network
-# volumes pay for replication twice; quorum plus passive-backup learners is
-# the durability story) and auth (set the tokens, or consciously run open).
+# decisions you cannot skip: storage (volumes that outlive the node, such as
+# a network block volume: a voter has to come back with its data) and auth
+# (set the tokens, or consciously run open).
 
 image:
   repository: ghcr.io/kronosdb/kronosdb
@@ -21,6 +21,11 @@ replicas: 3
 # useful as an analytics read target.
 learners:
   replicas: 0
+  # Where learners run. Empty means the voters' nodeSelector and tolerations.
+  # A learner is kept off nodes that already run a KronosDB pod when another
+  # node is free.
+  nodeSelector: {}
+  tolerations: []
 
 clusterDomain: cluster.local
 
@@ -32,9 +37,11 @@ resources:
     memory: 4Gi
 
 persistence:
-  # Strongly prefer a local-NVMe class (e.g. openebs-lvm, topolvm,
-  # local-path on bare metal). Acked writes are quorum-replicated;
-  # passive-backup learners (above) cover node loss beyond quorum.
+  # A class whose volumes outlive the node, such as a network block volume
+  # (gp3 on AWS). A voter that comes back with an empty volume has to copy the
+  # whole log again and does not count as a voter until it has, so the cluster
+  # tolerates no other loss in the meantime.
+  # Passive-backup learners (above) cover node loss beyond quorum.
   storageClassName: ""
   size: 100Gi
 
@@ -184,8 +191,24 @@ podDisruptionBudget:
 # to. Use "soft" only on clusters smaller than the replica count.
 antiAffinity: required
 
-# Spread voters across zones when the cluster is multi-zone (soft).
+# Spread voters across zones. "ScheduleAnyway" prefers an even spread;
+# "DoNotSchedule" refuses to place a voter in a zone that already has more
+# than the others. Use "DoNotSchedule" on a multi-zone cluster, where losing
+# one zone must not take the majority. It needs nodes labelled with
+# topology.kubernetes.io/zone: without the label a voter stays Pending.
 zoneSpread: true
+zoneSpreadWhenUnsatisfiable: ScheduleAnyway
+
+# Extra annotations and labels for every KronosDB pod, and the pods' priority
+# class. A voter should not be moved by a node autoscaler: with Karpenter set
+#   podAnnotations: { karpenter.sh/do-not-disrupt: "true" }
+# and with cluster-autoscaler
+#   podAnnotations: { cluster-autoscaler.kubernetes.io/safe-to-evict: "false" }
+# and run the voters on nodes that are not spot capacity, which is reclaimed
+# without regard to the disruption budget.
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
 
 serviceMonitor:
   # Prometheus-operator ServiceMonitor scraping /metrics on the admin port.

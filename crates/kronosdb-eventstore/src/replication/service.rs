@@ -21,6 +21,7 @@ use crate::append::{AppendRequest, RecordAppend};
 use crate::context::ContextManager;
 use crate::error::Error;
 use crate::event::Position;
+use crate::raft::amnesia::Amnesia;
 use crate::replication::MAX_RECORD_BYTES_PER_FRAME;
 use crate::replication::control::{ActiveClaim, ReplicationControl};
 use crate::replication::dispatcher::{LiveFrame, WaveSlice};
@@ -36,6 +37,8 @@ const TAIL_RECORDS_OVERHEAD: usize = 64;
 pub struct SegmentReplicationService {
     contexts: Arc<ContextManager>,
     control: Arc<ReplicationControl>,
+    /// Whether this node started empty and vouches for no claim yet.
+    amnesia: Arc<Amnesia>,
     node_id: u64,
     max_inflight_bytes: u64,
 }
@@ -44,18 +47,25 @@ impl SegmentReplicationService {
     pub fn new(
         contexts: Arc<ContextManager>,
         control: Arc<ReplicationControl>,
+        amnesia: Arc<Amnesia>,
         max_inflight_bytes: u64,
     ) -> Self {
         let node_id = control.node_id();
         Self {
             contexts,
             control,
+            amnesia,
             node_id,
             max_inflight_bytes: max_inflight_bytes.max(1),
         }
     }
 
     /// Answers `GetCursors` with where each context's log stands on this node.
+    ///
+    /// The cursors are always what the node holds. `control_epoch` is the
+    /// claim it vouches for, and a claimant counts a voter only under its own
+    /// epoch: a node that started empty reports 0 until it has caught up, so
+    /// it never stands in a claim's quorum for events it no longer holds.
     pub async fn get_cursors(&self, stream: ServerStream) -> Result<(), Error> {
         let names = self.contexts.list_contexts();
         let mut cursors = Vec::with_capacity(names.len());
@@ -89,7 +99,7 @@ impl SegmentReplicationService {
             .finish(&Frame::Cursors(p::Cursors {
                 node_id: self.node_id,
                 epoch: epoch.unwrap_or(0),
-                control_epoch: self.control.claim().map(|claim| claim.epoch).unwrap_or(0),
+                control_epoch: self.amnesia.vouched_epoch(&self.control),
                 contexts: cursors,
             }))
             .await;
@@ -227,6 +237,16 @@ impl SegmentReplicationService {
         {
             return Err(Error::Unavailable {
                 message: "node is not serving this context in the active claim epoch".into(),
+            });
+        } else if !self.control.is_reconciled(session_claim.epoch) {
+            // A leader that restarted into a claim of its own term has its
+            // engines in that epoch already. Its log may still be an old one:
+            // a follower that caught up with it would count as whole and
+            // stand in the very quorum this leader has yet to reconcile with.
+            return Err(Error::Unavailable {
+                message: "this leader has not yet reconciled its claim against a quorum of \
+                          voters, so it does not serve its log; the session is retried"
+                    .into(),
             });
         }
         let recovery_source = open.recovery_source;

@@ -327,6 +327,16 @@ fn spawn_once_present(cmd: &mut Command) -> std::io::Result<Child> {
 /// Spawn kronosdb-server as a child. Returns immediately after spawn — caller must
 /// call `wait_until_ready`.
 pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
+    spawn_server_with_env(cfg, &[])
+}
+
+/// [`spawn_server`] with extra environment for the child, for settings
+/// `SpawnConfig` has no field for (`KRONOSDB_ACK_MODE`, say). Set after the
+/// harness's own variables, so an entry here wins.
+pub fn spawn_server_with_env(
+    cfg: &SpawnConfig,
+    extra_env: &[(&str, &str)],
+) -> std::io::Result<ServerHandle> {
     // `KRONOSDB_SERVER_BIN` is set by crates/kronosdb-eventstore/build.rs. Stable
     // Cargo does not expose `CARGO_BIN_EXE_kronosdb-server` for cross-package
     // binaries, so the harness builds the server once per test-binary process.
@@ -391,6 +401,9 @@ pub fn spawn_server(cfg: &SpawnConfig) -> std::io::Result<ServerHandle> {
     if let Some(secs) = cfg.append_timeout_secs {
         cmd.env("KRONOSDB_APPEND_TIMEOUT", secs.to_string());
     }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = spawn_once_present(&mut cmd)?;
     Ok(ServerHandle {
@@ -423,7 +436,8 @@ pub async fn wait_until_ready(
     }
 }
 
-async fn admin_reports_ready(addr: SocketAddr) -> bool {
+/// Whether a node's `/ready` answers 200 right now.
+pub async fn admin_reports_ready(addr: SocketAddr) -> bool {
     let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
         return false;
     };

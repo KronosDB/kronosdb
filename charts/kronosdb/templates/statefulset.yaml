@@ -18,12 +18,18 @@ spec:
       labels:
         {{- include "kronosdb.selectorLabels" . | nindent 8 }}
         kronosdb.io/role: voter
-      {{- with (include "kronosdb.podAnnotations" .) }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with (include "kronosdb.podAnnotations" . | trim) }}
       annotations: {{- . | nindent 8 }}
       {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ add (int .Values.config.drainDeadlineSecs) 10 }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- if eq .Values.antiAffinity "required" }}
       affinity:
         podAntiAffinity:
@@ -49,7 +55,7 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: {{ .Values.zoneSpreadWhenUnsatisfiable }}
           labelSelector:
             matchLabels:
               {{- include "kronosdb.selectorLabels" . | nindent 14 }}

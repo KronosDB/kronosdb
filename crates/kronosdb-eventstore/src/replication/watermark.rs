@@ -99,6 +99,9 @@ pub struct WatermarkState {
     /// Mirrors `inner.poisoned.is_some()` so a waiter whose position the
     /// watermark already covers need not take the ledger lock to find out.
     poisoned: AtomicBool,
+    /// Set once this copy of the log has held every committed event at some
+    /// moment since the process started. See [`WatermarkState::mark_caught_up`].
+    caught_up: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -115,6 +118,7 @@ impl WatermarkState {
             voter_count: AtomicU64::new(voters.len() as u64),
             epoch: AtomicU64::new(epoch),
             poisoned: AtomicBool::new(false),
+            caught_up: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 epoch,
                 voters,
@@ -344,6 +348,21 @@ impl WatermarkState {
     /// True once `abort_all` has latched a failure.
     pub fn is_poisoned(&self) -> bool {
         self.inner.lock().unwrap().poisoned.is_some()
+    }
+
+    /// Records that this copy holds every committed event as of now. A
+    /// follower says so when the leader's watermark reaches it and its log
+    /// already extends that far; a leader says so when it opens for writes.
+    /// It is never cleared: a node that was whole once since it started only
+    /// falls behind by what a running Tail session is about to deliver, while
+    /// one that has just started may hold nothing at all (a replaced disk).
+    pub fn mark_caught_up(&self) {
+        self.caught_up.store(true, Ordering::Release);
+    }
+
+    /// Whether [`WatermarkState::mark_caught_up`] has been called.
+    pub fn has_caught_up(&self) -> bool {
+        self.caught_up.load(Ordering::Acquire)
     }
 }
 

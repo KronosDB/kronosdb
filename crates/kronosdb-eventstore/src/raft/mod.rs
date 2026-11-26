@@ -4,6 +4,7 @@
 //! allocation. Event records never enter its journal; `native_coordinator` and
 //! `routed_engine` connect committed claims to byte-exact segment replication.
 
+pub mod amnesia;
 pub mod cluster;
 pub mod handler_registry;
 pub mod log_store;
