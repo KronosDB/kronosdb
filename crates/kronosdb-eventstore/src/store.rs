@@ -3573,6 +3573,19 @@ impl EventStoreEngine {
         }
     }
 
+    /// Records that this copy holds every committed event as of now
+    /// ([`WatermarkState::mark_caught_up`]).
+    pub fn mark_caught_up(&self) {
+        self.watermark.mark_caught_up();
+    }
+
+    /// Whether this copy has held every committed event at some moment since
+    /// the process started. Until then the node must not be counted as a
+    /// healthy replica: it can be a voter whose disk was replaced.
+    pub fn has_caught_up(&self) -> bool {
+        self.watermark.has_caught_up()
+    }
+
     /// Takes a point-in-time snapshot of all metrics, including cache stats.
     pub fn metrics_snapshot(&self) -> crate::metrics::MetricsSnapshot {
         let mut snap = self.metrics.snapshot();

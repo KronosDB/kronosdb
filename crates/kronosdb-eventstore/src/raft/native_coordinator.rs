@@ -780,6 +780,14 @@ impl ClusterManager {
                 message: "voter membership changed while activating native leader claim".into(),
             });
         }
+        // The claim was reconciled against a quorum, so this node's logs are
+        // the cluster's logs: if it later follows another leader it is still
+        // a whole replica, not one that has to catch up before it is ready.
+        for context in self.context_manager.list_contexts() {
+            if let Ok(engine) = self.context_manager.get_context(&context) {
+                engine.mark_caught_up();
+            }
+        }
         tracing::info!(epoch, term, "native leader gate opened");
         Ok(())
     }
