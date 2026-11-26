@@ -111,6 +111,17 @@ pub struct ClusterManager {
     pub(super) archive_status: Arc<crate::tier::ArchiveStatus>,
 }
 
+/// Why a node does not report ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReady {
+    /// No committed leader claim this node could execute or forward writes
+    /// to: an election, a leader still taking over, or a node cut off.
+    NoLeaderClaim,
+    /// A follower that has a leader but has not held the whole committed log
+    /// since it started.
+    CatchingUp,
+}
+
 impl ClusterManager {
     /// Creates a new cluster manager. Every node is always a Raft node.
     pub fn new(context_manager: Arc<ContextManager>, cluster_config: ClusterConfig) -> Self {
@@ -462,19 +473,41 @@ impl ClusterManager {
     }
 
     /// True when the committed native claim still matches OpenRaft's current
-    /// leader/term and this node can either execute or forward appends.
+    /// leader/term and this node can either execute or forward appends, and,
+    /// on a follower, every context has caught up with the leader once since
+    /// the process started.
+    ///
+    /// The second half is what lets an orchestrator treat "ready" as "a
+    /// healthy replica": a voter that comes back with an empty disk has a
+    /// leader to forward to within a second, but it holds none of the log
+    /// until its Tail sessions have delivered it. Counting it as healthy
+    /// would let the next voter be taken down while this one is still empty.
     pub fn native_ready(&self) -> bool {
+        self.native_not_ready().is_none()
+    }
+
+    /// Why [`ClusterManager::native_ready`] is false, or `None` when the node
+    /// is ready.
+    pub fn native_not_ready(&self) -> Option<NotReady> {
         let Some(claim) = self.control.claim() else {
-            return false;
+            return Some(NotReady::NoLeaderClaim);
         };
         let Some(raft) = self.raft_node() else {
-            return false;
+            return Some(NotReady::NoLeaderClaim);
         };
         let metrics = raft.metrics().borrow().clone();
         if metrics.current_leader != Some(claim.leader_id) || metrics.current_term != claim.term {
-            return false;
+            return Some(NotReady::NoLeaderClaim);
         }
-        claim.leader_id != self.control.node_id() || claim.writable
+        if claim.leader_id == self.control.node_id() {
+            return (!claim.writable).then_some(NotReady::NoLeaderClaim);
+        }
+        let caught_up = self.context_manager.list_contexts().iter().all(|context| {
+            self.context_manager
+                .get_context(context)
+                .is_ok_and(|engine| engine.has_caught_up())
+        });
+        (!caught_up).then_some(NotReady::CatchingUp)
     }
 
     /// True when this node holds the writable native claim — the only node

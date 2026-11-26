@@ -514,15 +514,21 @@ async fn run(scenario: Scenario) {
     // The deposed leader returns with its unreplicated events.
     srvs[leader] = spawn_server(&spawn_config(tmp.path(), leader, &listen, &admin, &peers))
         .expect("respawn deposed leader");
-    wait_until_ready(srvs[leader].listen, srvs[leader].admin, READY_TIMEOUT)
-        .await
-        .expect("restarted node ready");
-
     if let Some(forged_log) = forged_log {
+        // It can never take the leader's log, so it never catches up, and a
+        // node that has not caught up is not ready: ready is what tells an
+        // orchestrator this replica may be counted on.
         expect_loud_refusal(tmp.path(), leader, &leader_dir, &forged_log, &evidence).await;
+        assert!(
+            !admin_reports_ready(srvs[leader].admin).await,
+            "a node that refuses the leader's history reported ready"
+        );
         evidence.finish();
         return;
     }
+    wait_until_ready(srvs[leader].listen, srvs[leader].admin, READY_TIMEOUT)
+        .await
+        .expect("restarted node ready");
 
     // Its unreplicated events are cut first: the head falls back to the
     // cluster's history.

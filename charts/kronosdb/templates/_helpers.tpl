@@ -193,7 +193,7 @@ livenessProbe:
 readinessProbe:
   httpGet: { path: /ready, port: admin }
 startupProbe:
-  httpGet: { path: /ready, port: admin }
+  httpGet: { path: /health, port: admin }
   failureThreshold: {{ $root.Values.startupProbe.failureThreshold }}
   periodSeconds: {{ $root.Values.startupProbe.periodSeconds }}
 {{- end -}}

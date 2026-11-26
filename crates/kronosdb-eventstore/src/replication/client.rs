@@ -292,6 +292,11 @@ async fn run_tail(
                     apply_epoch(&engine, frame_epoch),
                     Position(leader_watermark.min(engine.local_tail().0)),
                 );
+                // The first watermark of a session follows its catch-up, so
+                // a log that reaches it holds everything committed so far.
+                if engine.local_tail().0 >= leader_watermark {
+                    engine.mark_caught_up();
+                }
                 // The leader sends this once the catch-up it computed is
                 // out, so a claimant that stops here has every byte of the
                 // source's suffix (control records included), not just the

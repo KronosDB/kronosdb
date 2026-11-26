@@ -175,16 +175,21 @@ async fn health() -> &'static str {
 
 /// Readiness probe: 200 only when this node can serve. Liveness (`/health`)
 /// answers "is the process up"; this answers "should traffic be routed here"
-/// — contexts are open (implied by the server being wired) and a committed
-/// native leader claim can accept or forward writes.
+/// — contexts are open (implied by the server being wired), a committed
+/// native leader claim can accept or forward writes, and a follower has
+/// caught up with the leader once since it started.
 async fn ready(State(state): State<AdminState>) -> (StatusCode, &'static str) {
-    if state.cluster.native_ready() {
-        (StatusCode::OK, "ready")
-    } else {
-        (
+    use kronosdb_eventstore::raft::cluster::NotReady;
+    match state.cluster.native_not_ready() {
+        None => (StatusCode::OK, "ready"),
+        Some(NotReady::NoLeaderClaim) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "not ready: native leader claim unavailable",
-        )
+        ),
+        Some(NotReady::CatchingUp) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: catching up with the leader",
+        ),
     }
 }
 
