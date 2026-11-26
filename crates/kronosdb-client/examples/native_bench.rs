@@ -26,6 +26,11 @@
 //!
 //! `NB_WARMUP` (seconds, default 1) is how long the timed modes run before
 //! they start measuring; 0 measures from a cold start.
+//!
+//! `NB_RATE` (operations a second, all workers together) paces the timed
+//! modes instead of running them flat out: each worker sends on a fixed
+//! schedule, and latency counts from the scheduled send time, so an
+//! operation that waits behind a slow one is charged for the wait.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -72,6 +77,20 @@ fn cpu_per_op(since: Option<u64>, ops: f64) -> String {
     }
 }
 
+/// A value that differs between runs of this tool. Event identifiers carry it:
+/// the server answers an append whose events it holds among its most recent
+/// ones (same identifiers, same content) without writing it again, so a run
+/// that reused an earlier run's identifiers would measure that, not appends.
+fn run_nonce() -> u64 {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        xorshift(nanos ^ ((std::process::id() as u64) << 32))
+    })
+}
+
 fn agg_event(a: u64, n: u64) -> NewEvent {
     const NAMES: [&str; 4] = [
         "OrderPlaced",
@@ -80,7 +99,7 @@ fn agg_event(a: u64, n: u64) -> NewEvent {
         "OrderShipped",
     ];
     NewEvent {
-        identifier: format!("{a:010}-{n:016x}"),
+        identifier: format!("{a:010}-{:08x}{n:016x}", run_nonce() as u32),
         name: NAMES[(n % 4) as usize].into(),
         version: "1".into(),
         timestamp: 1_700_000_000_000,
@@ -169,6 +188,12 @@ async fn main() {
         // Keep the connection alive for the run; the benchmark exits after.
         std::mem::forget(extra);
     }
+    let rate: f64 = std::env::var("NB_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let period = (rate > 0.0).then(|| Duration::from_secs_f64(conc as f64 / rate));
+    let started = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let measuring = Arc::new(AtomicBool::new(false));
     let read = Arc::new(AtomicU64::new(0));
@@ -186,9 +211,20 @@ async fn main() {
         tasks.push(tokio::spawn(async move {
             let mut lat = Vec::new();
             let mut i = (w as u64) << 32;
+            // Paced: workers start staggered across one period.
+            let mut due =
+                started + period.map_or(Duration::ZERO, |p| p.mul_f64(w as f64 / conc as f64));
             while !stop.load(Ordering::Relaxed) {
                 i += 1;
-                let t = Instant::now();
+                let t = match period {
+                    Some(p) => {
+                        tokio::time::sleep_until(due.into()).await;
+                        let scheduled = due;
+                        due += p;
+                        scheduled
+                    }
+                    None => Instant::now(),
+                };
                 match mode.as_str() {
                     "head" => {
                         ctx.head().await.unwrap();
@@ -250,11 +286,18 @@ async fn main() {
         _ => String::new(),
     };
     println!(
-        "native {mode:<6} c{conc:<4} b{batch:<4} n{connections:<2} ops/s={:>9.0} p50={:>7.3}ms p90={:>7.3}ms p99={:>7.3}ms{cpu}",
+        "native {mode:<6} c{conc:<4} b{batch:<4} n{connections:<2} ops/s={:>9.0} p50={:>7.3}ms p90={:>7.3}ms p99={:>7.3}ms p999={:>7.3}ms max={:>7.3}ms{cpu}{}",
         all.len() as f64 / el,
         p(0.5),
         p(0.9),
-        p(0.99)
+        p(0.99),
+        p(0.999),
+        p(1.0),
+        if rate > 0.0 {
+            format!(" rate={rate:.0}")
+        } else {
+            String::new()
+        }
     );
     if mode == "source" || mode == "loop" {
         println!(
