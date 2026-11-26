@@ -8,8 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use openraft::raft::VoteRequest;
 use openraft::{BasicNode, Config, Raft};
 use parking_lot::RwLock;
 
@@ -18,6 +20,7 @@ use crate::context::ContextManager;
 use crate::error::Error;
 use crate::wire;
 
+use super::amnesia::{self, Amnesia, FirstStart, VoteRuling};
 use super::handler_registry::{HandlerKind, HandlerRegistration, HandlerRoutingTable};
 use super::log_store::{LogStore, LogStoreConfig};
 use super::network::NetworkFactory;
@@ -106,9 +109,53 @@ pub struct ClusterManager {
     /// background clear would wipe fresh registrations.
     handler_clear_once: tokio::sync::OnceCell<()>,
     pub(super) coordinator_started: AtomicBool,
+    amnesia_task_started: AtomicBool,
     pub(super) cluster_config: ClusterConfig,
     /// What the archive loops last did (ADR-0011), for metrics.
     pub(super) archive_status: Arc<crate::tier::ArchiveStatus>,
+    /// Whether this node started empty and still abstains ([`amnesia`]).
+    pub(super) amnesia: Arc<Amnesia>,
+}
+
+/// How often an amnesiac node looks whether it has become whole.
+const AMNESIA_CHECK: Duration = Duration::from_millis(100);
+
+/// How often an amnesiac bootstrapper asks the other voters whether the
+/// cluster is new.
+const FIRST_START_PROBE: Duration = Duration::from_millis(250);
+
+/// A bootstrapper that is still waiting for voters says so this often.
+const FIRST_START_REMINDER: Duration = Duration::from_secs(30);
+
+/// Makes a restarted leader come back as a voter that voted for itself.
+///
+/// openraft restores a node as leader at startup, with no election, when its
+/// stored vote says it was one. That is sound only while every other voter
+/// remembers the terms it has seen. A voter that lost its disk does not: it
+/// would follow this leader in a term the rest of the cluster has left
+/// behind, and its acknowledgements would let entries commit there. So the
+/// committed vote is turned into a plain vote of the same term, which is the
+/// state a restarted leader has in Raft as published. To lead again it has to
+/// win a new term, and a vote is what a voter that started empty withholds.
+/// A lone voter keeps its leadership: nobody else could have moved on.
+async fn forget_leadership(log_store: &mut LogStore, node_id: NodeId) -> Result<(), Error> {
+    use openraft::storage::RaftLogStorage;
+    let storage = |action: &str, error: &dyn std::fmt::Display| Error::Internal {
+        message: format!("failed to {action} the stored Raft vote: {error}"),
+    };
+    let Some(vote) = RaftLogStorage::<TypeConfig>::read_vote(log_store)
+        .await
+        .map_err(|error| storage("read", &error))?
+    else {
+        return Ok(());
+    };
+    if vote.is_committed() && vote.leader_id().voted_for() == Some(node_id) {
+        let plain = openraft::Vote::new(vote.leader_id().get_term(), node_id);
+        RaftLogStorage::<TypeConfig>::save_vote(log_store, &plain)
+            .await
+            .map_err(|error| storage("rewrite", &error))?;
+    }
+    Ok(())
 }
 
 /// Why a node does not report ready.
@@ -137,6 +184,12 @@ impl ClusterManager {
             .map(|peer| (peer.id, peer))
             .collect();
         let (control_updates, _) = tokio::sync::watch::channel(AppliedControlState::default());
+        let voter_ids: Vec<NodeId> = cluster_config.voters.iter().map(|peer| peer.id).collect();
+        let amnesia = Arc::new(Amnesia::new(
+            context_manager.data_dir(),
+            cluster_config.node_id,
+            &voter_ids,
+        ));
         Self {
             context_manager,
             stores: RwLock::new(HashMap::new()),
@@ -150,8 +203,10 @@ impl ClusterManager {
             handler_routing: Arc::new(HandlerRoutingTable::new()),
             handler_clear_once: tokio::sync::OnceCell::new(),
             coordinator_started: AtomicBool::new(false),
+            amnesia_task_started: AtomicBool::new(false),
             cluster_config,
             archive_status: Arc::default(),
+            amnesia,
         }
     }
 
@@ -171,12 +226,17 @@ impl ClusterManager {
         }
 
         let raft_dir = self.context_manager.data_dir().join("raft");
+        // Before the stores below create anything: a voter that finds no Raft
+        // state here has forgotten its vote and whatever it acknowledged, and
+        // must say so durably before it talks to anyone.
+        let has_raft_state = amnesia::raft_state_exists(&raft_dir).map_err(Error::Io)?;
+        let amnesiac = self.amnesia.begin(has_raft_state).map_err(Error::Io)?;
         // Deferred group commit: the log's own thread fsyncs every interval
         // and openraft keeps appending meanwhile, so a burst of handler
         // registrations shares an fsync instead of paying one each on the
         // async runtime. One millisecond is well under any control-plane
         // latency anyone notices.
-        let log_store = LogStore::new(
+        let mut log_store = LogStore::new(
             &raft_dir,
             LogStoreConfig {
                 group_commit_interval: Some(std::time::Duration::from_millis(1)),
@@ -184,6 +244,14 @@ impl ClusterManager {
             },
         )
         .map_err(Error::Io)?;
+        let other_voters = self
+            .cluster_config
+            .voters
+            .iter()
+            .any(|peer| peer.id != self.cluster_config.node_id);
+        if other_voters {
+            forget_leadership(&mut log_store, self.cluster_config.node_id).await?;
+        }
 
         // On-disk snapshot store. Lives in `<raft_dir>/snapshots`. Used to
         // persist `last_membership` across restart — without this, the
@@ -215,6 +283,11 @@ impl ClusterManager {
         })?;
 
         let raft = Arc::new(raft);
+        if amnesiac {
+            // Standing for election is a vote for itself, and a node that
+            // lost its log must not lead.
+            raft.runtime_config().elect(false);
+        }
 
         *self.raft.write() = Some(raft);
 
@@ -502,6 +575,11 @@ impl ClusterManager {
         if claim.leader_id == self.control.node_id() {
             return (!claim.writable).then_some(NotReady::NoLeaderClaim);
         }
+        // A node that still abstains from votes and leader claims is not a
+        // replica the cluster can count on, whatever its logs hold by now.
+        if self.amnesia.is_amnesiac() {
+            return Some(NotReady::CatchingUp);
+        }
         let caught_up = self.context_manager.list_contexts().iter().all(|context| {
             self.context_manager
                 .get_context(context)
@@ -545,24 +623,35 @@ impl ClusterManager {
     /// For single-node: initializes with just this node → instant leader.
     /// For multi-node: the lowest-numbered voter node bootstraps.
     ///
+    /// A node that started without Raft state beside other voters is
+    /// amnesiac ([`amnesia`]) and initializes nothing here. A task takes
+    /// over: it ends the amnesia once the node holds the whole log, and on
+    /// the lowest-numbered voter it initializes the cluster once every other
+    /// voter has answered and is empty too, which is what a cluster's first
+    /// start looks like. Startup does not wait for that.
+    ///
     /// Safe to call multiple times — if already initialized, this is a no-op.
-    pub async fn bootstrap(&self) -> Result<(), Error> {
-        let config = &self.cluster_config;
-
+    pub async fn bootstrap(self: &Arc<Self>) -> Result<(), Error> {
+        if self.amnesia.is_amnesiac() {
+            if !self.amnesia_task_started.swap(true, Ordering::AcqRel) {
+                tokio::spawn(Arc::clone(self).run_amnesia());
+            }
+            return Ok(());
+        }
         // Only the lowest-ID voter bootstraps.
-        let min_voter_id = config
-            .voters
-            .iter()
-            .map(|p| p.id)
-            .min()
-            .unwrap_or(config.node_id);
-        if config.node_id != min_voter_id {
+        if !self.amnesia.is_bootstrapper() {
             return Ok(()); // Not our job to bootstrap.
         }
+        self.initialize_group().await
+    }
 
+    /// Initializes the node's shared Raft group with the configured voters,
+    /// unless its log or vote says it already is (every restart): openraft
+    /// logs an error for an initialize it refuses.
+    async fn initialize_group(&self) -> Result<(), Error> {
         // Build initial membership from voter configs.
         let mut members = BTreeMap::new();
-        for peer in &config.voters {
+        for peer in &self.cluster_config.voters {
             members.insert(
                 peer.id,
                 BasicNode {
@@ -571,9 +660,6 @@ impl ClusterManager {
             );
         }
 
-        // Initialize the node's shared Raft group, unless its log or vote
-        // says it already is (every restart): openraft logs an error for an
-        // initialize it refuses.
         if let Some(raft) = self.raft_node() {
             let initialized = raft.is_initialized().await.map_err(|e| Error::Internal {
                 message: format!("failed to read the Raft group's state: {e}"),
@@ -604,6 +690,170 @@ impl ClusterManager {
         }
 
         Ok(())
+    }
+
+    // ── A voter that started empty ([`amnesia`]) ───────────────────────
+
+    /// Whether this node started empty and still abstains from votes and
+    /// leader claims.
+    pub fn is_amnesiac(&self) -> bool {
+        self.amnesia.is_amnesiac()
+    }
+
+    /// This node's amnesia, for the services that answer peers.
+    pub fn amnesia(&self) -> Arc<Amnesia> {
+        Arc::clone(&self.amnesia)
+    }
+
+    /// Whether Raft may answer a peer's vote request. `false` means the
+    /// request is answered "not granted" without Raft seeing it: this node is
+    /// amnesiac. The one request that ends the amnesia is the first election
+    /// of a new cluster ([`amnesia::rule_on_vote`]).
+    pub fn admit_vote(&self, request: &VoteRequest<NodeId>) -> bool {
+        match self.amnesia.rule_on_vote(request) {
+            VoteRuling::Normal => true,
+            VoteRuling::Refuse => {
+                tracing::debug!(
+                    request = %request.vote,
+                    "vote request refused: this node started empty and has not caught up"
+                );
+                false
+            }
+            VoteRuling::FirstStart => {
+                let because = "the lowest-id voter is electing itself with an empty log, so the \
+                               cluster is new and there was nothing to forget";
+                match self.leave_amnesia(because) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "vote request refused");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ends this node's amnesia: the marker goes first, durably, and then
+    /// the node may vote, stand for election and count in a claim again.
+    fn leave_amnesia(&self, because: &str) -> Result<(), Error> {
+        self.amnesia.leave(because).map_err(|error| {
+            Error::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "could not remove the amnesia marker: {error}. This node keeps abstaining \
+                     from votes and leader claims until it can; check that the data directory \
+                     is writable"
+                ),
+            ))
+        })?;
+        if let Some(raft) = self.raft_node() {
+            raft.runtime_config()
+                .elect(self.cluster_config.raft_config.enable_elect);
+        }
+        Ok(())
+    }
+
+    /// True once this node holds everything the cluster had committed at
+    /// some moment since it started: it has applied a leader's claim, holds
+    /// every context that claim names, and each of its contexts has caught up
+    /// with a leader. The claim is what says the context list is complete: a
+    /// node that starts empty knows only the contexts its own configuration
+    /// creates until the metadata group has told it the rest.
+    fn holds_whole_log(&self) -> bool {
+        let Some(claim) = self.control_updates.borrow().leader_claim.clone() else {
+            return false;
+        };
+        let contexts = self.context_manager.list_contexts();
+        claim
+            .per_context_tails
+            .keys()
+            .all(|context| contexts.contains(context))
+            && contexts.iter().all(|context| {
+                self.context_manager
+                    .get_context(context)
+                    .is_ok_and(|engine| engine.has_caught_up())
+            })
+    }
+
+    /// Runs while this node is amnesiac. Every node waits here to hold the
+    /// whole log. The lowest-id voter also asks the others whether the
+    /// cluster is new, and initializes it if every one of them is empty.
+    async fn run_amnesia(self: Arc<Self>) {
+        let mut probing = self.amnesia.is_bootstrapper();
+        let mut next_probe = Instant::now();
+        let mut next_reminder = Instant::now() + FIRST_START_REMINDER;
+        while self.amnesia.is_amnesiac() {
+            if self.holds_whole_log() {
+                match self.leave_amnesia("every context has caught up with the leader") {
+                    Ok(()) => return,
+                    Err(error) => tracing::warn!(%error, "still amnesiac"),
+                }
+            } else if probing && Instant::now() >= next_probe {
+                match self.probe_first_start().await {
+                    FirstStart::Initialize => match self.start_new_cluster().await {
+                        Ok(()) => return,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not start the new cluster; trying again")
+                        }
+                    },
+                    FirstStart::NotNew { holder } => {
+                        probing = false;
+                        tracing::info!(
+                            holder,
+                            "voter {holder} holds data, so this cluster is not new: this node \
+                             lost its data directory. It does not initialize a cluster and \
+                             waits for a leader to catch up with"
+                        );
+                    }
+                    FirstStart::Wait { unanswered } => {
+                        if Instant::now() >= next_reminder {
+                            next_reminder = Instant::now() + FIRST_START_REMINDER;
+                            tracing::warn!(
+                                ?unanswered,
+                                "this node has no Raft state and is the lowest-id voter. It \
+                                 starts a new cluster only once every other voter has answered \
+                                 and is empty too, and these have not answered. Start them, or \
+                                 check that this node can reach them"
+                            );
+                        }
+                    }
+                }
+                next_probe = Instant::now() + FIRST_START_PROBE;
+            }
+            tokio::time::sleep(AMNESIA_CHECK).await;
+        }
+    }
+
+    /// Asks every other configured voter what it holds.
+    async fn probe_first_start(&self) -> FirstStart {
+        let voters = &self.cluster_config.voters;
+        let answers = match self.collect_voter_cursors(voters).await {
+            Ok(answers) => answers,
+            Err(error) => {
+                tracing::debug!(%error, "could not read this node's own cursors");
+                Vec::new()
+            }
+        };
+        let others: Vec<(NodeId, Option<bool>)> = voters
+            .iter()
+            .filter(|peer| peer.id != self.cluster_config.node_id)
+            .map(|peer| {
+                let answer = answers.iter().find(|answer| answer.node_id == peer.id);
+                (peer.id, answer.map(|answer| answer.looks_empty()))
+            })
+            .collect();
+        amnesia::decide_first_start(&others)
+    }
+
+    /// Every voter is empty: this is the cluster's first start, and this
+    /// node is where it starts. The group is initialized before the marker
+    /// goes, so a crash in between leaves a node that asks again.
+    async fn start_new_cluster(&self) -> Result<(), Error> {
+        self.initialize_group().await?;
+        self.leave_amnesia(
+            "every other voter answered and is empty too, so the cluster is new and this node \
+             has initialized it",
+        )
     }
 
     /// Adds a learner to the cluster (for passive backup nodes).
@@ -698,5 +948,62 @@ impl ClusterManager {
         self.control.set_voters(voter_ids);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod forget_leadership_tests {
+    use super::*;
+    use openraft::Vote;
+    use openraft::storage::RaftLogStorage;
+
+    async fn vote_after_restart(stored: Vote<NodeId>, node_id: NodeId) -> Option<Vote<NodeId>> {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
+            RaftLogStorage::<TypeConfig>::save_vote(&mut store, &stored)
+                .await
+                .unwrap();
+        }
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
+        forget_leadership(&mut store, node_id).await.unwrap();
+        drop(store);
+        // What the next start reads from disk.
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
+        RaftLogStorage::<TypeConfig>::read_vote(&mut store)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_restarted_leader_keeps_its_term_and_its_vote_but_not_its_leadership() {
+        let vote = vote_after_restart(Vote::new_committed(7, 2), 2).await;
+        assert_eq!(vote, Some(Vote::new(7, 2)));
+        assert!(!vote.unwrap().is_committed());
+    }
+
+    #[tokio::test]
+    async fn a_follower_keeps_the_leader_it_follows() {
+        let vote = vote_after_restart(Vote::new_committed(7, 3), 2).await;
+        assert_eq!(vote, Some(Vote::new_committed(7, 3)));
+    }
+
+    #[tokio::test]
+    async fn a_plain_vote_is_left_alone() {
+        let vote = vote_after_restart(Vote::new(7, 2), 2).await;
+        assert_eq!(vote, Some(Vote::new(7, 2)));
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_vote_stays_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LogStore::new(dir.path(), LogStoreConfig::default()).unwrap();
+        forget_leadership(&mut store, 2).await.unwrap();
+        assert_eq!(
+            RaftLogStorage::<TypeConfig>::read_vote(&mut store)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
