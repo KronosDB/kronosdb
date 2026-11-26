@@ -693,6 +693,9 @@ impl ClusterManager {
                 .await?;
             safe_tails.insert(context.clone(), safe_tail);
         }
+        // From here this node's logs are the best a quorum holds, and the
+        // Tail service may serve them to followers (it refuses until then).
+        self.control.mark_reconciled(epoch);
 
         let current = raft.metrics().borrow().clone();
         if current.current_leader != Some(self.cluster_config.node_id)
@@ -792,25 +795,33 @@ impl ClusterManager {
         Ok(())
     }
 
-    async fn collect_voter_cursors(
+    /// Asks every voter where its logs stand. Voters that do not answer in
+    /// time are left out; this node's own answer comes first.
+    pub(super) async fn collect_voter_cursors(
         &self,
         active_voters: &[PeerConfig],
     ) -> Result<Vec<VoterCursors>, Error> {
         let mut snapshots = Vec::new();
         let mut local_contexts = HashMap::new();
+        let mut local_epoch: Option<u64> = None;
         for context in self.context_manager.list_contexts() {
             let engine = self.context_manager.get_context(&context)?;
+            let context_epoch = engine.replication_epoch();
+            local_epoch = Some(local_epoch.map_or(context_epoch, |epoch| epoch.min(context_epoch)));
             local_contexts.insert(
                 context,
                 CursorSnapshot {
                     position: engine.local_tail().0,
                     log_epoch: engine.log_epoch(),
+                    watermark: engine.head().0,
                 },
             );
         }
         snapshots.push(VoterCursors {
             node_id: self.cluster_config.node_id,
-            control_epoch: self.control.claim().map(|claim| claim.epoch).unwrap_or(0),
+            // An amnesiac claimant does not stand for itself either.
+            control_epoch: self.amnesia.vouched_epoch(&self.control),
+            epoch: local_epoch.unwrap_or(0),
             contexts: local_contexts,
         });
 
@@ -850,6 +861,7 @@ impl ClusterManager {
                     Ok(VoterCursors {
                         node_id: response.node_id,
                         control_epoch: response.control_epoch,
+                        epoch: response.epoch,
                         contexts: response
                             .contexts
                             .iter()
@@ -859,6 +871,7 @@ impl ClusterManager {
                                     CursorSnapshot {
                                         position: cursor.durable_position,
                                         log_epoch: cursor.log_epoch,
+                                        watermark: cursor.watermark,
                                     },
                                 )
                             })
@@ -913,9 +926,11 @@ impl ClusterManager {
             });
         }
 
-        // Any live voter quorum intersects the quorum that made every prior
-        // client acknowledgement durable, so some responder holds every
-        // committed byte. Which one is the one whose log is newest the way
+        // Any voter quorum intersects the quorum that made every prior client
+        // acknowledgement durable, so some responder holds every committed
+        // byte, provided every responder still holds what it acknowledged. A
+        // voter that started empty does not; it answers with claim epoch 0
+        // until it has caught up, so it is not among `snapshots`. Which one is the one whose log is newest the way
         // Raft ranks logs: by the epoch its last EpochChange names, then by
         // length. Tails of different epochs are not comparable: a deposed
         // leader's unacknowledged suffix is longer than the acknowledged
@@ -1024,15 +1039,36 @@ async fn abort_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
     }
 }
 
-struct VoterCursors {
-    node_id: NodeId,
-    control_epoch: u64,
-    contexts: HashMap<String, CursorSnapshot>,
+/// One voter's answer to a cursor query.
+pub(super) struct VoterCursors {
+    pub(super) node_id: NodeId,
+    /// The claim epoch the voter vouches for: 0 before it has seen a claim,
+    /// and 0 from a voter that started empty and has not caught up.
+    pub(super) control_epoch: u64,
+    /// The lowest replication epoch any of its contexts has adopted.
+    pub(super) epoch: u64,
+    pub(super) contexts: HashMap<String, CursorSnapshot>,
 }
 
-struct CursorSnapshot {
-    position: u64,
-    log_epoch: u64,
+pub(super) struct CursorSnapshot {
+    pub(super) position: u64,
+    pub(super) log_epoch: u64,
+    pub(super) watermark: u64,
+}
+
+impl VoterCursors {
+    /// Whether the voter shows no trace of a cluster that has run: it
+    /// vouches for no claim, and none of its contexts has adopted an epoch,
+    /// holds an event or an `EpochChange`, or knows a committed position.
+    pub(super) fn looks_empty(&self) -> bool {
+        super::amnesia::looks_empty(
+            self.control_epoch,
+            self.epoch,
+            self.contexts
+                .values()
+                .map(|cursor| (cursor.position, cursor.log_epoch, cursor.watermark)),
+        )
+    }
 }
 
 /// A Tail session that lasted this long was working: failures before it no

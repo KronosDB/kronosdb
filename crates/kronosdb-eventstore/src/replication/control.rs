@@ -32,6 +32,9 @@ pub struct ReplicationControl {
     /// recorded on the claimed leader for every session including learners.
     /// Informational: promotion gating and operator visibility, never quorum.
     progress: RwLock<std::collections::BTreeMap<(String, u64), u64>>,
+    /// The claim epoch this process has reconciled against a quorum of voters'
+    /// cursors (0: none). See [`ReplicationControl::mark_reconciled`].
+    reconciled_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl ReplicationControl {
@@ -46,7 +49,28 @@ impl ReplicationControl {
             voter_generation: std::sync::atomic::AtomicU64::new(0),
             claim,
             progress: RwLock::new(std::collections::BTreeMap::new()),
+            reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Records that this node, as the claimant of `epoch`, has compared its
+    /// logs with a quorum of voters and holds the best of them. Kept in
+    /// memory only: a leader that restarts and resumes a claim of the same
+    /// term finds its engines already in that claim's epoch, yet it has not
+    /// shown, in this run, that its log is the cluster's. Until it has, it
+    /// must not hand that log to followers as the one to catch up with.
+    pub fn mark_reconciled(&self, epoch: u64) {
+        self.reconciled_epoch
+            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether [`ReplicationControl::mark_reconciled`] was called for `epoch`.
+    pub fn is_reconciled(&self, epoch: u64) -> bool {
+        epoch != 0
+            && self
+                .reconciled_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == epoch
     }
 
     pub fn node_id(&self) -> u64 {

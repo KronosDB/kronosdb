@@ -479,6 +479,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         replication: Arc::new(SegmentReplicationService::new(
             Arc::clone(&contexts),
             cluster.replication_control(),
+            cluster.amnesia(),
             config.replication_inflight_bytes,
         )),
         max_snapshot_size: config.max_snapshot_size,

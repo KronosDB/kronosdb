@@ -11,7 +11,7 @@ use super::Ctx;
 use super::convert;
 
 pub async fn raft(ctx: Ctx, stream: ServerStream) -> Result<(), Failure> {
-    transport::serve(&ctx.deps.raft, stream)
+    transport::serve(&ctx.deps.raft, &ctx.deps.cluster, stream)
         .await
         .map_err(convert::failure)
 }
